@@ -6,6 +6,7 @@ members = ["crates/*"]
 version = "0.0.0"
 edition = "2024"
 rust-version = "1.99"
+license = "AGPL-3.0-only"
 publish = false
 
 [workspace.lints.rust]

@@ -1,0 +1,23 @@
+name: pull-request-policy
+
+on:
+  pull_request_target:
+    types: [opened, reopened]
+
+permissions:
+  pull-requests: write
+
+concurrency:
+  group: pull-request-policy-${{ github.event.pull_request.number }}
+
+jobs:
+  close-external:
+    if: ${{ !contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.pull_request.author_association) && github.event.pull_request.user.type != 'Bot' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - run: gh pr close "$NUMBER" --repo "$REPO" --comment "External pull requests are not accepted during development."
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
