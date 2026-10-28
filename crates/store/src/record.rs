@@ -18,6 +18,7 @@ const FLAGS: usize = 13;
 const FORMAT: usize = 14;
 const TENANT: usize = 16;
 const EPOCH: usize = 24;
+const RESERVED: usize = 20;
 const SEQUENCE: usize = 32;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -35,7 +36,9 @@ pub enum RecordError {
     HeaderChecksum,
     TooLarge(u32),
     Format(u16),
+    Reserved,
     BodyChecksum,
+    Padding,
 }
 
 impl fmt::Display for RecordError {
@@ -45,7 +48,9 @@ impl fmt::Display for RecordError {
             Self::HeaderChecksum => f.write_str("record header checksum mismatch"),
             Self::TooLarge(length) => write!(f, "record payload of {length} bytes is too large"),
             Self::Format(format) => write!(f, "unsupported record format {format}"),
+            Self::Reserved => f.write_str("record reserved bytes are not zero"),
             Self::BodyChecksum => f.write_str("record payload checksum mismatch"),
+            Self::Padding => f.write_str("record padding is not zero"),
         }
     }
 }
@@ -73,7 +78,7 @@ pub fn encode(header: &Header, payload: &[u8], out: &mut [u8]) -> usize {
     fields.put_u8(FLAGS, header.flags);
     fields.put_u16(FORMAT, RECORD_FORMAT);
     fields.put_u32(TENANT, header.tenant);
-    fields.put_u32(TENANT + 4, 0);
+    fields.put_u32(RESERVED, 0);
     fields.put_u64(EPOCH, header.epoch);
     fields.put_u64(SEQUENCE, header.sequence);
     let sum = checksum(&out[BODY_CRC..RECORD_HEADER_SIZE]);
@@ -99,6 +104,9 @@ fn verified_length(bytes: &[u8]) -> Result<usize, RecordError> {
     if !(OLDEST_RECORD_FORMAT..=RECORD_FORMAT).contains(&format) {
         return Err(RecordError::Format(format));
     }
+    if fields.u32(RESERVED) != 0 {
+        return Err(RecordError::Reserved);
+    }
     match usize::try_from(length) {
         Ok(length) if length <= MAX_PAYLOAD => Ok(length),
         _ => Err(RecordError::TooLarge(length)),
@@ -120,6 +128,10 @@ impl<'a> Record<'a> {
         let payload = &bytes[RECORD_HEADER_SIZE..end];
         if Fields::new(bytes).u32(BODY_CRC) != checksum(payload) {
             return Err(RecordError::BodyChecksum);
+        }
+        let padded = record_size(length).min(bytes.len());
+        if bytes[end..padded].iter().any(|&b| b != 0) {
+            return Err(RecordError::Padding);
         }
         Ok(Self {
             bytes: &bytes[..end],

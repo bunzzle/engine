@@ -2,7 +2,7 @@ use std::env;
 
 use store::{
     FLAG_MORE, Header, MAX_PAYLOAD, RECORD_ALIGN, RECORD_FORMAT, RECORD_HEADER_SIZE, Record,
-    RecordError, chunks, encode, peek, record_size,
+    RecordError, checksum, chunks, encode, peek, record_size,
 };
 
 const HEADER: Header = Header {
@@ -95,6 +95,14 @@ fn damage_is_reported_by_kind() {
     body[RECORD_HEADER_SIZE] ^= 1;
     assert_eq!(peek(&body), Ok(bytes.len()));
     assert_eq!(Record::decode(&body).err(), Some(RecordError::BodyChecksum));
+    let mut padding = bytes.clone();
+    padding[RECORD_HEADER_SIZE + 7] = 1;
+    assert_eq!(Record::decode(&padding).err(), Some(RecordError::Padding));
+    let mut reserved = bytes.clone();
+    reserved[20] = 1;
+    let sum = checksum(&reserved[4..RECORD_HEADER_SIZE]);
+    reserved[..4].copy_from_slice(&sum.to_le_bytes());
+    assert_eq!(Record::decode(&reserved).err(), Some(RecordError::Reserved));
 }
 
 #[test]
