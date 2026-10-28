@@ -1,5 +1,7 @@
 use std::{fmt, io};
 
+use crate::record::RecordError;
+
 #[derive(Debug)]
 pub enum Error {
     Io(io::Error),
@@ -18,6 +20,7 @@ pub enum Error {
     FormatTooOld(u16),
     Reserve,
     Full,
+    Record(RecordError),
 }
 
 impl fmt::Display for Error {
@@ -45,6 +48,7 @@ impl fmt::Display for Error {
             Self::FormatTooOld(format) => write!(f, "format {format} is older than supported"),
             Self::Reserve => f.write_str("free-space reserve reached"),
             Self::Full => f.write_str("no free region"),
+            Self::Record(e) => e.fmt(f),
         }
     }
 }
@@ -53,6 +57,7 @@ impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Io(e) => Some(e),
+            Self::Record(e) => Some(e),
             _ => None,
         }
     }
@@ -61,5 +66,11 @@ impl std::error::Error for Error {
 impl From<io::Error> for Error {
     fn from(e: io::Error) -> Self {
         Self::Io(e)
+    }
+}
+
+impl From<RecordError> for Error {
+    fn from(e: RecordError) -> Self {
+        Self::Record(e)
     }
 }
