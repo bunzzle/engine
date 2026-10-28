@@ -1,6 +1,7 @@
 mod crc32c;
 mod data_file;
 mod error;
+mod journal;
 mod layout;
 mod record;
 mod regions;
@@ -9,6 +10,7 @@ mod superblock;
 pub use crc32c::checksum;
 pub use data_file::{DataFile, Options};
 pub use error::Error;
+pub use journal::{Allocation, Commit, Entry, Journal, KIND_COMMIT, Position, Range};
 pub use layout::{Fields, FieldsMut};
 pub use record::{
     FLAG_MORE, Header, MAX_PAYLOAD, RECORD_ALIGN, RECORD_FORMAT, RECORD_HEADER_SIZE, Record,

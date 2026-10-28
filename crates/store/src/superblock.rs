@@ -33,6 +33,7 @@ pub struct Superblock {
     pub(crate) file_id: u64,
     pub(crate) file_size: u64,
     pub(crate) regions_offset: u64,
+    pub(crate) journal_size: u64,
     pub(crate) region_size: u64,
     pub(crate) region_count: u32,
     pub(crate) checkpoint: Option<Checkpoint>,
@@ -71,6 +72,17 @@ impl Superblock {
         self.regions_offset
     }
 
+    pub fn journal_size(&self) -> u64 {
+        self.journal_size
+    }
+
+    pub fn journal_offsets(&self) -> [u64; 2] {
+        [
+            ZONE_SIZE,
+            self.regions_offset + u64::from(self.region_count) * self.region_size,
+        ]
+    }
+
     pub fn region_size(&self) -> u64 {
         self.region_size
     }
@@ -98,6 +110,7 @@ impl Superblock {
         fields.put_u64(40, self.file_id);
         fields.put_u64(48, self.file_size);
         fields.put_u64(56, self.regions_offset);
+        fields.put_u64(112, self.journal_size);
         fields.put_u64(64, self.region_size);
         fields.put_u32(72, self.region_count);
         if let Some(checkpoint) = self.checkpoint {
@@ -139,6 +152,7 @@ impl Superblock {
                 file_id: fields.u64(40),
                 file_size: fields.u64(48),
                 regions_offset: fields.u64(56),
+                journal_size: fields.u64(112),
                 region_size: fields.u64(64),
                 region_count: fields.u32(72),
                 checkpoint,
@@ -157,12 +171,19 @@ impl Superblock {
         if self.region_size == 0 || !self.region_size.is_multiple_of(SLOT_SIZE) {
             return Err(Error::Invalid("region size"));
         }
-        if self.region_count == 0 || self.shards == 0 || self.regions_offset != ZONE_SIZE {
+        if self.journal_size == 0 || !self.journal_size.is_multiple_of(SLOT_SIZE) {
+            return Err(Error::Invalid("journal size"));
+        }
+        if self.region_count == 0
+            || self.shards == 0
+            || self.regions_offset != ZONE_SIZE + self.journal_size
+        {
             return Err(Error::Invalid("layout"));
         }
         let size = u64::from(self.region_count)
             .checked_mul(self.region_size)
-            .and_then(|regions| regions.checked_add(self.regions_offset));
+            .and_then(|regions| regions.checked_add(self.regions_offset))
+            .and_then(|end| end.checked_add(self.journal_size));
         if size != Some(self.file_size) {
             return Err(Error::Invalid("file size"));
         }
@@ -262,8 +283,9 @@ mod tests {
             parent: 0,
             shards: 4,
             file_id: 7,
-            file_size: ZONE_SIZE + 2 * 65536,
-            regions_offset: ZONE_SIZE,
+            file_size: ZONE_SIZE + 4 * 65536,
+            regions_offset: ZONE_SIZE + 65536,
+            journal_size: 65536,
             region_size: 65536,
             region_count: 2,
             checkpoint: None,
