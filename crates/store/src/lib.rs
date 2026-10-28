@@ -1,3 +1,4 @@
+mod committer;
 mod crc32c;
 mod data_file;
 mod error;
@@ -7,6 +8,7 @@ mod record;
 mod regions;
 mod superblock;
 
+pub use committer::{Client, Committer, Durable, Location, Submission, Write};
 pub use crc32c::checksum;
 pub use data_file::{DataFile, Options};
 pub use error::Error;
