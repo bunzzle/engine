@@ -1,0 +1,18 @@
+name: Feature
+description: Propose new behaviour
+type: Feature
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What
+      description: The behaviour you want.
+    validations:
+      required: true
+  - type: textarea
+    id: done
+    attributes:
+      label: Done when
+      description: How we know it works.
+    validations:
+      required: true
