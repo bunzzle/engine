@@ -20,6 +20,8 @@ pub enum Error {
     FormatTooOld(u16),
     Reserve,
     Full,
+    JournalFull,
+    CommitTooLarge,
     Record(RecordError),
 }
 
@@ -48,6 +50,8 @@ impl fmt::Display for Error {
             Self::FormatTooOld(format) => write!(f, "format {format} is older than supported"),
             Self::Reserve => f.write_str("free-space reserve reached"),
             Self::Full => f.write_str("no free region"),
+            Self::JournalFull => f.write_str("commit journal full"),
+            Self::CommitTooLarge => f.write_str("commit record too large"),
             Self::Record(e) => e.fmt(f),
         }
     }

@@ -10,6 +10,7 @@ const MILLION: u32 = 1_000_000;
 const PATH: &str = "/data/store";
 
 const OPTIONS: Options = Options {
+    journal_size: SLOT_SIZE,
     region_size: 2 * SLOT_SIZE,
     region_count: 4,
     shards: 8,
@@ -79,9 +80,13 @@ fn create_then_open_reads_the_same_superblock() {
         assert_eq!(superblock.shards(), 8);
         assert_eq!(superblock.region_count(), 4);
         assert_eq!(superblock.checkpoint(), None);
-        assert_eq!(superblock.file_size(), ZONE_SIZE + 8 * SLOT_SIZE);
-        assert_eq!(data.region_offset(0), ZONE_SIZE);
-        assert_eq!(data.region_offset(3), ZONE_SIZE + 6 * SLOT_SIZE);
+        assert_eq!(superblock.file_size(), ZONE_SIZE + 10 * SLOT_SIZE);
+        assert_eq!(data.region_offset(0), ZONE_SIZE + SLOT_SIZE);
+        assert_eq!(data.region_offset(3), ZONE_SIZE + 7 * SLOT_SIZE);
+        assert_eq!(
+            superblock.journal_offsets(),
+            [ZONE_SIZE, ZONE_SIZE + 9 * SLOT_SIZE]
+        );
         let stat = data.file().stat().await.expect("stat");
         assert_eq!(stat.len, superblock.file_size());
     });

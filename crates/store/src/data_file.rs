@@ -12,6 +12,7 @@ const FILL_CHUNK: u64 = 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Options {
+    pub journal_size: u64,
     pub region_size: u64,
     pub region_count: u32,
     pub shards: u32,
@@ -31,15 +32,22 @@ impl DataFile {
                 "region size must be a non-zero multiple of 64 KiB",
             ));
         }
+        if options.journal_size == 0 || !options.journal_size.is_multiple_of(SLOT_SIZE) {
+            return Err(Error::Config(
+                "journal size must be a non-zero multiple of 64 KiB",
+            ));
+        }
         if options.region_count == 0 {
             return Err(Error::Config("region count must not be zero"));
         }
         if options.shards == 0 {
             return Err(Error::Config("shard count must not be zero"));
         }
+        let regions_offset = ZONE_SIZE + options.journal_size;
         let file_size = u64::from(options.region_count)
             .checked_mul(options.region_size)
-            .and_then(|regions| regions.checked_add(ZONE_SIZE))
+            .and_then(|regions| regions.checked_add(regions_offset))
+            .and_then(|end| end.checked_add(options.journal_size))
             .ok_or(Error::Config("data file too large"))?;
         let path = path.as_ref();
         let file = File::open(
@@ -65,7 +73,8 @@ impl DataFile {
             shards: options.shards,
             file_id: file_id(),
             file_size,
-            regions_offset: ZONE_SIZE,
+            regions_offset,
+            journal_size: options.journal_size,
             region_size: options.region_size,
             region_count: options.region_count,
             checkpoint: None,

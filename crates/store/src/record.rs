@@ -136,6 +136,10 @@ impl<'a> Record<'a> {
         }
     }
 
+    pub fn checksum(&self) -> u32 {
+        self.fields().u32(HEADER_CRC)
+    }
+
     pub fn kind(&self) -> u8 {
         self.fields().u8(KIND)
     }
