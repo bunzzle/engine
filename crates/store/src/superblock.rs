@@ -1,0 +1,403 @@
+use crate::crc32c::checksum;
+use crate::error::Error;
+
+pub const FORMAT: u16 = 1;
+pub const COPIES: usize = 4;
+pub const SLOT_SIZE: u64 = 64 * 1024;
+pub const ZONE_SIZE: u64 = SLOT_SIZE * COPIES as u64;
+pub const MIN_SECTOR_SIZE: u32 = 4096;
+pub const MAX_SECTOR_SIZE: u32 = 64 * 1024;
+
+pub(crate) const HEADER_SIZE: usize = 4096;
+const QUORUM: usize = 2;
+const MAGIC: [u8; 8] = *b"bunzzle\0";
+const CHECKED: usize = 6;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Checkpoint {
+    pub sequence: u64,
+    pub offset: u64,
+    pub length: u64,
+    pub checksum: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Superblock {
+    pub(crate) format: u16,
+    pub(crate) oldest_format: u16,
+    pub(crate) sector_size: u32,
+    pub(crate) sequence: u64,
+    pub(crate) parent: u32,
+    pub(crate) shards: u32,
+    pub(crate) file_id: u64,
+    pub(crate) file_size: u64,
+    pub(crate) regions_offset: u64,
+    pub(crate) region_size: u64,
+    pub(crate) region_count: u32,
+    pub(crate) checkpoint: Option<Checkpoint>,
+}
+
+impl Superblock {
+    pub fn format(&self) -> u16 {
+        self.format
+    }
+
+    pub fn oldest_format(&self) -> u16 {
+        self.oldest_format
+    }
+
+    pub fn sector_size(&self) -> u32 {
+        self.sector_size
+    }
+
+    pub fn sequence(&self) -> u64 {
+        self.sequence
+    }
+
+    pub fn shards(&self) -> u32 {
+        self.shards
+    }
+
+    pub fn file_id(&self) -> u64 {
+        self.file_id
+    }
+
+    pub fn file_size(&self) -> u64 {
+        self.file_size
+    }
+
+    pub fn regions_offset(&self) -> u64 {
+        self.regions_offset
+    }
+
+    pub fn region_size(&self) -> u64 {
+        self.region_size
+    }
+
+    pub fn region_count(&self) -> u32 {
+        self.region_count
+    }
+
+    pub fn checkpoint(&self) -> Option<Checkpoint> {
+        self.checkpoint
+    }
+
+    pub(crate) fn encode(&self, copy: u16, out: &mut [u8]) -> u32 {
+        let out = &mut out[..HEADER_SIZE];
+        out.fill(0);
+        put(out, 4, &copy.to_le_bytes());
+        put(out, 6, &MAGIC);
+        put(out, 14, &self.format.to_le_bytes());
+        put(out, 16, &self.oldest_format.to_le_bytes());
+        put(out, 20, &self.sector_size.to_le_bytes());
+        put(out, 24, &self.sequence.to_le_bytes());
+        put(out, 32, &self.parent.to_le_bytes());
+        put(out, 36, &self.shards.to_le_bytes());
+        put(out, 40, &self.file_id.to_le_bytes());
+        put(out, 48, &self.file_size.to_le_bytes());
+        put(out, 56, &self.regions_offset.to_le_bytes());
+        put(out, 64, &self.region_size.to_le_bytes());
+        put(out, 72, &self.region_count.to_le_bytes());
+        if let Some(checkpoint) = self.checkpoint {
+            put(out, 80, &checkpoint.sequence.to_le_bytes());
+            put(out, 88, &checkpoint.offset.to_le_bytes());
+            put(out, 96, &checkpoint.length.to_le_bytes());
+            put(out, 104, &checkpoint.checksum.to_le_bytes());
+        }
+        let sum = checksum(&out[CHECKED..]);
+        put(out, 0, &sum.to_le_bytes());
+        sum
+    }
+
+    pub(crate) fn decode(bytes: &[u8]) -> Option<Stored> {
+        if bytes.len() < HEADER_SIZE {
+            return None;
+        }
+        let bytes = &bytes[..HEADER_SIZE];
+        let sum = u32::from_le_bytes(take(bytes, 0));
+        if sum != checksum(&bytes[CHECKED..]) || take::<8>(bytes, 6) != MAGIC {
+            return None;
+        }
+        let length = u64::from_le_bytes(take(bytes, 96));
+        let checkpoint = (length > 0).then(|| Checkpoint {
+            sequence: u64::from_le_bytes(take(bytes, 80)),
+            offset: u64::from_le_bytes(take(bytes, 88)),
+            length,
+            checksum: u32::from_le_bytes(take(bytes, 104)),
+        });
+        Some(Stored {
+            superblock: Self {
+                format: u16::from_le_bytes(take(bytes, 14)),
+                oldest_format: u16::from_le_bytes(take(bytes, 16)),
+                sector_size: u32::from_le_bytes(take(bytes, 20)),
+                sequence: u64::from_le_bytes(take(bytes, 24)),
+                parent: u32::from_le_bytes(take(bytes, 32)),
+                shards: u32::from_le_bytes(take(bytes, 36)),
+                file_id: u64::from_le_bytes(take(bytes, 40)),
+                file_size: u64::from_le_bytes(take(bytes, 48)),
+                regions_offset: u64::from_le_bytes(take(bytes, 56)),
+                region_size: u64::from_le_bytes(take(bytes, 64)),
+                region_count: u32::from_le_bytes(take(bytes, 72)),
+                checkpoint,
+            },
+            copy: u16::from_le_bytes(take(bytes, 4)),
+            checksum: sum,
+        })
+    }
+
+    pub(crate) fn validate(&self) -> Result<(), Error> {
+        if !self.sector_size.is_power_of_two()
+            || !(MIN_SECTOR_SIZE..=MAX_SECTOR_SIZE).contains(&self.sector_size)
+        {
+            return Err(Error::Invalid("sector size"));
+        }
+        if self.region_size == 0 || !self.region_size.is_multiple_of(SLOT_SIZE) {
+            return Err(Error::Invalid("region size"));
+        }
+        if self.region_count == 0 || self.shards == 0 || self.regions_offset != ZONE_SIZE {
+            return Err(Error::Invalid("layout"));
+        }
+        let size = u64::from(self.region_count)
+            .checked_mul(self.region_size)
+            .and_then(|regions| regions.checked_add(self.regions_offset));
+        if size != Some(self.file_size) {
+            return Err(Error::Invalid("file size"));
+        }
+        if self.oldest_format > self.format {
+            return Err(Error::Invalid("oldest format"));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Stored {
+    pub superblock: Superblock,
+    pub copy: u16,
+    pub checksum: u32,
+}
+
+#[derive(Debug)]
+pub(crate) struct Selected {
+    pub superblock: Superblock,
+    pub checksum: u32,
+    pub stale: Vec<usize>,
+}
+
+struct Group {
+    superblock: Superblock,
+    checksum: u32,
+    count: usize,
+}
+
+pub(crate) fn select(copies: &[Option<Stored>; COPIES]) -> Result<Selected, Error> {
+    let mut groups: Vec<Group> = Vec::new();
+    for (slot, copy) in copies.iter().enumerate() {
+        let Some(copy) = copy else { continue };
+        if usize::from(copy.copy) != slot {
+            continue;
+        }
+        match groups.iter_mut().find(|g| g.checksum == copy.checksum) {
+            Some(group) => group.count += 1,
+            None => groups.push(Group {
+                superblock: copy.superblock,
+                checksum: copy.checksum,
+                count: 1,
+            }),
+        }
+    }
+    if groups.is_empty() {
+        return Err(Error::NotFormatted);
+    }
+    let best = groups
+        .iter()
+        .filter(|g| g.count >= QUORUM)
+        .max_by_key(|g| g.superblock.sequence)
+        .ok_or(Error::QuorumLost)?;
+    let newest = best.superblock;
+    for group in &groups {
+        let other = group.superblock;
+        if group.checksum == best.checksum || other.file_id != newest.file_id {
+            continue;
+        }
+        if other.sequence == newest.sequence {
+            return Err(Error::Fork);
+        }
+        if other.sequence > newest.sequence + 1 {
+            return Err(Error::SequenceSkipped);
+        }
+        if other.sequence + 1 == newest.sequence && newest.parent != group.checksum {
+            return Err(Error::ParentNotConnected);
+        }
+    }
+    let stale = copies
+        .iter()
+        .enumerate()
+        .filter(|(slot, copy)| {
+            !copy.is_some_and(|c| c.checksum == best.checksum && usize::from(c.copy) == *slot)
+        })
+        .map(|(slot, _)| slot)
+        .collect();
+    Ok(Selected {
+        superblock: newest,
+        checksum: best.checksum,
+        stale,
+    })
+}
+
+fn put(out: &mut [u8], at: usize, bytes: &[u8]) {
+    out[at..at + bytes.len()].copy_from_slice(bytes);
+}
+
+fn take<const N: usize>(bytes: &[u8], at: usize) -> [u8; N] {
+    let mut out = [0u8; N];
+    out.copy_from_slice(&bytes[at..at + N]);
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{COPIES, Checkpoint, FORMAT, HEADER_SIZE, Stored, Superblock, ZONE_SIZE, select};
+    use crate::error::Error;
+
+    fn superblock(sequence: u64) -> Superblock {
+        Superblock {
+            format: FORMAT,
+            oldest_format: FORMAT,
+            sector_size: 4096,
+            sequence,
+            parent: 0,
+            shards: 4,
+            file_id: 7,
+            file_size: ZONE_SIZE + 2 * 65536,
+            regions_offset: ZONE_SIZE,
+            region_size: 65536,
+            region_count: 2,
+            checkpoint: None,
+        }
+    }
+
+    fn copy(superblock: &Superblock, slot: usize) -> Option<Stored> {
+        let mut bytes = vec![0u8; HEADER_SIZE];
+        superblock.encode(u16::try_from(slot).expect("slot"), &mut bytes);
+        Superblock::decode(&bytes)
+    }
+
+    fn chain() -> (Superblock, Superblock) {
+        let first = superblock(1);
+        let mut bytes = vec![0u8; HEADER_SIZE];
+        let mut second = superblock(2);
+        second.parent = first.encode(0, &mut bytes);
+        (first, second)
+    }
+
+    fn slots(layout: [Option<&Superblock>; COPIES]) -> [Option<Stored>; COPIES] {
+        let mut out = [None; COPIES];
+        for (slot, superblock) in layout.iter().enumerate() {
+            out[slot] = superblock.and_then(|s| copy(s, slot));
+        }
+        out
+    }
+
+    #[test]
+    fn encode_and_decode_round_trip() {
+        let mut original = superblock(9);
+        original.checkpoint = Some(Checkpoint {
+            sequence: 3,
+            offset: 4096,
+            length: 512,
+            checksum: 11,
+        });
+        let decoded = copy(&original, 2).expect("decodes");
+        assert_eq!(decoded.superblock, original);
+        assert_eq!(decoded.copy, 2);
+        assert_eq!(
+            copy(&original, 0).expect("decodes").checksum,
+            decoded.checksum
+        );
+    }
+
+    #[test]
+    fn a_flipped_bit_fails_the_checksum() {
+        let mut bytes = vec![0u8; HEADER_SIZE];
+        superblock(1).encode(0, &mut bytes);
+        bytes[200] ^= 1;
+        assert!(Superblock::decode(&bytes).is_none());
+    }
+
+    #[test]
+    fn the_newest_quorum_wins() {
+        let (first, second) = chain();
+        let picked =
+            select(&slots([Some(&second), Some(&second), Some(&first), None])).expect("selects");
+        assert_eq!(picked.superblock.sequence, 2);
+        assert_eq!(picked.stale, vec![2, 3]);
+    }
+
+    #[test]
+    fn a_single_newer_copy_is_an_unfinished_update() {
+        let (first, second) = chain();
+        let picked = select(&slots([
+            Some(&second),
+            Some(&first),
+            Some(&first),
+            Some(&first),
+        ]))
+        .expect("selects");
+        assert_eq!(picked.superblock.sequence, 1);
+        assert_eq!(picked.stale, vec![0]);
+    }
+
+    #[test]
+    fn a_misplaced_copy_does_not_count() {
+        let (_, second) = chain();
+        let mut layout = slots([Some(&second), None, None, None]);
+        layout[1] = copy(&second, 0);
+        assert!(matches!(select(&layout), Err(Error::QuorumLost)));
+    }
+
+    #[test]
+    fn errors_are_typed() {
+        let (first, second) = chain();
+        assert!(matches!(select(&[None; COPIES]), Err(Error::NotFormatted)));
+        assert!(matches!(
+            select(&slots([Some(&first), None, None, None])),
+            Err(Error::QuorumLost)
+        ));
+
+        let mut forked = second;
+        forked.shards = 8;
+        assert!(matches!(
+            select(&slots([
+                Some(&second),
+                Some(&second),
+                Some(&forked),
+                Some(&forked)
+            ])),
+            Err(Error::Fork)
+        ));
+
+        let mut orphan = second;
+        orphan.parent = 99;
+        assert!(matches!(
+            select(&slots([
+                Some(&orphan),
+                Some(&orphan),
+                Some(&first),
+                Some(&first)
+            ])),
+            Err(Error::ParentNotConnected)
+        ));
+
+        let skipped = superblock(4);
+        assert!(matches!(
+            select(&slots([
+                Some(&skipped),
+                Some(&first),
+                Some(&first),
+                Some(&first)
+            ])),
+            Err(Error::SequenceSkipped)
+        ));
+    }
+}
