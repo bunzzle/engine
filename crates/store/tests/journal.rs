@@ -181,11 +181,144 @@ fn a_damaged_copy_is_read_from_the_other_ring() {
             .expect("recover");
         assert_eq!(sequences(&entries), vec![1, 2, 3]);
         damage(rings[1] + second.offset).await;
+        let (_, entries) = Journal::recover(&data, Position::START)
+            .await
+            .expect("recover");
+        assert_eq!(sequences(&entries), vec![1, 2, 3], "ring A was repaired");
+        damage(rings[0] + second.offset).await;
+        damage(rings[1] + second.offset).await;
         let (journal, entries) = Journal::recover(&data, Position::START)
             .await
             .expect("recover");
         assert_eq!(sequences(&entries), vec![1]);
         assert_eq!(journal.position().sequence, 2);
+    });
+}
+
+async fn raw(at: u64) -> Vec<u8> {
+    let file = File::open(
+        PATH,
+        &OpenOptions {
+            read: true,
+            ..OpenOptions::default()
+        },
+    )
+    .await
+    .expect("open raw");
+    let (result, buf) = file.read_at(Buf::new(4096), at).await;
+    result.expect("read raw");
+    buf.to_vec()
+}
+
+async fn overwrite(at: u64, bytes: Vec<u8>) {
+    let file = File::open(
+        PATH,
+        &OpenOptions {
+            read: true,
+            write: true,
+            ..OpenOptions::default()
+        },
+    )
+    .await
+    .expect("open raw");
+    let (result, _) = file.write_all_at(Buf::from_slice(&bytes), at).await;
+    result.expect("overwrite");
+    file.sync_data().await.expect("sync");
+}
+
+async fn two_versions_of_the_second_commit(with_successor: bool) -> Result<Vec<u64>, Error> {
+    let data = DataFile::create(PATH, &OPTIONS).await.expect("create");
+    let rings = data.superblock().journal_offsets();
+    let (mut journal, _) = Journal::recover(&data, Position::START)
+        .await
+        .expect("recover");
+    journal
+        .append(data.file(), &commit(1, 2))
+        .await
+        .expect("append");
+    let stale = journal
+        .append(data.file(), &commit(2, 5))
+        .await
+        .expect("append");
+    data.file().sync_data().await.expect("sync");
+    let stale_bytes = raw(rings[0] + stale.offset).await;
+    damage(rings[0] + stale.offset).await;
+    damage(rings[1] + stale.offset).await;
+    let (mut journal, entries) = Journal::recover(&data, Position::START)
+        .await
+        .expect("recover");
+    assert_eq!(sequences(&entries), vec![1]);
+    journal
+        .append(data.file(), &commit(2, 2))
+        .await
+        .expect("append");
+    if with_successor {
+        journal
+            .append(data.file(), &commit(3, 2))
+            .await
+            .expect("append");
+    }
+    data.file().sync_data().await.expect("sync");
+    overwrite(rings[0] + stale.offset, stale_bytes).await;
+    let (_, entries) = Journal::recover(&data, Position::START).await?;
+    for entry in &entries {
+        assert_eq!(entry.commit, commit(entry.sequence, 2));
+    }
+    let first = sequences(&entries);
+    damage(rings[1] + stale.offset).await;
+    let (_, entries) = Journal::recover(&data, Position::START).await?;
+    assert_eq!(sequences(&entries), first, "ring A was repaired");
+    Ok(first)
+}
+
+#[test]
+fn the_copy_with_a_successor_wins_when_the_rings_disagree() {
+    let driver = Rc::new(SimDriver::new(5, Config::default()));
+    let result = run(&driver, two_versions_of_the_second_commit(true));
+    assert_eq!(result.expect("recovers"), vec![1, 2, 3]);
+}
+
+#[test]
+fn rings_that_disagree_without_a_successor_are_a_fork() {
+    let driver = Rc::new(SimDriver::new(6, Config::default()));
+    let result = run(&driver, two_versions_of_the_second_commit(false));
+    assert!(matches!(result, Err(Error::JournalFork)));
+}
+
+#[test]
+fn a_read_error_is_never_the_end_of_the_log() {
+    check(0..80, |seed| {
+        let setup = Rc::new(SimDriver::new(seed, Config::default()));
+        run(&setup, async {
+            let data = DataFile::create(PATH, &OPTIONS).await.expect("create");
+            let (mut journal, _) = Journal::recover(&data, Position::START)
+                .await
+                .expect("recover");
+            for sequence in 1..=4 {
+                journal
+                    .append(data.file(), &commit(sequence, 2))
+                    .await
+                    .expect("append");
+            }
+            data.file().sync_data().await.expect("sync");
+        });
+        let config = Config {
+            faults: Faults {
+                read_error: MILLION / 20,
+                ..Faults::default()
+            },
+            ..Config::default()
+        };
+        let driver = Rc::new(SimDriver::with_disk(seed, config, setup.crash()));
+        run(&driver, async {
+            let Ok(data) = DataFile::open(PATH).await else {
+                return;
+            };
+            match Journal::recover(&data, Position::START).await {
+                Ok((_, entries)) => assert_eq!(sequences(&entries), vec![1, 2, 3, 4]),
+                Err(e) => assert!(matches!(e, Error::Io(_)), "unexpected error {e}"),
+            }
+        });
     });
 }
 

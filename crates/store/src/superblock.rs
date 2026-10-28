@@ -221,7 +221,10 @@ pub(crate) fn select(copies: &[Option<Stored>; COPIES]) -> Result<Selected, Erro
         if usize::from(copy.copy) != slot {
             continue;
         }
-        match groups.iter_mut().find(|g| g.checksum == copy.checksum) {
+        match groups
+            .iter_mut()
+            .find(|g| g.checksum == copy.checksum && g.superblock == copy.superblock)
+        {
             Some(group) => group.count += 1,
             None => groups.push(Group {
                 superblock: copy.superblock,
@@ -241,7 +244,10 @@ pub(crate) fn select(copies: &[Option<Stored>; COPIES]) -> Result<Selected, Erro
     let newest = best.superblock;
     for group in &groups {
         let other = group.superblock;
-        if group.checksum == best.checksum || other.file_id != newest.file_id {
+        if other.file_id != newest.file_id {
+            return Err(Error::ForeignCopy);
+        }
+        if group.checksum == best.checksum && other == newest {
             continue;
         }
         if other.sequence == newest.sequence {
@@ -402,6 +408,13 @@ mod tests {
                 Some(&first)
             ])),
             Err(Error::ParentNotConnected)
+        ));
+
+        let mut foreign = first;
+        foreign.file_id = 8;
+        assert!(matches!(
+            select(&slots([Some(&first), Some(&first), Some(&foreign), None])),
+            Err(Error::ForeignCopy)
         ));
 
         let skipped = superblock(4);

@@ -10,6 +10,7 @@ pub enum Error {
     NotFormatted,
     QuorumLost,
     Fork,
+    ForeignCopy,
     ParentNotConnected,
     SequenceSkipped,
     Invalid(&'static str),
@@ -21,6 +22,7 @@ pub enum Error {
     Reserve,
     Full,
     JournalFull,
+    JournalFork,
     CommitTooLarge,
     Record(RecordError),
 }
@@ -34,6 +36,7 @@ impl fmt::Display for Error {
             Self::NotFormatted => f.write_str("no valid superblock found"),
             Self::QuorumLost => f.write_str("superblock quorum lost"),
             Self::Fork => f.write_str("superblock copies disagree at the same sequence"),
+            Self::ForeignCopy => f.write_str("superblock copy from another data file"),
             Self::ParentNotConnected => {
                 f.write_str("newest superblock does not chain to its parent")
             }
@@ -51,6 +54,7 @@ impl fmt::Display for Error {
             Self::Reserve => f.write_str("free-space reserve reached"),
             Self::Full => f.write_str("no free region"),
             Self::JournalFull => f.write_str("commit journal full"),
+            Self::JournalFork => f.write_str("commit journal rings disagree"),
             Self::CommitTooLarge => f.write_str("commit record too large"),
             Self::Record(e) => e.fmt(f),
         }
