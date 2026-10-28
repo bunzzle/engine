@@ -109,7 +109,9 @@ impl MemDriver {
                 drop(data);
                 Completion::Bytes(Ok(n), buf)
             }
-            Op::SyncData { .. } | Op::Shutdown { .. } => Completion::Unit(Ok(())),
+            Op::SyncData { .. } | Op::SyncDir { .. } | Op::Shutdown { .. } => {
+                Completion::Unit(Ok(()))
+            }
             Op::Allocate { handle, len } => {
                 let mut data = state.open[&handle].borrow_mut();
                 let len = usize::try_from(len).unwrap_or(usize::MAX);

@@ -48,6 +48,9 @@ pub enum Op {
     SyncData {
         handle: Handle,
     },
+    SyncDir {
+        path: PathBuf,
+    },
     Allocate {
         handle: Handle,
         len: u64,

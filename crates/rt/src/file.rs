@@ -7,6 +7,16 @@ use crate::driver::{Completion, Driver, Handle, Op, OpenOptions, Stat};
 use crate::executor;
 use crate::op::{OpFuture, mismatch};
 
+pub async fn sync_dir(path: impl AsRef<Path>) -> io::Result<()> {
+    let op = Op::SyncDir {
+        path: path.as_ref().to_path_buf(),
+    };
+    match OpFuture::with_driver(executor::driver(), op).await {
+        Completion::Unit(result) => result,
+        _ => Err(mismatch()),
+    }
+}
+
 pub struct File {
     driver: Rc<dyn Driver>,
     handle: Option<Handle>,
