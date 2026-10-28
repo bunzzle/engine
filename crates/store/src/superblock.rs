@@ -1,5 +1,6 @@
 use crate::crc32c::checksum;
 use crate::error::Error;
+use crate::layout::{Fields, FieldsMut};
 
 pub const FORMAT: u16 = 1;
 pub const COPIES: usize = 4;
@@ -85,27 +86,28 @@ impl Superblock {
     pub(crate) fn encode(&self, copy: u16, out: &mut [u8]) -> u32 {
         let out = &mut out[..HEADER_SIZE];
         out.fill(0);
-        put(out, 4, &copy.to_le_bytes());
-        put(out, 6, &MAGIC);
-        put(out, 14, &self.format.to_le_bytes());
-        put(out, 16, &self.oldest_format.to_le_bytes());
-        put(out, 20, &self.sector_size.to_le_bytes());
-        put(out, 24, &self.sequence.to_le_bytes());
-        put(out, 32, &self.parent.to_le_bytes());
-        put(out, 36, &self.shards.to_le_bytes());
-        put(out, 40, &self.file_id.to_le_bytes());
-        put(out, 48, &self.file_size.to_le_bytes());
-        put(out, 56, &self.regions_offset.to_le_bytes());
-        put(out, 64, &self.region_size.to_le_bytes());
-        put(out, 72, &self.region_count.to_le_bytes());
+        let mut fields = FieldsMut::new(out);
+        fields.put_u16(4, copy);
+        fields.put_bytes(6, &MAGIC);
+        fields.put_u16(14, self.format);
+        fields.put_u16(16, self.oldest_format);
+        fields.put_u32(20, self.sector_size);
+        fields.put_u64(24, self.sequence);
+        fields.put_u32(32, self.parent);
+        fields.put_u32(36, self.shards);
+        fields.put_u64(40, self.file_id);
+        fields.put_u64(48, self.file_size);
+        fields.put_u64(56, self.regions_offset);
+        fields.put_u64(64, self.region_size);
+        fields.put_u32(72, self.region_count);
         if let Some(checkpoint) = self.checkpoint {
-            put(out, 80, &checkpoint.sequence.to_le_bytes());
-            put(out, 88, &checkpoint.offset.to_le_bytes());
-            put(out, 96, &checkpoint.length.to_le_bytes());
-            put(out, 104, &checkpoint.checksum.to_le_bytes());
+            fields.put_u64(80, checkpoint.sequence);
+            fields.put_u64(88, checkpoint.offset);
+            fields.put_u64(96, checkpoint.length);
+            fields.put_u32(104, checkpoint.checksum);
         }
         let sum = checksum(&out[CHECKED..]);
-        put(out, 0, &sum.to_le_bytes());
+        FieldsMut::new(out).put_u32(0, sum);
         sum
     }
 
@@ -114,33 +116,34 @@ impl Superblock {
             return None;
         }
         let bytes = &bytes[..HEADER_SIZE];
-        let sum = u32::from_le_bytes(take(bytes, 0));
-        if sum != checksum(&bytes[CHECKED..]) || take::<8>(bytes, 6) != MAGIC {
+        let fields = Fields::new(bytes);
+        let sum = fields.u32(0);
+        if sum != checksum(&bytes[CHECKED..]) || fields.bytes(6, 8) != MAGIC {
             return None;
         }
-        let length = u64::from_le_bytes(take(bytes, 96));
+        let length = fields.u64(96);
         let checkpoint = (length > 0).then(|| Checkpoint {
-            sequence: u64::from_le_bytes(take(bytes, 80)),
-            offset: u64::from_le_bytes(take(bytes, 88)),
+            sequence: fields.u64(80),
+            offset: fields.u64(88),
             length,
-            checksum: u32::from_le_bytes(take(bytes, 104)),
+            checksum: fields.u32(104),
         });
         Some(Stored {
             superblock: Self {
-                format: u16::from_le_bytes(take(bytes, 14)),
-                oldest_format: u16::from_le_bytes(take(bytes, 16)),
-                sector_size: u32::from_le_bytes(take(bytes, 20)),
-                sequence: u64::from_le_bytes(take(bytes, 24)),
-                parent: u32::from_le_bytes(take(bytes, 32)),
-                shards: u32::from_le_bytes(take(bytes, 36)),
-                file_id: u64::from_le_bytes(take(bytes, 40)),
-                file_size: u64::from_le_bytes(take(bytes, 48)),
-                regions_offset: u64::from_le_bytes(take(bytes, 56)),
-                region_size: u64::from_le_bytes(take(bytes, 64)),
-                region_count: u32::from_le_bytes(take(bytes, 72)),
+                format: fields.u16(14),
+                oldest_format: fields.u16(16),
+                sector_size: fields.u32(20),
+                sequence: fields.u64(24),
+                parent: fields.u32(32),
+                shards: fields.u32(36),
+                file_id: fields.u64(40),
+                file_size: fields.u64(48),
+                regions_offset: fields.u64(56),
+                region_size: fields.u64(64),
+                region_count: fields.u32(72),
                 checkpoint,
             },
-            copy: u16::from_le_bytes(take(bytes, 4)),
+            copy: fields.u16(4),
             checksum: sum,
         })
     }
@@ -243,16 +246,6 @@ pub(crate) fn select(copies: &[Option<Stored>; COPIES]) -> Result<Selected, Erro
         checksum: best.checksum,
         stale,
     })
-}
-
-fn put(out: &mut [u8], at: usize, bytes: &[u8]) {
-    out[at..at + bytes.len()].copy_from_slice(bytes);
-}
-
-fn take<const N: usize>(bytes: &[u8], at: usize) -> [u8; N] {
-    let mut out = [0u8; N];
-    out.copy_from_slice(&bytes[at..at + N]);
-    out
 }
 
 #[cfg(test)]
