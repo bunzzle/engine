@@ -113,20 +113,18 @@ impl Journal {
         self.failed
     }
 
+    pub fn reserve(&self, commit: &Commit) -> Result<(), Error> {
+        let bytes = self.bytes(commit_payload_size(commit)?);
+        self.place(bytes).map(|_| ())
+    }
+
     pub async fn append(&mut self, file: &File, commit: &Commit) -> Result<Position, Error> {
         if self.failed {
             return Err(Error::Failed);
         }
         let payload = encode_commit(self.next.previous, commit)?;
-        let bytes = (record_size(payload.len()) as u64).next_multiple_of(self.sector);
-        let (offset, waste) = if self.next.offset + bytes > self.size {
-            (0, self.size - self.next.offset)
-        } else {
-            (self.next.offset, 0)
-        };
-        if bytes > self.size || self.used + waste + bytes > self.size {
-            return Err(Error::JournalFull);
-        }
+        let bytes = self.bytes(payload.len());
+        let (offset, waste) = self.place(bytes)?;
         let len = usize::try_from(bytes).expect("commit fits in memory");
         let align = usize::try_from(self.sector).expect("sector fits in usize");
         let mut buf = Buf::aligned(len, align);
@@ -161,6 +159,22 @@ impl Journal {
             self.used -= bytes;
             self.pending.pop_front();
         }
+    }
+
+    fn bytes(&self, payload: usize) -> u64 {
+        (record_size(payload) as u64).next_multiple_of(self.sector)
+    }
+
+    fn place(&self, bytes: u64) -> Result<(u64, u64), Error> {
+        let (offset, waste) = if self.next.offset + bytes > self.size {
+            (0, self.size - self.next.offset)
+        } else {
+            (self.next.offset, 0)
+        };
+        if bytes > self.size || self.used + waste + bytes > self.size {
+            return Err(Error::JournalFull);
+        }
+        Ok((offset, waste))
     }
 
     fn advance(&mut self, offset: u64, bytes: u64, waste: u64, checksum: u32) {
@@ -235,11 +249,19 @@ async fn read_exact(file: &File, offset: u64, len: usize, align: usize) -> Optio
     }
 }
 
-fn encode_commit(previous: u32, commit: &Commit) -> Result<Vec<u8>, Error> {
+fn commit_payload_size(commit: &Commit) -> Result<usize, Error> {
     let size = FIXED + commit.ranges.len() * RANGE + commit.allocations.len() * ALLOCATION;
-    if size > MAX_PAYLOAD {
+    if size > MAX_PAYLOAD
+        || u16::try_from(commit.ranges.len()).is_err()
+        || u16::try_from(commit.allocations.len()).is_err()
+    {
         return Err(Error::CommitTooLarge);
     }
+    Ok(size)
+}
+
+fn encode_commit(previous: u32, commit: &Commit) -> Result<Vec<u8>, Error> {
+    let size = commit_payload_size(commit)?;
     let ranges = u16::try_from(commit.ranges.len()).map_err(|_| Error::CommitTooLarge)?;
     let allocations = u16::try_from(commit.allocations.len()).map_err(|_| Error::CommitTooLarge)?;
     let mut out = vec![0u8; size];
