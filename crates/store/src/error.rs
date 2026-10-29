@@ -24,6 +24,8 @@ pub enum Error {
     JournalFull,
     JournalFork,
     CommitTooLarge,
+    Lost { sequence: u64, newer: u64 },
+    BadCommit(u64),
     Record(RecordError),
 }
 
@@ -56,6 +58,13 @@ impl fmt::Display for Error {
             Self::JournalFull => f.write_str("commit journal full"),
             Self::JournalFork => f.write_str("commit journal rings disagree"),
             Self::CommitTooLarge => f.write_str("commit record too large"),
+            Self::Lost { sequence, newer } => write!(
+                f,
+                "commit {sequence} is damaged or missing but commit {newer} exists; acknowledged data was lost"
+            ),
+            Self::BadCommit(sequence) => {
+                write!(f, "commit {sequence} does not match the recovered state")
+            }
             Self::Record(e) => e.fmt(f),
         }
     }

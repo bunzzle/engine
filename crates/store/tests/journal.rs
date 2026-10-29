@@ -25,6 +25,7 @@ fn run<T: 'static>(driver: &Rc<SimDriver>, future: impl Future<Output = T> + 'st
 
 fn commit(sequence: u64, ranges: usize) -> Commit {
     Commit {
+        record_sequence: sequence,
         ranges: (0..ranges)
             .map(|i| Range {
                 region: u32::try_from(i % 2).expect("fits"),
@@ -157,7 +158,7 @@ fn a_full_ring_applies_backpressure() {
 }
 
 #[test]
-fn a_damaged_copy_is_read_from_the_other_ring() {
+fn a_damaged_copy_is_read_from_the_other_ring_and_a_lost_one_stops() {
     let driver = Rc::new(SimDriver::new(4, Config::default()));
     run(&driver, async {
         let data = DataFile::create(PATH, &OPTIONS).await.expect("create");
@@ -187,11 +188,17 @@ fn a_damaged_copy_is_read_from_the_other_ring() {
         assert_eq!(sequences(&entries), vec![1, 2, 3], "ring A was repaired");
         damage(rings[0] + second.offset).await;
         damage(rings[1] + second.offset).await;
-        let (journal, entries) = Journal::recover(&data, Position::START)
-            .await
-            .expect("recover");
-        assert_eq!(sequences(&entries), vec![1]);
-        assert_eq!(journal.position().sequence, 2);
+        let lost = Journal::recover(&data, Position::START).await;
+        assert!(
+            matches!(
+                lost,
+                Err(Error::Lost {
+                    sequence: 2,
+                    newer: 3
+                })
+            ),
+            "a damaged middle commit stops recovery"
+        );
     });
 }
 

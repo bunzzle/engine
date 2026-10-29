@@ -1,4 +1,5 @@
 use std::collections::VecDeque;
+use std::io;
 
 use rt::{Buf, File};
 
@@ -9,7 +10,8 @@ use crate::record::{self, Header, MAX_PAYLOAD, Record, record_size};
 
 pub const KIND_COMMIT: u8 = 1;
 
-const FIXED: usize = 8;
+const FIXED: usize = 16;
+const SCAN_CHUNK: u64 = 1024 * 1024;
 const RANGE: usize = 32;
 const ALLOCATION: usize = 16;
 
@@ -30,6 +32,7 @@ pub struct Allocation {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Commit {
+    pub record_sequence: u64,
     pub ranges: Vec<Range>,
     pub allocations: Vec<Allocation>,
 }
@@ -68,8 +71,14 @@ pub struct Journal {
 
 impl Journal {
     pub async fn recover(data: &DataFile, start: Position) -> Result<(Self, Vec<Entry>), Error> {
+        let scan = Self::scan(data, start).await?;
+        let keep = scan.found.len();
+        scan.finish(data.file(), keep).await
+    }
+
+    pub(crate) async fn scan(data: &DataFile, start: Position) -> Result<Scan, Error> {
         let superblock = data.superblock();
-        let mut journal = Self {
+        let journal = Self {
             rings: superblock.journal_offsets(),
             size: superblock.journal_size(),
             sector: u64::from(superblock.sector_size()),
@@ -83,10 +92,9 @@ impl Journal {
             "journal start out of range"
         );
         let file = data.file();
-        let mut entries = Vec::new();
-        let mut repairs = Vec::new();
+        let mut next = start;
+        let mut walked = Vec::new();
         loop {
-            let next = journal.next;
             let mut found = journal
                 .candidates(file, next.offset, next.sequence, next.previous)
                 .await?;
@@ -110,25 +118,17 @@ impl Journal {
                     chained.pop().expect("one chained candidate")
                 }
             };
-            for (ring, present) in journal.rings.iter().zip(pick.rings) {
-                if !present {
-                    repairs.push((ring + pick.offset, pick.raw.clone()));
-                }
-            }
-            journal.advance(pick.offset, pick.bytes, pick.waste, pick.entry.checksum);
-            entries.push(pick.entry);
+            next = Position {
+                offset: (pick.offset + pick.bytes) % journal.size,
+                sequence: next.sequence + 1,
+                previous: pick.entry.checksum,
+            };
+            walked.push(pick);
         }
-        if !repairs.is_empty() {
-            let align = usize::try_from(journal.sector).expect("sector fits in usize");
-            for (offset, raw) in repairs {
-                let mut buf = Buf::aligned(raw.len(), align);
-                buf.extend_from_slice(&raw);
-                let (result, _) = file.write_all_at(buf, offset).await;
-                result?;
-            }
-            file.sync_data().await?;
-        }
-        Ok((journal, entries))
+        Ok(Scan {
+            journal,
+            found: walked,
+        })
     }
 
     pub fn position(&self) -> Position {
@@ -215,6 +215,30 @@ impl Journal {
             sequence: self.next.sequence + 1,
             previous: checksum,
         };
+    }
+
+    async fn newer(&self, file: &File, sequence: u64) -> Result<Option<u64>, Error> {
+        let align = usize::try_from(self.sector).expect("sector fits in usize");
+        let chunk = SCAN_CHUNK.min(self.size);
+        for ring in self.rings {
+            let mut at = 0;
+            while at < self.size {
+                let len = usize::try_from(chunk.min(self.size - at)).expect("chunk fits in usize");
+                let Some(buf) = read_exact(file, ring + at, len, align).await? else {
+                    return Err(Error::Io(io::ErrorKind::UnexpectedEof.into()));
+                };
+                for offset in (0..len).step_by(align) {
+                    if let Ok(header) = record::peek_header(&buf[offset..])
+                        && header.kind == KIND_COMMIT
+                        && header.sequence > sequence
+                    {
+                        return Ok(Some(header.sequence));
+                    }
+                }
+                at += len as u64;
+            }
+        }
+        Ok(None)
     }
 
     async fn candidates(
@@ -312,6 +336,67 @@ impl Journal {
     }
 }
 
+pub(crate) struct Scan {
+    journal: Journal,
+    found: Vec<Found>,
+}
+
+impl Scan {
+    pub(crate) fn entries(&self) -> impl Iterator<Item = &Entry> {
+        self.found.iter().map(|found| &found.entry)
+    }
+
+    pub(crate) async fn finish(
+        self,
+        file: &File,
+        keep: usize,
+    ) -> Result<(Journal, Vec<Entry>), Error> {
+        let Self { mut journal, found } = self;
+        assert!(keep <= found.len(), "cannot keep more than was found");
+        if let Some(newer) = found.get(keep + 1) {
+            return Err(Error::Lost {
+                sequence: found[keep].entry.sequence,
+                newer: newer.entry.sequence,
+            });
+        }
+        let end = journal.next.sequence + keep as u64;
+        if let Some(newer) = journal.newer(file, end).await? {
+            return Err(Error::Lost {
+                sequence: end,
+                newer,
+            });
+        }
+        let sector = usize::try_from(journal.sector).expect("sector fits in usize");
+        let mut writes = Vec::new();
+        let mut entries = Vec::with_capacity(keep);
+        let mut found = found.into_iter();
+        for pick in found.by_ref().take(keep) {
+            for (ring, present) in journal.rings.iter().zip(pick.rings) {
+                if !present {
+                    writes.push((ring + pick.offset, pick.raw.clone()));
+                }
+            }
+            journal.advance(pick.offset, pick.bytes, pick.waste, pick.entry.checksum);
+            entries.push(pick.entry);
+        }
+        for cut in found {
+            for ring in journal.rings {
+                writes.push((ring + cut.offset, vec![0; sector]));
+            }
+        }
+        if !writes.is_empty() {
+            for (offset, raw) in writes {
+                let mut buf = Buf::aligned(raw.len(), sector);
+                buf.extend_from_slice(&raw);
+                let (result, _) = file.write_all_at(buf, offset).await;
+                result?;
+            }
+            file.sync_data().await?;
+        }
+        Ok((journal, entries))
+    }
+}
+
 struct Found {
     entry: Entry,
     bytes: u64,
@@ -351,6 +436,7 @@ fn encode_commit(previous: u32, commit: &Commit) -> Result<Vec<u8>, Error> {
     fields.put_u32(0, previous);
     fields.put_u16(4, ranges);
     fields.put_u16(6, allocations);
+    fields.put_u64(8, commit.record_sequence);
     let mut at = FIXED;
     for range in &commit.ranges {
         fields.put_u32(at, range.region);
@@ -379,6 +465,7 @@ fn decode_commit(payload: &[u8]) -> Option<(u32, Commit)> {
         return None;
     }
     let mut commit = Commit {
+        record_sequence: fields.u64(8),
         ranges: Vec::with_capacity(ranges),
         allocations: Vec::with_capacity(allocations),
     };

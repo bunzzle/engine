@@ -36,6 +36,29 @@ pub fn checksum(data: &[u8]) -> u32 {
     !update(!0, data)
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct Hasher(u32);
+
+impl Hasher {
+    pub fn new() -> Self {
+        Self(!0)
+    }
+
+    pub fn update(&mut self, data: &[u8]) {
+        self.0 = update(self.0, data);
+    }
+
+    pub fn finish(self) -> u32 {
+        !self.0
+    }
+}
+
+impl Default for Hasher {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 fn update(mut crc: u32, data: &[u8]) -> u32 {
     let (words, rest) = data.as_chunks::<8>();
     for word in words {
@@ -58,7 +81,7 @@ fn update(mut crc: u32, data: &[u8]) -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use super::checksum;
+    use super::{Hasher, checksum};
 
     #[test]
     fn matches_the_standard_check_values() {
@@ -86,6 +109,19 @@ mod tests {
                 }
             }
             assert_eq!(checksum(&data[..len]), !crc);
+        }
+    }
+
+    #[test]
+    fn the_hasher_matches_one_shot_checksums() {
+        let data: Vec<u8> = (0..1000u32)
+            .map(|i| u8::try_from(i % 251).expect("byte"))
+            .collect();
+        for split in [0, 1, 7, 8, 9, 500, 999, 1000] {
+            let mut hasher = Hasher::new();
+            hasher.update(&data[..split]);
+            hasher.update(&data[split..]);
+            assert_eq!(hasher.finish(), checksum(&data));
         }
     }
 }
