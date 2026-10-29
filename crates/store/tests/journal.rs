@@ -40,6 +40,7 @@ fn commit(sequence: u64, ranges: usize) -> Commit {
             length: 48,
         }],
         record_sequence: sequence,
+        streams: u16::try_from(ranges / 2).expect("fits"),
         ranges: (0..ranges)
             .map(|i| Range {
                 region: u32::try_from(i % 2).expect("fits"),
