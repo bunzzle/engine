@@ -8,11 +8,14 @@ mod reader;
 mod record;
 mod recovery;
 mod regions;
+mod session;
 mod superblock;
 mod usage;
 
 pub use checkpoint::{KIND_CHECKPOINT, Loaded, PART_TAG_OTHER, Part, load};
-pub use committer::{Body, Client, Committer, Durable, Lease, Location, Submission, Write};
+pub use committer::{
+    Body, Client, Committer, Durable, Lease, Location, PART_TIMEOUT, Submission, Write,
+};
 pub use data_file::{DataFile, Options};
 pub use error::Error;
 pub use journal::{Allocation, Commit, Dead, Entry, Journal, KIND_COMMIT, Live, Position, Range};
@@ -24,6 +27,7 @@ pub use record::{
 };
 pub use recovery::{Recovered, State, recover};
 pub use regions::{CHECKPOINT_RESERVE, Claim, Regions};
+pub use session::{Event, Results, Session};
 pub use superblock::{
     COPIES, Checkpoint, CheckpointCopy, FORMAT, MAX_SECTOR_SIZE, MAX_SHARDS, MIN_SECTOR_SIZE,
     SLOT_SIZE, Superblock, ZONE_SIZE,

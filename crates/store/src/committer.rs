@@ -1,8 +1,11 @@
 use std::collections::BTreeMap;
+use std::sync::Arc;
+use std::sync::atomic::AtomicU32;
+use std::time::Duration;
 
-use rt::{Buf, Receiver, Sender, channel};
+use rt::{Buf, Receiver, Sender, channel, timeout};
 
-use crate::checkpoint::{Snapshot, encode, write_copy};
+use crate::checkpoint::{Part, Snapshot, encode, write_copy};
 use crate::data_file::DataFile;
 use crate::error::Error;
 use crate::journal::{Allocation, Commit, Dead, Journal, Live, Position, Range};
@@ -10,6 +13,7 @@ use crate::reader::{Pins, Reader};
 use crate::record::{self, Header, MAX_PAYLOAD, record_size};
 use crate::recovery::State;
 use crate::regions::{CHECKPOINT_RESERVE, Claim, Regions};
+use crate::session::{Answer, Event, Results, Session};
 use crate::superblock::Checkpoint;
 use crate::usage::Usage;
 use sys::crc32c::checksum;
@@ -51,8 +55,15 @@ pub struct Durable {
     pub locations: Vec<Location>,
 }
 
-enum Request {
-    Commit(Submission, Sender<Result<Durable, Error>>),
+pub const PART_TIMEOUT: Duration = Duration::from_secs(60);
+
+pub(crate) enum Reply {
+    Once(Sender<Result<Durable, Error>>),
+    Stream { session: usize, tag: u64 },
+}
+
+pub(crate) enum Request {
+    Commit(Submission, Reply),
     Allocate(Claim, Sender<Result<(u32, u64), Error>>),
     Seal(u32, u64),
     Checkpoint(Sender<Result<u64, Error>>),
@@ -84,7 +95,7 @@ impl Drop for Lease {
 
 #[derive(Clone)]
 pub struct Client {
-    sender: Sender<Request>,
+    pub(crate) sender: Sender<Request>,
 }
 
 impl Client {
@@ -92,7 +103,7 @@ impl Client {
         let (reply, mut answer) = channel();
         if self
             .sender
-            .send(Request::Commit(submission, reply))
+            .send(Request::Commit(submission, Reply::Once(reply)))
             .is_err()
         {
             return Err(Error::Failed);
@@ -136,7 +147,7 @@ struct Segment {
 }
 
 struct Accepted {
-    reply: Sender<Result<Durable, Error>>,
+    reply: Reply,
     locations: Vec<Location>,
 }
 
@@ -155,6 +166,10 @@ pub struct Committer {
     carried: Vec<u32>,
     pins: Pins,
     inbox: Receiver<Request>,
+    sessions: Vec<Option<Sender<Event>>>,
+    parts: Receiver<Answer>,
+    part_sender: Sender<Answer>,
+    part_timeout: Duration,
     failed: bool,
 }
 
@@ -164,6 +179,7 @@ impl Committer {
         assert_eq!(state.regions.count(), count, "region count mismatch");
         assert_eq!(state.epochs.len(), count as usize, "epoch count mismatch");
         let (sender, inbox) = channel();
+        let (part_sender, parts) = channel();
         let committer = Self {
             data,
             journal,
@@ -179,9 +195,92 @@ impl Committer {
             carried: Vec::new(),
             pins: Pins::default(),
             inbox,
+            sessions: Vec::new(),
+            parts,
+            part_sender,
+            part_timeout: PART_TIMEOUT,
             failed: false,
         };
         (committer, Client { sender })
+    }
+
+    pub fn session(&mut self, client: &Client, credits: u32) -> (Session, Results) {
+        let (events, receiver) = channel();
+        let credits = Arc::new(AtomicU32::new(credits));
+        self.sessions.push(Some(events));
+        let session = Session {
+            id: self.sessions.len() - 1,
+            client: client.clone(),
+            parts: self.part_sender.clone(),
+            credits: Arc::clone(&credits),
+        };
+        (
+            session,
+            Results {
+                events: receiver,
+                credits,
+            },
+        )
+    }
+
+    pub fn set_part_timeout(&mut self, part_timeout: Duration) {
+        self.part_timeout = part_timeout;
+    }
+
+    fn reply(&mut self, reply: Reply, result: Result<Durable, Error>) {
+        match reply {
+            Reply::Once(sender) => {
+                let _ = sender.send(result);
+            }
+            Reply::Stream { session, tag } => {
+                let event = match result {
+                    Ok(durable) => Event::Durable {
+                        tag,
+                        sequence: durable.sequence,
+                        locations: durable.locations,
+                    },
+                    Err(error) => Event::Rejected { tag, error },
+                };
+                self.send_event(session, event);
+            }
+        }
+    }
+
+    fn send_event(&mut self, session: usize, event: Event) {
+        if let Some(slot) = self.sessions.get_mut(session)
+            && let Some(sender) = slot
+            && sender.send(event).is_err()
+        {
+            *slot = None;
+        }
+    }
+
+    fn broadcast(&mut self, event: impl Fn() -> Event) {
+        for session in 0..self.sessions.len() {
+            self.send_event(session, event());
+        }
+    }
+
+    async fn collect_parts(&mut self, sequence: u64) -> Result<Vec<Part>, Error> {
+        self.broadcast(|| Event::Cut { sequence });
+        let mut waiting: Vec<usize> = (0..self.sessions.len())
+            .filter(|&s| self.sessions[s].is_some())
+            .collect();
+        let mut parts = Vec::new();
+        while !waiting.is_empty() {
+            let Ok(Some(answer)) = timeout(self.part_timeout, self.parts.recv()).await else {
+                panic!("checkpoint part missing from sessions {waiting:?} at cut {sequence}");
+            };
+            if answer.sequence != sequence || !waiting.contains(&answer.session) {
+                continue;
+            }
+            waiting.retain(|&s| s != answer.session);
+            if answer.parts.iter().any(|p| p.replay_sequence != sequence) {
+                return Err(Error::Invalid("part"));
+            }
+            parts.extend(answer.parts);
+        }
+        Ok(parts)
     }
 
     pub fn reader(&self) -> Reader {
@@ -231,7 +330,7 @@ impl Committer {
     fn handle(
         &mut self,
         request: Request,
-        batch: &mut Vec<(Submission, Sender<Result<Durable, Error>>)>,
+        batch: &mut Vec<(Submission, Reply)>,
     ) -> Option<Sender<Result<u64, Error>>> {
         match request {
             Request::Allocate(claim, reply) => {
@@ -244,7 +343,7 @@ impl Committer {
             }
             Request::Commit(submission, reply) => {
                 if self.failed {
-                    let _ = reply.send(Err(Error::Failed));
+                    self.reply(reply, Err(Error::Failed));
                 } else {
                     batch.push((submission, reply));
                 }
@@ -260,17 +359,19 @@ impl Committer {
     }
 
     pub async fn checkpoint(&mut self) -> Result<Position, Error> {
-        if self.failed {
-            return Err(Error::Failed);
+        let mut cut = None;
+        let result = self.write_checkpoint(&mut cut).await;
+        if let Some(sequence) = cut {
+            if result.is_ok() {
+                self.broadcast(|| Event::Published { sequence });
+            } else {
+                self.broadcast(|| Event::Abandoned { sequence });
+            }
         }
-        let position = self.journal.position();
-        let count = self.regions.count();
-        let mut used: Vec<bool> = (0..count).map(|r| self.regions.is_used(r)).collect();
-        let mut epochs = self.epochs.clone();
-        for allocation in &self.allocations {
-            used[allocation.region as usize] = false;
-            epochs[allocation.region as usize] = allocation.epoch - 1;
-        }
+        result
+    }
+
+    fn acquire_checkpoint_regions(&mut self) -> Result<Vec<u32>, Error> {
         let mut regions = Vec::with_capacity(CHECKPOINT_RESERVE as usize);
         for _ in 0..CHECKPOINT_RESERVE {
             match self.regions.acquire(Claim::Checkpoint) {
@@ -283,6 +384,32 @@ impl Committer {
                 }
             }
         }
+        Ok(regions)
+    }
+
+    async fn write_checkpoint(&mut self, cut: &mut Option<u64>) -> Result<Position, Error> {
+        if self.failed {
+            return Err(Error::Failed);
+        }
+        let position = self.journal.position();
+        let count = self.regions.count();
+        let mut used: Vec<bool> = (0..count).map(|r| self.regions.is_used(r)).collect();
+        let mut epochs = self.epochs.clone();
+        for allocation in &self.allocations {
+            used[allocation.region as usize] = false;
+            epochs[allocation.region as usize] = allocation.epoch - 1;
+        }
+        let regions = self.acquire_checkpoint_regions()?;
+        *cut = Some(position.sequence);
+        let parts = match self.collect_parts(position.sequence).await {
+            Ok(parts) => parts,
+            Err(e) => {
+                for region in regions {
+                    self.regions.release(region);
+                }
+                return Err(e);
+            }
+        };
         let pending: Vec<u32> = (0..count)
             .filter(|&r| {
                 used[r as usize]
@@ -312,7 +439,7 @@ impl Committer {
             epochs,
             usage: self.usage.clone(),
             release,
-            parts: Vec::new(),
+            parts,
         });
         let sequence = self.data.superblock().sequence() + 1;
         let mut copies = Vec::with_capacity(regions.len());
@@ -385,7 +512,7 @@ impl Committer {
         Ok((region, *epoch))
     }
 
-    async fn commit(&mut self, batch: Vec<(Submission, Sender<Result<Durable, Error>>)>) {
+    async fn commit(&mut self, batch: Vec<(Submission, Reply)>) {
         let sector = u64::from(self.data.sector_size());
         let mut segments = Vec::new();
         let mut ranges = Vec::new();
@@ -401,7 +528,7 @@ impl Committer {
                     accepted.push(Accepted { reply, locations });
                 }
                 Err(e) => {
-                    let _ = reply.send(Err(e));
+                    self.reply(reply, Err(e));
                 }
             }
         }
@@ -452,7 +579,7 @@ impl Committer {
                     Error::JournalFull => Error::JournalFull,
                     _ => Error::CommitTooLarge,
                 };
-                let _ = entry.reply.send(Err(error));
+                self.reply(entry.reply, Err(error));
             }
             return;
         }
@@ -460,17 +587,18 @@ impl Committer {
             self.usage.forget();
             self.failed = true;
             for entry in accepted {
-                let _ = entry.reply.send(Err(Error::Failed));
+                self.reply(entry.reply, Err(Error::Failed));
             }
             return;
         };
         self.allocations.clear();
         self.usage.settle(&commit.live, &commit.dead);
         for entry in accepted {
-            let _ = entry.reply.send(Ok(Durable {
+            let durable = Durable {
                 sequence,
                 locations: entry.locations,
-            }));
+            };
+            self.reply(entry.reply, Ok(durable));
         }
         if self.due() {
             let _ = self.checkpoint().await;
