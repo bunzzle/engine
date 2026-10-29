@@ -25,6 +25,7 @@ use sys::crc32c::checksum;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Write {
     pub kind: u8,
+    pub counted: bool,
     pub shard: u16,
     pub tenant: u32,
     pub payload: Vec<u8>,
@@ -735,6 +736,7 @@ fn count_live(
         .records
         .iter()
         .zip(locations)
+        .filter(|(w, _)| w.counted)
         .map(|(w, l)| (w.tenant, l.region, u64::from(l.size)));
     let bodies = submission
         .bodies

@@ -174,6 +174,7 @@ fn applying_results_and_records_read_back_give_the_same_map() {
                 claim: Claim::Intake,
                 records: vec![Write {
                     kind: 9,
+                    counted: true,
                     shard: 1,
                     tenant: 7,
                     payload: index.payload(&[0xAB; 40]),

@@ -7,6 +7,7 @@ mod error;
 mod journal;
 mod keeper;
 mod layout;
+mod owner;
 mod reader;
 mod rebuild;
 mod record;
@@ -31,6 +32,7 @@ pub use error::Error;
 pub use journal::{Allocation, Commit, Dead, Entry, Journal, KIND_COMMIT, Live, Position, Range};
 pub use keeper::Keeper;
 pub use layout::{Fields, FieldsMut};
+pub use owner::{Changes, Shards};
 pub use reader::{Owner, Pin, Pins, READ_ATTEMPTS, Reader};
 pub use record::{
     FLAG_MORE, Header, MAX_PAYLOAD, RECORD_ALIGN, RECORD_FORMAT, RECORD_HEADER_SIZE, Record,

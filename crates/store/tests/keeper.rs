@@ -97,6 +97,7 @@ impl Core {
             .iter()
             .map(|index| Write {
                 kind: KIND_STATE,
+                counted: true,
                 shard,
                 tenant: index.tenant,
                 payload: index.payload(&[0xCD; 32]),
@@ -518,6 +519,7 @@ fn a_restart_rebuilds_runs_and_the_journal_after_them() {
             claim: Claim::Intake,
             records: vec![Write {
                 kind: KIND_STATE,
+                counted: true,
                 shard: 1,
                 tenant: 7,
                 payload: put(99, 9).payload(&[2; 16]),
@@ -621,6 +623,7 @@ async fn keep(start: Start, model: Shared) {
             claim: Claim::Intake,
             records: vec![Write {
                 kind: KIND_STATE,
+                counted: true,
                 shard,
                 tenant: 7,
                 payload: index.payload(&[1; 24]),
