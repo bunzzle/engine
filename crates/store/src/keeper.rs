@@ -4,7 +4,7 @@ use crate::checkpoint::Part;
 use crate::committer::Location;
 use crate::core_file::CoreFile;
 use crate::error::Error;
-use crate::run::{self, MAX_DELTAS, Root, encode_roots, run_size};
+use crate::run::{self, MAX_DELTAS, Root, encode_roots};
 use crate::session::Session;
 use crate::shard::{Delta, Index, ShardState};
 
@@ -53,9 +53,16 @@ impl Keeper {
         self.shards.get(&shard).map(|k| k.roots.as_slice())
     }
 
-    pub fn apply(&mut self, shard: u16, index: &Index, location: Location, commit: u64) {
+    pub fn apply(
+        &mut self,
+        shard: u16,
+        index: &Index,
+        clear: &[u8],
+        location: Location,
+        commit: u64,
+    ) {
         let kept = self.shards.get_mut(&shard).expect("shard is kept here");
-        kept.state.apply(index, location, commit);
+        kept.state.apply(index, clear, location, commit);
     }
 
     pub async fn cut(
@@ -113,8 +120,11 @@ impl Keeper {
         }
         let deltas = kept.roots.iter().filter(|r| !r.base);
         let count = deltas.clone().count();
-        let delta_bytes: u64 =
-            deltas.map(|r| u64::from(r.length)).sum::<u64>() + run_size(changes.len()) as u64;
+        let delta_bytes: u64 = deltas.map(|r| u64::from(r.length)).sum::<u64>()
+            + changes
+                .values()
+                .map(|item| run::entry_size(item.as_ref()) as u64)
+                .sum::<u64>();
         let rebase = match kept.roots.first() {
             Some(base) if base.base => count >= MAX_DELTAS || delta_bytes > u64::from(base.length),
             _ => true,
@@ -125,7 +135,6 @@ impl Keeper {
                 shard,
                 true,
                 covered,
-                entries.len(),
                 entries.iter().map(|(&k, v)| (k, Some(v))),
             )
         } else {
@@ -133,7 +142,6 @@ impl Keeper {
                 shard,
                 false,
                 covered,
-                changes.len(),
                 changes.iter().map(|(&k, v)| (k, v.as_ref())),
             )
         };

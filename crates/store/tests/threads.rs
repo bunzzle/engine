@@ -9,8 +9,8 @@ use std::{fs, process};
 
 use rt::{Native, Runtime, spawn};
 use store::{
-    Change, Claim, Core, DataFile, Delivery, Error, Event, Index, KIND_STATE, Location, Options,
-    Owner, SLOT_SIZE, Setup, Submission, Write, launch,
+    Change, Claim, Core, DataFile, Delivery, Error, Event, Index, KIND_STATE, Key, Location,
+    Options, Owner, SLOT_SIZE, Setup, Submission, Write, launch,
 };
 
 const OPTIONS: Options = Options {
@@ -55,7 +55,7 @@ fn scratch(name: &str) -> PathBuf {
 
 fn put(key: u64) -> Index {
     Index {
-        key,
+        key: Key::head(key),
         tenant: 5,
         change: Change::Put(Delivery {
             status: 1,
@@ -93,7 +93,8 @@ async fn fill(mut core: Core) {
                 locations,
             } => {
                 let (shard, index) = sent.remove(&tag).expect("sent");
-                core.keeper.apply(shard, &index, locations[0], sequence);
+                core.keeper
+                    .apply(shard, &index, &[], locations[0], sequence);
                 written.push(locations[0]);
             }
             other => panic!("unexpected {other:?}"),
@@ -140,7 +141,7 @@ fn record(seen: &Arc<Mutex<Seen>>, core: &Core) {
                 .expect("kept")
                 .entries()
                 .keys()
-                .copied()
+                .map(|k| k.message)
         })
         .collect();
     seen.keys.insert(core.index, keys);
