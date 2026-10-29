@@ -443,7 +443,7 @@ async fn read_exact(
     Ok((result? == len).then_some(buf))
 }
 
-pub(crate) fn fits(ranges: usize, allocations: usize, live: usize, dead: usize) -> bool {
+pub fn fits(ranges: usize, allocations: usize, live: usize, dead: usize) -> bool {
     let counts = [ranges, allocations, live, dead];
     counts.iter().all(|&n| u16::try_from(n).is_ok())
         && FIXED + ranges * RANGE + allocations * ALLOCATION + live * LIVE + dead * DEAD

@@ -17,7 +17,22 @@ use sys::crc32c::checksum;
 
 enum Reply {
     Caller(Sender<Result<Vec<Location>, Error>>),
+    Created(Sender<Result<Vec<Vec<Location>>, Error>>),
     Move,
+}
+
+impl Reply {
+    fn refuse(self, error: Error) {
+        match self {
+            Self::Caller(reply) => {
+                let _ = reply.send(Err(error));
+            }
+            Self::Created(reply) => {
+                let _ = reply.send(Err(error));
+            }
+            Self::Move => {}
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -78,8 +93,14 @@ impl Owner for Itself {
 }
 
 struct Request {
-    batch: Batch,
+    batches: Vec<Batch>,
     reply: Reply,
+}
+
+impl Request {
+    fn keys(&self) -> impl Iterator<Item = (u16, u64)> + '_ {
+        self.batches.iter().map(|b| (b.shard, b.message))
+    }
 }
 
 enum Input {
@@ -120,8 +141,20 @@ impl Changes {
     pub async fn apply(&self, batch: Batch) -> Result<Vec<Location>, Error> {
         let (reply, mut answer) = channel();
         let request = Request {
-            batch,
+            batches: vec![batch],
             reply: Reply::Caller(reply),
+        };
+        if self.sender.send(Input::Change(request)).is_err() {
+            return Err(Error::Failed);
+        }
+        answer.recv().await.unwrap_or(Err(Error::Failed))
+    }
+
+    pub async fn create(&self, batches: Vec<Batch>) -> Result<Vec<Vec<Location>>, Error> {
+        let (reply, mut answer) = channel();
+        let request = Request {
+            batches,
+            reply: Reply::Created(reply),
         };
         if self.sender.send(Input::Change(request)).is_err() {
             return Err(Error::Failed);
@@ -211,18 +244,39 @@ impl Shards {
     }
 
     fn request(&mut self, request: Request) {
-        if !self.owned.contains(&request.batch.shard) || self.closing {
-            let error = if self.closing {
-                Error::Failed
-            } else {
-                Error::Invalid("owner")
-            };
-            if let Reply::Caller(reply) = request.reply {
-                let _ = reply.send(Err(error));
-            }
+        let error = if self.closing {
+            Some(Error::Failed)
+        } else if !request
+            .batches
+            .iter()
+            .all(|b| self.owned.contains(&b.shard))
+        {
+            Some(Error::Invalid("owner"))
+        } else if request.batches.is_empty() {
+            Some(Error::Invalid("batch"))
+        } else {
+            None
+        };
+        if let Some(error) = error {
+            request.reply.refuse(error);
             return;
         }
-        let key = (request.batch.shard, request.batch.message);
+        if matches!(request.reply, Reply::Created(_)) {
+            let mut keys = BTreeSet::new();
+            let free = request
+                .keys()
+                .all(|key| keys.insert(key) && !self.busy.contains_key(&key));
+            if !free {
+                request.reply.refuse(Error::Invalid("busy"));
+                return;
+            }
+            for key in keys {
+                self.busy.insert(key, VecDeque::new());
+            }
+            self.start(request);
+            return;
+        }
+        let key = (request.batches[0].shard, request.batches[0].message);
         if let Some(queue) = self.busy.get_mut(&key) {
             queue.push_back(request);
             return;
@@ -232,7 +286,7 @@ impl Shards {
     }
 
     fn start(&mut self, request: Request) {
-        match self.submission(&request.batch) {
+        match self.merged(&request) {
             Ok(submission) => {
                 self.tag += 1;
                 self.sent.insert(self.tag, request);
@@ -242,7 +296,24 @@ impl Shards {
         }
     }
 
-    fn submission(&self, batch: &Batch) -> Result<Submission, Error> {
+    fn merged(&self, request: &Request) -> Result<Submission, Error> {
+        let create = matches!(request.reply, Reply::Created(_));
+        let mut merged: Option<Submission> = None;
+        for batch in &request.batches {
+            let next = self.submission(batch, create)?;
+            match merged.as_mut() {
+                None => merged = Some(next),
+                Some(merged) => {
+                    merged.records.extend(next.records);
+                    merged.bodies.extend(next.bodies);
+                    merged.dead.extend(next.dead);
+                }
+            }
+        }
+        merged.ok_or(Error::Invalid("batch"))
+    }
+
+    fn submission(&self, batch: &Batch, create: bool) -> Result<Submission, Error> {
         let state = self.keeper.state(batch.shard).expect("owned shard is kept");
         let ops = &batch.ops;
         let alone = |op: &Op| matches!(op.change, Change::Drop | Change::Move { .. });
@@ -259,6 +330,7 @@ impl Shards {
             .any(|op| op.item == HEAD_ITEM && matches!(op.change, Change::Put(_)));
         match head {
             None if !creates => return Err(Error::NotFound),
+            Some(_) if create => return Err(Error::Invalid("exists")),
             Some(head) if head.tenant != batch.tenant => return Err(Error::Invalid("tenant")),
             _ => {}
         }
@@ -354,8 +426,11 @@ impl Shards {
                 locations,
             } => {
                 let request = self.sent.remove(&tag).expect("result for a sent change");
-                let batch = &request.batch;
-                for (op, &location) in batch.ops.iter().zip(&locations) {
+                let ops = request
+                    .batches
+                    .iter()
+                    .flat_map(|batch| batch.ops.iter().map(move |op| (batch, op)));
+                for ((batch, op), &location) in ops.zip(&locations) {
                     self.keeper.apply(
                         batch.shard,
                         &batch.index(op),
@@ -382,11 +457,25 @@ impl Shards {
     }
 
     fn finish(&mut self, request: Request, result: Result<Vec<Location>, Error>) {
-        let Request { batch, reply } = request;
-        let key = (batch.shard, batch.message);
+        let keys: Vec<(u16, u64)> = request.keys().collect();
+        let Request { batches, reply } = request;
         match reply {
             Reply::Caller(reply) => {
                 let _ = reply.send(result);
+            }
+            Reply::Created(reply) => {
+                let split = result.map(|locations| {
+                    let mut rest = locations.as_slice();
+                    batches
+                        .iter()
+                        .map(|batch| {
+                            let (these, tail) = rest.split_at(batch.ops.len());
+                            rest = tail;
+                            these.to_vec()
+                        })
+                        .collect()
+                });
+                let _ = reply.send(split);
             }
             Reply::Move => {
                 if let Some(compacting) = self.compacting.as_mut() {
@@ -394,11 +483,13 @@ impl Shards {
                 }
             }
         }
-        let next = self.busy.get_mut(&key).and_then(VecDeque::pop_front);
-        match next {
-            Some(next) => self.start(next),
-            None => {
-                self.busy.remove(&key);
+        for key in keys {
+            let next = self.busy.get_mut(&key).and_then(VecDeque::pop_front);
+            match next {
+                Some(next) => self.start(next),
+                None => {
+                    self.busy.remove(&key);
+                }
             }
         }
         self.settle_compaction();
@@ -481,7 +572,7 @@ impl Shards {
         compacting.leases = copied.leases;
         for batch in copied.batches {
             self.request(Request {
-                batch,
+                batches: vec![batch],
                 reply: Reply::Move,
             });
         }

@@ -32,7 +32,9 @@ pub use core_file::{CoreFile, Source};
 pub use data_file::{DataFile, Options};
 pub use error::Error;
 pub use ids::{Ids, message_key, split_key};
-pub use journal::{Allocation, Commit, Dead, Entry, Journal, KIND_COMMIT, Live, Position, Range};
+pub use journal::{
+    Allocation, Commit, Dead, Entry, Journal, KIND_COMMIT, Live, Position, Range, fits,
+};
 pub use keeper::Keeper;
 pub use layout::{Fields, FieldsMut};
 pub use owner::{Batch, Changes, Op, Shards};
