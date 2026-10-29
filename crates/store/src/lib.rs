@@ -4,6 +4,7 @@ mod committer;
 mod core_file;
 mod data_file;
 mod error;
+mod ids;
 mod journal;
 mod keeper;
 mod layout;
@@ -30,6 +31,7 @@ pub use committer::{
 pub use core_file::{CoreFile, Source};
 pub use data_file::{DataFile, Options};
 pub use error::Error;
+pub use ids::{Ids, message_key, split_key};
 pub use journal::{Allocation, Commit, Dead, Entry, Journal, KIND_COMMIT, Live, Position, Range};
 pub use keeper::Keeper;
 pub use layout::{Fields, FieldsMut};

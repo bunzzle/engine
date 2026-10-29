@@ -218,10 +218,10 @@ fn updates_chain_and_survive_a_restart() {
     let driver = restart(14, created(13), Config::default());
     run(&driver, async {
         let mut data = DataFile::open(PATH).await.expect("open");
-        data.update(Some(checkpoint(5)), FORMAT)
+        data.update(Some(checkpoint(5)), FORMAT, 0)
             .await
             .expect("update");
-        data.update(Some(checkpoint(9)), FORMAT)
+        data.update(Some(checkpoint(9)), FORMAT, 0)
             .await
             .expect("update");
     });
@@ -247,7 +247,7 @@ fn an_update_is_atomic_across_a_crash() {
         run(&driver, async move {
             spawn(async move {
                 let mut data = DataFile::open(PATH).await.expect("open");
-                data.update(Some(checkpoint(7)), FORMAT)
+                data.update(Some(checkpoint(7)), FORMAT, 0)
                     .await
                     .expect("update");
                 finished.set(true);
@@ -282,12 +282,12 @@ fn a_failed_sync_fails_the_data_file() {
     run(&driver, async {
         let mut data = DataFile::open(PATH).await.expect("open");
         assert!(matches!(
-            data.update(Some(checkpoint(1)), FORMAT).await,
+            data.update(Some(checkpoint(1)), FORMAT, 0).await,
             Err(Error::Io(_))
         ));
         assert!(data.is_failed());
         assert!(matches!(
-            data.update(Some(checkpoint(1)), FORMAT).await,
+            data.update(Some(checkpoint(1)), FORMAT, 0).await,
             Err(Error::Failed)
         ));
     });

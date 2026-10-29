@@ -6,6 +6,7 @@ use crate::committer::{Client, Committer};
 use crate::core_file::{CoreFile, Source};
 use crate::data_file::DataFile;
 use crate::error::Error;
+use crate::ids::Ids;
 use crate::journal::Entry;
 use crate::keeper::Keeper;
 use crate::recovery::recover;
@@ -27,6 +28,7 @@ pub struct Booted {
 
 pub struct Start {
     index: u16,
+    boot: u32,
     shards: Vec<u16>,
     session: Session,
     results: Results,
@@ -42,11 +44,12 @@ pub struct Core {
     pub results: Results,
     pub file: CoreFile,
     pub keeper: Keeper,
+    pub ids: Ids,
 }
 
 pub async fn boot(path: impl AsRef<Path>, setup: Setup) -> Result<Booted, Error> {
-    let data = DataFile::open(path).await?;
-    let superblock = data.superblock();
+    let mut data = DataFile::open(path).await?;
+    let superblock = *data.superblock();
     let shards = superblock.shards();
     if setup.cores == 0 || u32::from(setup.cores) > shards {
         return Err(Error::Config(
@@ -61,6 +64,7 @@ pub async fn boot(path: impl AsRef<Path>, setup: Setup) -> Result<Booted, Error>
     }
     let loaded = load(&data, setup.reserve).await?;
     let recovered = recover(&data, loaded.position, loaded.state).await?;
+    let boot = data.next_boot().await?;
     let (mut committer, client) = Committer::new(data, recovered.journal, recovered.state);
     let parts: Arc<[Part]> = loaded.parts.into();
     let entries: Arc<[Entry]> = recovered.entries.into();
@@ -70,6 +74,7 @@ pub async fn boot(path: impl AsRef<Path>, setup: Setup) -> Result<Booted, Error>
             let (session, results) = committer.session(&client, setup.credits);
             Start {
                 index,
+                boot,
                 shards: (0..shards)
                     .filter(|s| s % u32::from(setup.cores) == u32::from(index))
                     .map(|s| u16::try_from(s).expect("shard fits in u16"))
@@ -99,6 +104,7 @@ impl Start {
         let keeper = Keeper::rebuild(&file, &self.parts, &self.entries, &self.shards).await?;
         Ok(Core {
             index: self.index,
+            ids: Ids::new(self.boot, &self.shards),
             shards: self.shards,
             session: self.session,
             results: self.results,

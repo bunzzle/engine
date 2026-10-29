@@ -44,6 +44,7 @@ pub struct Superblock {
     pub(crate) journal_size: u64,
     pub(crate) region_size: u64,
     pub(crate) region_count: u32,
+    pub(crate) boot: u32,
     pub(crate) checkpoint: Option<Checkpoint>,
 }
 
@@ -100,6 +101,10 @@ impl Superblock {
         self.regions_offset + u64::from(region) * self.region_size
     }
 
+    pub fn boot(&self) -> u32 {
+        self.boot
+    }
+
     pub fn region_count(&self) -> u32 {
         self.region_count
     }
@@ -126,6 +131,7 @@ impl Superblock {
         fields.put_u64(112, self.journal_size);
         fields.put_u64(64, self.region_size);
         fields.put_u32(72, self.region_count);
+        fields.put_u32(100, self.boot);
         if let Some(checkpoint) = self.checkpoint {
             fields.put_u64(80, checkpoint.position.sequence);
             fields.put_u64(88, checkpoint.position.offset);
@@ -180,6 +186,7 @@ impl Superblock {
                 journal_size: fields.u64(112),
                 region_size: fields.u64(64),
                 region_count: fields.u32(72),
+                boot: fields.u32(100),
                 checkpoint,
             },
             copy: fields.u16(4),
@@ -343,6 +350,7 @@ mod tests {
             journal_size: 65536,
             region_size: 65536,
             region_count: 2,
+            boot: 0,
             checkpoint: None,
         }
     }
@@ -372,6 +380,7 @@ mod tests {
     #[test]
     fn encode_and_decode_round_trip() {
         let mut original = superblock(9);
+        original.boot = 0xDEAD_BEEF;
         original.checkpoint = Some(Checkpoint {
             position: Position {
                 sequence: 3,
