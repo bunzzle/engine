@@ -4,8 +4,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::task::Waker;
 
-use crate::buf::Buf;
 use crate::time::Instant;
+use sys::buf::Buf;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Handle(pub u64);

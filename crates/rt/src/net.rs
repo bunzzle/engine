@@ -2,10 +2,10 @@ use std::io;
 use std::net::SocketAddr;
 use std::rc::Rc;
 
-use crate::buf::Buf;
 use crate::driver::{Completion, Driver, Handle, Op};
 use crate::executor;
 use crate::op::{OpFuture, mismatch};
+use sys::buf::Buf;
 
 struct Socket {
     driver: Rc<dyn Driver>,

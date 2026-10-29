@@ -1,4 +1,4 @@
-#![cfg(target_os = "macos")]
+#![cfg(any(target_os = "macos", target_os = "linux"))]
 
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -16,18 +16,31 @@ const OPTIONS: Options = Options {
     shards: 4,
 };
 
-fn run<T: 'static>(future: impl Future<Output = T> + 'static) -> T {
-    let driver = Rc::new(Native::new().expect("native driver"));
-    Runtime::new(driver).block_on(future)
+fn run<T: 'static>(plain: bool, future: impl Future<Output = T> + 'static) -> T {
+    let driver = if plain {
+        Native::plain()
+    } else {
+        Native::new()
+    };
+    Runtime::new(Rc::new(driver.expect("native driver"))).block_on(future)
 }
 
 #[test]
 fn the_store_works_on_a_real_disk() {
-    let dir = std::env::temp_dir().join(format!("store-native-{}", process::id()));
+    store_on_disk(false);
+}
+
+#[test]
+fn the_store_works_without_the_ring() {
+    store_on_disk(true);
+}
+
+fn store_on_disk(plain: bool) {
+    let dir = std::env::temp_dir().join(format!("store-native-{}-{plain}", process::id()));
     fs::create_dir_all(&dir).expect("scratch dir");
     let path: PathBuf = dir.join("store");
     let target = path.clone();
-    let locations = run(async move {
+    let locations = run(plain, async move {
         DataFile::create(&target, &OPTIONS).await.expect("create");
         let data = DataFile::open(&target).await.expect("open");
         let loaded = load(&data, 0).await.expect("load");
@@ -60,7 +73,7 @@ fn the_store_works_on_a_real_disk() {
         drop(committer.await);
         locations
     });
-    run(async move {
+    run(plain, async move {
         let data = DataFile::open(&path).await.expect("reopen");
         let loaded = load(&data, 0).await.expect("load");
         let recovered = recover(&data, loaded.position, loaded.state)
