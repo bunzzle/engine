@@ -243,6 +243,7 @@ fn allocations_not_yet_committed_stay_out_of_the_checkpoint() {
         client
             .commit(Submission {
                 bodies: vec![Body {
+                    shard: 0,
                     tenant: 3,
                     range: Range {
                         region: body,

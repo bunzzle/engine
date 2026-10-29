@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use crate::checkpoint::Part;
 use crate::committer::Location;
-use crate::data_file::DataFile;
+use crate::core_file::CoreFile;
 use crate::error::Error;
 use crate::run::{self, MAX_DELTAS, Root, encode_roots, run_size};
 use crate::session::Session;
@@ -61,7 +61,7 @@ impl Keeper {
     pub async fn cut(
         &mut self,
         session: &Session,
-        data: &DataFile,
+        data: &CoreFile,
         sequence: u64,
     ) -> Result<(), Error> {
         let covered = sequence - 1;
@@ -101,7 +101,7 @@ impl Keeper {
     async fn next_roots(
         &mut self,
         shard: u16,
-        data: &DataFile,
+        data: &CoreFile,
         session: &Session,
         covered: u64,
     ) -> Result<Vec<Root>, Error> {
@@ -148,7 +148,7 @@ impl Keeper {
 
     async fn write(
         &mut self,
-        data: &DataFile,
+        data: &CoreFile,
         session: &Session,
         blob: &[u8],
     ) -> Result<Root, Error> {

@@ -95,6 +95,11 @@ impl Superblock {
         self.region_size
     }
 
+    pub fn region_offset(&self, region: u32) -> u64 {
+        assert!(region < self.region_count, "region {region} out of range");
+        self.regions_offset + u64::from(region) * self.region_size
+    }
+
     pub fn region_count(&self) -> u32 {
         self.region_count
     }

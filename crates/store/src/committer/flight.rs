@@ -3,7 +3,7 @@ use std::collections::VecDeque;
 use rt::{Buf, Sender, now, timeout};
 
 use super::{Accepted, Committer, Request};
-use crate::checkpoint::{Snapshot, encode, parts_valid, write_copy};
+use crate::checkpoint::{Part, Snapshot, encode, parts_valid, write_copy};
 use crate::error::Error;
 use crate::journal::{Commit, Position};
 use crate::regions::{CHECKPOINT_RESERVE, Claim};
@@ -108,7 +108,13 @@ impl Committer {
             return;
         }
         flight.waiting.retain(|&s| s != answer.session);
-        if answer.failed || answer.parts.iter().any(|p| p.replay_sequence != cut) {
+        let cores = self.sessions.len();
+        let shards = self.data.superblock().shards();
+        let foreign = answer
+            .parts
+            .iter()
+            .any(|p| u32::from(p.tag) < shards && usize::from(p.tag) % cores != answer.session);
+        if answer.failed || foreign || answer.parts.iter().any(|p| p.replay_sequence != cut) {
             flight.invalid = true;
         }
         match referenced {
@@ -119,12 +125,22 @@ impl Committer {
     }
 
     fn prune_waiting(&mut self) {
+        for (slot, appending) in self.sessions.iter_mut().zip(&mut self.runs.appending) {
+            if slot.as_ref().is_none_or(Sender::is_closed) {
+                *slot = None;
+                *appending = None;
+            }
+        }
         let sessions = &self.sessions;
         if let Some(flight) = self.queues.flight.as_mut() {
-            flight
-                .waiting
-                .retain(|&s| sessions[s].as_ref().is_some_and(|tx| !tx.is_closed()));
+            flight.waiting.retain(|&s| sessions[s].is_some());
         }
+    }
+
+    fn covers_shards(&self, parts: &[Part]) -> bool {
+        self.sessions.is_empty()
+            || (0..self.data.superblock().shards())
+                .all(|s| parts.iter().any(|p| u32::from(p.tag) == s))
     }
 
     pub(super) fn begin_checkpoint(&mut self, reply: Option<CheckpointReply>) {
@@ -266,7 +282,9 @@ impl Committer {
         let sequence = flight.snapshot.position.sequence;
         let reply = flight.reply.take();
         let shards = self.data.superblock().shards();
-        let result = if flight.invalid || !parts_valid(&flight.snapshot.parts, shards) {
+        let parts = &flight.snapshot.parts;
+        let result = if flight.invalid || !parts_valid(parts, shards) || !self.covers_shards(parts)
+        {
             for &region in &flight.regions {
                 self.regions.release(region);
             }

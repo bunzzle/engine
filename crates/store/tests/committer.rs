@@ -199,6 +199,7 @@ fn body_ranges_are_committed_with_their_allocation() {
         let refused = client
             .commit(Submission {
                 bodies: vec![Body {
+                    shard: 0,
                     tenant: 3,
                     range: bad,
                 }],
@@ -208,7 +209,11 @@ fn body_ranges_are_committed_with_their_allocation() {
         assert!(matches!(refused, Err(Error::Invalid("range"))));
         let durable = client
             .commit(Submission {
-                bodies: vec![Body { tenant: 3, range }],
+                bodies: vec![Body {
+                    shard: 0,
+                    tenant: 3,
+                    range,
+                }],
                 ..submission(vec![payload(1, 1, 50)])
             })
             .await

@@ -156,7 +156,11 @@ async fn bodies(client: Client, model: Shared) {
             model.borrow_mut().bodies.retain(|(r, _)| !same(r, old));
         }
         let dead = old.iter().map(kill_body).collect();
-        let body = Body { tenant: 3, range };
+        let body = Body {
+            shard: 0,
+            tenant: 3,
+            range,
+        };
         if client
             .commit(submission(Vec::new(), vec![body], dead))
             .await

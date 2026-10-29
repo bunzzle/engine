@@ -8,6 +8,7 @@ use rt::{Buf, Receiver, Sender, channel};
 mod flight;
 mod runs;
 
+use crate::core_file::Source;
 use crate::data_file::DataFile;
 use crate::error::Error;
 use crate::journal::{Allocation, Commit, Dead, Journal, Live, Range};
@@ -31,6 +32,7 @@ pub struct Write {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Body {
+    pub shard: u16,
     pub tenant: u32,
     pub range: Range,
 }
@@ -197,7 +199,7 @@ impl Committer {
             sequence: state.record_sequence,
             checkpoint: state.checkpoint,
             carried: Vec::new(),
-            pins: Pins::default(),
+            pins: Pins::new(count),
             inbox,
             sessions: Vec::new(),
             queues: Queues::default(),
@@ -271,6 +273,10 @@ impl Committer {
 
     pub fn reader(&self) -> Reader {
         self.data.reader(self.pins.clone())
+    }
+
+    pub fn source(&self) -> Source {
+        self.data.source(self.pins.clone())
     }
 
     pub fn data(&self) -> &DataFile {
@@ -396,6 +402,10 @@ impl Committer {
         let mut dead = Vec::new();
         let mut accepted = Vec::new();
         for (submission, reply) in batch {
+            if !self.owns(&reply, &submission) {
+                self.reply(reply, Err(Error::Invalid("owner")));
+                continue;
+            }
             match self.pack(&submission, &mut segments) {
                 Ok(locations) => {
                     count_live(&submission, &locations, &mut live);
@@ -549,6 +559,19 @@ impl Committer {
             && self.allocations.iter().all(|a| a.region != region)
     }
 
+    fn owns(&self, reply: &Reply, submission: &Submission) -> bool {
+        let cores = self.sessions.len();
+        let mut shards = submission
+            .records
+            .iter()
+            .map(|w| w.shard)
+            .chain(submission.bodies.iter().map(|b| b.shard));
+        match reply {
+            Reply::Stream { session, .. } => shards.all(|s| usize::from(s) % cores == *session),
+            Reply::Once(_) => cores == 0 || shards.next().is_none(),
+        }
+    }
+
     fn pack(
         &mut self,
         submission: &Submission,
@@ -558,6 +581,9 @@ impl Committer {
         let region_size = superblock.region_size();
         let sector = u64::from(superblock.sector_size());
         for body in &submission.bodies {
+            if u32::from(body.shard) >= superblock.shards() {
+                return Err(Error::Invalid("shard"));
+            }
             let range = &body.range;
             let valid = range.region < superblock.region_count()
                 && self.regions.is_used(range.region)

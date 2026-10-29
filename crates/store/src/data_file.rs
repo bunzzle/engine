@@ -1,8 +1,9 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use rt::{Buf, File, OpenOptions, sync_dir};
 
+use crate::core_file::Source;
 use crate::error::Error;
 use crate::reader::{Pins, Reader};
 use crate::superblock::{
@@ -21,6 +22,7 @@ pub struct Options {
 }
 
 pub struct DataFile {
+    path: PathBuf,
     file: Rc<File>,
     superblock: Superblock,
     checksum: u32,
@@ -92,6 +94,7 @@ impl DataFile {
             .unwrap_or(Path::new("."));
         sync_dir(dir).await?;
         Ok(Self {
+            path: path.to_path_buf(),
             file: Rc::new(file),
             superblock,
             checksum,
@@ -100,6 +103,7 @@ impl DataFile {
     }
 
     pub async fn open(path: impl AsRef<Path>) -> Result<Self, Error> {
+        let path = path.as_ref();
         let file = File::open(
             path,
             &OpenOptions {
@@ -141,6 +145,7 @@ impl DataFile {
             file.sync_data().await?;
         }
         Ok(Self {
+            path: path.to_path_buf(),
             file: Rc::new(file),
             superblock,
             checksum: selected.checksum,
@@ -165,21 +170,15 @@ impl DataFile {
     }
 
     pub(crate) fn reader(&self, pins: Pins) -> Reader {
-        Reader::new(
-            Rc::clone(&self.file),
-            self.superblock.regions_offset,
-            self.superblock.region_size,
-            self.superblock.region_count,
-            pins,
-        )
+        Reader::new(Rc::clone(&self.file), &self.superblock, pins)
+    }
+
+    pub(crate) fn source(&self, pins: Pins) -> Source {
+        Source::new(self.path.clone(), self.superblock, pins)
     }
 
     pub fn region_offset(&self, region: u32) -> u64 {
-        assert!(
-            region < self.superblock.region_count,
-            "region {region} out of range"
-        );
-        self.superblock.regions_offset + u64::from(region) * self.superblock.region_size
+        self.superblock.region_offset(region)
     }
 
     pub async fn update(
@@ -232,7 +231,7 @@ impl DataFile {
     }
 }
 
-fn sector_size(reported: u32) -> Result<u32, Error> {
+pub(crate) fn sector_size(reported: u32) -> Result<u32, Error> {
     let size = reported.max(MIN_SECTOR_SIZE);
     if !size.is_power_of_two() || size > MAX_SECTOR_SIZE {
         return Err(Error::UnsupportedSectorSize(reported));

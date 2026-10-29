@@ -1,21 +1,26 @@
-use std::cell::RefCell;
-use std::collections::BTreeMap;
 use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use rt::{Buf, File};
 
 use crate::committer::Location;
 use crate::error::Error;
 use crate::record::{Record, record_size};
+use crate::superblock::Superblock;
 
 pub const READ_ATTEMPTS: u32 = 4;
 
-#[derive(Clone, Default)]
-pub struct Pins(Rc<RefCell<BTreeMap<u32, u32>>>);
+#[derive(Clone)]
+pub struct Pins(Arc<[AtomicU32]>);
 
 impl Pins {
+    pub(crate) fn new(count: u32) -> Self {
+        Self((0..count).map(|_| AtomicU32::new(0)).collect())
+    }
+
     pub fn pin(&self, region: u32) -> Pin {
-        *self.0.borrow_mut().entry(region).or_default() += 1;
+        self.0[region as usize].fetch_add(1, Ordering::AcqRel);
         Pin {
             pins: self.clone(),
             region,
@@ -23,7 +28,7 @@ impl Pins {
     }
 
     pub fn is_pinned(&self, region: u32) -> bool {
-        self.0.borrow().contains_key(&region)
+        self.0[region as usize].load(Ordering::Acquire) > 0
     }
 }
 
@@ -34,13 +39,7 @@ pub struct Pin {
 
 impl Drop for Pin {
     fn drop(&mut self) {
-        let mut pins = self.pins.0.borrow_mut();
-        if let Some(count) = pins.get_mut(&self.region) {
-            *count -= 1;
-            if *count == 0 {
-                pins.remove(&self.region);
-            }
-        }
+        self.pins.0[self.region as usize].fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -57,18 +56,12 @@ pub struct Reader {
 }
 
 impl Reader {
-    pub(crate) fn new(
-        file: Rc<File>,
-        regions_offset: u64,
-        region_size: u64,
-        region_count: u32,
-        pins: Pins,
-    ) -> Self {
+    pub(crate) fn new(file: Rc<File>, superblock: &Superblock, pins: Pins) -> Self {
         Self {
             file,
-            regions_offset,
-            region_size,
-            region_count,
+            regions_offset: superblock.regions_offset(),
+            region_size: superblock.region_size(),
+            region_count: superblock.region_count(),
             pins,
         }
     }

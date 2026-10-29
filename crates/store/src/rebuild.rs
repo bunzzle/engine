@@ -4,7 +4,7 @@ use rt::Buf;
 
 use crate::checkpoint::Part;
 use crate::committer::Location;
-use crate::data_file::DataFile;
+use crate::core_file::CoreFile;
 use crate::error::Error;
 use crate::journal::{Entry, Range};
 use crate::keeper::Keeper;
@@ -20,7 +20,7 @@ struct Rebuilding {
 
 impl Keeper {
     pub async fn rebuild(
-        data: &DataFile,
+        data: &CoreFile,
         parts: &[Part],
         entries: &[Entry],
         shards: &[u16],
@@ -60,7 +60,7 @@ impl Keeper {
 }
 
 async fn replay(
-    data: &DataFile,
+    data: &CoreFile,
     commit: u64,
     range: &Range,
     rebuilding: &mut BTreeMap<u16, Rebuilding>,

@@ -1,5 +1,7 @@
+mod boot;
 mod checkpoint;
 mod committer;
+mod core_file;
 mod data_file;
 mod error;
 mod journal;
@@ -14,12 +16,16 @@ mod run;
 mod session;
 mod shard;
 mod superblock;
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+mod threads;
 mod usage;
 
+pub use boot::{Booted, Core, Setup, Start, boot};
 pub use checkpoint::{KIND_CHECKPOINT, Loaded, PART_TAG_OTHER, Part, load};
 pub use committer::{
     Body, Client, Committer, Durable, Lease, Location, PART_TIMEOUT, Submission, Write,
 };
+pub use core_file::{CoreFile, Source};
 pub use data_file::{DataFile, Options};
 pub use error::Error;
 pub use journal::{Allocation, Commit, Dead, Entry, Journal, KIND_COMMIT, Live, Position, Range};
@@ -40,4 +46,6 @@ pub use superblock::{
     SLOT_SIZE, Superblock, ZONE_SIZE,
 };
 pub use sys::crc32c::checksum;
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub use threads::launch;
 pub use usage::{Count, Usage};
