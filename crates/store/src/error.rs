@@ -30,6 +30,7 @@ pub enum Error {
     CheckpointTooLarge,
     Record(RecordError),
     NotFound,
+    Busy,
     Damaged { region: u32, offset: u64 },
 }
 
@@ -73,6 +74,7 @@ impl fmt::Display for Error {
             Self::CheckpointTooLarge => f.write_str("checkpoint does not fit in a region"),
             Self::Record(e) => e.fmt(f),
             Self::NotFound => f.write_str("record no longer exists"),
+            Self::Busy => f.write_str("no submission credits left"),
             Self::Damaged { region, offset } => {
                 write!(f, "damaged data in region {region} at offset {offset}")
             }
