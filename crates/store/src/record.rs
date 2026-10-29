@@ -6,7 +6,8 @@ use sys::crc32c::checksum;
 pub const RECORD_HEADER_SIZE: usize = 40;
 pub const RECORD_ALIGN: usize = 8;
 pub const MAX_PAYLOAD: usize = 1024 * 1024;
-pub const RECORD_FORMAT: u16 = 1;
+pub const RECORD_FORMAT: u16 = 2;
+pub const SYSTEM_SHARD: u16 = u16::MAX;
 pub const FLAG_MORE: u8 = 1;
 
 const OLDEST_RECORD_FORMAT: u16 = 1;
@@ -18,13 +19,15 @@ const FLAGS: usize = 13;
 const FORMAT: usize = 14;
 const TENANT: usize = 16;
 const EPOCH: usize = 24;
-const RESERVED: usize = 20;
+const SHARD: usize = 20;
+const RESERVED: usize = 22;
 const SEQUENCE: usize = 32;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Header {
     pub kind: u8,
     pub flags: u8,
+    pub shard: u16,
     pub tenant: u32,
     pub epoch: u64,
     pub sequence: u64,
@@ -78,7 +81,8 @@ pub fn encode(header: &Header, payload: &[u8], out: &mut [u8]) -> usize {
     fields.put_u8(FLAGS, header.flags);
     fields.put_u16(FORMAT, RECORD_FORMAT);
     fields.put_u32(TENANT, header.tenant);
-    fields.put_u32(RESERVED, 0);
+    fields.put_u16(SHARD, header.shard);
+    fields.put_u16(RESERVED, 0);
     fields.put_u64(EPOCH, header.epoch);
     fields.put_u64(SEQUENCE, header.sequence);
     let sum = checksum(&out[BODY_CRC..RECORD_HEADER_SIZE]);
@@ -97,10 +101,19 @@ pub fn peek_header(bytes: &[u8]) -> Result<Header, RecordError> {
     Ok(Header {
         kind: fields.u8(KIND),
         flags: fields.u8(FLAGS),
+        shard: shard(&fields),
         tenant: fields.u32(TENANT),
         epoch: fields.u64(EPOCH),
         sequence: fields.u64(SEQUENCE),
     })
+}
+
+fn shard(fields: &Fields<'_>) -> u16 {
+    if fields.u16(FORMAT) == 1 {
+        0
+    } else {
+        fields.u16(SHARD)
+    }
 }
 
 fn verified_length(bytes: &[u8]) -> Result<usize, RecordError> {
@@ -116,7 +129,12 @@ fn verified_length(bytes: &[u8]) -> Result<usize, RecordError> {
     if !(OLDEST_RECORD_FORMAT..=RECORD_FORMAT).contains(&format) {
         return Err(RecordError::Format(format));
     }
-    if fields.u32(RESERVED) != 0 {
+    let reserved = if format == 1 {
+        fields.u32(SHARD) != 0
+    } else {
+        fields.u16(RESERVED) != 0
+    };
+    if reserved {
         return Err(RecordError::Reserved);
     }
     match usize::try_from(length) {
@@ -154,6 +172,7 @@ impl<'a> Record<'a> {
         Header {
             kind: self.kind(),
             flags: self.flags(),
+            shard: self.shard(),
             tenant: self.tenant(),
             epoch: self.epoch(),
             sequence: self.sequence(),
@@ -162,6 +181,10 @@ impl<'a> Record<'a> {
 
     pub fn checksum(&self) -> u32 {
         self.fields().u32(HEADER_CRC)
+    }
+
+    pub fn shard(&self) -> u16 {
+        shard(&self.fields())
     }
 
     pub fn kind(&self) -> u8 {

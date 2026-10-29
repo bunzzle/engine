@@ -6,8 +6,8 @@ use rt::{Buf, File, OpenOptions, sync_dir};
 use crate::error::Error;
 use crate::reader::{Pins, Reader};
 use crate::superblock::{
-    COPIES, Checkpoint, FORMAT, HEADER_SIZE, MAX_SECTOR_SIZE, MIN_SECTOR_SIZE, SLOT_SIZE, Stored,
-    Superblock, ZONE_SIZE, select,
+    COPIES, Checkpoint, FORMAT, HEADER_SIZE, MAX_SECTOR_SIZE, MAX_SHARDS, MIN_SECTOR_SIZE,
+    SLOT_SIZE, Stored, Superblock, ZONE_SIZE, select,
 };
 
 const FILL_CHUNK: u64 = 1024 * 1024;
@@ -42,8 +42,8 @@ impl DataFile {
         if options.region_count == 0 {
             return Err(Error::Config("region count must not be zero"));
         }
-        if options.shards == 0 {
-            return Err(Error::Config("shard count must not be zero"));
+        if options.shards == 0 || options.shards > MAX_SHARDS {
+            return Err(Error::Config("shard count must be between 1 and 32768"));
         }
         let regions_offset = ZONE_SIZE + options.journal_size;
         let file_size = u64::from(options.region_count)

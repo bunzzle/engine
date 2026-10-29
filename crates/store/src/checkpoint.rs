@@ -6,7 +6,7 @@ use crate::data_file::DataFile;
 use crate::error::Error;
 use crate::journal::Position;
 use crate::layout::{Fields, FieldsMut};
-use crate::record::{self, FLAG_MORE, Header, Record, record_size};
+use crate::record::{self, FLAG_MORE, Header, Record, SYSTEM_SHARD, record_size};
 use crate::recovery::State;
 use crate::superblock::CheckpointCopy;
 use crate::usage::{Count, Usage};
@@ -18,6 +18,8 @@ const BLOB_FORMAT: u32 = 2;
 const HEAD: usize = 48;
 const PART_HEAD: usize = 24;
 const TENANT: usize = 16;
+
+pub const PART_TAG_OTHER: u16 = 0x8000;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Part {
@@ -239,6 +241,7 @@ pub(crate) async fn write_copy(
         let header = Header {
             kind: KIND_CHECKPOINT,
             flags,
+            shard: SYSTEM_SHARD,
             tenant: 0,
             epoch,
             sequence,
@@ -311,7 +314,12 @@ pub async fn load(data: &DataFile, reserve: u32) -> Result<Loaded, Error> {
         let Some(found) = decode(&blob, count) else {
             continue;
         };
-        if consistent(&found, &checkpoint.copies, checkpoint.position) {
+        if consistent(
+            &found,
+            &checkpoint.copies,
+            checkpoint.position,
+            data.superblock().shards(),
+        ) {
             snapshot = Some(found);
             break;
         }
@@ -339,7 +347,12 @@ pub async fn load(data: &DataFile, reserve: u32) -> Result<Loaded, Error> {
     })
 }
 
-fn consistent(snapshot: &Snapshot, copies: &[CheckpointCopy; 2], position: Position) -> bool {
+fn consistent(
+    snapshot: &Snapshot,
+    copies: &[CheckpointCopy; 2],
+    position: Position,
+    shards: u32,
+) -> bool {
     let count = snapshot.used.len();
     let usage = &snapshot.usage;
     let mut released = vec![false; count];
@@ -379,13 +392,23 @@ fn consistent(snapshot: &Snapshot, copies: &[CheckpointCopy; 2], position: Posit
             .parts
             .iter()
             .all(|p| p.replay_sequence == position.sequence)
+        && parts_valid(&snapshot.parts, shards)
+}
+
+fn parts_valid(parts: &[Part], shards: u32) -> bool {
+    let mut tags: Vec<u16> = parts.iter().map(|p| p.tag).collect();
+    tags.sort_unstable();
+    tags.windows(2).all(|w| w[0] != w[1])
+        && tags
+            .iter()
+            .all(|&tag| tag >= PART_TAG_OTHER || u32::from(tag) < shards)
 }
 
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
 
-    use super::{Part, Snapshot, decode, encode};
+    use super::{PART_TAG_OTHER, Part, Snapshot, decode, encode, parts_valid};
     use crate::journal::Position;
     use crate::usage::{Count, Usage};
 
@@ -443,5 +466,21 @@ mod tests {
         for cut in 0..blob.len() {
             let _ = decode(&blob[..cut], 11);
         }
+    }
+
+    fn part(tag: u16) -> Part {
+        Part {
+            tag,
+            replay_sequence: 1,
+            bytes: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn part_tags_are_unique_shards_or_other() {
+        assert!(parts_valid(&[part(0), part(3), part(PART_TAG_OTHER)], 4));
+        assert!(!parts_valid(&[part(4)], 4));
+        assert!(!parts_valid(&[part(2), part(2)], 4));
+        assert!(parts_valid(&[part(u16::MAX)], 4));
     }
 }

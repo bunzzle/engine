@@ -64,6 +64,7 @@ async fn commit(client: &Client, tenant: u32, payload: &[u8]) -> Location {
             claim: Claim::Intake,
             records: vec![Write {
                 kind: 7,
+                shard: 0,
                 tenant,
                 payload: payload.to_vec(),
             }],

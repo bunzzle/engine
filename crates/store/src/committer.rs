@@ -17,6 +17,7 @@ use sys::crc32c::checksum;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Write {
     pub kind: u8,
+    pub shard: u16,
     pub tenant: u32,
     pub payload: Vec<u8>,
 }
@@ -540,6 +541,9 @@ impl Committer {
         }
         let mut total = 0u64;
         for write in &submission.records {
+            if u32::from(write.shard) >= superblock.shards() {
+                return Err(Error::Invalid("shard"));
+            }
             if write.payload.len() > MAX_PAYLOAD {
                 return Err(Error::CommitTooLarge);
             }
@@ -594,6 +598,7 @@ impl Committer {
             let header = Header {
                 kind: write.kind,
                 flags: 0,
+                shard: write.shard,
                 tenant: write.tenant,
                 epoch: stream.epoch,
                 sequence: self.sequence,

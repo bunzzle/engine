@@ -8,6 +8,7 @@ use store::{
 const HEADER: Header = Header {
     kind: 3,
     flags: 0,
+    shard: 5,
     tenant: 0xDEAD_BEEF,
     epoch: 9,
     sequence: 1234,
@@ -99,10 +100,30 @@ fn damage_is_reported_by_kind() {
     padding[RECORD_HEADER_SIZE + 7] = 1;
     assert_eq!(Record::decode(&padding).err(), Some(RecordError::Padding));
     let mut reserved = bytes.clone();
-    reserved[20] = 1;
-    let sum = checksum(&reserved[4..RECORD_HEADER_SIZE]);
-    reserved[..4].copy_from_slice(&sum.to_le_bytes());
+    reserved[22] = 1;
+    resum(&mut reserved);
     assert_eq!(Record::decode(&reserved).err(), Some(RecordError::Reserved));
+}
+
+fn resum(bytes: &mut [u8]) {
+    let sum = checksum(&bytes[4..RECORD_HEADER_SIZE]);
+    bytes[..4].copy_from_slice(&sum.to_le_bytes());
+}
+
+#[test]
+fn format_one_records_read_as_shard_zero() {
+    let mut bytes = encoded(&HEADER, b"old");
+    assert_eq!(Record::decode(&bytes).expect("decode").shard(), 5);
+    bytes[14..16].copy_from_slice(&1u16.to_le_bytes());
+    bytes[20..24].fill(0);
+    resum(&mut bytes);
+    let record = Record::decode(&bytes).expect("format 1 decodes");
+    assert_eq!(record.format(), 1);
+    assert_eq!(record.shard(), 0);
+    assert_eq!(record.header().shard, 0);
+    bytes[20] = 5;
+    resum(&mut bytes);
+    assert_eq!(Record::decode(&bytes).err(), Some(RecordError::Reserved));
 }
 
 #[test]
@@ -162,6 +183,7 @@ fn fuzz_decode() {
         let header = Header {
             kind: rng.bytes(1)[0],
             flags: rng.bytes(1)[0],
+            shard: 5,
             tenant: u32::try_from(rng.next() >> 32).expect("fits"),
             epoch: rng.next(),
             sequence: rng.next(),

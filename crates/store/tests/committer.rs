@@ -60,6 +60,7 @@ fn submission(records: Vec<Vec<u8>>) -> Submission {
             .into_iter()
             .map(|payload| Write {
                 kind: 7,
+                shard: 0,
                 tenant: 3,
                 payload,
             })
@@ -346,5 +347,31 @@ fn acknowledged_records_survive_a_crash() {
                 }
             }
         });
+    });
+}
+
+#[test]
+fn records_carry_their_shard_and_unknown_shards_are_refused() {
+    let driver = created(9);
+    run(&driver, async {
+        let (client, committer) = start(0).await;
+        let mut known = submission(vec![payload(0, 0, 10)]);
+        known.records[0].shard = 3;
+        let durable = client.commit(known).await.expect("commit");
+        let mut unknown = submission(vec![payload(0, 1, 10)]);
+        unknown.records[0].shard = 4;
+        let refused = client.commit(unknown).await;
+        assert!(matches!(refused, Err(Error::Invalid("shard"))));
+        drop(client);
+        let committer = committer.await;
+        let location = durable.locations[0];
+        let offset = committer.data().region_offset(location.region) + location.offset;
+        let (read, buf) = committer
+            .data()
+            .file()
+            .read_at(Buf::new(location.size as usize), offset)
+            .await;
+        read.expect("read");
+        assert_eq!(Record::decode(&buf).expect("decode").shard(), 3);
     });
 }

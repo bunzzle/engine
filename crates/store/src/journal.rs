@@ -6,7 +6,7 @@ use rt::{Buf, File};
 use crate::data_file::DataFile;
 use crate::error::Error;
 use crate::layout::{Fields, FieldsMut};
-use crate::record::{self, Header, MAX_PAYLOAD, Record, record_size};
+use crate::record::{self, Header, MAX_PAYLOAD, Record, SYSTEM_SHARD, record_size};
 
 pub const KIND_COMMIT: u8 = 1;
 
@@ -187,6 +187,7 @@ impl Journal {
         let header = Header {
             kind: KIND_COMMIT,
             flags: 0,
+            shard: SYSTEM_SHARD,
             tenant: 0,
             epoch: 0,
             sequence: self.next.sequence,
