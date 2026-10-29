@@ -129,7 +129,7 @@ mod tests {
         assert_eq!(buf.extend_from_slice(b"abcdef"), 4);
         assert_eq!(&buf[..], b"abcd");
         assert_eq!(buf.remaining(), 0);
-        assert!(buf.spare_mut().is_empty());
+        assert_eq!(buf.spare_mut(), []);
     }
 
     #[test]
