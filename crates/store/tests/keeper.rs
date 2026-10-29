@@ -688,7 +688,9 @@ fn workload(seed: u64, halt_after: Option<u64>, disk: Disk) -> (Rc<SimDriver>, M
         credits: 1,
         reserve: 0,
     };
-    let Ok(booted) = machine.block_on(0, boot(PATH, setup)) else {
+    let Ok(Ok(booted)) =
+        machine.block_on(0, async move { timeout(HORIZON, boot(PATH, setup)).await })
+    else {
         return (driver, Model::default());
     };
     let model = Shared::default();

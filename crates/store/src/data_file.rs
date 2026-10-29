@@ -81,6 +81,7 @@ impl DataFile {
             journal_size: options.journal_size,
             region_size: options.region_size,
             region_count: options.region_count,
+            boot: 0,
             checkpoint: None,
         };
         let mut checksum = 0;
@@ -185,6 +186,7 @@ impl DataFile {
         &mut self,
         checkpoint: Option<Checkpoint>,
         oldest_format: u16,
+        boot: u32,
     ) -> Result<(), Error> {
         if self.failed {
             return Err(Error::Failed);
@@ -202,11 +204,13 @@ impl DataFile {
                 || (checkpoint.is_none() && self.superblock.checkpoint.is_none()),
             "checkpoint must not move backwards"
         );
+        assert!(boot >= self.superblock.boot, "boot must not move backwards");
         let next = Superblock {
             format: FORMAT,
             oldest_format,
             sequence: self.superblock.sequence + 1,
             parent: self.checksum,
+            boot,
             checkpoint,
             ..self.superblock
         };
@@ -228,6 +232,18 @@ impl DataFile {
         self.superblock = next;
         self.checksum = checksum;
         Ok(())
+    }
+
+    pub async fn next_boot(&mut self) -> Result<u32, Error> {
+        let boot = self
+            .superblock
+            .boot
+            .checked_add(1)
+            .ok_or(Error::Invalid("boot"))?;
+        let checkpoint = self.superblock.checkpoint;
+        let oldest = self.superblock.oldest_format;
+        self.update(checkpoint, oldest, boot).await?;
+        Ok(boot)
     }
 }
 

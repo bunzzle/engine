@@ -12,6 +12,7 @@ use crate::superblock::Checkpoint;
 use rt::Instant;
 
 type CheckpointReply = Sender<Result<u64, Error>>;
+type BootReply = Sender<Result<u32, Error>>;
 
 pub(super) struct Flight {
     snapshot: Snapshot,
@@ -43,6 +44,7 @@ pub(super) struct Queues {
     pub(super) parked: Option<Parked>,
     pub(super) deferred: VecDeque<Request>,
     pub(super) requested: VecDeque<CheckpointReply>,
+    pub(super) boots: Vec<BootReply>,
 }
 
 impl Committer {
@@ -273,6 +275,10 @@ impl Committer {
                 && let Some(reply) = self.queues.requested.pop_front()
             {
                 self.begin_checkpoint(Some(reply));
+            } else if self.queues.parked.is_none() && !self.queues.boots.is_empty() {
+                if self.try_begin_checkpoint().is_err() {
+                    self.refuse_boots();
+                }
             } else {
                 return;
             }
@@ -297,6 +303,8 @@ impl Committer {
         };
         let sequence = flight.snapshot.position.sequence;
         let reply = flight.reply.take();
+        let boots = std::mem::take(&mut self.queues.boots);
+        let renew = !boots.is_empty() && self.data.superblock().boot() < u32::MAX;
         let surveys = std::mem::take(&mut flight.surveys);
         let snapshot = &flight.snapshot;
         self.survey(&snapshot.usage, &snapshot.used, &snapshot.epochs, &surveys);
@@ -309,12 +317,25 @@ impl Committer {
             }
             Err(Error::Invalid("part"))
         } else {
-            self.write_flight(flight).await
+            self.write_flight(flight, renew).await
         };
         if result.is_ok() {
             self.broadcast(|| Event::Published { sequence });
         } else {
             self.broadcast(|| Event::Abandoned { sequence });
+        }
+        let boot = result
+            .is_ok()
+            .then(|| self.data.superblock().boot())
+            .filter(|_| renew);
+        self.queues.boots.extend(boots);
+        match boot {
+            Some(boot) => {
+                for reply in self.queues.boots.drain(..) {
+                    let _ = reply.send(Ok(boot));
+                }
+            }
+            None => self.refuse_boots(),
         }
         if let Some(reply) = reply {
             let _ = reply.send(result.map(|p| p.sequence));
@@ -323,7 +344,18 @@ impl Committer {
         self.start_victim();
     }
 
-    async fn write_flight(&mut self, flight: Flight) -> Result<Position, Error> {
+    fn refuse_boots(&mut self) {
+        for reply in self.queues.boots.drain(..) {
+            let error = if self.failed {
+                Error::Failed
+            } else {
+                Error::Busy
+            };
+            let _ = reply.send(Err(error));
+        }
+    }
+
+    async fn write_flight(&mut self, flight: Flight, renew: bool) -> Result<Position, Error> {
         let Flight {
             mut snapshot,
             regions,
@@ -361,7 +393,8 @@ impl Committer {
             copies: [copies[0], copies[1]],
         };
         let oldest = self.data.superblock().oldest_format();
-        if let Err(e) = self.data.update(Some(checkpoint), oldest).await {
+        let boot = self.data.superblock().boot() + u32::from(renew);
+        if let Err(e) = self.data.update(Some(checkpoint), oldest, boot).await {
             self.failed = true;
             return Err(e);
         }

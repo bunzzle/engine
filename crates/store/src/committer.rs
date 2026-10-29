@@ -78,6 +78,7 @@ pub(crate) enum Request {
     Seal(u32, u64),
     ClaimState(usize, Sender<Result<(u32, u64), Error>>),
     Checkpoint(Sender<Result<u64, Error>>),
+    Boot(Sender<Result<u32, Error>>),
     Survey(usize, u64, Vec<Owned>),
     Compacted(usize, u32, u64),
 }
@@ -135,6 +136,14 @@ impl Client {
             epoch,
             sender: self.sender.clone(),
         })
+    }
+
+    pub async fn boot(&self) -> Result<u32, Error> {
+        let (reply, mut answer) = channel();
+        if self.sender.send(Request::Boot(reply)).is_err() {
+            return Err(Error::Failed);
+        }
+        answer.recv().await.unwrap_or(Err(Error::Failed))
     }
 
     pub async fn checkpoint(&self) -> Result<u64, Error> {
@@ -372,6 +381,7 @@ impl Committer {
                 }
             }
             Request::Checkpoint(reply) => self.queues.requested.push_back(reply),
+            Request::Boot(reply) => self.queues.boots.push(reply),
             Request::Survey(session, sequence, owned) => self.surveyed(session, sequence, owned),
             Request::Compacted(session, region, epoch) => self.compacted(session, region, epoch),
         }
