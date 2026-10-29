@@ -7,7 +7,7 @@ use crate::checkpoint::{Part, Snapshot, encode, parts_valid, write_copy};
 use crate::error::Error;
 use crate::journal::{Commit, Position};
 use crate::regions::{CHECKPOINT_RESERVE, Claim};
-use crate::session::{Answer, Event};
+use crate::session::{Answer, Event, Owned};
 use crate::superblock::Checkpoint;
 use rt::Instant;
 
@@ -19,6 +19,7 @@ pub(super) struct Flight {
     pending: Vec<u32>,
     waiting: Vec<usize>,
     referenced: Vec<u32>,
+    surveys: Vec<Vec<Owned>>,
     invalid: bool,
     deadline: Instant,
     reply: Option<CheckpointReply>,
@@ -60,7 +61,11 @@ impl Committer {
         self.queues.parked.is_some()
             && !matches!(
                 request,
-                Request::Answer(_) | Request::Seal(..) | Request::ClaimState(..)
+                Request::Answer(_)
+                    | Request::Seal(..)
+                    | Request::ClaimState(..)
+                    | Request::Survey(..)
+                    | Request::Compacted(..)
             )
     }
 
@@ -124,6 +129,15 @@ impl Committer {
         flight.snapshot.parts.extend(answer.parts);
     }
 
+    pub(super) fn surveyed(&mut self, session: usize, sequence: u64, owned: Vec<Owned>) {
+        if let Some(flight) = self.queues.flight.as_mut()
+            && flight.snapshot.position.sequence == sequence
+            && flight.waiting.contains(&session)
+        {
+            flight.surveys.push(owned);
+        }
+    }
+
     fn prune_waiting(&mut self) {
         for (slot, appending) in self.sessions.iter_mut().zip(&mut self.runs.appending) {
             if slot.as_ref().is_none_or(Sender::is_closed) {
@@ -135,6 +149,7 @@ impl Committer {
         if let Some(flight) = self.queues.flight.as_mut() {
             flight.waiting.retain(|&s| sessions[s].is_some());
         }
+        self.settle_victim();
     }
 
     fn covers_shards(&self, parts: &[Part]) -> bool {
@@ -215,6 +230,7 @@ impl Committer {
                 pending,
                 waiting,
                 referenced: Vec::new(),
+                surveys: Vec::new(),
                 invalid: false,
                 deadline: Instant::from_nanos(now().as_nanos().saturating_add(
                     u64::try_from(self.part_timeout.as_nanos()).unwrap_or(u64::MAX),
@@ -281,6 +297,9 @@ impl Committer {
         };
         let sequence = flight.snapshot.position.sequence;
         let reply = flight.reply.take();
+        let surveys = std::mem::take(&mut flight.surveys);
+        let snapshot = &flight.snapshot;
+        self.survey(&snapshot.usage, &snapshot.used, &snapshot.epochs, &surveys);
         let shards = self.data.superblock().shards();
         let parts = &flight.snapshot.parts;
         let result = if flight.invalid || !parts_valid(parts, shards) || !self.covers_shards(parts)
@@ -301,6 +320,7 @@ impl Committer {
             let _ = reply.send(result.map(|p| p.sequence));
         }
         self.unpark().await;
+        self.start_victim();
     }
 
     async fn write_flight(&mut self, flight: Flight) -> Result<Position, Error> {

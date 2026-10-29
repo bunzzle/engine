@@ -139,6 +139,7 @@ impl Core {
             }
             Event::Published { sequence } => self.keeper.published(*sequence),
             Event::Abandoned { sequence } => self.keeper.abandoned(*sequence),
+            Event::Compact { .. } => panic!("no survey was sent"),
         }
         event
     }
@@ -660,6 +661,7 @@ async fn keep(start: Start, model: Shared) {
                 }
                 Some(Event::Published { sequence }) => core.keeper.published(sequence),
                 Some(Event::Abandoned { sequence }) => core.keeper.abandoned(sequence),
+                Some(Event::Compact { .. }) => panic!("no survey was sent"),
                 Some(Event::Rejected { .. }) | None => return,
             }
         }

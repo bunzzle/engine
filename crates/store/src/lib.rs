@@ -24,7 +24,8 @@ mod usage;
 pub use boot::{Booted, Core, Setup, Start, boot};
 pub use checkpoint::{KIND_CHECKPOINT, Loaded, PART_TAG_OTHER, Part, load};
 pub use committer::{
-    Body, Client, Committer, Durable, Lease, Location, PART_TIMEOUT, Submission, Write,
+    Body, Client, Committer, CompactionStats, Durable, Lease, Location, PART_TIMEOUT, Submission,
+    Write,
 };
 pub use core_file::{CoreFile, Source};
 pub use data_file::{DataFile, Options};
@@ -41,7 +42,7 @@ pub use record::{
 pub use recovery::{Recovered, State, recover};
 pub use regions::{CHECKPOINT_RESERVE, COMPACTION_RESERVE, Claim, Regions};
 pub use run::{KIND_RUN, MAX_DELTAS, ROOT_SIZE, Root, Run, decode_roots, encode_roots, read_run};
-pub use session::{Event, Results, Session};
+pub use session::{Event, Owned, Results, Session};
 pub use shard::{Change, Delivery, Delta, INDEX_SIZE, Index, Item, KIND_STATE, ShardState};
 pub use superblock::{
     COPIES, Checkpoint, CheckpointCopy, FORMAT, MAX_SECTOR_SIZE, MAX_SHARDS, MIN_SECTOR_SIZE,

@@ -478,3 +478,41 @@ fn moved_records_get_their_own_stream_and_bodies_need_a_lease() {
         drop(committer.await);
     });
 }
+
+#[test]
+fn a_batch_that_mixes_streams_recovers() {
+    let driver = created(14);
+    run(&driver, async {
+        let (client, committer) = start(0).await;
+        let claims = [
+            Claim::Intake,
+            Claim::Internal,
+            Claim::Intake,
+            Claim::Internal,
+        ];
+        let sends: Vec<_> = (0u64..)
+            .zip(claims)
+            .map(|(step, claim)| {
+                let client = client.clone();
+                let submission = Submission {
+                    claim,
+                    ..submission(vec![payload(1, step, 100)])
+                };
+                spawn(async move { client.commit(submission).await })
+            })
+            .collect();
+        let mut sequences = BTreeSet::new();
+        for send in sends {
+            sequences.insert(send.await.expect("commit").sequence);
+        }
+        assert_eq!(sequences.len(), 1, "one batch");
+        drop(client);
+        drop(committer.await);
+        let data = DataFile::open(PATH).await.expect("reopen");
+        let loaded = load(&data, 0).await.expect("load");
+        let recovered = recover(&data, loaded.position, loaded.state)
+            .await
+            .expect("recover");
+        assert_eq!(recovered.torn, None);
+    });
+}

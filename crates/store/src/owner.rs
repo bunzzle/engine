@@ -8,11 +8,31 @@ use crate::core_file::CoreFile;
 use crate::error::Error;
 use crate::journal::Dead;
 use crate::keeper::Keeper;
+use crate::reader::Owner;
+use crate::record::Record;
 use crate::regions::Claim;
-use crate::session::{Event, Results, Session};
-use crate::shard::{Change, Index, KIND_STATE};
+use crate::session::{Event, Owned, Results, Session};
+use crate::shard::{Change, INDEX_SIZE, Index, KIND_STATE};
 
-type Reply = Sender<Result<Location, Error>>;
+enum Reply {
+    Caller(Sender<Result<Location, Error>>),
+    Move,
+}
+
+struct Compacting {
+    region: u32,
+    epoch: u64,
+    moves: usize,
+    skipped: Vec<(u16, u64)>,
+}
+
+struct Itself;
+
+impl Owner for Itself {
+    fn locate(&self, _: Location) -> impl Future<Output = Option<Location>> {
+        std::future::ready(None)
+    }
+}
 
 struct Request {
     shard: u16,
@@ -44,7 +64,7 @@ impl Changes {
             shard,
             index,
             sealed,
-            reply,
+            reply: Reply::Caller(reply),
         };
         if self.sender.send(Input::Change(request)).is_err() {
             return Err(Error::Failed);
@@ -68,6 +88,7 @@ pub struct Shards {
     waiting: VecDeque<(u64, Submission)>,
     sent: BTreeMap<u64, Request>,
     tag: u64,
+    compacting: Option<Compacting>,
     closing: bool,
 }
 
@@ -93,6 +114,7 @@ impl Shards {
             waiting: VecDeque::new(),
             sent: BTreeMap::new(),
             tag: 0,
+            compacting: None,
             closing: false,
         };
         (owner, Changes { sender })
@@ -123,12 +145,15 @@ impl Shards {
     }
 
     fn request(&mut self, request: Request) {
-        if !self.owned.contains(&request.shard) {
-            let _ = request.reply.send(Err(Error::Invalid("owner")));
-            return;
-        }
-        if self.closing {
-            let _ = request.reply.send(Err(Error::Failed));
+        if !self.owned.contains(&request.shard) || self.closing {
+            let error = if self.closing {
+                Error::Failed
+            } else {
+                Error::Invalid("owner")
+            };
+            if let Reply::Caller(reply) = request.reply {
+                let _ = reply.send(Err(error));
+            }
             return;
         }
         let key = (request.shard, request.index.key);
@@ -225,8 +250,10 @@ impl Shards {
                 self.finish(request, Err(error));
             }
             Event::Cut { sequence } => {
+                let _ = self.session.survey(sequence, self.owned_bytes());
                 let _ = self.keeper.cut(&self.session, &self.file, sequence).await;
             }
+            Event::Compact { region, epoch } => self.compact(region, epoch).await,
             Event::Published { sequence } => self.keeper.published(sequence),
             Event::Abandoned { sequence } => self.keeper.abandoned(sequence),
         }
@@ -240,13 +267,111 @@ impl Shards {
             ..
         } = request;
         let key = (shard, index.key);
-        let _ = reply.send(result);
+        match reply {
+            Reply::Caller(reply) => {
+                let _ = reply.send(result);
+            }
+            Reply::Move => {
+                if let Some(compacting) = self.compacting.as_mut() {
+                    compacting.moves -= 1;
+                }
+            }
+        }
         let next = self.busy.get_mut(&key).and_then(VecDeque::pop_front);
         match next {
             Some(next) => self.start(next),
             None => {
                 self.busy.remove(&key);
             }
+        }
+        self.settle_compaction();
+    }
+
+    fn owned_bytes(&self) -> Vec<Owned> {
+        let mut owned = BTreeMap::<u32, Owned>::new();
+        for &shard in &self.owned {
+            let Some(state) = self.keeper.state(shard) else {
+                continue;
+            };
+            for item in state.entries().values() {
+                let region = item.location.region;
+                let entry = owned.entry(region).or_insert(Owned {
+                    region,
+                    ..Owned::default()
+                });
+                entry.extents += 1;
+                entry.bytes += u64::from(item.location.size);
+            }
+        }
+        owned.into_values().collect()
+    }
+
+    async fn compact(&mut self, region: u32, epoch: u64) {
+        let mut found = Vec::new();
+        for &shard in &self.owned {
+            let Some(state) = self.keeper.state(shard) else {
+                continue;
+            };
+            for (&key, item) in state.entries() {
+                if item.location.region == region && item.location.epoch == epoch {
+                    found.push((shard, key, *item));
+                }
+            }
+        }
+        let mut compacting = Compacting {
+            region,
+            epoch,
+            moves: 0,
+            skipped: Vec::new(),
+        };
+        let reader = self.file.reader();
+        let mut moves = Vec::new();
+        for (shard, key, item) in found {
+            if self.busy.contains_key(&(shard, key)) {
+                compacting.skipped.push((shard, key));
+                continue;
+            }
+            let Ok(buf) = reader.read(item.location, item.tenant, &Itself).await else {
+                continue;
+            };
+            let Ok(record) = Record::decode(&buf) else {
+                continue;
+            };
+            let Some(sealed) = record.payload().get(INDEX_SIZE..) else {
+                continue;
+            };
+            let index = Index {
+                key,
+                tenant: item.tenant,
+                change: Change::Move { old: item.location },
+            };
+            moves.push(Request {
+                shard,
+                index,
+                sealed: sealed.to_vec(),
+                reply: Reply::Move,
+            });
+        }
+        compacting.moves = moves.len();
+        self.compacting = Some(compacting);
+        for request in moves {
+            self.request(request);
+        }
+        self.settle_compaction();
+    }
+
+    fn settle_compaction(&mut self) {
+        let Some(compacting) = self.compacting.as_ref() else {
+            return;
+        };
+        let resolved = compacting.moves == 0
+            && compacting
+                .skipped
+                .iter()
+                .all(|key| !self.busy.contains_key(key));
+        if resolved {
+            let _ = self.session.compacted(compacting.region, compacting.epoch);
+            self.compacting = None;
         }
     }
 }
