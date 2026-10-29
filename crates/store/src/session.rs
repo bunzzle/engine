@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use rt::{Receiver, Sender};
+use rt::Receiver;
 
 use crate::checkpoint::Part;
 use crate::committer::{Client, Location, Reply, Request, Submission};
@@ -38,7 +38,6 @@ pub(crate) struct Answer {
 pub struct Session {
     pub(crate) id: usize,
     pub(crate) client: Client,
-    pub(crate) parts: Sender<Answer>,
     pub(crate) credits: Arc<AtomicU32>,
 }
 
@@ -75,12 +74,14 @@ impl Session {
     }
 
     pub fn parts(&self, sequence: u64, parts: Vec<Part>) -> Result<(), Error> {
-        self.parts
-            .send(Answer {
-                session: self.id,
-                sequence,
-                parts,
-            })
+        let answer = Answer {
+            session: self.id,
+            sequence,
+            parts,
+        };
+        self.client
+            .sender
+            .send(Request::Answer(answer))
             .map_err(|_| Error::Failed)
     }
 }

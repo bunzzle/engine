@@ -2,10 +2,10 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use rt::sim::{Config, SimDriver};
-use rt::{JoinHandle, Runtime, spawn};
+use rt::{Buf, File, JoinHandle, OpenOptions, Runtime, now, sleep, spawn};
 use store::{
-    Claim, Client, Committer, DataFile, Error, Event, Options, Part, Results, SLOT_SIZE, Session,
-    Submission, Write, load, recover,
+    Body, Claim, Client, Committer, DataFile, Dead, Error, Event, Location, Options, Part, Range,
+    Results, SLOT_SIZE, Session, Submission, Write, ZONE_SIZE, checksum, load, recover,
 };
 
 const PATH: &str = "/data/store";
@@ -13,7 +13,7 @@ const PATH: &str = "/data/store";
 const OPTIONS: Options = Options {
     journal_size: 4 * SLOT_SIZE,
     region_size: 2 * SLOT_SIZE,
-    region_count: 8,
+    region_count: 16,
     shards: 4,
 };
 
@@ -214,4 +214,165 @@ fn a_missing_part_stops_the_process() {
         let _silent = sessions;
         let _ = client.checkpoint().await;
     });
+}
+
+fn answer_late(
+    session: Session,
+    mut results: Results,
+    delay: Duration,
+    stop_after: u32,
+) -> JoinHandle<u32> {
+    spawn(async move {
+        let mut published = 0;
+        while published < stop_after
+            && let Some(event) = results.recv().await
+        {
+            match event {
+                Event::Cut { sequence } => {
+                    sleep(delay).await;
+                    session
+                        .parts(sequence, vec![part(0, sequence)])
+                        .expect("send parts");
+                }
+                Event::Published { .. } => published += 1,
+                _ => {}
+            }
+        }
+        published
+    })
+}
+
+#[test]
+fn commits_continue_while_parts_are_collected() {
+    run(7, async {
+        let (client, mut sessions, committer) = start(1, 2, Duration::from_secs(5)).await;
+        let (session, results) = sessions.remove(0);
+        let answers = answer_late(session, results, Duration::from_millis(50), 1);
+        let checkpoint = {
+            let client = client.clone();
+            spawn(async move { client.checkpoint().await })
+        };
+        sleep(Duration::from_millis(1)).await;
+        let started = now();
+        let durable = client.commit(submission(1, 9)).await.expect("commit");
+        assert!(now().saturating_duration_since(started) < Duration::from_millis(50));
+        let cut = checkpoint.await.expect("checkpoint");
+        assert!(durable.sequence >= cut);
+        drop(client);
+        drop(committer.await);
+        assert_eq!(answers.await, 1);
+        let data = DataFile::open(PATH).await.expect("reopen");
+        let loaded = load(&data, 0).await.expect("load");
+        assert_eq!(loaded.position.sequence, cut);
+        let recovered = recover(&data, loaded.position, loaded.state)
+            .await
+            .expect("recover");
+        assert_eq!(recovered.torn, None);
+        assert!(recovered.journal.position().sequence > durable.sequence);
+    });
+}
+
+#[test]
+fn a_full_journal_waits_for_the_checkpoint_in_flight() {
+    run(8, async {
+        let (client, mut sessions, committer) = start(1, 2, Duration::from_secs(5)).await;
+        let (session, results) = sessions.remove(0);
+        let answers = answer_late(session, results, Duration::from_secs(2), 2);
+        let mut previous: Option<Location> = None;
+        for step in 0..300u32 {
+            let mut next = submission(0, u8::try_from(step % 251).expect("fits"));
+            if let Some(location) = previous {
+                next.dead.push(Dead {
+                    tenant: 1,
+                    region: location.region,
+                    epoch: location.epoch,
+                    offset: location.offset,
+                    length: location.size,
+                });
+            }
+            let durable = client
+                .commit(next)
+                .await
+                .unwrap_or_else(|e| panic!("commit {step}: {e}"));
+            previous = Some(durable.locations[0]);
+        }
+        assert_eq!(
+            answers.await,
+            2,
+            "the journal wrapped through two checkpoints"
+        );
+        drop(client);
+        drop(committer.await);
+    });
+}
+
+#[test]
+fn a_region_being_released_takes_no_bodies() {
+    run(9, async {
+        let (client, mut sessions, _committer) = start(1, 2, Duration::from_secs(5)).await;
+        let (session, results) = sessions.remove(0);
+        let _answers = answer_late(session, results, Duration::from_millis(50), 1);
+        let lease = client.allocate(Claim::Intake).await.expect("allocate");
+        let (region, epoch) = (lease.region(), lease.epoch());
+        let bytes = vec![4u8; 4096];
+        write_raw(region, &bytes).await;
+        let range = Range {
+            region,
+            epoch,
+            offset: 0,
+            length: 4096,
+            checksum: checksum(&bytes),
+        };
+        client
+            .commit(body(range, Vec::new()))
+            .await
+            .expect("commit body");
+        let dead = Dead {
+            tenant: 1,
+            region,
+            epoch,
+            offset: 0,
+            length: 4096,
+        };
+        client.commit(body_dead(dead)).await.expect("kill body");
+        lease.seal();
+        let checkpoint = {
+            let client = client.clone();
+            spawn(async move { client.checkpoint().await })
+        };
+        sleep(Duration::from_millis(1)).await;
+        let late = client.commit(body(range, Vec::new())).await;
+        assert!(matches!(late, Err(Error::Invalid("range"))));
+        checkpoint.await.expect("checkpoint");
+    });
+}
+
+fn body(range: Range, dead: Vec<Dead>) -> Submission {
+    Submission {
+        claim: Claim::Intake,
+        records: Vec::new(),
+        bodies: vec![Body { tenant: 1, range }],
+        dead,
+    }
+}
+
+fn body_dead(dead: Dead) -> Submission {
+    Submission {
+        claim: Claim::Intake,
+        records: Vec::new(),
+        bodies: Vec::new(),
+        dead: vec![dead],
+    }
+}
+
+async fn write_raw(region: u32, bytes: &[u8]) {
+    let options = OpenOptions {
+        read: true,
+        write: true,
+        ..OpenOptions::default()
+    };
+    let file = File::open(PATH, &options).await.expect("open raw");
+    let at = ZONE_SIZE + OPTIONS.journal_size + u64::from(region) * OPTIONS.region_size;
+    let (result, _) = file.write_all_at(Buf::from_slice(bytes), at).await;
+    result.expect("write raw");
 }
