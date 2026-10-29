@@ -71,6 +71,21 @@ pub(crate) struct Inner {
 }
 
 impl Inner {
+    pub(crate) fn new(driver: Rc<dyn Driver>) -> Rc<Self> {
+        let shared = Arc::new(Shared {
+            ready: Mutex::new(VecDeque::new()),
+            unpark: driver.unparker(),
+            owner: thread::current().id(),
+        });
+        Rc::new(Self {
+            driver,
+            shared,
+            tasks: RefCell::new(Vec::new()),
+            free: RefCell::new(Vec::new()),
+            timers: RefCell::new(Timers::default()),
+        })
+    }
+
     fn spawn_local(&self, future: LocalFuture) {
         let reused = self.free.borrow_mut().pop();
         let id = reused.unwrap_or_else(|| {
@@ -90,7 +105,7 @@ impl Inner {
         waker.wake_by_ref();
     }
 
-    fn run_ready(&self) {
+    pub(crate) fn run_ready(&self) {
         let batch: Vec<usize> = self
             .shared
             .ready
@@ -114,7 +129,7 @@ impl Inner {
         }
     }
 
-    fn has_ready(&self) -> bool {
+    pub(crate) fn has_ready(&self) -> bool {
         !self
             .shared
             .ready
@@ -142,7 +157,7 @@ impl Inner {
         self.timers.borrow_mut().wakers.remove(&key);
     }
 
-    fn fire_timers(&self) {
+    pub(crate) fn fire_timers(&self) {
         let now = self.driver.now();
         let mut due = Vec::new();
         {
@@ -162,7 +177,7 @@ impl Inner {
         }
     }
 
-    fn next_deadline(&self) -> Option<Instant> {
+    pub(crate) fn next_deadline(&self) -> Option<Instant> {
         let mut timers = self.timers.borrow_mut();
         while let Some(Reverse((deadline, key))) = timers.heap.peek().copied() {
             if timers.wakers.contains_key(&key) {
@@ -194,7 +209,9 @@ pub(crate) fn driver() -> Rc<dyn Driver> {
     Rc::clone(&current().driver)
 }
 
-struct Enter;
+pub(crate) struct Enter {
+    previous: Option<Rc<Inner>>,
+}
 
 impl Enter {
     fn new(inner: Rc<Inner>) -> Self {
@@ -206,13 +223,19 @@ impl Enter {
             );
             *current = Some(inner);
         });
-        Self
+        Self { previous: None }
+    }
+
+    pub(crate) fn swap(inner: Rc<Inner>) -> Self {
+        let previous = CURRENT.with(|current| current.borrow_mut().replace(inner));
+        Self { previous }
     }
 }
 
 impl Drop for Enter {
     fn drop(&mut self) {
-        CURRENT.with(|current| current.borrow_mut().take());
+        let previous = self.previous.take();
+        CURRENT.with(|current| *current.borrow_mut() = previous);
     }
 }
 
@@ -222,19 +245,8 @@ pub struct Runtime {
 
 impl Runtime {
     pub fn new(driver: Rc<dyn Driver>) -> Self {
-        let shared = Arc::new(Shared {
-            ready: Mutex::new(VecDeque::new()),
-            unpark: driver.unparker(),
-            owner: thread::current().id(),
-        });
         Self {
-            inner: Rc::new(Inner {
-                driver,
-                shared,
-                tasks: RefCell::new(Vec::new()),
-                free: RefCell::new(Vec::new()),
-                timers: RefCell::new(Timers::default()),
-            }),
+            inner: Inner::new(driver),
         }
     }
 
