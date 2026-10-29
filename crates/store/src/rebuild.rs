@@ -90,7 +90,8 @@ async fn replay(
             && let Some(shard) = rebuilding.get_mut(&record.shard())
             && commit > shard.covered
         {
-            let index = Index::decode(record.payload()).ok_or(Error::BadCommit(commit))?;
+            let (index, clear, _) =
+                Index::parts(record.payload()).ok_or(Error::BadCommit(commit))?;
             let location = Location {
                 region: range.region,
                 epoch: range.epoch,
@@ -98,7 +99,7 @@ async fn replay(
                 sequence: record.sequence(),
                 size: u32::try_from(size).expect("record fits in u32"),
             };
-            shard.state.apply(&index, location, commit);
+            shard.state.apply(&index, clear, location, commit);
         }
         at += size;
     }

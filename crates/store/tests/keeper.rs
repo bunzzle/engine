@@ -9,9 +9,9 @@ use rt::sim::{Config, Disk, Machine, SimDriver, Stalls, check};
 use rt::{JoinHandle, Runtime, sleep, spawn, timeout};
 use store::{
     Body, Change, Claim, Client, Committer, CoreFile, DataFile, Dead, Delivery, Error, Event,
-    Index, Item, KIND_STATE, Keeper, Location, MAX_DELTAS, Options, Part, Range, Results, Root,
-    SLOT_SIZE, Session, Setup, ShardState, Source, Start, Submission, Write, boot, encode_roots,
-    load, read_run, recover,
+    Index, Item, KIND_STATE, Keeper, Key, Location, MAX_DELTAS, Options, Part, Range, Results,
+    Root, SLOT_SIZE, Session, Setup, ShardState, Source, Start, Submission, Write, boot,
+    encode_roots, load, read_run, recover,
 };
 
 const PATH: &str = "/data/store";
@@ -127,7 +127,7 @@ impl Core {
             } => {
                 let (shard, indexes) = self.sent.remove(tag).expect("sent");
                 for (index, location) in indexes.iter().zip(locations) {
-                    self.keeper.apply(shard, index, *location, *sequence);
+                    self.keeper.apply(shard, index, &[], *location, *sequence);
                 }
             }
             Event::Rejected { error, .. } => panic!("rejected: {error:?}"),
@@ -170,7 +170,7 @@ impl Core {
     }
 }
 
-async fn fold(data: &CoreFile, shard: u16, roots: &[Root]) -> BTreeMap<u64, Item> {
+async fn fold(data: &CoreFile, shard: u16, roots: &[Root]) -> BTreeMap<Key, Item> {
     let mut map = BTreeMap::new();
     for root in roots {
         let run = read_run(data, root, shard).await.expect("run");
@@ -189,7 +189,7 @@ async fn fold(data: &CoreFile, shard: u16, roots: &[Root]) -> BTreeMap<u64, Item
 
 fn put(key: u64, status: u8) -> Index {
     Index {
-        key,
+        key: Key::head(key),
         tenant: 7,
         change: Change::Put(Delivery {
             status,
@@ -201,7 +201,7 @@ fn put(key: u64, status: u8) -> Index {
 
 fn delete(key: u64) -> Index {
     Index {
-        key,
+        key: Key::head(key),
         tenant: 7,
         change: Change::Delete,
     }
@@ -246,7 +246,7 @@ fn runs_hold_the_shard_state_across_checkpoints_and_restarts() {
             bases > 1 && deltas > MAX_DELTAS,
             "{bases} bases, {deltas} deltas"
         );
-        let expected: Vec<BTreeMap<u64, Item>> = (0..SHARDS)
+        let expected: Vec<BTreeMap<Key, Item>> = (0..SHARDS)
             .map(|s| core.keeper.state(s).expect("kept").entries().clone())
             .collect();
         drop(client);
@@ -327,7 +327,7 @@ fn an_abandoned_cut_keeps_its_changes_for_the_next_one() {
         let roots = core.keeper.roots(2).expect("kept");
         assert_eq!(roots.len(), 2, "the next cut writes a delta");
         let entries = fold(&core.data, 2, roots).await;
-        let keys: Vec<u64> = entries.keys().copied().collect();
+        let keys: Vec<u64> = entries.keys().map(|k| k.message).collect();
         assert_eq!(keys, vec![0, 1, 3, 4, 6, 9]);
         core.check().await;
     });
@@ -482,10 +482,10 @@ fn moved(core: &Core, shard: u16, key: u64) -> Index {
         .keeper
         .state(shard)
         .expect("kept")
-        .get(key)
+        .get(Key::head(key))
         .expect("present");
     Index {
-        key,
+        key: Key::head(key),
         tenant: 7,
         change: Change::Move { old: old.location },
     }
@@ -597,7 +597,7 @@ fn created(seed: u64) -> Disk {
 
 fn step_index(step: u64, state: &ShardState) -> Index {
     let key = step * 5 % 13;
-    let change = match (step % 4, state.get(key)) {
+    let change = match (step % 4, state.get(Key::head(key))) {
         (3, Some(item)) => Change::Move { old: item.location },
         (2, _) => Change::Delete,
         _ => Change::Put(Delivery {
@@ -607,7 +607,7 @@ fn step_index(step: u64, state: &ShardState) -> Index {
         }),
     };
     Index {
-        key,
+        key: Key::head(key),
         tenant: 7,
         change,
     }
@@ -643,7 +643,8 @@ async fn keep(start: Start, model: Shared) {
                     locations,
                     ..
                 }) => {
-                    core.keeper.apply(shard, &index, locations[0], sequence);
+                    core.keeper
+                        .apply(shard, &index, &[], locations[0], sequence);
                     let mut model = model.borrow_mut();
                     model.inflight.remove(&shard);
                     model.acked.push((shard, index, locations[0], sequence));
@@ -730,7 +731,7 @@ fn expected(model: &Model, shard: u16) -> ShardState {
     let mut state = ShardState::default();
     for (s, index, location, sequence) in &model.acked {
         if *s == shard {
-            state.apply(index, *location, *sequence);
+            state.apply(index, &[], *location, *sequence);
         }
     }
     state
@@ -757,7 +758,7 @@ fn audit(model: &Model, rebuilt: &Keeper) {
             },
             |item| item.location,
         );
-        state.apply(&index, location, u64::MAX);
+        state.apply(&index, &[], location, u64::MAX);
         assert_eq!(
             found,
             state.entries(),

@@ -7,8 +7,9 @@ use std::time::Duration;
 use rt::sim::{Config, Disk, Faults, Machine, SimDriver, Stalls, check};
 use rt::{JoinHandle, Runtime, sleep, spawn, timeout};
 use store::{
-    Change, Changes, Claim, Committer, DataFile, Delivery, Error, Index, Keeper, Options,
-    SLOT_SIZE, Setup, Shards, Submission, Usage, Write, boot, load, recover,
+    Batch, CHECKPOINT_RESERVE, COMPACTION_RESERVE, Change, Changes, Claim, Client, Committer,
+    DataFile, Delivery, Error, HEAD_ITEM, Index, Keeper, Key, Op, Options, SLOT_SIZE, Setup,
+    Shards, Submission, Usage, Write, boot, load, recover,
 };
 
 const PATH: &str = "/data/store";
@@ -36,7 +37,7 @@ fn created(seed: u64) -> Disk {
 
 fn put(key: u64, step: u64) -> Index {
     Index {
-        key,
+        key: Key::head(key),
         tenant: 7,
         change: Change::Put(Delivery {
             status: u8::try_from(step % 200).expect("fits"),
@@ -48,9 +49,9 @@ fn put(key: u64, step: u64) -> Index {
 
 fn delete(key: u64) -> Index {
     Index {
-        key,
+        key: Key::head(key),
         tenant: 7,
-        change: Change::Delete,
+        change: Change::Drop,
     }
 }
 
@@ -85,21 +86,51 @@ fn merge(keepers: Vec<Keeper>) -> Keeper {
     all
 }
 
+fn batch(shard: u16, key: u64, worker: u64, step: u64) -> Batch {
+    let sealed =
+        vec![u8::try_from(worker).expect("fits"); 16 + usize::try_from(step % 40).expect("fits")];
+    let clear =
+        vec![u8::try_from(step % 251).expect("fits"); usize::try_from(step % 13).expect("fits")];
+    let mut ops = Vec::new();
+    if step % 3 != 1 {
+        ops.push(Op {
+            item: HEAD_ITEM,
+            change: put(key, step).change,
+            clear: Vec::new(),
+            sealed: sealed.clone(),
+        });
+    }
+    ops.push(Op {
+        item: 1 + u32::try_from(step % 3).expect("fits"),
+        change: put(key, step).change,
+        clear,
+        sealed,
+    });
+    Batch {
+        shard,
+        message: key,
+        tenant: 7,
+        ops,
+    }
+}
+
 async fn work(changes: Changes, shards: Vec<u16>, worker: u64, steps: u64) -> bool {
     for step in 0..steps {
         let shard = shards[usize::try_from(step).expect("fits") % shards.len()];
         let key = (step * 7 + worker * 3) % KEYS;
-        let index = if step % 5 == 4 {
-            delete(key)
+        let result = if step % 5 == 4 {
+            changes
+                .change(shard, delete(key), Vec::new())
+                .await
+                .map(|_| ())
         } else {
-            put(key, step)
+            changes
+                .apply(batch(shard, key, worker, step))
+                .await
+                .map(|_| ())
         };
-        let sealed = vec![
-            u8::try_from(worker).expect("fits");
-            16 + usize::try_from(step % 40).expect("fits")
-        ];
-        match changes.change(shard, index, sealed).await {
-            Ok(_) | Err(Error::NotFound) => {}
+        match result {
+            Ok(()) | Err(Error::NotFound) => {}
             Err(_) => return false,
         }
     }
@@ -311,22 +342,45 @@ fn uncounted_records_leave_their_region_empty() {
     });
 }
 
+async fn owner_on_core_zero() -> (Changes, JoinHandle<Keeper>, Client, JoinHandle<Committer>) {
+    let setup = Setup {
+        cores: CORES,
+        credits: 2,
+        reserve: 0,
+    };
+    let booted = boot(PATH, setup).await.expect("boot");
+    let committer = spawn(booted.committer.run());
+    let mut starts = booted.starts.into_iter();
+    let core = starts.next().expect("core 0").open().await.expect("open");
+    drop(starts);
+    let (owner, changes) = Shards::new(core);
+    (changes, spawn(owner.run()), booted.client, committer)
+}
+
+async fn close_and_audit(
+    changes: Changes,
+    owner: JoinHandle<Keeper>,
+    client: Client,
+    committer: JoinHandle<Committer>,
+) -> Keeper {
+    changes.close();
+    let keeper = owner.await;
+    drop(client);
+    let committer = committer.await;
+    let mut all = Keeper::default();
+    for shard in ALL {
+        let kept = keeper.state(shard).cloned().unwrap_or_default();
+        all.insert(shard, kept, Vec::new());
+    }
+    audit(committer.usage(), &all);
+    all
+}
+
 #[test]
 fn the_owner_refuses_changes_it_cannot_apply() {
     let driver = Rc::new(SimDriver::with_disk(4, Config::default(), created(4)));
     Runtime::new(driver).block_on(async {
-        let setup = Setup {
-            cores: CORES,
-            credits: 2,
-            reserve: 0,
-        };
-        let booted = boot(PATH, setup).await.expect("boot");
-        let committer = spawn(booted.committer.run());
-        let mut starts = booted.starts.into_iter();
-        let core = starts.next().expect("core 0").open().await.expect("open");
-        drop(starts);
-        let (owner, changes) = Shards::new(core);
-        let owner = spawn(owner.run());
+        let (changes, owner, client, committer) = owner_on_core_zero().await;
         let refused = changes.change(1, put(5, 1), Vec::new()).await;
         assert!(matches!(refused, Err(Error::Invalid("owner"))));
         let missing = changes.change(2, delete(5), Vec::new()).await;
@@ -340,28 +394,152 @@ fn the_owner_refuses_changes_it_cannot_apply() {
             .await
             .expect("put");
         let stale = Index {
-            key: 5,
+            key: Key::head(5),
             tenant: 7,
             change: Change::Move { old: first },
         };
         let moved = changes.change(2, stale, vec![4; 10]).await;
         assert!(matches!(moved, Err(Error::Invalid("moved"))));
         let current = Index {
-            key: 5,
+            key: Key::head(5),
             tenant: 7,
             change: Change::Move { old: second },
         };
         changes.change(2, current, vec![4; 10]).await.expect("move");
-        changes.close();
-        let keeper = owner.await;
-        drop(booted.client);
-        let committer = committer.await;
-        let mut all = Keeper::default();
-        for shard in ALL {
-            let kept = keeper.state(shard).cloned().unwrap_or_default();
-            all.insert(shard, kept, Vec::new());
+        close_and_audit(changes, owner, client, committer).await;
+    });
+}
+
+#[test]
+fn the_owner_runs_one_batch_per_message() {
+    let driver = Rc::new(SimDriver::with_disk(6, Config::default(), created(6)));
+    Runtime::new(driver).block_on(async {
+        let (changes, owner, client, committer) = owner_on_core_zero().await;
+        let op = |item: u32, change: Change| Op {
+            item,
+            change,
+            clear: vec![9; 5],
+            sealed: vec![1; 20],
+        };
+        let message = |ops: Vec<Op>| Batch {
+            shard: 2,
+            message: 6,
+            tenant: 7,
+            ops,
+        };
+        let delivery = put(6, 1).change;
+        let headless = changes.apply(message(vec![op(1, delivery)])).await;
+        assert!(matches!(headless, Err(Error::NotFound)));
+        let created = changes
+            .apply(message(vec![
+                op(0, delivery),
+                op(1, delivery),
+                op(2, delivery),
+            ]))
+            .await
+            .expect("batch");
+        assert_eq!(created.len(), 3);
+        assert!(created.windows(2).all(|w| w[0].sequence < w[1].sequence));
+        let refused = [
+            (message(Vec::new()), "batch"),
+            (message(vec![op(1, delivery), op(1, delivery)]), "item"),
+            (message(vec![op(0, Change::Delete)]), "head"),
+            (message(vec![op(1, delivery), op(2, Change::Drop)]), "batch"),
+            (
+                message(vec![
+                    op(1, Change::Move { old: created[1] }),
+                    op(2, delivery),
+                ]),
+                "batch",
+            ),
+            (
+                Batch {
+                    tenant: 8,
+                    ..message(vec![op(3, delivery)])
+                },
+                "tenant",
+            ),
+        ];
+        for (batch, why) in refused {
+            let result = changes.apply(batch).await;
+            assert!(
+                matches!(result, Err(Error::Invalid(w)) if w == why),
+                "{why}: {result:?}"
+            );
         }
-        audit(committer.usage(), &all);
+        changes
+            .apply(message(vec![op(2, delivery), op(3, delivery)]))
+            .await
+            .expect("state change");
+        let dropped = changes.change(2, delete(6), Vec::new()).await;
+        assert!(dropped.is_ok());
+        let after = changes.apply(message(vec![op(1, delivery)])).await;
+        assert!(
+            matches!(after, Err(Error::NotFound)),
+            "no item outlives its message"
+        );
+        let all = close_and_audit(changes, owner, client, committer).await;
+        assert_eq!(all.state(2).expect("kept").message(6).count(), 0);
+    });
+}
+
+#[test]
+fn state_changes_go_through_when_intake_is_refused() {
+    let driver = Rc::new(SimDriver::with_disk(5, Config::default(), created(5)));
+    Runtime::new(driver).block_on(async {
+        let reserve =
+            OPTIONS.region_count - CHECKPOINT_RESERVE - COMPACTION_RESERVE - u32::from(CORES) - 3;
+        let setup = Setup {
+            cores: 1,
+            credits: 2,
+            reserve,
+        };
+        let booted = boot(PATH, setup).await.expect("boot");
+        let committer = spawn(booted.committer.run());
+        let mut starts = booted.starts.into_iter();
+        let core = starts.next().expect("core 0").open().await.expect("open");
+        drop(starts);
+        let (owner, changes) = Shards::new(core);
+        let owner = spawn(owner.run());
+        let mut message = 0;
+        let mut refusals = 0;
+        while refusals < 3 {
+            match changes.change(2, put(message, 1), vec![5; 2000]).await {
+                Ok(_) => {
+                    message += 1;
+                    refusals = 0;
+                }
+                Err(Error::Reserve) => {
+                    refusals += 1;
+                    sleep(Duration::from_millis(1)).await;
+                }
+                Err(Error::JournalFull) => {
+                    booted.client.checkpoint().await.expect("checkpoint");
+                }
+                Err(error) => panic!("{error:?}"),
+            }
+        }
+        assert!(message > 0);
+        let state = Op {
+            item: 1,
+            change: put(0, 2).change,
+            clear: vec![1; 8],
+            sealed: vec![2; 40],
+        };
+        let batch = Batch {
+            shard: 2,
+            message: 0,
+            tenant: 7,
+            ops: vec![state],
+        };
+        changes
+            .apply(batch)
+            .await
+            .expect("state change on a full disk");
+        changes.close();
+        drop(owner.await);
+        drop(booted.client);
+        drop(committer.await);
     });
 }
 

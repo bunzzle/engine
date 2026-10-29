@@ -8,7 +8,7 @@ use rt::sim::{Config, Disk, Faults, Machine, SimDriver, Stalls, check};
 use rt::{JoinHandle, Runtime, sleep, spawn, timeout};
 use store::{
     Change, Changes, Committer, CoreFile, DataFile, Delivery, Error, INDEX_SIZE, Index, Keeper,
-    Location, Options, Owner, Record, SLOT_SIZE, Setup, Shards, Usage, boot, load, recover,
+    Key, Location, Options, Owner, Record, SLOT_SIZE, Setup, Shards, Usage, boot, load, recover,
 };
 
 const PATH: &str = "/data/store";
@@ -51,7 +51,7 @@ fn sealed(key: u64, version: u64) -> Vec<u8> {
 
 fn put(key: u64, version: u64) -> Index {
     Index {
-        key,
+        key: Key::head(key),
         tenant: 7,
         change: Change::Put(Delivery {
             status: 1,
@@ -85,6 +85,7 @@ async fn contents(file: &CoreFile, keeper: &Keeper) -> usize {
     let reader = file.reader();
     for shard in ALL {
         for (&key, item) in keeper.state(shard).expect("kept").entries() {
+            let key = key.message;
             let buf = reader
                 .read(item.location, item.tenant, &Nobody)
                 .await
@@ -267,7 +268,7 @@ fn compaction_moves_live_records_and_frees_their_regions() {
         .iter()
         .map(|&s| {
             let entries = keeper.state(s).expect("kept").entries();
-            entries.keys().filter(|&&k| k > COLD).count()
+            entries.keys().filter(|k| k.message > COLD).count()
         })
         .sum();
     assert_eq!(cold, 200);

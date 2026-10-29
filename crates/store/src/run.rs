@@ -7,16 +7,16 @@ use crate::core_file::CoreFile;
 use crate::error::Error;
 use crate::layout::{Fields, FieldsMut};
 use crate::record::{self, FLAG_MORE, Header, Record, record_size};
-use crate::shard::{Delivery, Item};
+use crate::shard::{Delivery, Item, Key};
 use sys::crc32c::checksum;
 
 pub const KIND_RUN: u8 = 3;
 pub const MAX_DELTAS: usize = 8;
 pub const ROOT_SIZE: usize = 40;
 
-const RUN_FORMAT: u32 = 1;
+const RUN_FORMAT: u32 = 2;
 const HEAD: usize = 24;
-const ENTRY: usize = 56;
+const ENTRY: usize = 64;
 const FLAG_BASE: u8 = 1;
 const OP_PUT: u8 = 1;
 const OP_TOMBSTONE: u8 = 2;
@@ -37,7 +37,7 @@ pub struct Run {
     pub shard: u16,
     pub base: bool,
     pub covered: u64,
-    pub changes: BTreeMap<u64, Option<Item>>,
+    pub changes: BTreeMap<Key, Option<Item>>,
 }
 
 pub fn encode_roots(roots: &[Root]) -> Vec<u8> {
@@ -82,101 +82,116 @@ pub fn decode_roots(bytes: &[u8]) -> Option<Vec<Root>> {
     ordered.then_some(roots)
 }
 
-pub(crate) fn run_size(entries: usize) -> usize {
-    HEAD + entries * ENTRY
+pub(crate) fn entry_size(item: Option<&Item>) -> usize {
+    ENTRY + item.map_or(0, |item| item.clear.len().next_multiple_of(8))
 }
 
 pub(crate) fn encode<'a>(
     shard: u16,
     base: bool,
     covered: u64,
-    len: usize,
-    changes: impl Iterator<Item = (u64, Option<&'a Item>)>,
+    changes: impl Iterator<Item = (Key, Option<&'a Item>)>,
 ) -> Vec<u8> {
-    let mut out = vec![0u8; run_size(len)];
+    let mut out = vec![0u8; HEAD];
+    let mut len: u32 = 0;
+    for (key, item) in changes {
+        let at = out.len();
+        out.resize(at + entry_size(item), 0);
+        let mut fields = FieldsMut::new(&mut out[at..]);
+        fields.put_u64(0, key.message);
+        fields.put_u32(8, key.item);
+        match item {
+            Some(item) => {
+                fields.put_u32(12, item.tenant);
+                fields.put_u8(16, OP_PUT);
+                fields.put_u8(17, item.delivery.status);
+                fields.put_u16(18, item.delivery.attempts);
+                fields.put_u32(
+                    20,
+                    u32::try_from(item.clear.len()).expect("clear part fits in u32"),
+                );
+                fields.put_u64(24, item.delivery.due);
+                fields.put_u32(32, item.location.region);
+                fields.put_u32(36, item.location.size);
+                fields.put_u64(40, item.location.epoch);
+                fields.put_u64(48, item.location.offset);
+                fields.put_u64(56, item.location.sequence);
+                out[at + ENTRY..at + ENTRY + item.clear.len()].copy_from_slice(&item.clear);
+            }
+            None => fields.put_u8(16, OP_TOMBSTONE),
+        }
+        len += 1;
+    }
     let mut fields = FieldsMut::new(&mut out);
     fields.put_u32(0, RUN_FORMAT);
     fields.put_u16(4, shard);
     fields.put_u8(6, if base { FLAG_BASE } else { 0 });
-    fields.put_u32(8, u32::try_from(len).expect("entry count fits in u32"));
+    fields.put_u32(8, len);
     fields.put_u64(16, covered);
-    let mut at = HEAD;
-    let mut written = 0;
-    for (key, item) in changes {
-        fields.put_u64(at, key);
-        match item {
-            Some(item) => {
-                fields.put_u32(at + 8, item.tenant);
-                fields.put_u8(at + 12, OP_PUT);
-                fields.put_u8(at + 13, item.delivery.status);
-                fields.put_u16(at + 14, item.delivery.attempts);
-                fields.put_u64(at + 16, item.delivery.due);
-                fields.put_u32(at + 24, item.location.region);
-                fields.put_u32(at + 28, item.location.size);
-                fields.put_u64(at + 32, item.location.epoch);
-                fields.put_u64(at + 40, item.location.offset);
-                fields.put_u64(at + 48, item.location.sequence);
-            }
-            None => fields.put_u8(at + 12, OP_TOMBSTONE),
-        }
-        at += ENTRY;
-        written += 1;
-    }
-    assert_eq!(written, len, "run entry count mismatch");
     out
 }
 
 pub(crate) fn decode(blob: &[u8]) -> Option<Run> {
     let fields = Fields::new(blob.get(..HEAD)?);
     let flags = fields.u8(6);
-    let len = fields.u32(8) as usize;
+    let len = fields.u32(8);
     if fields.u32(0) != RUN_FORMAT
         || flags & !FLAG_BASE != 0
         || fields.u8(7) != 0
         || fields.u32(12) != 0
-        || len.checked_mul(ENTRY)?.checked_add(HEAD)? != blob.len()
     {
         return None;
     }
     let base = flags == FLAG_BASE;
-    let fields = Fields::new(blob);
     let mut changes = BTreeMap::new();
     let mut last = None;
-    for index in 0..len {
-        let at = HEAD + index * ENTRY;
-        let key = fields.u64(at);
+    let mut at = HEAD;
+    for _ in 0..len {
+        let entry = Fields::new(blob.get(at..at.checked_add(ENTRY)?)?);
+        let key = Key::new(entry.u64(0), entry.u32(8));
         if last.is_some_and(|last| last >= key) {
             return None;
         }
         last = Some(key);
-        let item = match fields.u8(at + 12) {
-            OP_PUT => Some(Item {
-                tenant: fields.u32(at + 8),
-                delivery: Delivery {
-                    status: fields.u8(at + 13),
-                    attempts: fields.u16(at + 14),
-                    due: fields.u64(at + 16),
-                },
-                location: Location {
-                    region: fields.u32(at + 24),
-                    epoch: fields.u64(at + 32),
-                    offset: fields.u64(at + 40),
-                    sequence: fields.u64(at + 48),
-                    size: fields.u32(at + 28),
-                },
-            }),
+        let item = match entry.u8(16) {
+            OP_PUT => {
+                let clear = usize::try_from(entry.u32(20)).ok()?;
+                let padded = clear.checked_next_multiple_of(8)?;
+                let tail = blob.get(at + ENTRY..at.checked_add(ENTRY + padded)?)?;
+                if tail[clear..].iter().any(|&b| b != 0) {
+                    return None;
+                }
+                at += padded;
+                Some(Item {
+                    tenant: entry.u32(12),
+                    delivery: Delivery {
+                        status: entry.u8(17),
+                        attempts: entry.u16(18),
+                        due: entry.u64(24),
+                    },
+                    location: Location {
+                        region: entry.u32(32),
+                        epoch: entry.u64(40),
+                        offset: entry.u64(48),
+                        sequence: entry.u64(56),
+                        size: entry.u32(36),
+                    },
+                    clear: tail[..clear].into(),
+                })
+            }
             OP_TOMBSTONE
                 if !base
-                    && fields.bytes(at + 8, 4) == [0; 4]
-                    && fields.bytes(at + 13, ENTRY - 13).iter().all(|&b| b == 0) =>
+                    && entry.bytes(12, 4) == [0; 4]
+                    && entry.bytes(17, ENTRY - 17).iter().all(|&b| b == 0) =>
             {
                 None
             }
             _ => return None,
         };
+        at += ENTRY;
         changes.insert(key, item);
     }
-    Some(Run {
+    (at == blob.len()).then_some(Run {
         shard: fields.u16(4),
         base,
         covered: fields.u64(16),
@@ -290,7 +305,7 @@ mod tests {
 
     use super::{ENTRY, HEAD, MAX_DELTAS, Root, decode, decode_roots, encode, encode_roots};
     use crate::committer::Location;
-    use crate::shard::{Delivery, Item};
+    use crate::shard::{Delivery, Item, Key};
 
     fn item(key: u64) -> Item {
         Item {
@@ -307,6 +322,7 @@ mod tests {
                 sequence: 70 + key,
                 size: 128,
             },
+            clear: vec![0xC0 | u8::try_from(key).expect("small key"); 3].into(),
         }
     }
 
@@ -322,43 +338,53 @@ mod tests {
         }
     }
 
+    fn changes() -> BTreeMap<Key, Option<Item>> {
+        BTreeMap::from([
+            (Key::new(1, 0), Some(item(1))),
+            (Key::new(1, 7), None),
+            (Key::new(4, 0), None),
+            (Key::new(9, 2), Some(item(9))),
+        ])
+    }
+
+    fn blob(base: bool) -> Vec<u8> {
+        let changes = changes();
+        encode(2, base, 41, changes.iter().map(|(&k, v)| (k, v.as_ref())))
+    }
+
     #[test]
-    fn a_run_round_trips_with_tombstones() {
-        let changes = BTreeMap::from([(1, Some(item(1))), (4, None), (9, Some(item(9)))]);
-        let blob = encode(
-            2,
-            false,
-            41,
-            changes.len(),
-            changes.iter().map(|(&k, v)| (k, v.as_ref())),
-        );
-        let run = decode(&blob).expect("decode");
+    fn a_run_round_trips_with_tombstones_and_clear_parts() {
+        let run = decode(&blob(false)).expect("decode");
         assert_eq!((run.shard, run.base, run.covered), (2, false, 41));
-        assert_eq!(run.changes, changes);
+        assert_eq!(run.changes, changes());
+        assert_eq!(blob(false).len(), HEAD + 4 * ENTRY + 2 * 8);
     }
 
     #[test]
     fn damaged_runs_are_rejected() {
-        let changes = BTreeMap::from([(1, Some(item(1))), (4, None)]);
-        let blob = encode(
-            0,
-            false,
-            8,
-            2,
-            changes.iter().map(|(&k, v)| (k, v.as_ref())),
-        );
+        let blob = blob(false);
+        let second = HEAD + ENTRY + 8;
         let mut base = blob.clone();
         base[6] = 1;
         assert_eq!(decode(&base), None, "a base holds no tombstones");
         let mut unsorted = blob.clone();
-        unsorted[HEAD + ENTRY..HEAD + ENTRY + 8].copy_from_slice(&1u64.to_le_bytes());
+        unsorted[second + 8..second + 12].copy_from_slice(&0u32.to_le_bytes());
         assert_eq!(decode(&unsorted), None);
         let mut tombstone = blob.clone();
-        tombstone[HEAD + ENTRY + 20] = 1;
+        tombstone[second + 24] = 1;
         assert_eq!(decode(&tombstone), None);
         let mut op = blob.clone();
-        op[HEAD + 12] = 7;
+        op[HEAD + 16] = 7;
         assert_eq!(decode(&op), None);
+        let mut padding = blob.clone();
+        padding[HEAD + ENTRY + 3] = 1;
+        assert_eq!(decode(&padding), None);
+        let mut clear = blob.clone();
+        clear[HEAD + 20..HEAD + 24].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert_eq!(decode(&clear), None);
+        let mut count = blob.clone();
+        count[8] = 3;
+        assert_eq!(decode(&count), None);
         assert_eq!(decode(&blob[..blob.len() - 1]), None);
         for cut in 0..blob.len() {
             let _ = decode(&blob[..cut]);
