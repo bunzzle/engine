@@ -3,7 +3,6 @@ use std::collections::BTreeMap;
 use rt::{Buf, Receiver, Sender, channel};
 
 use crate::checkpoint::{Snapshot, encode, write_copy};
-use crate::crc32c::checksum;
 use crate::data_file::DataFile;
 use crate::error::Error;
 use crate::journal::{Allocation, Commit, Dead, Journal, Live, Position, Range};
@@ -12,6 +11,7 @@ use crate::recovery::State;
 use crate::regions::{CHECKPOINT_RESERVE, Claim, Regions};
 use crate::superblock::Checkpoint;
 use crate::usage::Usage;
+use sys::crc32c::checksum;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Write {

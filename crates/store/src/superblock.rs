@@ -1,7 +1,7 @@
-use crate::crc32c::checksum;
 use crate::error::Error;
 use crate::journal::Position;
 use crate::layout::{Fields, FieldsMut};
+use sys::crc32c::checksum;
 
 pub const FORMAT: u16 = 1;
 pub const COPIES: usize = 4;
