@@ -1,14 +1,27 @@
-use super::Committer;
+use super::{Committer, Location, Submission};
+use crate::regions::{CHECKPOINT_RESERVE, COMPACTION_RESERVE, Claim};
 use crate::session::{Event, Owned};
 use crate::usage::Usage;
 
 const MAX_LIVE_SHARE: f64 = 0.75;
+const LOW_SHARE: u32 = 8;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CompactionStats {
     pub victims: u64,
     pub emptied: u64,
     pub dropped: u64,
+    pub moved: u64,
+    pub debt: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Space {
+    pub free: u32,
+    pub reserved: u32,
+    pub releasable: u32,
+    pub quarantined: u32,
+    pub low: bool,
 }
 
 struct Victim {
@@ -37,6 +50,59 @@ impl Compaction {
 impl Committer {
     pub fn compaction(&self) -> CompactionStats {
         self.compaction.stats
+    }
+
+    pub fn space(&self) -> Space {
+        let count = self.regions.count();
+        Space {
+            free: self.regions.free(),
+            reserved: self.regions.reserved(),
+            releasable: u32::try_from((0..count).filter(|&r| self.releasable(r)).count())
+                .expect("region count fits in u32"),
+            quarantined: u32::try_from(self.usage.quarantined().iter().filter(|&&q| q).count())
+                .expect("region count fits in u32"),
+            low: self.low_space(),
+        }
+    }
+
+    fn low_space(&self) -> bool {
+        let held = COMPACTION_RESERVE
+            + self.regions.reserved()
+            + CHECKPOINT_RESERVE
+            + self.regions.state_reserve();
+        let margin = (self.regions.count() / LOW_SHARE).max(2);
+        self.regions.free() < self.regions.reserve() + held + margin
+    }
+
+    fn releasable(&self, region: u32) -> bool {
+        self.regions.is_used(region)
+            && !self.open[region as usize]
+            && self.usage.is_empty(region)
+            && !self.usage.is_quarantined(region)
+            && !self.checkpoint.contains(&region)
+            && !self.is_state(region)
+            && !self.pins.is_pinned(region)
+    }
+
+    pub(super) fn space_needs_checkpoint(&self) -> bool {
+        self.low_space() && (0..self.regions.count()).any(|r| self.releasable(r))
+    }
+
+    pub(super) fn account(&mut self, submission: &Submission, locations: &[Location]) {
+        let records = submission
+            .records
+            .iter()
+            .zip(locations)
+            .filter(|(w, _)| w.counted)
+            .map(|(_, l)| u64::from(l.size));
+        let bodies = submission.bodies.iter().map(|b| u64::from(b.range.length));
+        let bytes: u64 = records.chain(bodies).sum();
+        let stats = &mut self.compaction.stats;
+        if submission.claim == Claim::Internal {
+            stats.moved += bytes;
+        } else {
+            stats.debt += bytes;
+        }
     }
 
     pub(super) fn sealed(&mut self, region: u32) {
@@ -105,6 +171,9 @@ impl Committer {
         let Some((_, region, bytes)) = best else {
             return;
         };
+        if bytes > self.compaction.stats.debt && !self.low_space() {
+            return;
+        }
         let regions = u32::try_from(bytes.div_ceil(region_size) + 1).unwrap_or(u32::MAX);
         if self.regions.reserve_internal(regions).is_err() {
             return;
@@ -119,6 +188,7 @@ impl Committer {
             waiting,
         });
         self.compaction.stats.victims += 1;
+        self.compaction.stats.debt = 0;
         self.broadcast(|| Event::Compact { region, epoch });
         self.settle_victim();
     }

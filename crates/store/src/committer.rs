@@ -20,7 +20,7 @@ use crate::regions::{Claim, Regions};
 use crate::session::{Answer, Event, Owned, Results, Session};
 use crate::usage::Usage;
 use compaction::Compaction;
-pub use compaction::CompactionStats;
+pub use compaction::{CompactionStats, Space};
 use flight::{Next, Parked, Queues};
 use runs::Runs;
 use sys::crc32c::checksum;
@@ -438,6 +438,7 @@ impl Committer {
             match self.pack(&submission, &mut segments) {
                 Ok(locations) => {
                     load = load.add(&submission);
+                    self.account(&submission, &locations);
                     count_live(&submission, &locations, &mut live);
                     ranges.extend(submission.bodies.iter().map(|b| b.range));
                     dead.extend_from_slice(&submission.dead);
@@ -551,9 +552,10 @@ impl Committer {
             };
             self.reply(entry.reply, Ok(durable));
         }
-        if self.due() && !self.checkpoint_in_flight() {
+        if (self.due() || self.space_needs_checkpoint()) && !self.checkpoint_in_flight() {
             self.begin_checkpoint(None);
         }
+        self.start_victim();
     }
 
     async fn write(&mut self, buffers: Vec<(u64, Buf)>, commit: &Commit) -> Result<u64, Error> {
