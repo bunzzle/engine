@@ -24,8 +24,8 @@ mod usage;
 pub use boot::{Booted, Core, Setup, Start, boot};
 pub use checkpoint::{KIND_CHECKPOINT, Loaded, PART_TAG_OTHER, Part, load};
 pub use committer::{
-    Body, Client, Committer, CompactionStats, Durable, Lease, Location, PART_TIMEOUT, Submission,
-    Write,
+    Body, Client, Committer, CompactionStats, Durable, Lease, Location, PART_TIMEOUT, Space,
+    Submission, Write,
 };
 pub use core_file::{CoreFile, Source};
 pub use data_file::{DataFile, Options};

@@ -406,3 +406,104 @@ fn a_region_with_a_record_nobody_owns_is_never_a_victim() {
         assert!(committer.usage().count(stray.region).extents >= 1);
     });
 }
+
+const SMALL: Options = Options {
+    journal_size: 8 * SLOT_SIZE,
+    region_size: 2 * SLOT_SIZE,
+    region_count: 16,
+    shards: SHARDS as u32,
+};
+
+#[test]
+fn compaction_keeps_intake_running_on_a_small_disk() {
+    let setup = Rc::new(SimDriver::new(6, Config::default()));
+    Runtime::new(setup.clone()).block_on(async {
+        DataFile::create(PATH, &SMALL).await.expect("create");
+    });
+    let driver = Rc::new(SimDriver::with_disk(6, Config::default(), setup.crash()));
+    Runtime::new(driver).block_on(async {
+        let setup = Setup {
+            cores: 1,
+            credits: 8,
+            reserve: 1,
+        };
+        let booted = boot(PATH, setup).await.expect("boot");
+        let committer = spawn(booted.committer.run());
+        let client = booted.client;
+        let core = booted
+            .starts
+            .into_iter()
+            .next()
+            .expect("core")
+            .open()
+            .await
+            .expect("open");
+        let (owner, changes) = Shards::new(core);
+        let owner = spawn(owner.run());
+        let workers: Vec<JoinHandle<u64>> = (0..4u64)
+            .map(|worker| {
+                let changes = changes.clone();
+                spawn(async move {
+                    let mut written = 0;
+                    for step in 0..16_000u64 {
+                        let shard =
+                            u16::try_from((step + worker) % u64::from(SHARDS)).expect("fits");
+                        let key = if step % 10 == 0 {
+                            COLD + worker * 1000 + step % 400
+                        } else {
+                            worker * 10 + step % HOT
+                        };
+                        let body = sealed(key, step);
+                        written += body.len() as u64;
+                        changes
+                            .change(shard, put(key, step), body)
+                            .await
+                            .unwrap_or_else(|e| panic!("worker {worker} step {step}: {e}"));
+                    }
+                    written
+                })
+            })
+            .collect();
+        let mut written = 0;
+        for worker in workers {
+            written += worker.await;
+        }
+        changes.close();
+        let keeper = owner.await;
+        drop(client);
+        let committer = committer.await;
+        let disk = u64::from(SMALL.region_count) * SMALL.region_size;
+        assert!(
+            written > 5 * disk,
+            "{written} bytes written on a {disk} byte disk"
+        );
+        let stats = committer.compaction();
+        assert!(stats.emptied > 0 && stats.moved > 0, "{stats:?}");
+        assert!(
+            stats.moved < 2 * written,
+            "{stats:?} for {written} bytes written"
+        );
+        assert!(!committer.space().low, "{:?}", committer.space());
+        let mut all = Keeper::default();
+        for shard in ALL {
+            let kept = keeper.state(shard).cloned().unwrap_or_default();
+            all.insert(shard, kept, Vec::new());
+        }
+        let mut held = vec![(0u32, 0u64); SMALL.region_count as usize];
+        for shard in ALL {
+            for item in all.state(shard).expect("kept").entries().values() {
+                let slot = &mut held[item.location.region as usize];
+                slot.0 += 1;
+                slot.1 += u64::from(item.location.size);
+            }
+        }
+        for (region, (extents, bytes)) in (0u32..).zip(held) {
+            let count = committer.usage().count(region);
+            assert_eq!(
+                (count.extents, count.bytes),
+                (extents, bytes),
+                "region {region}"
+            );
+        }
+    });
+}
