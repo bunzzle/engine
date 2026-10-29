@@ -9,6 +9,7 @@ mod record;
 mod recovery;
 mod regions;
 mod session;
+mod shard;
 mod superblock;
 mod usage;
 
@@ -28,6 +29,7 @@ pub use record::{
 pub use recovery::{Recovered, State, recover};
 pub use regions::{CHECKPOINT_RESERVE, Claim, Regions};
 pub use session::{Event, Results, Session};
+pub use shard::{Change, Delivery, Delta, INDEX_SIZE, Index, Item, ShardState};
 pub use superblock::{
     COPIES, Checkpoint, CheckpointCopy, FORMAT, MAX_SECTOR_SIZE, MAX_SHARDS, MIN_SECTOR_SIZE,
     SLOT_SIZE, Superblock, ZONE_SIZE,
