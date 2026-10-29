@@ -1,13 +1,16 @@
+use std::cell::RefCell;
 use std::collections::BTreeMap;
+use std::env;
+use std::panic::{self, AssertUnwindSafe};
 use std::rc::Rc;
 use std::time::Duration;
 
-use rt::sim::{Config, SimDriver};
-use rt::{JoinHandle, Runtime, spawn};
+use rt::sim::{Config, Disk, SimDriver, check};
+use rt::{JoinHandle, Runtime, sleep, spawn};
 use store::{
     Body, Change, Claim, Client, Committer, DataFile, Dead, Delivery, Error, Event, Index, Item,
-    Keeper, MAX_DELTAS, Options, Part, Range, Results, Root, SLOT_SIZE, Session, ShardState,
-    Submission, Write, encode_roots, load, read_run, recover,
+    KIND_STATE, Keeper, Location, MAX_DELTAS, Options, Part, Range, Results, Root, SLOT_SIZE,
+    Session, ShardState, Submission, Write, encode_roots, load, read_run, recover,
 };
 
 const PATH: &str = "/data/store";
@@ -76,7 +79,7 @@ impl Core {
         let records = indexes
             .iter()
             .map(|index| Write {
-                kind: 9,
+                kind: KIND_STATE,
                 shard,
                 tenant: index.tenant,
                 payload: index.payload(&[0xCD; 32]),
@@ -410,5 +413,320 @@ fn a_new_base_follows_the_last_allowed_delta() {
         expected.push(1);
         assert_eq!(lengths, expected);
         core.check().await;
+    });
+}
+
+const ALL: [u16; SHARDS as usize] = [0, 1, 2, 3];
+
+async fn rebuild(shards: &[u16]) -> Keeper {
+    let data = DataFile::open(PATH).await.expect("open");
+    let loaded = load(&data, 0).await.expect("load");
+    let parts = loaded.parts.clone();
+    let recovered = recover(&data, loaded.position, loaded.state)
+        .await
+        .expect("recover");
+    Keeper::rebuild(&data, &parts, &recovered.entries, shards)
+        .await
+        .expect("rebuild")
+}
+
+fn moved(core: &Core, shard: u16, key: u64) -> Index {
+    let old = core
+        .keeper
+        .state(shard)
+        .expect("kept")
+        .get(key)
+        .expect("present");
+    Index {
+        key,
+        tenant: 7,
+        change: Change::Move { old: old.location },
+    }
+}
+
+#[test]
+fn a_restart_rebuilds_runs_and_the_journal_after_them() {
+    run(26, async {
+        let (client, mut sessions, committer) = start(1).await;
+        let mut core = Core::new(sessions.remove(0)).await;
+        for round in 0..12u64 {
+            let shard = u16::try_from(round % 4).expect("fits");
+            core.changes(shard, (0..6).map(|k| put(round + k, 1)).collect())
+                .await;
+            if round % 3 == 2 {
+                core.change(shard, delete(round)).await;
+                let index = moved(&core, shard, round + 1);
+                core.change(shard, index).await;
+                core.checkpoint(&client).await.expect("checkpoint");
+            }
+        }
+        let lease = client.allocate(Claim::Intake).await.expect("lease");
+        let bytes = vec![0x5A; 4096];
+        let at = core.data.region_offset(lease.region());
+        let (written, _) = core
+            .data
+            .file()
+            .write_all_at(rt::Buf::from_slice(&bytes), at)
+            .await;
+        written.expect("write body");
+        let body = Submission {
+            claim: Claim::Intake,
+            records: vec![Write {
+                kind: KIND_STATE,
+                shard: 1,
+                tenant: 7,
+                payload: put(99, 9).payload(&[2; 16]),
+            }],
+            bodies: vec![Body {
+                tenant: 7,
+                range: Range {
+                    region: lease.region(),
+                    epoch: lease.epoch(),
+                    offset: 0,
+                    length: 4096,
+                    checksum: store::checksum(&bytes),
+                },
+            }],
+            dead: Vec::new(),
+        };
+        core.tag += 1;
+        core.sent.insert(core.tag, (1, vec![put(99, 9)]));
+        core.session.submit(core.tag, body).expect("credit");
+        while !core.sent.is_empty() {
+            core.pump().await;
+        }
+        lease.seal();
+        core.change(2, delete(10)).await;
+        let index = moved(&core, 3, 12);
+        core.change(3, index).await;
+        let roots: Vec<Vec<Root>> = ALL
+            .iter()
+            .map(|&s| core.keeper.roots(s).expect("kept").to_vec())
+            .collect();
+        let states: Vec<ShardState> = ALL
+            .iter()
+            .map(|&s| core.keeper.state(s).expect("kept").clone())
+            .collect();
+        drop(client);
+        drop(core);
+        drop(committer.await);
+        let rebuilt = rebuild(&ALL).await;
+        for shard in ALL {
+            let index = usize::from(shard);
+            assert_eq!(rebuilt.roots(shard).expect("kept"), roots[index].as_slice());
+            assert_eq!(
+                rebuilt.state(shard).expect("kept").entries(),
+                states[index].entries()
+            );
+        }
+        let some = rebuild(&[1, 3]).await;
+        assert!(some.state(0).is_none() && some.state(2).is_none());
+        assert_eq!(some.state(3).expect("kept").entries(), states[3].entries());
+    });
+}
+
+#[derive(Clone, Default)]
+struct Model {
+    acked: Vec<(u16, Index, Location, u64)>,
+    inflight: Option<(u16, Index)>,
+}
+
+type Shared = Rc<RefCell<Model>>;
+
+const MILLION: u32 = 1_000_000;
+const HORIZON: Duration = Duration::from_secs(60);
+
+fn created(seed: u64) -> Disk {
+    let setup = Rc::new(SimDriver::new(seed, Config::default()));
+    Runtime::new(setup.clone()).block_on(async {
+        DataFile::create(PATH, &OPTIONS).await.expect("create");
+    });
+    setup.crash()
+}
+
+fn step_index(step: u64, state: &ShardState) -> Index {
+    let key = step * 5 % 13;
+    let change = match (step % 4, state.get(key)) {
+        (3, Some(item)) => Change::Move { old: item.location },
+        (2, _) => Change::Delete,
+        _ => Change::Put(Delivery {
+            status: u8::try_from(step % 200).expect("fits"),
+            attempts: 1,
+            due: step,
+        }),
+    };
+    Index {
+        key,
+        tenant: 7,
+        change,
+    }
+}
+
+async fn keep(core: (Session, Results), model: Shared) {
+    let (session, mut results) = core;
+    let Ok(data) = DataFile::open(PATH).await else {
+        return;
+    };
+    let mut keeper = Keeper::default();
+    for shard in ALL {
+        keeper.insert(shard, ShardState::default(), Vec::new());
+    }
+    for step in 0..48u64 {
+        let shard = u16::try_from(step % 3).expect("fits");
+        let index = step_index(step, keeper.state(shard).expect("kept"));
+        let submission = Submission {
+            claim: Claim::Intake,
+            records: vec![Write {
+                kind: KIND_STATE,
+                shard,
+                tenant: 7,
+                payload: index.payload(&[1; 24]),
+            }],
+            bodies: Vec::new(),
+            dead: Vec::new(),
+        };
+        model.borrow_mut().inflight = Some((shard, index));
+        if session.submit(step, submission).is_err() {
+            return;
+        }
+        loop {
+            match results.recv().await {
+                Some(Event::Durable {
+                    sequence,
+                    locations,
+                    ..
+                }) => {
+                    keeper.apply(shard, &index, locations[0], sequence);
+                    let mut model = model.borrow_mut();
+                    model.inflight = None;
+                    model.acked.push((shard, index, locations[0], sequence));
+                    break;
+                }
+                Some(Event::Cut { sequence }) => {
+                    if keeper.cut(&session, &data, sequence).await.is_err() {
+                        return;
+                    }
+                }
+                Some(Event::Published { sequence }) => keeper.published(sequence),
+                Some(Event::Abandoned { sequence }) => keeper.abandoned(sequence),
+                Some(Event::Rejected { .. }) | None => return,
+            }
+        }
+    }
+}
+
+fn workload(seed: u64, halt_after: Option<u64>, disk: Disk) -> (Rc<SimDriver>, Model) {
+    let config = Config {
+        halt_after,
+        faults: rt::sim::Faults {
+            torn_write: MILLION / 4,
+            ..rt::sim::Faults::default()
+        },
+        ..Config::default()
+    };
+    let driver = Rc::new(SimDriver::with_disk(seed, config, disk));
+    let model = Shared::default();
+    let shared = model.clone();
+    Runtime::new(driver.clone()).block_on(async move {
+        let Ok(data) = DataFile::open(PATH).await else {
+            return;
+        };
+        let Ok(loaded) = load(&data, 0).await else {
+            return;
+        };
+        let Ok(recovered) = recover(&data, loaded.position, loaded.state).await else {
+            return;
+        };
+        let (mut committer, client) = Committer::new(data, recovered.journal, recovered.state);
+        let core = committer.session(&client, 1);
+        let committer = spawn(committer.run());
+        let task = spawn(keep(core, shared));
+        spawn(async move {
+            for _ in 0..6 {
+                sleep(Duration::from_millis(3)).await;
+                if client.checkpoint().await.is_err() {
+                    break;
+                }
+            }
+            task.await;
+            drop(client);
+            drop(committer.await);
+        });
+        sleep(HORIZON).await;
+    });
+    let model = model.borrow().clone();
+    (driver, model)
+}
+
+fn expected(model: &Model, shard: u16) -> ShardState {
+    let mut state = ShardState::default();
+    for (s, index, location, sequence) in &model.acked {
+        if *s == shard {
+            state.apply(index, *location, *sequence);
+        }
+    }
+    state
+}
+
+fn audit(model: &Model, rebuilt: &Keeper) {
+    for shard in ALL {
+        let found = rebuilt.state(shard).expect("kept").entries();
+        let mut state = expected(model, shard);
+        if found == state.entries() {
+            continue;
+        }
+        let (inflight, index) = model
+            .inflight
+            .expect("only an unanswered change may differ");
+        assert_eq!(inflight, shard, "shard {shard} differs");
+        let location = found.get(&index.key).map_or(
+            Location {
+                region: 0,
+                epoch: 0,
+                offset: 0,
+                sequence: 0,
+                size: 0,
+            },
+            |item| item.location,
+        );
+        state.apply(&index, location, u64::MAX);
+        assert_eq!(
+            found,
+            state.entries(),
+            "shard {shard} after the unanswered change"
+        );
+    }
+}
+
+fn crash_at(seed: u64, point: u64) {
+    let (driver, model) = workload(seed, Some(point), created(seed));
+    assert!(driver.is_halted(), "crash point {point} not reached");
+    let after = Rc::new(SimDriver::with_disk(
+        seed + 1,
+        Config::default(),
+        driver.crash(),
+    ));
+    Runtime::new(after).block_on(async move {
+        let rebuilt = rebuild(&ALL).await;
+        audit(&model, &rebuilt);
+    });
+}
+
+#[test]
+fn shard_state_survives_a_crash_at_every_disk_operation() {
+    let only = env::var("SIM_CRASH_AT")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok());
+    check(0..1, |seed| {
+        let (driver, model) = workload(seed, None, created(seed));
+        assert_eq!(model.acked.len(), 48, "workload ran");
+        let total = driver.disk_ops();
+        let points: Vec<u64> = only.map_or_else(|| (1..=total).collect(), |p| vec![p]);
+        for point in points {
+            if let Err(failure) = panic::catch_unwind(AssertUnwindSafe(|| crash_at(seed, point))) {
+                eprintln!("crash point {point} of {total}; replay with SIM_CRASH_AT={point}");
+                panic::resume_unwind(failure);
+            }
+        }
     });
 }

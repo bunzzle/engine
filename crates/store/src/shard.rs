@@ -2,8 +2,10 @@ use std::collections::BTreeMap;
 
 use crate::committer::Location;
 use crate::layout::{Fields, FieldsMut};
+use crate::run::Run;
 
 pub const INDEX_SIZE: usize = 64;
+pub const KIND_STATE: u8 = 4;
 
 const OP: usize = 0;
 const STATUS: usize = 1;
@@ -154,6 +156,19 @@ impl ShardState {
                 }
             }
         }
+    }
+
+    pub fn load_run(&mut self, run: Run) {
+        if run.base {
+            self.entries.clear();
+        }
+        for (key, item) in run.changes {
+            match item {
+                Some(item) => self.entries.insert(key, item),
+                None => self.entries.remove(&key),
+            };
+        }
+        self.covered = self.covered.max(run.covered);
     }
 
     pub fn freeze(&mut self, covered: u64) -> Delta {

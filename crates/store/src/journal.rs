@@ -52,6 +52,7 @@ pub struct Dead {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Commit {
     pub record_sequence: u64,
+    pub streams: u16,
     pub ranges: Vec<Range>,
     pub allocations: Vec<Allocation>,
     pub live: Vec<Live>,
@@ -473,6 +474,7 @@ fn encode_commit(previous: u32, commit: &Commit) -> Result<Vec<u8>, Error> {
     fields.put_u64(8, commit.record_sequence);
     fields.put_u16(16, live);
     fields.put_u16(18, dead);
+    fields.put_u16(20, commit.streams);
     let mut at = FIXED;
     for range in &commit.ranges {
         fields.put_u32(at, range.region);
@@ -514,13 +516,17 @@ fn decode_commit(payload: &[u8]) -> Option<(u32, Commit)> {
     let allocations = usize::from(fields.u16(6));
     let live = usize::from(fields.u16(16));
     let dead = usize::from(fields.u16(18));
+    let streams = fields.u16(20);
     if payload.len()
         != FIXED + ranges * RANGE + allocations * ALLOCATION + live * LIVE + dead * DEAD
+        || usize::from(streams) > ranges
+        || fields.u16(22) != 0
     {
         return None;
     }
     let mut commit = Commit {
         record_sequence: fields.u64(8),
+        streams,
         ranges: Vec::with_capacity(ranges),
         allocations: Vec::with_capacity(allocations),
         live: Vec::with_capacity(live),

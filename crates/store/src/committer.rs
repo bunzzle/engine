@@ -416,6 +416,7 @@ impl Committer {
         }
         let mut commit = Commit {
             record_sequence: self.sequence,
+            streams: u16::try_from(segments.len()).expect("stream segments fit in u16"),
             ranges: Vec::with_capacity(segments.len() + ranges.len()),
             allocations: self.allocations.clone(),
             live: live.into_values().collect(),
