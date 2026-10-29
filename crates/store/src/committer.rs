@@ -167,7 +167,8 @@ pub struct Committer {
     usage: Usage,
     open: Vec<bool>,
     busy: Vec<u32>,
-    stream: Option<Stream>,
+    streams: [Option<Stream>; 2],
+    leased: Vec<Option<u64>>,
     allocations: Vec<Allocation>,
     sequence: u64,
     checkpoint: Vec<u32>,
@@ -195,7 +196,8 @@ impl Committer {
             usage: state.usage,
             open: vec![false; count as usize],
             busy: Vec::new(),
-            stream: None,
+            streams: [None, None],
+            leased: vec![None; count as usize],
             allocations: Vec::new(),
             sequence: state.record_sequence,
             checkpoint: state.checkpoint,
@@ -336,6 +338,9 @@ impl Committer {
                 } else {
                     self.allocate(claim)
                 };
+                if let Ok((region, epoch)) = result {
+                    self.leased[region as usize] = Some(epoch);
+                }
                 let _ = reply.send(result);
             }
             Request::Commit(submission, reply) => {
@@ -434,7 +439,7 @@ impl Committer {
                 }
             }
         }
-        if let Some(stream) = &mut self.stream {
+        for stream in self.streams.iter_mut().flatten() {
             stream.offset = stream.offset.next_multiple_of(sector);
         }
         if accepted.is_empty() {
@@ -610,6 +615,7 @@ impl Committer {
             }
             let range = &body.range;
             let valid = range.region < superblock.region_count()
+                && self.leased[range.region as usize] == Some(range.epoch)
                 && self.regions.is_used(range.region)
                 && !self.checkpoint.contains(&range.region)
                 && !self.releasing(range.region)
@@ -640,8 +646,8 @@ impl Committer {
         if total == 0 {
             return Ok(Vec::new());
         }
-        let fits = self
-            .stream
+        let class = usize::from(submission.claim == Claim::Internal);
+        let fits = self.streams[class]
             .as_ref()
             .is_some_and(|s| s.offset + total <= region_size);
         if !fits {
@@ -652,16 +658,16 @@ impl Committer {
                     return Err(e);
                 }
             };
-            if let Some(old) = &self.stream {
+            if let Some(old) = &self.streams[class] {
                 self.open[old.region as usize] = false;
             }
-            self.stream = Some(Stream {
+            self.streams[class] = Some(Stream {
                 region,
                 epoch,
                 offset: 0,
             });
         }
-        let stream = self.stream.as_mut().expect("stream allocated");
+        let stream = self.streams[class].as_mut().expect("stream allocated");
         let same = segments
             .last()
             .is_some_and(|s: &Segment| s.region == stream.region && s.epoch == stream.epoch);

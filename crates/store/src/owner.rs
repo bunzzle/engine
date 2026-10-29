@@ -146,6 +146,11 @@ impl Shards {
             .state(request.shard)
             .and_then(|state| state.get(request.index.key))
             .map(|item| (item.tenant, item.location));
+        let claim = match (request.index.change, current) {
+            (Change::Move { .. }, _) => Claim::Internal,
+            (Change::Put(_), None) => Claim::Intake,
+            _ => Claim::Control,
+        };
         let counted = match request.index.change {
             Change::Put(_) => true,
             Change::Delete => {
@@ -175,7 +180,7 @@ impl Shards {
             .collect();
         let payload = request.index.payload(&request.sealed);
         let submission = Submission {
-            claim: Claim::Intake,
+            claim,
             records: vec![Write {
                 kind: KIND_STATE,
                 counted,

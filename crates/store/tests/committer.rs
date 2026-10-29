@@ -249,7 +249,7 @@ fn body_ranges_are_committed_with_their_allocation() {
 fn intake_is_refused_at_the_reserve() {
     let driver = created(4);
     run(&driver, async {
-        let (client, committer) = start(5).await;
+        let (client, committer) = start(3).await;
         client
             .commit(submission(vec![payload(0, 0, 10)]))
             .await
@@ -425,6 +425,55 @@ fn submissions_past_the_commit_limit_wait_for_the_next_commit() {
             .expect("third waits for the next commit");
         assert!(third.sequence > first.sequence);
         lease.seal();
+        drop(client);
+        drop(committer.await);
+    });
+}
+
+#[test]
+fn moved_records_get_their_own_stream_and_bodies_need_a_lease() {
+    let driver = created(13);
+    run(&driver, async {
+        let (client, committer) = start(0).await;
+        let hot = client
+            .commit(submission(vec![payload(0, 1, 40)]))
+            .await
+            .expect("intake");
+        let cold = client
+            .commit(Submission {
+                claim: Claim::Internal,
+                ..submission(vec![payload(0, 2, 40)])
+            })
+            .await
+            .expect("internal");
+        let control = client
+            .commit(Submission {
+                claim: Claim::Control,
+                ..submission(vec![payload(0, 3, 40)])
+            })
+            .await
+            .expect("control");
+        let (hot, cold, control) = (hot.locations[0], cold.locations[0], control.locations[0]);
+        assert_ne!(hot.region, cold.region);
+        assert_eq!(hot.region, control.region);
+        let into_stream = Submission {
+            bodies: vec![Body {
+                shard: 0,
+                tenant: 3,
+                range: Range {
+                    region: hot.region,
+                    epoch: hot.epoch,
+                    offset: 4096,
+                    length: 4096,
+                    checksum: 0,
+                },
+            }],
+            ..submission(Vec::new())
+        };
+        assert!(matches!(
+            client.commit(into_stream).await,
+            Err(Error::Invalid("range"))
+        ));
         drop(client);
         drop(committer.await);
     });

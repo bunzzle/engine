@@ -39,7 +39,7 @@ pub use record::{
     RecordError, SYSTEM_SHARD, chunks, encode, peek, peek_header, record_size,
 };
 pub use recovery::{Recovered, State, recover};
-pub use regions::{CHECKPOINT_RESERVE, Claim, Regions};
+pub use regions::{CHECKPOINT_RESERVE, COMPACTION_RESERVE, Claim, Regions};
 pub use run::{KIND_RUN, MAX_DELTAS, ROOT_SIZE, Root, Run, decode_roots, encode_roots, read_run};
 pub use session::{Event, Results, Session};
 pub use shard::{Change, Delivery, Delta, INDEX_SIZE, Index, Item, KIND_STATE, ShardState};
