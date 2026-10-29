@@ -22,7 +22,7 @@ const OPTIONS: Options = Options {
     shards: 4,
 };
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct Model {
     records: Vec<(Location, Vec<u8>)>,
     bodies: Vec<(Range, Vec<u8>)>,
@@ -296,18 +296,55 @@ fn recover_and_continue(seed: u64, disk: Disk, model: Model) {
     });
 }
 
+fn replay_point(name: &str) -> Option<u64> {
+    env::var(name).ok().and_then(|s| s.parse::<u64>().ok())
+}
+
+fn crash_in_recovery(seed: u64, disk: Disk, step: u64, model: &Model) {
+    let config = Config {
+        halt_after: Some(step),
+        faults: Faults {
+            torn_write: MILLION / 4,
+            ..Faults::default()
+        },
+        ..Config::default()
+    };
+    let driver = Rc::new(SimDriver::with_disk(seed + 1, config, disk));
+    run(&driver, async {
+        spawn(async { drop(reopen().await) });
+        sleep(HORIZON).await;
+    });
+    assert!(driver.is_halted(), "recovery point {step} not reached");
+    recover_and_continue(seed + 2, driver.crash(), model.clone());
+}
+
 fn crash_at(seed: u64, point: u64) {
     let (driver, model) = workload(seed, Some(point), created(seed));
     assert!(driver.is_halted(), "crash point {point} not reached");
+    let disk = driver.crash();
     let model = model.take();
-    recover_and_continue(seed + 1, driver.crash(), model);
+    let probe = Rc::new(SimDriver::with_disk(
+        seed + 1,
+        Config::default(),
+        disk.clone(),
+    ));
+    run(&probe, async { drop(reopen().await) });
+    let total = probe.disk_ops();
+    let steps: Vec<u64> =
+        replay_point("SIM_RECOVERY_AT").map_or_else(|| (1..=total).collect(), |s| vec![s]);
+    for step in steps {
+        let attempt = || crash_in_recovery(seed, disk.clone(), step, &model);
+        if let Err(failure) = panic::catch_unwind(AssertUnwindSafe(attempt)) {
+            eprintln!("recovery point {step} of {total}; replay with SIM_RECOVERY_AT={step}");
+            panic::resume_unwind(failure);
+        }
+    }
+    recover_and_continue(seed + 1, disk, model);
 }
 
 #[test]
 fn every_crash_point_recovers() {
-    let only = env::var("SIM_CRASH_AT")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok());
+    let only = replay_point("SIM_CRASH_AT");
     check(0..1, |seed| {
         let (driver, model) = workload(seed, None, created(seed));
         assert!(!model.borrow().records.is_empty(), "workload ran");
