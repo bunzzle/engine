@@ -1,14 +1,17 @@
+use std::collections::BTreeMap;
+
 use rt::{Buf, Receiver, Sender, channel};
 
 use crate::checkpoint::{Snapshot, encode, write_copy};
 use crate::crc32c::checksum;
 use crate::data_file::DataFile;
 use crate::error::Error;
-use crate::journal::{Allocation, Commit, Journal, Position, Range};
+use crate::journal::{Allocation, Commit, Dead, Journal, Live, Position, Range};
 use crate::record::{self, Header, MAX_PAYLOAD, record_size};
 use crate::recovery::State;
 use crate::regions::{CHECKPOINT_RESERVE, Claim, Regions};
 use crate::superblock::Checkpoint;
+use crate::usage::Usage;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Write {
@@ -17,11 +20,18 @@ pub struct Write {
     pub payload: Vec<u8>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Body {
+    pub tenant: u32,
+    pub range: Range,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Submission {
     pub claim: Claim,
     pub records: Vec<Write>,
-    pub ranges: Vec<Range>,
+    pub bodies: Vec<Body>,
+    pub dead: Vec<Dead>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -42,7 +52,32 @@ pub struct Durable {
 enum Request {
     Commit(Submission, Sender<Result<Durable, Error>>),
     Allocate(Claim, Sender<Result<(u32, u64), Error>>),
+    Seal(u32, u64),
     Checkpoint(Sender<Result<u64, Error>>),
+}
+
+pub struct Lease {
+    region: u32,
+    epoch: u64,
+    sender: Sender<Request>,
+}
+
+impl Lease {
+    pub fn region(&self) -> u32 {
+        self.region
+    }
+
+    pub fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
+    pub fn seal(self) {}
+}
+
+impl Drop for Lease {
+    fn drop(&mut self) {
+        let _ = self.sender.send(Request::Seal(self.region, self.epoch));
+    }
 }
 
 #[derive(Clone)]
@@ -63,12 +98,17 @@ impl Client {
         answer.recv().await.unwrap_or(Err(Error::Failed))
     }
 
-    pub async fn allocate(&self, claim: Claim) -> Result<(u32, u64), Error> {
+    pub async fn allocate(&self, claim: Claim) -> Result<Lease, Error> {
         let (reply, mut answer) = channel();
         if self.sender.send(Request::Allocate(claim, reply)).is_err() {
             return Err(Error::Failed);
         }
-        answer.recv().await.unwrap_or(Err(Error::Failed))
+        let (region, epoch) = answer.recv().await.unwrap_or(Err(Error::Failed))?;
+        Ok(Lease {
+            region,
+            epoch,
+            sender: self.sender.clone(),
+        })
     }
 
     pub async fn checkpoint(&self) -> Result<u64, Error> {
@@ -103,6 +143,9 @@ pub struct Committer {
     journal: Journal,
     regions: Regions,
     epochs: Vec<u64>,
+    usage: Usage,
+    open: Vec<bool>,
+    busy: Vec<u32>,
     stream: Option<Stream>,
     allocations: Vec<Allocation>,
     sequence: u64,
@@ -122,6 +165,9 @@ impl Committer {
             journal,
             regions: state.regions,
             epochs: state.epochs,
+            usage: state.usage,
+            open: vec![false; count as usize],
+            busy: Vec::new(),
             stream: None,
             allocations: Vec::new(),
             sequence: state.record_sequence,
@@ -142,6 +188,10 @@ impl Committer {
 
     pub fn regions(&self) -> &Regions {
         &self.regions
+    }
+
+    pub fn usage(&self) -> &Usage {
+        &self.usage
     }
 
     pub fn is_failed(&self) -> bool {
@@ -189,6 +239,11 @@ impl Committer {
                     batch.push((submission, reply));
                 }
             }
+            Request::Seal(region, epoch) => {
+                if self.epochs[region as usize] == epoch {
+                    self.open[region as usize] = false;
+                }
+            }
             Request::Checkpoint(reply) => return Some(reply),
         }
         None
@@ -218,18 +273,32 @@ impl Committer {
                 }
             }
         }
+        let pending: Vec<u32> = (0..count)
+            .filter(|&r| {
+                used[r as usize]
+                    && !self.open[r as usize]
+                    && self.usage.is_empty(r)
+                    && !self.usage.is_quarantined(r)
+                    && !self.checkpoint.contains(&r)
+                    && !self.busy.contains(&r)
+                    && !regions.contains(&r)
+            })
+            .collect();
         for &region in &regions {
             let epoch = &mut self.epochs[region as usize];
             *epoch += 1;
             used[region as usize] = true;
             epochs[region as usize] = *epoch;
         }
+        let mut release = self.checkpoint.clone();
+        release.extend_from_slice(&pending);
         let blob = encode(&Snapshot {
             position,
             record_sequence: self.sequence,
             used,
             epochs,
-            release: self.checkpoint.clone(),
+            usage: self.usage.clone(),
+            release,
             parts: Vec::new(),
         });
         let sequence = self.data.superblock().sequence() + 1;
@@ -267,6 +336,9 @@ impl Committer {
         for region in std::mem::replace(&mut self.checkpoint, regions) {
             self.regions.release(region);
         }
+        for region in pending {
+            self.regions.release(region);
+        }
         Ok(position)
     }
 
@@ -276,6 +348,11 @@ impl Committer {
 
     fn allocate(&mut self, claim: Claim) -> Result<(u32, u64), Error> {
         let region = self.regions.acquire(claim)?;
+        assert!(
+            self.usage.is_empty(region),
+            "free region {region} has live data"
+        );
+        self.open[region as usize] = true;
         let epoch = &mut self.epochs[region as usize];
         *epoch += 1;
         self.allocations.push(Allocation {
@@ -289,11 +366,15 @@ impl Committer {
         let sector = u64::from(self.data.sector_size());
         let mut segments = Vec::new();
         let mut ranges = Vec::new();
+        let mut live = BTreeMap::<(u32, u32), Live>::new();
+        let mut dead = Vec::new();
         let mut accepted = Vec::new();
         for (submission, reply) in batch {
             match self.pack(&submission, &mut segments) {
                 Ok(locations) => {
-                    ranges.extend_from_slice(&submission.ranges);
+                    count_live(&submission, &locations, &mut live);
+                    ranges.extend(submission.bodies.iter().map(|b| b.range));
+                    dead.extend_from_slice(&submission.dead);
                     accepted.push(Accepted { reply, locations });
                 }
                 Err(e) => {
@@ -311,6 +392,8 @@ impl Committer {
             record_sequence: self.sequence,
             ranges: Vec::with_capacity(segments.len() + ranges.len()),
             allocations: self.allocations.clone(),
+            live: live.into_values().collect(),
+            dead,
         };
         let align = self.data.sector_size() as usize;
         let mut buffers = Vec::with_capacity(segments.len());
@@ -332,11 +415,14 @@ impl Committer {
             ));
         }
         commit.ranges.extend(ranges);
+        self.busy = commit.ranges.iter().map(|r| r.region).collect();
         let mut reserved = self.journal.reserve(&commit);
         if matches!(reserved, Err(Error::JournalFull)) && self.checkpoint().await.is_ok() {
             reserved = self.journal.reserve(&commit);
         }
+        self.busy.clear();
         if let Err(e) = reserved {
+            self.usage.forget();
             for entry in accepted {
                 let error = match e {
                     _ if self.failed => Error::Failed,
@@ -348,6 +434,7 @@ impl Committer {
             return;
         }
         let Ok(sequence) = self.write(buffers, &commit).await else {
+            self.usage.forget();
             self.failed = true;
             for entry in accepted {
                 let _ = entry.reply.send(Err(Error::Failed));
@@ -355,6 +442,7 @@ impl Committer {
             return;
         };
         self.allocations.clear();
+        self.usage.settle(&commit.live, &commit.dead);
         for entry in accepted {
             let _ = entry.reply.send(Ok(Durable {
                 sequence,
@@ -377,6 +465,35 @@ impl Committer {
         Ok(position.sequence)
     }
 
+    fn admit(&mut self, dead: &[Dead], region_size: u64) -> Result<(), Error> {
+        for entry in dead {
+            if !self.tracked(entry.region, entry.epoch) {
+                return Err(Error::Invalid("dead"));
+            }
+            let fits = entry
+                .offset
+                .checked_add(u64::from(entry.length))
+                .is_some_and(|end| end <= region_size);
+            if entry.length == 0 || !fits {
+                self.usage.quarantine(entry.region);
+                return Err(Error::Invalid("dead"));
+            }
+        }
+        if let Err(region) = self.usage.hold(dead) {
+            self.usage.quarantine(region);
+            return Err(Error::Invalid("dead"));
+        }
+        Ok(())
+    }
+
+    fn tracked(&self, region: u32, epoch: u64) -> bool {
+        region < self.regions.count()
+            && self.regions.is_used(region)
+            && self.epochs[region as usize] == epoch
+            && !self.checkpoint.contains(&region)
+            && self.allocations.iter().all(|a| a.region != region)
+    }
+
     fn pack(
         &mut self,
         submission: &Submission,
@@ -385,9 +502,13 @@ impl Committer {
         let superblock = self.data.superblock();
         let region_size = superblock.region_size();
         let sector = u64::from(superblock.sector_size());
-        for range in &submission.ranges {
+        for body in &submission.bodies {
+            let range = &body.range;
             let valid = range.region < superblock.region_count()
+                && self.regions.is_used(range.region)
+                && !self.checkpoint.contains(&range.region)
                 && self.epochs[range.region as usize] == range.epoch
+                && range.length > 0
                 && range.offset.is_multiple_of(sector)
                 && u64::from(range.length).is_multiple_of(sector)
                 && range.offset + u64::from(range.length) <= region_size;
@@ -402,18 +523,28 @@ impl Committer {
             }
             total += record_size(write.payload.len()) as u64;
         }
-        if total == 0 {
-            return Ok(Vec::new());
-        }
         if total > region_size {
             return Err(Error::CommitTooLarge);
+        }
+        self.admit(&submission.dead, region_size)?;
+        if total == 0 {
+            return Ok(Vec::new());
         }
         let fits = self
             .stream
             .as_ref()
             .is_some_and(|s| s.offset + total <= region_size);
         if !fits {
-            let (region, epoch) = self.allocate(submission.claim)?;
+            let (region, epoch) = match self.allocate(submission.claim) {
+                Ok(allocated) => allocated,
+                Err(e) => {
+                    self.usage.unhold(&submission.dead);
+                    return Err(e);
+                }
+            };
+            if let Some(old) = &self.stream {
+                self.open[old.region as usize] = false;
+            }
             self.stream = Some(Stream {
                 region,
                 epoch,
@@ -457,5 +588,31 @@ impl Committer {
             stream.offset += size as u64;
         }
         Ok(locations)
+    }
+}
+
+fn count_live(
+    submission: &Submission,
+    locations: &[Location],
+    live: &mut BTreeMap<(u32, u32), Live>,
+) {
+    let records = submission
+        .records
+        .iter()
+        .zip(locations)
+        .map(|(w, l)| (w.tenant, l.region, u64::from(l.size)));
+    let bodies = submission
+        .bodies
+        .iter()
+        .map(|b| (b.tenant, b.range.region, u64::from(b.range.length)));
+    for (tenant, region, bytes) in records.chain(bodies) {
+        let entry = live.entry((tenant, region)).or_insert(Live {
+            tenant,
+            region,
+            extents: 0,
+            bytes: 0,
+        });
+        entry.extents += 1;
+        entry.bytes += bytes;
     }
 }

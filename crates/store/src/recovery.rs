@@ -7,6 +7,7 @@ use crate::data_file::DataFile;
 use crate::error::Error;
 use crate::journal::{Entry, Journal, Position};
 use crate::regions::Regions;
+use crate::usage::Usage;
 
 const VERIFY_CHUNK: u64 = 1024 * 1024;
 
@@ -14,6 +15,7 @@ const VERIFY_CHUNK: u64 = 1024 * 1024;
 pub struct State {
     pub regions: Regions,
     pub epochs: Vec<u64>,
+    pub usage: Usage,
     pub record_sequence: u64,
     pub checkpoint: Vec<u32>,
 }
@@ -23,6 +25,7 @@ impl State {
         Self {
             regions: Regions::new(count, reserve),
             epochs: vec![0; count as usize],
+            usage: Usage::new(count),
             record_sequence: 1,
             checkpoint: Vec::new(),
         }
@@ -53,7 +56,7 @@ pub async fn recover(
             torn = Some(entry.sequence);
             break;
         }
-        apply(&mut state, entry);
+        apply(data, &mut state, entry)?;
         keep += 1;
     }
     let (journal, entries) = scan.finish(data.file(), keep).await?;
@@ -135,10 +138,34 @@ async fn intact(data: &DataFile, entry: &Entry) -> Result<bool, Error> {
     Ok(true)
 }
 
-fn apply(state: &mut State, entry: &Entry) {
+fn apply(data: &DataFile, state: &mut State, entry: &Entry) -> Result<(), Error> {
+    let superblock = data.superblock();
+    let bad = Error::BadCommit(entry.sequence);
     for allocation in &entry.commit.allocations {
         state.regions.mark_used(allocation.region);
         state.epochs[allocation.region as usize] = allocation.epoch;
     }
+    for dead in &entry.commit.dead {
+        let valid = dead.region < superblock.region_count()
+            && state.regions.is_used(dead.region)
+            && state.epochs[dead.region as usize] == dead.epoch
+            && dead.length > 0
+            && dead
+                .offset
+                .checked_add(u64::from(dead.length))
+                .is_some_and(|end| end <= superblock.region_size());
+        if !valid || state.usage.remove(dead).is_none() {
+            return Err(bad);
+        }
+    }
+    for live in &entry.commit.live {
+        let valid = live.region < superblock.region_count()
+            && state.regions.is_used(live.region)
+            && live.extents > 0;
+        if !valid || state.usage.add(live).is_none() {
+            return Err(bad);
+        }
+    }
     state.record_sequence = entry.commit.record_sequence;
+    Ok(())
 }

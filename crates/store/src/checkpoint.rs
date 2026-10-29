@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use rt::Buf;
 
 use crate::crc32c::checksum;
@@ -8,12 +10,14 @@ use crate::layout::{Fields, FieldsMut};
 use crate::record::{self, FLAG_MORE, Header, Record, record_size};
 use crate::recovery::State;
 use crate::superblock::CheckpointCopy;
+use crate::usage::{Count, Usage};
 
 pub const KIND_CHECKPOINT: u8 = 2;
 
-const BLOB_FORMAT: u32 = 1;
+const BLOB_FORMAT: u32 = 2;
 const HEAD: usize = 48;
 const PART_HEAD: usize = 24;
+const TENANT: usize = 16;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Part {
@@ -28,6 +32,7 @@ pub(crate) struct Snapshot {
     pub record_sequence: u64,
     pub used: Vec<bool>,
     pub epochs: Vec<u64>,
+    pub usage: Usage,
     pub release: Vec<u32>,
     pub parts: Vec<Part>,
 }
@@ -42,17 +47,43 @@ fn padded(len: usize) -> usize {
     len.next_multiple_of(8)
 }
 
+fn write_bitmap(fields: &mut FieldsMut, at: usize, set: &[bool]) -> usize {
+    let mut bits = vec![0u8; padded(set.len().div_ceil(8))];
+    for (index, _) in set.iter().enumerate().filter(|(_, on)| **on) {
+        bits[index / 8] |= 1 << (index % 8);
+    }
+    fields.put_bytes(at, &bits);
+    bits.len()
+}
+
+fn read_bitmap(blob: &[u8], at: usize, count: usize) -> Vec<bool> {
+    (0..count)
+        .map(|i| blob[at + i / 8] & (1 << (i % 8)) != 0)
+        .collect()
+}
+
 pub(crate) fn encode(snapshot: &Snapshot) -> Vec<u8> {
     let count = snapshot.epochs.len();
     assert_eq!(snapshot.used.len(), count, "region table mismatch");
+    assert_eq!(snapshot.usage.counts().len(), count, "usage table mismatch");
     let bitmap = padded(count.div_ceil(8));
     let release = padded(snapshot.release.len() * 4);
+    let tenants = snapshot.usage.tenants();
     let parts: usize = snapshot
         .parts
         .iter()
         .map(|p| PART_HEAD + padded(p.bytes.len()))
         .sum();
-    let mut out = vec![0u8; HEAD + count * 8 + bitmap + release + parts];
+    let mut out = vec![
+        0u8;
+        HEAD + count * 8
+            + padded(count * 4)
+            + count * 8
+            + 2 * bitmap
+            + release
+            + tenants.len() * TENANT
+            + parts
+    ];
     let mut fields = FieldsMut::new(&mut out);
     fields.put_u32(0, BLOB_FORMAT);
     fields.put_u32(4, u32::try_from(count).expect("region count fits in u32"));
@@ -68,21 +99,34 @@ pub(crate) fn encode(snapshot: &Snapshot) -> Vec<u8> {
         40,
         u32::try_from(snapshot.parts.len()).expect("part count fits in u32"),
     );
+    fields.put_u32(
+        44,
+        u32::try_from(tenants.len()).expect("tenant count fits in u32"),
+    );
     let mut at = HEAD;
     for epoch in &snapshot.epochs {
         fields.put_u64(at, *epoch);
         at += 8;
     }
-    let mut bits = vec![0u8; bitmap];
-    for (index, _) in snapshot.used.iter().enumerate().filter(|(_, used)| **used) {
-        bits[index / 8] |= 1 << (index % 8);
+    for (index, count) in snapshot.usage.counts().iter().enumerate() {
+        fields.put_u32(at + index * 4, count.extents);
     }
-    fields.put_bytes(at, &bits);
-    at += bitmap;
+    at += padded(count * 4);
+    for count in snapshot.usage.counts() {
+        fields.put_u64(at, count.bytes);
+        at += 8;
+    }
+    at += write_bitmap(&mut fields, at, &snapshot.used);
+    at += write_bitmap(&mut fields, at, snapshot.usage.quarantined());
     for (index, region) in snapshot.release.iter().enumerate() {
         fields.put_u32(at + index * 4, *region);
     }
     at += release;
+    for (tenant, bytes) in tenants {
+        fields.put_u32(at, *tenant);
+        fields.put_u64(at + 8, *bytes);
+        at += TENANT;
+    }
     for part in &snapshot.parts {
         fields.put_u16(at, part.tag);
         fields.put_u64(at + 8, part.replay_sequence);
@@ -99,26 +143,45 @@ pub(crate) fn decode(blob: &[u8], region_count: u32) -> Option<Snapshot> {
     }
     let fields = Fields::new(blob);
     let count = fields.u32(4);
-    if fields.u32(0) != BLOB_FORMAT || count != region_count || fields.u32(44) != 0 {
+    if fields.u32(0) != BLOB_FORMAT || count != region_count {
         return None;
     }
     let count = count as usize;
     let releases = fields.u32(36) as usize;
     let part_count = fields.u32(40) as usize;
+    let tenant_count = fields.u32(44) as usize;
     let bitmap = padded(count.div_ceil(8));
     let mut at = HEAD;
-    let fixed = at + count * 8 + bitmap + padded(releases * 4);
+    let fixed = (at + count * 8 + padded(count * 4) + count * 8 + 2 * bitmap)
+        .checked_add(padded(releases.checked_mul(4)?))?
+        .checked_add(tenant_count.checked_mul(TENANT)?)?;
     if blob.len() < fixed {
         return None;
     }
     let epochs = (0..count).map(|i| fields.u64(at + i * 8)).collect();
     at += count * 8;
-    let used = (0..count)
-        .map(|i| blob[at + i / 8] & (1 << (i % 8)) != 0)
+    let extents: Vec<u32> = (0..count).map(|i| fields.u32(at + i * 4)).collect();
+    at += padded(count * 4);
+    let counts = (0..count)
+        .map(|i| Count {
+            extents: extents[i],
+            bytes: fields.u64(at + i * 8),
+        })
         .collect();
+    at += count * 8;
+    let used = read_bitmap(blob, at, count);
+    at += bitmap;
+    let quarantined = read_bitmap(blob, at, count);
     at += bitmap;
     let release = (0..releases).map(|i| fields.u32(at + i * 4)).collect();
-    at = fixed;
+    at += padded(releases * 4);
+    let mut tenants = BTreeMap::new();
+    for _ in 0..tenant_count {
+        if fields.u32(at + 4) != 0 || tenants.insert(fields.u32(at), fields.u64(at + 8)).is_some() {
+            return None;
+        }
+        at += TENANT;
+    }
     let mut parts = Vec::with_capacity(part_count.min(blob.len() / PART_HEAD));
     for _ in 0..part_count {
         if blob.len() < at + PART_HEAD || fields.u16(at + 2) != 0 || fields.u32(at + 4) != 0 {
@@ -148,6 +211,7 @@ pub(crate) fn decode(blob: &[u8], region_count: u32) -> Option<Snapshot> {
         record_sequence: fields.u64(8),
         used,
         epochs,
+        usage: Usage::from_parts(counts, quarantined, tenants),
         release,
         parts,
     })
@@ -253,13 +317,19 @@ pub async fn load(data: &DataFile, reserve: u32) -> Result<Loaded, Error> {
         }
     }
     let snapshot = snapshot.ok_or(Error::CheckpointLost)?;
+    let mut released = vec![false; snapshot.used.len()];
+    for &region in &snapshot.release {
+        released[region as usize] = true;
+    }
     for (region, used) in snapshot.used.iter().enumerate() {
-        let region = u32::try_from(region).expect("region count fits in u32");
-        if *used && !snapshot.release.contains(&region) {
-            state.regions.mark_used(region);
+        if *used && !released[region] {
+            state
+                .regions
+                .mark_used(u32::try_from(region).expect("region count fits in u32"));
         }
     }
     state.epochs = snapshot.epochs;
+    state.usage = snapshot.usage;
     state.record_sequence = snapshot.record_sequence;
     state.checkpoint = checkpoint.copies.iter().map(|c| c.region).collect();
     Ok(Loaded {
@@ -271,15 +341,39 @@ pub async fn load(data: &DataFile, reserve: u32) -> Result<Loaded, Error> {
 
 fn consistent(snapshot: &Snapshot, copies: &[CheckpointCopy; 2], position: Position) -> bool {
     let count = snapshot.used.len();
-    snapshot.position == position
+    let usage = &snapshot.usage;
+    let mut released = vec![false; count];
+    let mut unique = true;
+    for &region in &snapshot.release {
+        if let Some(slot) = released.get_mut(region as usize) {
+            unique &= !*slot;
+            *slot = true;
+        }
+    }
+    let region_bytes = usage
+        .counts()
+        .iter()
+        .try_fold(0u64, |a, c| a.checked_add(c.bytes));
+    let tenant_bytes = usage
+        .tenants()
+        .values()
+        .try_fold(0u64, |a, b| a.checked_add(*b));
+    unique
+        && region_bytes.is_some()
+        && region_bytes == tenant_bytes
+        && usage.tenants().values().all(|b| *b > 0)
+        && (0..count).all(|r| {
+            snapshot.used[r] && !released[r]
+                || usage.counts()[r] == Count::default() && !usage.quarantined()[r]
+        })
+        && snapshot.position == position
         && copies.iter().all(|c| {
             snapshot.used[c.region as usize] && snapshot.epochs[c.region as usize] == c.epoch
         })
-        && snapshot.release.iter().enumerate().all(|(index, &region)| {
+        && snapshot.release.iter().all(|&region| {
             (region as usize) < count
                 && snapshot.used[region as usize]
                 && copies.iter().all(|c| c.region != region)
-                && !snapshot.release[..index].contains(&region)
         })
         && snapshot
             .parts
@@ -289,8 +383,11 @@ fn consistent(snapshot: &Snapshot, copies: &[CheckpointCopy; 2], position: Posit
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use super::{Part, Snapshot, decode, encode};
     use crate::journal::Position;
+    use crate::usage::{Count, Usage};
 
     fn snapshot() -> Snapshot {
         Snapshot {
@@ -302,6 +399,16 @@ mod tests {
             record_sequence: 99,
             used: (0..11).map(|i| i % 3 == 0).collect(),
             epochs: (0..11).map(|i| i * 2).collect(),
+            usage: Usage::from_parts(
+                (0..11)
+                    .map(|i| Count {
+                        extents: i,
+                        bytes: u64::from(i) * 100,
+                    })
+                    .collect(),
+                (0..11).map(|i| i == 6).collect(),
+                BTreeMap::from([(3, 2000), (8, 3500)]),
+            ),
             release: vec![3, 9],
             parts: vec![
                 Part {
