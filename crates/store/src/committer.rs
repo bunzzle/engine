@@ -5,6 +5,7 @@ use crate::data_file::DataFile;
 use crate::error::Error;
 use crate::journal::{Allocation, Commit, Journal, Range};
 use crate::record::{self, Header, MAX_PAYLOAD, record_size};
+use crate::recovery::State;
 use crate::regions::{Claim, Regions};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -99,18 +100,19 @@ pub struct Committer {
 }
 
 impl Committer {
-    pub fn new(data: DataFile, journal: Journal, regions: Regions) -> (Self, Client) {
+    pub fn new(data: DataFile, journal: Journal, state: State) -> (Self, Client) {
         let count = data.superblock().region_count();
-        assert_eq!(regions.count(), count, "region count mismatch");
+        assert_eq!(state.regions.count(), count, "region count mismatch");
+        assert_eq!(state.epochs.len(), count as usize, "epoch count mismatch");
         let (sender, inbox) = channel();
         let committer = Self {
             data,
             journal,
-            regions,
-            epochs: vec![0; count as usize],
+            regions: state.regions,
+            epochs: state.epochs,
             stream: None,
             allocations: Vec::new(),
-            sequence: 1,
+            sequence: state.record_sequence,
             inbox,
             failed: false,
         };
@@ -205,6 +207,7 @@ impl Committer {
             return;
         }
         let mut commit = Commit {
+            record_sequence: self.sequence,
             ranges: Vec::with_capacity(segments.len() + ranges.len()),
             allocations: self.allocations.clone(),
         };

@@ -91,6 +91,18 @@ pub fn peek(bytes: &[u8]) -> Result<usize, RecordError> {
     Ok(record_size(length))
 }
 
+pub fn peek_header(bytes: &[u8]) -> Result<Header, RecordError> {
+    verified_length(bytes)?;
+    let fields = Fields::new(bytes);
+    Ok(Header {
+        kind: fields.u8(KIND),
+        flags: fields.u8(FLAGS),
+        tenant: fields.u32(TENANT),
+        epoch: fields.u64(EPOCH),
+        sequence: fields.u64(SEQUENCE),
+    })
+}
+
 fn verified_length(bytes: &[u8]) -> Result<usize, RecordError> {
     if bytes.len() < RECORD_HEADER_SIZE {
         return Err(RecordError::Truncated);

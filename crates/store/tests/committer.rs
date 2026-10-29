@@ -7,7 +7,7 @@ use rt::sim::{Config, Faults, SimDriver, check};
 use rt::{Buf, File, JoinHandle, OpenOptions, Runtime, sleep, spawn};
 use store::{
     Claim, Client, Committer, DataFile, Durable, Error, Journal, Location, Options, Position,
-    Range, Record, Regions, SLOT_SIZE, Submission, Write, ZONE_SIZE, checksum,
+    Range, Record, SLOT_SIZE, State, Submission, Write, ZONE_SIZE, checksum, recover,
 };
 
 const MILLION: u32 = 1_000_000;
@@ -36,11 +36,12 @@ fn created(seed: u64) -> Rc<SimDriver> {
 
 async fn start(reserve: u32) -> (Client, JoinHandle<Committer>) {
     let data = DataFile::open(PATH).await.expect("open");
-    let (journal, _) = Journal::recover(&data, Position::START)
+    let state = State::new(OPTIONS.region_count, reserve);
+    let recovered = recover(&data, Position::START, state)
         .await
         .expect("recover");
-    let regions = Regions::new(OPTIONS.region_count, reserve);
-    let (committer, client) = Committer::new(data, journal, regions);
+    assert_eq!(recovered.torn, None);
+    let (committer, client) = Committer::new(data, recovered.journal, recovered.state);
     (client, spawn(committer.run()))
 }
 

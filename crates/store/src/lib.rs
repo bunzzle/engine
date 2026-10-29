@@ -5,6 +5,7 @@ mod error;
 mod journal;
 mod layout;
 mod record;
+mod recovery;
 mod regions;
 mod superblock;
 
@@ -16,8 +17,9 @@ pub use journal::{Allocation, Commit, Entry, Journal, KIND_COMMIT, Position, Ran
 pub use layout::{Fields, FieldsMut};
 pub use record::{
     FLAG_MORE, Header, MAX_PAYLOAD, RECORD_ALIGN, RECORD_FORMAT, RECORD_HEADER_SIZE, Record,
-    RecordError, chunks, encode, peek, record_size,
+    RecordError, chunks, encode, peek, peek_header, record_size,
 };
+pub use recovery::{Recovered, State, recover};
 pub use regions::{Claim, Regions};
 pub use superblock::{
     COPIES, Checkpoint, FORMAT, MAX_SECTOR_SIZE, MIN_SECTOR_SIZE, SLOT_SIZE, Superblock, ZONE_SIZE,
