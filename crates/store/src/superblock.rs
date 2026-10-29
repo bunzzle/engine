@@ -1,5 +1,6 @@
 use crate::crc32c::checksum;
 use crate::error::Error;
+use crate::journal::Position;
 use crate::layout::{Fields, FieldsMut};
 
 pub const FORMAT: u16 = 1;
@@ -16,8 +17,14 @@ const CHECKED: usize = 6;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Checkpoint {
-    pub sequence: u64,
-    pub offset: u64,
+    pub position: Position,
+    pub copies: [CheckpointCopy; 2],
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CheckpointCopy {
+    pub region: u32,
+    pub epoch: u64,
     pub length: u64,
     pub checksum: u32,
 }
@@ -114,10 +121,15 @@ impl Superblock {
         fields.put_u64(64, self.region_size);
         fields.put_u32(72, self.region_count);
         if let Some(checkpoint) = self.checkpoint {
-            fields.put_u64(80, checkpoint.sequence);
-            fields.put_u64(88, checkpoint.offset);
-            fields.put_u64(96, checkpoint.length);
-            fields.put_u32(104, checkpoint.checksum);
+            fields.put_u64(80, checkpoint.position.sequence);
+            fields.put_u64(88, checkpoint.position.offset);
+            fields.put_u32(96, checkpoint.position.previous);
+            for (copy, at) in checkpoint.copies.iter().zip([120, 144]) {
+                fields.put_u32(at, copy.region);
+                fields.put_u32(at + 4, copy.checksum);
+                fields.put_u64(at + 8, copy.epoch);
+                fields.put_u64(at + 16, copy.length);
+            }
         }
         let sum = checksum(&out[CHECKED..]);
         FieldsMut::new(out).put_u32(0, sum);
@@ -134,12 +146,19 @@ impl Superblock {
         if sum != checksum(&bytes[CHECKED..]) || fields.bytes(6, 8) != MAGIC {
             return None;
         }
-        let length = fields.u64(96);
-        let checkpoint = (length > 0).then(|| Checkpoint {
-            sequence: fields.u64(80),
-            offset: fields.u64(88),
-            length,
-            checksum: fields.u32(104),
+        let copy = |at: usize| CheckpointCopy {
+            region: fields.u32(at),
+            checksum: fields.u32(at + 4),
+            epoch: fields.u64(at + 8),
+            length: fields.u64(at + 16),
+        };
+        let checkpoint = (fields.u64(136) > 0).then(|| Checkpoint {
+            position: Position {
+                sequence: fields.u64(80),
+                offset: fields.u64(88),
+                previous: fields.u32(96),
+            },
+            copies: [copy(120), copy(144)],
         });
         Some(Stored {
             superblock: Self {
@@ -189,6 +208,26 @@ impl Superblock {
         }
         if self.oldest_format > self.format {
             return Err(Error::Invalid("oldest format"));
+        }
+        if let Some(checkpoint) = self.checkpoint {
+            let [first, second] = checkpoint.copies;
+            let valid = checkpoint.position.sequence > 0
+                && checkpoint.position.offset < self.journal_size
+                && checkpoint
+                    .position
+                    .offset
+                    .is_multiple_of(u64::from(self.sector_size))
+                && first.region != second.region
+                && checkpoint.copies.iter().all(|c| {
+                    c.region < self.region_count
+                        && c.epoch > 0
+                        && c.length > 0
+                        && c.length <= self.region_size
+                        && c.length.is_multiple_of(u64::from(self.sector_size))
+                });
+            if !valid {
+                return Err(Error::Invalid("checkpoint"));
+            }
         }
         Ok(())
     }
@@ -277,7 +316,10 @@ pub(crate) fn select(copies: &[Option<Stored>; COPIES]) -> Result<Selected, Erro
 
 #[cfg(test)]
 mod tests {
-    use super::{COPIES, Checkpoint, FORMAT, HEADER_SIZE, Stored, Superblock, ZONE_SIZE, select};
+    use super::{
+        COPIES, Checkpoint, CheckpointCopy, FORMAT, HEADER_SIZE, Position, Stored, Superblock,
+        ZONE_SIZE, select,
+    };
     use crate::error::Error;
 
     fn superblock(sequence: u64) -> Superblock {
@@ -324,10 +366,25 @@ mod tests {
     fn encode_and_decode_round_trip() {
         let mut original = superblock(9);
         original.checkpoint = Some(Checkpoint {
-            sequence: 3,
-            offset: 4096,
-            length: 512,
-            checksum: 11,
+            position: Position {
+                sequence: 3,
+                offset: 4096,
+                previous: 5,
+            },
+            copies: [
+                CheckpointCopy {
+                    region: 1,
+                    epoch: 2,
+                    length: 8192,
+                    checksum: 11,
+                },
+                CheckpointCopy {
+                    region: 4,
+                    epoch: 6,
+                    length: 4096,
+                    checksum: 12,
+                },
+            ],
         });
         let decoded = copy(&original, 2).expect("decodes");
         assert_eq!(decoded.superblock, original);

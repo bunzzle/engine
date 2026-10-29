@@ -135,6 +135,10 @@ impl Journal {
         self.next
     }
 
+    pub fn size(&self) -> u64 {
+        self.size
+    }
+
     pub fn free(&self) -> u64 {
         self.size - self.used
     }

@@ -1,12 +1,15 @@
 use crate::error::Error;
 
+pub const CHECKPOINT_RESERVE: u32 = 2;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Claim {
     Intake,
     Internal,
+    Checkpoint,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct Regions {
     used: Vec<bool>,
     free: u32,
@@ -15,7 +18,10 @@ pub struct Regions {
 
 impl Regions {
     pub fn new(count: u32, reserve: u32) -> Self {
-        assert!(reserve <= count, "reserve exceeds region count");
+        assert!(
+            reserve + CHECKPOINT_RESERVE <= count,
+            "reserve exceeds region count"
+        );
         Self {
             used: vec![false; count as usize],
             free: count,
@@ -43,8 +49,17 @@ impl Regions {
         if self.free == 0 {
             return Err(Error::Full);
         }
-        if claim == Claim::Intake && self.free <= self.reserve {
-            return Err(Error::Reserve);
+        let keep = match claim {
+            Claim::Intake => self.reserve + CHECKPOINT_RESERVE,
+            Claim::Internal => CHECKPOINT_RESERVE,
+            Claim::Checkpoint => 0,
+        };
+        if self.free <= keep {
+            return Err(if claim == Claim::Intake {
+                Error::Reserve
+            } else {
+                Error::Full
+            });
         }
         let index = self
             .used

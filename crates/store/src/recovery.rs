@@ -15,6 +15,7 @@ pub struct State {
     pub regions: Regions,
     pub epochs: Vec<u64>,
     pub record_sequence: u64,
+    pub checkpoint: Vec<u32>,
 }
 
 impl State {
@@ -23,6 +24,7 @@ impl State {
             regions: Regions::new(count, reserve),
             epochs: vec![0; count as usize],
             record_sequence: 1,
+            checkpoint: Vec::new(),
         }
     }
 }

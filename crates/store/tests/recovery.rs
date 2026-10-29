@@ -7,7 +7,7 @@ use rt::sim::{Config, Faults, SimDriver, check};
 use rt::{Buf, File, JoinHandle, OpenOptions, Runtime, sleep, spawn};
 use store::{
     Claim, Client, Commit, Committer, DataFile, Durable, Error, Journal, Location, Options,
-    Position, Range, Record, Recovered, SLOT_SIZE, State, Submission, Write, recover,
+    Position, Range, Record, Recovered, SLOT_SIZE, State, Submission, Write, load, recover,
 };
 
 const MILLION: u32 = 1_000_000;
@@ -36,8 +36,10 @@ fn created(seed: u64) -> Rc<SimDriver> {
 
 async fn reopen() -> (DataFile, Result<Recovered, Error>) {
     let data = DataFile::open(PATH).await.expect("open");
-    let state = State::new(OPTIONS.region_count, 0);
-    let recovered = recover(&data, Position::START, state).await;
+    let recovered = match load(&data, 0).await {
+        Ok(loaded) => recover(&data, loaded.position, loaded.state).await,
+        Err(e) => Err(e),
+    };
     (data, recovered)
 }
 

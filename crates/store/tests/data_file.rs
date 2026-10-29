@@ -4,7 +4,10 @@ use std::time::Duration;
 
 use rt::sim::{Config, Disk, Faults, SimDriver, check};
 use rt::{Buf, File, OpenOptions, Runtime, sleep, spawn};
-use store::{Checkpoint, Claim, DataFile, Error, FORMAT, Options, Regions, SLOT_SIZE, ZONE_SIZE};
+use store::{
+    Checkpoint, CheckpointCopy, Claim, DataFile, Error, FORMAT, Options, Position, Regions,
+    SLOT_SIZE, ZONE_SIZE,
+};
 
 const MILLION: u32 = 1_000_000;
 const PATH: &str = "/data/store";
@@ -27,11 +30,19 @@ fn config(edit: impl FnOnce(&mut Config)) -> Config {
 }
 
 fn checkpoint(sequence: u64) -> Checkpoint {
-    Checkpoint {
-        sequence,
-        offset: ZONE_SIZE,
+    let copy = |region| CheckpointCopy {
+        region,
+        epoch: 1,
         length: 4096,
         checksum: 42,
+    };
+    Checkpoint {
+        position: Position {
+            offset: 0,
+            sequence,
+            previous: 7,
+        },
+        copies: [copy(0), copy(1)],
     }
 }
 
@@ -276,8 +287,8 @@ fn a_failed_sync_fails_the_data_file() {
 }
 
 #[test]
-fn intake_stops_at_the_reserve() {
-    let mut regions = Regions::new(4, 2);
+fn each_claim_stops_at_its_reserve() {
+    let mut regions = Regions::new(6, 2);
     assert_eq!(regions.acquire(Claim::Intake).expect("first"), 0);
     assert_eq!(regions.acquire(Claim::Intake).expect("second"), 1);
     assert!(matches!(
@@ -285,12 +296,22 @@ fn intake_stops_at_the_reserve() {
         Err(Error::Reserve)
     ));
     assert_eq!(regions.acquire(Claim::Internal).expect("internal"), 2);
+    assert_eq!(regions.acquire(Claim::Internal).expect("internal"), 3);
+    assert!(matches!(regions.acquire(Claim::Internal), Err(Error::Full)));
+    assert_eq!(regions.acquire(Claim::Checkpoint).expect("checkpoint"), 4);
+    assert_eq!(regions.acquire(Claim::Checkpoint).expect("checkpoint"), 5);
+    assert!(matches!(
+        regions.acquire(Claim::Checkpoint),
+        Err(Error::Full)
+    ));
     regions.release(0);
     regions.release(2);
-    assert_eq!(regions.acquire(Claim::Intake).expect("reused"), 0);
-    regions.mark_used(3);
-    assert_eq!(regions.acquire(Claim::Internal).expect("last"), 2);
-    assert_eq!(regions.free(), 0);
-    assert!(matches!(regions.acquire(Claim::Internal), Err(Error::Full)));
-    assert_eq!(regions.count(), 4);
+    regions.release(4);
+    assert!(matches!(
+        regions.acquire(Claim::Intake),
+        Err(Error::Reserve)
+    ));
+    assert_eq!(regions.acquire(Claim::Internal).expect("reused"), 0);
+    assert_eq!(regions.free(), 2);
+    assert_eq!(regions.count(), 6);
 }

@@ -182,13 +182,12 @@ impl DataFile {
             (self.superblock.oldest_format..=FORMAT).contains(&oldest_format),
             "oldest format must not move backwards"
         );
+        let previous = self
+            .superblock
+            .checkpoint
+            .map_or(0, |c| c.position.sequence);
         assert!(
-            checkpoint.is_none_or(|c| c.length > 0),
-            "checkpoint length must not be zero"
-        );
-        let previous = self.superblock.checkpoint.map_or(0, |c| c.sequence);
-        assert!(
-            checkpoint.is_some_and(|c| c.sequence >= previous)
+            checkpoint.is_some_and(|c| c.position.sequence >= previous)
                 || (checkpoint.is_none() && self.superblock.checkpoint.is_none()),
             "checkpoint must not move backwards"
         );
@@ -200,6 +199,7 @@ impl DataFile {
             checkpoint,
             ..self.superblock
         };
+        assert!(next.validate().is_ok(), "checkpoint out of range");
         let mut checksum = 0;
         for slot in 0..COPIES {
             let written = match write_copy(&self.file, &next, slot).await {
