@@ -1,0 +1,52 @@
+name: sanitizers
+
+on:
+  schedule:
+    - cron: "43 2 * * *"
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - crates/sys/**
+      - .github/workflows/sanitizers.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sanitizers-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  NIGHTLY: nightly-2026-10-15
+  TARGET: x86_64-unknown-linux-gnu
+
+jobs:
+  miri:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      RUSTFLAGS: -D warnings -C target-feature=+sse4.2
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install "$NIGHTLY" --profile minimal --component miri,rust-src
+      - run: cargo "+$NIGHTLY" miri test --locked --target "$TARGET" -p sys --lib
+
+  address:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      RUSTFLAGS: -D warnings -Zsanitizer=address
+      RUSTDOCFLAGS: -Zsanitizer=address
+      ASAN_OPTIONS: detect_leaks=1:detect_stack_use_after_return=1
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install "$NIGHTLY" --profile minimal --component rust-src
+      - run: cargo "+$NIGHTLY" test --locked -Zbuild-std --target "$TARGET" -p sys --lib --test uring
+      - run: cargo "+$NIGHTLY" test --locked -Zbuild-std --target "$TARGET" -p rt --test native
+      - run: cargo "+$NIGHTLY" test --locked -Zbuild-std --target "$TARGET" -p store --test native

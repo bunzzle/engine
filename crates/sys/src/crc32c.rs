@@ -164,7 +164,8 @@ mod tests {
         if cfg!(any(target_arch = "x86_64", target_arch = "aarch64")) {
             assert!(hardware());
         }
-        let data: Vec<u8> = (0..1100u32)
+        let size: u32 = if cfg!(miri) { 80 } else { 1100 };
+        let data: Vec<u8> = (0..size)
             .map(|i| u8::try_from(i.wrapping_mul(2_654_435_761) >> 24).expect("byte"))
             .collect();
         for start in 0..9 {

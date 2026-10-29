@@ -108,3 +108,44 @@ impl fmt::Debug for Buf {
             .finish_non_exhaustive()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::Buf;
+
+    #[test]
+    fn aligned_buffers_start_on_the_boundary() {
+        for align in [1, 8, 512, 4096] {
+            let buf = Buf::aligned(100, align);
+            assert_eq!(buf.as_ptr().addr() % align, 0);
+            assert_eq!(buf.capacity(), 100);
+            assert!(buf.is_empty());
+        }
+    }
+
+    #[test]
+    fn writes_stop_at_capacity() {
+        let mut buf = Buf::aligned(4, 64);
+        assert_eq!(buf.extend_from_slice(b"abcdef"), 4);
+        assert_eq!(&buf[..], b"abcd");
+        assert_eq!(buf.remaining(), 0);
+        assert_eq!(buf.spare_mut(), []);
+    }
+
+    #[test]
+    fn the_spare_area_follows_the_data() {
+        let mut buf = Buf::new(8);
+        buf.extend_from_slice(b"ab");
+        buf.spare_mut()[..3].copy_from_slice(b"cde");
+        buf.set_len(5);
+        assert_eq!(&buf[..], b"abcde");
+        buf.clear();
+        assert_eq!(buf.full_mut().len(), 8);
+    }
+
+    #[test]
+    #[should_panic(expected = "length exceeds capacity")]
+    fn a_length_past_capacity_panics() {
+        Buf::new(2).set_len(3);
+    }
+}
