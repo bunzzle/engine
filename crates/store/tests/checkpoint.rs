@@ -6,8 +6,8 @@ use std::time::Duration;
 use rt::sim::{Config, Faults, SimDriver, check};
 use rt::{Buf, File, JoinHandle, OpenOptions, Runtime, sleep, spawn};
 use store::{
-    CHECKPOINT_RESERVE, Claim, Client, Committer, DataFile, Durable, Error, Location, Options,
-    Range, Record, Recovered, SLOT_SIZE, Submission, Write, checksum, load, recover,
+    Body, CHECKPOINT_RESERVE, Claim, Client, Committer, DataFile, Durable, Error, Location,
+    Options, Range, Record, Recovered, SLOT_SIZE, Submission, Write, checksum, load, recover,
 };
 
 const MILLION: u32 = 1_000_000;
@@ -69,7 +69,8 @@ fn submission(records: Vec<Vec<u8>>) -> Submission {
                 payload,
             })
             .collect(),
-        ranges: Vec::new(),
+        bodies: Vec::new(),
+        dead: Vec::new(),
     }
 }
 
@@ -223,8 +224,10 @@ fn allocations_not_yet_committed_stay_out_of_the_checkpoint() {
     let driver = created(4);
     run(&driver, async {
         let (client, committer) = start().await;
-        let (pending, _) = client.allocate(Claim::Intake).await.expect("allocate");
-        let (body, epoch) = client.allocate(Claim::Intake).await.expect("allocate");
+        let lease = client.allocate(Claim::Intake).await.expect("allocate");
+        let pending = lease.region();
+        let chain = client.allocate(Claim::Intake).await.expect("allocate");
+        let (body, epoch) = (chain.region(), chain.epoch());
         client.checkpoint().await.expect("checkpoint");
         let bytes = vec![3u8; 4096];
         let data_offset = {
@@ -238,17 +241,21 @@ fn allocations_not_yet_committed_stay_out_of_the_checkpoint() {
         raw_write(data_offset, &bytes).await;
         client
             .commit(Submission {
-                ranges: vec![Range {
-                    region: body,
-                    epoch,
-                    offset: 0,
-                    length: 4096,
-                    checksum: checksum(&bytes),
+                bodies: vec![Body {
+                    tenant: 3,
+                    range: Range {
+                        region: body,
+                        epoch,
+                        offset: 0,
+                        length: 4096,
+                        checksum: checksum(&bytes),
+                    },
                 }],
                 ..submission(Vec::new())
             })
             .await
             .expect("commit range");
+        drop((lease, chain));
         drop(client);
         committer.await;
         let (_, recovered) = reopen().await;

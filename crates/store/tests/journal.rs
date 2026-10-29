@@ -5,7 +5,8 @@ use std::time::Duration;
 use rt::sim::{Config, Faults, SimDriver, check};
 use rt::{Buf, File, OpenOptions, Runtime, sleep, spawn};
 use store::{
-    Allocation, Commit, DataFile, Entry, Error, Journal, Options, Position, Range, SLOT_SIZE,
+    Allocation, Commit, DataFile, Dead, Entry, Error, Journal, Live, Options, Position, Range,
+    SLOT_SIZE,
 };
 
 const MILLION: u32 = 1_000_000;
@@ -25,6 +26,19 @@ fn run<T: 'static>(driver: &Rc<SimDriver>, future: impl Future<Output = T> + 'st
 
 fn commit(sequence: u64, ranges: usize) -> Commit {
     Commit {
+        live: vec![Live {
+            tenant: 4,
+            region: 1,
+            extents: u32::try_from(ranges).expect("fits"),
+            bytes: sequence * 10,
+        }],
+        dead: vec![Dead {
+            tenant: 4,
+            region: 0,
+            epoch: sequence,
+            offset: SECTOR,
+            length: 48,
+        }],
         record_sequence: sequence,
         ranges: (0..ranges)
             .map(|i| Range {

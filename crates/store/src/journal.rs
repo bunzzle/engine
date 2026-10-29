@@ -10,10 +10,12 @@ use crate::record::{self, Header, MAX_PAYLOAD, Record, record_size};
 
 pub const KIND_COMMIT: u8 = 1;
 
-const FIXED: usize = 16;
+const FIXED: usize = 24;
 const SCAN_CHUNK: u64 = 1024 * 1024;
 const RANGE: usize = 32;
 const ALLOCATION: usize = 16;
+const LIVE: usize = 24;
+const DEAD: usize = 32;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Range {
@@ -30,11 +32,30 @@ pub struct Allocation {
     pub epoch: u64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Live {
+    pub tenant: u32,
+    pub region: u32,
+    pub extents: u32,
+    pub bytes: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Dead {
+    pub tenant: u32,
+    pub region: u32,
+    pub epoch: u64,
+    pub offset: u64,
+    pub length: u32,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Commit {
     pub record_sequence: u64,
     pub ranges: Vec<Range>,
     pub allocations: Vec<Allocation>,
+    pub live: Vec<Live>,
+    pub dead: Vec<Dead>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -421,10 +442,16 @@ async fn read_exact(
 }
 
 fn commit_payload_size(commit: &Commit) -> Result<usize, Error> {
-    let size = FIXED + commit.ranges.len() * RANGE + commit.allocations.len() * ALLOCATION;
+    let size = FIXED
+        + commit.ranges.len() * RANGE
+        + commit.allocations.len() * ALLOCATION
+        + commit.live.len() * LIVE
+        + commit.dead.len() * DEAD;
     if size > MAX_PAYLOAD
         || u16::try_from(commit.ranges.len()).is_err()
         || u16::try_from(commit.allocations.len()).is_err()
+        || u16::try_from(commit.live.len()).is_err()
+        || u16::try_from(commit.dead.len()).is_err()
     {
         return Err(Error::CommitTooLarge);
     }
@@ -435,12 +462,16 @@ fn encode_commit(previous: u32, commit: &Commit) -> Result<Vec<u8>, Error> {
     let size = commit_payload_size(commit)?;
     let ranges = u16::try_from(commit.ranges.len()).map_err(|_| Error::CommitTooLarge)?;
     let allocations = u16::try_from(commit.allocations.len()).map_err(|_| Error::CommitTooLarge)?;
+    let live = u16::try_from(commit.live.len()).map_err(|_| Error::CommitTooLarge)?;
+    let dead = u16::try_from(commit.dead.len()).map_err(|_| Error::CommitTooLarge)?;
     let mut out = vec![0u8; size];
     let mut fields = FieldsMut::new(&mut out);
     fields.put_u32(0, previous);
     fields.put_u16(4, ranges);
     fields.put_u16(6, allocations);
     fields.put_u64(8, commit.record_sequence);
+    fields.put_u16(16, live);
+    fields.put_u16(18, dead);
     let mut at = FIXED;
     for range in &commit.ranges {
         fields.put_u32(at, range.region);
@@ -455,6 +486,21 @@ fn encode_commit(previous: u32, commit: &Commit) -> Result<Vec<u8>, Error> {
         fields.put_u64(at + 8, allocation.epoch);
         at += ALLOCATION;
     }
+    for live in &commit.live {
+        fields.put_u32(at, live.tenant);
+        fields.put_u32(at + 4, live.region);
+        fields.put_u32(at + 8, live.extents);
+        fields.put_u64(at + 16, live.bytes);
+        at += LIVE;
+    }
+    for dead in &commit.dead {
+        fields.put_u32(at, dead.tenant);
+        fields.put_u32(at + 4, dead.region);
+        fields.put_u32(at + 8, dead.length);
+        fields.put_u64(at + 16, dead.epoch);
+        fields.put_u64(at + 24, dead.offset);
+        at += DEAD;
+    }
     Ok(out)
 }
 
@@ -465,13 +511,19 @@ fn decode_commit(payload: &[u8]) -> Option<(u32, Commit)> {
     let fields = Fields::new(payload);
     let ranges = usize::from(fields.u16(4));
     let allocations = usize::from(fields.u16(6));
-    if payload.len() != FIXED + ranges * RANGE + allocations * ALLOCATION {
+    let live = usize::from(fields.u16(16));
+    let dead = usize::from(fields.u16(18));
+    if payload.len()
+        != FIXED + ranges * RANGE + allocations * ALLOCATION + live * LIVE + dead * DEAD
+    {
         return None;
     }
     let mut commit = Commit {
         record_sequence: fields.u64(8),
         ranges: Vec::with_capacity(ranges),
         allocations: Vec::with_capacity(allocations),
+        live: Vec::with_capacity(live),
+        dead: Vec::with_capacity(dead),
     };
     let mut at = FIXED;
     for _ in 0..ranges {
@@ -490,6 +542,25 @@ fn decode_commit(payload: &[u8]) -> Option<(u32, Commit)> {
             epoch: fields.u64(at + 8),
         });
         at += ALLOCATION;
+    }
+    for _ in 0..live {
+        commit.live.push(Live {
+            tenant: fields.u32(at),
+            region: fields.u32(at + 4),
+            extents: fields.u32(at + 8),
+            bytes: fields.u64(at + 16),
+        });
+        at += LIVE;
+    }
+    for _ in 0..dead {
+        commit.dead.push(Dead {
+            tenant: fields.u32(at),
+            region: fields.u32(at + 4),
+            length: fields.u32(at + 8),
+            epoch: fields.u64(at + 16),
+            offset: fields.u64(at + 24),
+        });
+        at += DEAD;
     }
     Some((fields.u32(0), commit))
 }

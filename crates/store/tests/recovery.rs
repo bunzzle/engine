@@ -69,7 +69,8 @@ fn submission(records: Vec<Vec<u8>>) -> Submission {
                 payload,
             })
             .collect(),
-        ranges: Vec::new(),
+        bodies: Vec::new(),
+        dead: Vec::new(),
     }
 }
 
@@ -251,7 +252,7 @@ fn a_commit_that_does_not_match_the_state_is_reported() {
                 length: 4096,
                 checksum: 0,
             }],
-            allocations: Vec::new(),
+            ..Commit::default()
         };
         journal.append(data.file(), &commit).await.expect("append");
         data.file().sync_data().await.expect("sync");

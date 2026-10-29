@@ -6,7 +6,7 @@ use std::time::Duration;
 use rt::sim::{Config, Faults, SimDriver, check};
 use rt::{Buf, File, JoinHandle, OpenOptions, Runtime, sleep, spawn};
 use store::{
-    Claim, Client, Committer, DataFile, Durable, Error, Journal, Location, Options, Position,
+    Body, Claim, Client, Committer, DataFile, Durable, Error, Journal, Location, Options, Position,
     Range, Record, SLOT_SIZE, Submission, Write, ZONE_SIZE, checksum, load, recover,
 };
 
@@ -64,7 +64,8 @@ fn submission(records: Vec<Vec<u8>>) -> Submission {
                 payload,
             })
             .collect(),
-        ranges: Vec::new(),
+        bodies: Vec::new(),
+        dead: Vec::new(),
     }
 }
 
@@ -167,7 +168,8 @@ fn body_ranges_are_committed_with_their_allocation() {
     let driver = created(3);
     run(&driver, async {
         let (client, committer) = start(0).await;
-        let (region, epoch) = client.allocate(Claim::Intake).await.expect("allocate");
+        let lease = client.allocate(Claim::Intake).await.expect("allocate");
+        let (region, epoch) = (lease.region(), lease.epoch());
         let file = File::open(
             PATH,
             &OpenOptions {
@@ -195,18 +197,22 @@ fn body_ranges_are_committed_with_their_allocation() {
         };
         let refused = client
             .commit(Submission {
-                ranges: vec![bad],
+                bodies: vec![Body {
+                    tenant: 3,
+                    range: bad,
+                }],
                 ..submission(Vec::new())
             })
             .await;
         assert!(matches!(refused, Err(Error::Invalid("range"))));
         let durable = client
             .commit(Submission {
-                ranges: vec![range],
+                bodies: vec![Body { tenant: 3, range }],
                 ..submission(vec![payload(1, 1, 50)])
             })
             .await
             .expect("commit");
+        lease.seal();
         drop(client);
         let committer = committer.await;
         assert_eq!(
