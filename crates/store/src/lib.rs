@@ -39,14 +39,15 @@ pub use owner::{Batch, Changes, Op, Shards};
 pub use reader::{Owner, Pin, Pins, READ_ATTEMPTS, Reader};
 pub use record::{
     FLAG_MORE, Header, MAX_PAYLOAD, RECORD_ALIGN, RECORD_FORMAT, RECORD_HEADER_SIZE, Record,
-    RecordError, SYSTEM_SHARD, chunks, encode, peek, peek_header, record_size,
+    RecordError, SYSTEM_SHARD, chunks, encode, peek, peek_header, rebase, record_size,
 };
 pub use recovery::{Recovered, State, recover};
 pub use regions::{CHECKPOINT_RESERVE, COMPACTION_RESERVE, Claim, Regions};
 pub use run::{KIND_RUN, MAX_DELTAS, ROOT_SIZE, Root, Run, decode_roots, encode_roots, read_run};
 pub use session::{Event, Owned, Results, Session};
 pub use shard::{
-    Change, Delivery, Delta, HEAD_ITEM, INDEX_SIZE, Index, Item, KIND_STATE, Key, ShardState,
+    BODY_SIZE, Change, Delivery, Delta, HEAD_ITEM, INDEX_SIZE, Index, Item, KIND_STATE, Key, Parts,
+    ShardState,
 };
 pub use superblock::{
     COPIES, Checkpoint, CheckpointCopy, FORMAT, MAX_SECTOR_SIZE, MAX_SHARDS, MIN_SECTOR_SIZE,

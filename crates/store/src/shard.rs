@@ -1,10 +1,12 @@
 use std::collections::BTreeMap;
 
 use crate::committer::Location;
+use crate::journal::Range;
 use crate::layout::{Fields, FieldsMut};
 use crate::run::Run;
 
 pub const INDEX_SIZE: usize = 72;
+pub const BODY_SIZE: usize = 32;
 pub const KIND_STATE: u8 = 4;
 pub const HEAD_ITEM: u32 = 0;
 
@@ -21,7 +23,8 @@ const OLD_SIZE: usize = 36;
 const OLD_EPOCH: usize = 40;
 const OLD_OFFSET: usize = 48;
 const OLD_SEQUENCE: usize = 56;
-const RESERVED: usize = 64;
+const BODIES: usize = 64;
+const RESERVED: usize = 68;
 
 const OP_PUT: u8 = 1;
 const OP_DELETE: u8 = 2;
@@ -66,8 +69,46 @@ pub struct Index {
     pub change: Change,
 }
 
+pub(crate) fn encode_body(range: &Range, out: &mut [u8]) {
+    let mut fields = FieldsMut::new(&mut out[..BODY_SIZE]);
+    fields.put_u32(0, range.region);
+    fields.put_u32(4, range.length);
+    fields.put_u64(8, range.epoch);
+    fields.put_u64(16, range.offset);
+    fields.put_u32(24, range.checksum);
+    fields.put_u32(28, 0);
+}
+
+pub(crate) fn decode_bodies(bytes: &[u8]) -> Option<Vec<Range>> {
+    let (chunks, rest) = bytes.as_chunks::<BODY_SIZE>();
+    if !rest.is_empty() {
+        return None;
+    }
+    chunks
+        .iter()
+        .map(|chunk| {
+            let fields = Fields::new(chunk);
+            (fields.u32(28) == 0 && fields.u32(4) > 0).then(|| Range {
+                region: fields.u32(0),
+                epoch: fields.u64(8),
+                offset: fields.u64(16),
+                length: fields.u32(4),
+                checksum: fields.u32(24),
+            })
+        })
+        .collect()
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct Parts<'a> {
+    pub index: Index,
+    pub clear: &'a [u8],
+    pub bodies: Vec<Range>,
+    pub sealed: &'a [u8],
+}
+
 impl Index {
-    fn encode(&self, clear: usize, out: &mut [u8]) {
+    fn encode(&self, clear: usize, bodies: usize, out: &mut [u8]) {
         let out = &mut out[..INDEX_SIZE];
         out.fill(0);
         let mut fields = FieldsMut::new(out);
@@ -75,6 +116,7 @@ impl Index {
         fields.put_u64(MESSAGE, self.key.message);
         fields.put_u32(ITEM, self.key.item);
         fields.put_u32(CLEAR, u32::try_from(clear).expect("clear part fits in u32"));
+        fields.put_u32(BODIES, u32::try_from(bodies).expect("bodies fit in u32"));
         match self.change {
             Change::Put(delivery) => {
                 fields.put_u8(OP, OP_PUT);
@@ -96,13 +138,13 @@ impl Index {
     }
 
     pub fn decode(payload: &[u8]) -> Option<Self> {
-        Self::parts(payload).map(|(index, _, _)| index)
+        Self::parts(payload).map(|parts| parts.index)
     }
 
-    pub fn parts(payload: &[u8]) -> Option<(Self, &[u8], &[u8])> {
+    pub fn parts(payload: &[u8]) -> Option<Parts<'_>> {
         let bytes = payload.get(..INDEX_SIZE)?;
         let fields = Fields::new(bytes);
-        if fields.u64(RESERVED) != 0 {
+        if fields.u32(RESERVED) != 0 {
             return None;
         }
         let change = match fields.u8(OP) {
@@ -126,7 +168,10 @@ impl Index {
         };
         let rest = &payload[INDEX_SIZE..];
         let clear = usize::try_from(fields.u32(CLEAR)).ok()?;
-        if clear > rest.len() {
+        let bodies = usize::try_from(fields.u32(BODIES))
+            .ok()?
+            .checked_mul(BODY_SIZE)?;
+        if clear.checked_add(bodies)? > rest.len() {
             return None;
         }
         let index = Self {
@@ -134,19 +179,30 @@ impl Index {
             tenant: fields.u32(TENANT),
             change,
         };
-        let (clear, sealed) = rest.split_at(clear);
-        Some((index, clear, sealed))
+        let (clear, rest) = rest.split_at(clear);
+        let (bodies, sealed) = rest.split_at(bodies);
+        Some(Parts {
+            index,
+            clear,
+            bodies: decode_bodies(bodies)?,
+            sealed,
+        })
     }
 
     pub fn payload(&self, sealed: &[u8]) -> Vec<u8> {
-        self.record(&[], sealed)
+        self.record(&[], &[], sealed)
     }
 
-    pub fn record(&self, clear: &[u8], sealed: &[u8]) -> Vec<u8> {
-        let mut out = vec![0; INDEX_SIZE + clear.len() + sealed.len()];
-        self.encode(clear.len(), &mut out);
-        out[INDEX_SIZE..INDEX_SIZE + clear.len()].copy_from_slice(clear);
-        out[INDEX_SIZE + clear.len()..].copy_from_slice(sealed);
+    pub fn record(&self, clear: &[u8], bodies: &[Range], sealed: &[u8]) -> Vec<u8> {
+        let start = INDEX_SIZE + clear.len();
+        let end = start + bodies.len() * BODY_SIZE;
+        let mut out = vec![0; end + sealed.len()];
+        self.encode(clear.len(), bodies.len(), &mut out);
+        out[INDEX_SIZE..start].copy_from_slice(clear);
+        for (body, bytes) in bodies.iter().zip(out[start..end].chunks_mut(BODY_SIZE)) {
+            encode_body(body, bytes);
+        }
+        out[end..].copy_from_slice(sealed);
         out
     }
 }
@@ -157,6 +213,7 @@ pub struct Item {
     pub delivery: Delivery,
     pub location: Location,
     pub clear: Box<[u8]>,
+    pub bodies: Box<[Range]>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -173,7 +230,14 @@ pub struct ShardState {
 }
 
 impl ShardState {
-    pub fn apply(&mut self, index: &Index, clear: &[u8], location: Location, commit: u64) {
+    pub fn apply(
+        &mut self,
+        index: &Index,
+        clear: &[u8],
+        bodies: &[Range],
+        location: Location,
+        commit: u64,
+    ) {
         self.covered = self.covered.max(commit);
         match index.change {
             Change::Put(delivery) => {
@@ -182,6 +246,7 @@ impl ShardState {
                     delivery,
                     location,
                     clear: clear.into(),
+                    bodies: bodies.into(),
                 };
                 self.delta.insert(index.key, Some(entry.clone()));
                 self.entries.insert(index.key, entry);
@@ -196,6 +261,7 @@ impl ShardState {
                 {
                     entry.location = location;
                     entry.clear = clear.into();
+                    entry.bodies = bodies.into();
                     self.delta.insert(index.key, Some(entry.clone()));
                 }
             }

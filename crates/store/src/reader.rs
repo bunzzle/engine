@@ -6,8 +6,10 @@ use rt::{Buf, File};
 
 use crate::committer::Location;
 use crate::error::Error;
+use crate::journal::Range;
 use crate::record::{Record, record_size};
 use crate::superblock::Superblock;
+use sys::crc32c::checksum;
 
 pub const READ_ATTEMPTS: u32 = 4;
 
@@ -52,6 +54,7 @@ pub struct Reader {
     regions_offset: u64,
     region_size: u64,
     region_count: u32,
+    sector: usize,
     pins: Pins,
 }
 
@@ -62,6 +65,7 @@ impl Reader {
             regions_offset: superblock.regions_offset(),
             region_size: superblock.region_size(),
             region_count: superblock.region_count(),
+            sector: superblock.sector_size() as usize,
             pins,
         }
     }
@@ -90,6 +94,33 @@ impl Reader {
             region: at.region,
             offset: at.offset,
         })
+    }
+
+    pub async fn range(&self, range: Range) -> Result<Buf, Error> {
+        let damaged = Error::Damaged {
+            region: range.region,
+            offset: range.offset,
+        };
+        let length = u64::from(range.length);
+        let inside = range
+            .offset
+            .checked_add(length)
+            .is_some_and(|end| end <= self.region_size);
+        if range.region >= self.region_count || !inside {
+            return Err(damaged);
+        }
+        let _pin = self.pins.pin(range.region);
+        let offset =
+            self.regions_offset + u64::from(range.region) * self.region_size + range.offset;
+        let len = range.length as usize;
+        let (read, buf) = self
+            .file
+            .read_at(Buf::aligned(len, self.sector), offset)
+            .await;
+        if read? != len || checksum(&buf) != range.checksum {
+            return Err(damaged);
+        }
+        Ok(buf)
     }
 
     async fn read_once(&self, at: Location, tenant: u32) -> Option<Buf> {

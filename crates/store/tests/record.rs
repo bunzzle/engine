@@ -2,7 +2,7 @@ use std::env;
 
 use store::{
     FLAG_MORE, Header, MAX_PAYLOAD, RECORD_ALIGN, RECORD_FORMAT, RECORD_HEADER_SIZE, Record,
-    RecordError, checksum, chunks, encode, peek, record_size,
+    RecordError, checksum, chunks, encode, peek, rebase, record_size,
 };
 
 const HEADER: Header = Header {
@@ -233,4 +233,47 @@ fn fuzz_decode() {
             assert!(record.size() <= input.len().next_multiple_of(RECORD_ALIGN));
         }
     }
+}
+
+fn range(payloads: &[usize], len: usize) -> Vec<u8> {
+    let mut out = vec![0u8; len];
+    let mut at = 0;
+    for &size in payloads {
+        at += encode(&HEADER, &vec![7; size], &mut out[at..]);
+    }
+    out
+}
+
+#[test]
+fn rebase_moves_every_record_to_the_new_epoch() {
+    let mut bytes = range(&[10, 300, 1], 4096);
+    let before = bytes.clone();
+    assert!(rebase(&mut bytes, HEADER.tenant, 9, 40));
+    let mut at = 0;
+    for size in [10, 300, 1] {
+        let record = Record::decode(&bytes[at..]).expect("rebased record");
+        assert_eq!(record.epoch(), 40);
+        assert_eq!(
+            record.header(),
+            Header {
+                epoch: 40,
+                ..HEADER
+            }
+        );
+        assert_eq!(record.payload(), vec![7; size].as_slice());
+        at += record.size();
+    }
+    assert_eq!(&bytes[at..], &before[at..]);
+    for (tenant, epoch) in [(HEADER.tenant + 1, 9), (HEADER.tenant, 8)] {
+        let mut bytes = before.clone();
+        assert!(!rebase(&mut bytes, tenant, epoch, 40));
+    }
+    let mut tail = before.clone();
+    tail[4000] = 1;
+    assert!(
+        !rebase(&mut tail, HEADER.tenant, 9, 40),
+        "garbage after records"
+    );
+    let mut empty = vec![0u8; 4096];
+    assert!(!rebase(&mut empty, HEADER.tenant, 9, 40), "no records");
 }

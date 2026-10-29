@@ -7,16 +7,16 @@ use crate::core_file::CoreFile;
 use crate::error::Error;
 use crate::layout::{Fields, FieldsMut};
 use crate::record::{self, FLAG_MORE, Header, Record, record_size};
-use crate::shard::{Delivery, Item, Key};
+use crate::shard::{BODY_SIZE, Delivery, Item, Key, decode_bodies, encode_body};
 use sys::crc32c::checksum;
 
 pub const KIND_RUN: u8 = 3;
 pub const MAX_DELTAS: usize = 8;
 pub const ROOT_SIZE: usize = 40;
 
-const RUN_FORMAT: u32 = 2;
+const RUN_FORMAT: u32 = 3;
 const HEAD: usize = 24;
-const ENTRY: usize = 64;
+const ENTRY: usize = 72;
 const FLAG_BASE: u8 = 1;
 const OP_PUT: u8 = 1;
 const OP_TOMBSTONE: u8 = 2;
@@ -83,7 +83,10 @@ pub fn decode_roots(bytes: &[u8]) -> Option<Vec<Root>> {
 }
 
 pub(crate) fn entry_size(item: Option<&Item>) -> usize {
-    ENTRY + item.map_or(0, |item| item.clear.len().next_multiple_of(8))
+    ENTRY
+        + item.map_or(0, |item| {
+            item.clear.len().next_multiple_of(8) + item.bodies.len() * BODY_SIZE
+        })
 }
 
 pub(crate) fn encode<'a>(
@@ -116,7 +119,16 @@ pub(crate) fn encode<'a>(
                 fields.put_u64(40, item.location.epoch);
                 fields.put_u64(48, item.location.offset);
                 fields.put_u64(56, item.location.sequence);
-                out[at + ENTRY..at + ENTRY + item.clear.len()].copy_from_slice(&item.clear);
+                fields.put_u32(
+                    64,
+                    u32::try_from(item.bodies.len()).expect("bodies fit in u32"),
+                );
+                let clear = at + ENTRY;
+                out[clear..clear + item.clear.len()].copy_from_slice(&item.clear);
+                let bodies = clear + item.clear.len().next_multiple_of(8);
+                for (body, bytes) in item.bodies.iter().zip(out[bodies..].chunks_mut(BODY_SIZE)) {
+                    encode_body(body, bytes);
+                }
             }
             None => fields.put_u8(16, OP_TOMBSTONE),
         }
@@ -154,14 +166,18 @@ pub(crate) fn decode(blob: &[u8]) -> Option<Run> {
         }
         last = Some(key);
         let item = match entry.u8(16) {
-            OP_PUT => {
+            OP_PUT if entry.u32(68) == 0 => {
                 let clear = usize::try_from(entry.u32(20)).ok()?;
                 let padded = clear.checked_next_multiple_of(8)?;
-                let tail = blob.get(at + ENTRY..at.checked_add(ENTRY + padded)?)?;
-                if tail[clear..].iter().any(|&b| b != 0) {
+                let bodies = usize::try_from(entry.u32(64))
+                    .ok()?
+                    .checked_mul(BODY_SIZE)?;
+                let size = padded.checked_add(bodies)?;
+                let tail = blob.get(at + ENTRY..at.checked_add(ENTRY)?.checked_add(size)?)?;
+                if tail[clear..padded].iter().any(|&b| b != 0) {
                     return None;
                 }
-                at += padded;
+                at += size;
                 Some(Item {
                     tenant: entry.u32(12),
                     delivery: Delivery {
@@ -177,6 +193,7 @@ pub(crate) fn decode(blob: &[u8]) -> Option<Run> {
                         size: entry.u32(36),
                     },
                     clear: tail[..clear].into(),
+                    bodies: decode_bodies(&tail[padded..])?.into(),
                 })
             }
             OP_TOMBSTONE
@@ -305,7 +322,8 @@ mod tests {
 
     use super::{ENTRY, HEAD, MAX_DELTAS, Root, decode, decode_roots, encode, encode_roots};
     use crate::committer::Location;
-    use crate::shard::{Delivery, Item, Key};
+    use crate::journal::Range;
+    use crate::shard::{BODY_SIZE, Delivery, Item, Key};
 
     fn item(key: u64) -> Item {
         Item {
@@ -323,6 +341,15 @@ mod tests {
                 size: 128,
             },
             clear: vec![0xC0 | u8::try_from(key).expect("small key"); 3].into(),
+            bodies: (key..key + key / 4)
+                .map(|n| Range {
+                    region: 5,
+                    epoch: 2,
+                    offset: n * 4096,
+                    length: 4096,
+                    checksum: 0xC0DE,
+                })
+                .collect(),
         }
     }
 
@@ -353,11 +380,11 @@ mod tests {
     }
 
     #[test]
-    fn a_run_round_trips_with_tombstones_and_clear_parts() {
+    fn a_run_round_trips_with_tombstones_clear_parts_and_bodies() {
         let run = decode(&blob(false)).expect("decode");
         assert_eq!((run.shard, run.base, run.covered), (2, false, 41));
         assert_eq!(run.changes, changes());
-        assert_eq!(blob(false).len(), HEAD + 4 * ENTRY + 2 * 8);
+        assert_eq!(blob(false).len(), HEAD + 4 * ENTRY + 2 * 8 + 2 * BODY_SIZE);
     }
 
     #[test]
@@ -382,6 +409,19 @@ mod tests {
         let mut clear = blob.clone();
         clear[HEAD + 20..HEAD + 24].copy_from_slice(&u32::MAX.to_le_bytes());
         assert_eq!(decode(&clear), None);
+        let last = blob.len() - 2 * BODY_SIZE;
+        let mut body = blob.clone();
+        body[last + 28] = 1;
+        assert_eq!(decode(&body), None, "body reserved bytes");
+        let mut empty = blob.clone();
+        empty[last + 4..last + 8].copy_from_slice(&0u32.to_le_bytes());
+        assert_eq!(decode(&empty), None, "empty body range");
+        let mut reserved = blob.clone();
+        reserved[HEAD + 68] = 1;
+        assert_eq!(decode(&reserved), None);
+        let mut bodies = blob.clone();
+        bodies[last - 8 - ENTRY + 64] = 3;
+        assert_eq!(decode(&bodies), None, "body count past the end");
         let mut count = blob.clone();
         count[8] = 3;
         assert_eq!(decode(&count), None);

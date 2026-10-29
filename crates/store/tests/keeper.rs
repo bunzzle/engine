@@ -127,7 +127,8 @@ impl Core {
             } => {
                 let (shard, indexes) = self.sent.remove(tag).expect("sent");
                 for (index, location) in indexes.iter().zip(locations) {
-                    self.keeper.apply(shard, index, &[], *location, *sequence);
+                    self.keeper
+                        .apply(shard, index, &[], &[], *location, *sequence);
                 }
             }
             Event::Rejected { error, .. } => panic!("rejected: {error:?}"),
@@ -644,7 +645,7 @@ async fn keep(start: Start, model: Shared) {
                     ..
                 }) => {
                     core.keeper
-                        .apply(shard, &index, &[], locations[0], sequence);
+                        .apply(shard, &index, &[], &[], locations[0], sequence);
                     let mut model = model.borrow_mut();
                     model.inflight.remove(&shard);
                     model.acked.push((shard, index, locations[0], sequence));
@@ -731,7 +732,7 @@ fn expected(model: &Model, shard: u16) -> ShardState {
     let mut state = ShardState::default();
     for (s, index, location, sequence) in &model.acked {
         if *s == shard {
-            state.apply(index, &[], *location, *sequence);
+            state.apply(index, &[], &[], *location, *sequence);
         }
     }
     state
@@ -758,7 +759,7 @@ fn audit(model: &Model, rebuilt: &Keeper) {
             },
             |item| item.location,
         );
-        state.apply(&index, &[], location, u64::MAX);
+        state.apply(&index, &[], &[], location, u64::MAX);
         assert_eq!(
             found,
             state.entries(),

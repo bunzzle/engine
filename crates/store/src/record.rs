@@ -143,6 +143,23 @@ fn verified_length(bytes: &[u8]) -> Result<usize, RecordError> {
     }
 }
 
+pub fn rebase(bytes: &mut [u8], tenant: u32, from: u64, to: u64) -> bool {
+    let mut at = 0;
+    while at < bytes.len() {
+        let size = match Record::decode(&bytes[at..]) {
+            Ok(record) if record.tenant() == tenant && record.epoch() == from => record.size(),
+            Ok(_) => return false,
+            Err(_) => return at > 0 && bytes[at..].iter().all(|&b| b == 0),
+        };
+        let header = &mut bytes[at..at + RECORD_HEADER_SIZE];
+        FieldsMut::new(header).put_u64(EPOCH, to);
+        let sum = checksum(&header[BODY_CRC..]);
+        FieldsMut::new(header).put_u32(HEADER_CRC, sum);
+        at += size;
+    }
+    at > 0
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct Record<'a> {
     bytes: &'a [u8],
