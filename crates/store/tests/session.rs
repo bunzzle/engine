@@ -49,6 +49,7 @@ fn submission(shard: u16, byte: u8) -> Submission {
         claim: Claim::Intake,
         records: vec![Write {
             kind: 7,
+            counted: true,
             shard,
             tenant: 1,
             payload: vec![byte; 64],

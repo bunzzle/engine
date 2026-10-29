@@ -65,6 +65,7 @@ fn submission(records: Vec<Vec<u8>>) -> Submission {
             .into_iter()
             .map(|payload| Write {
                 kind: 7,
+                counted: true,
                 shard: 0,
                 tenant: 3,
                 payload,

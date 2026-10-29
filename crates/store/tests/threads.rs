@@ -73,6 +73,7 @@ async fn fill(mut core: Core) {
             claim: Claim::Intake,
             records: vec![Write {
                 kind: KIND_STATE,
+                counted: true,
                 shard,
                 tenant: 5,
                 payload: index.payload(&[9; 40]),

@@ -56,6 +56,7 @@ fn store_on_disk(plain: bool) {
                     claim: Claim::Intake,
                     records: vec![Write {
                         kind: 7,
+                        counted: true,
                         shard: 0,
                         tenant: 3,
                         payload: vec![step; 100 + usize::from(step) * 10],
