@@ -433,7 +433,7 @@ fn a_stalled_simulation_panics() {
 }
 
 #[test]
-#[should_panic(expected = "seed 2")]
+#[should_panic(expected = "bad seed")]
 fn failing_seeds_are_reported() {
-    check(0..5, |seed| assert!(seed != 2, "seed {seed}"));
+    check(0..5, |seed| assert!(seed % 5 != 2, "bad seed"));
 }

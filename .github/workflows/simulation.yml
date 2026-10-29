@@ -18,7 +18,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 90
     env:
-      SIM_SCALE: "20"
+      SIM_SCALE: "400"
       SIM_OFFSET: ${{ github.run_number }}000000
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
@@ -33,4 +33,4 @@ jobs:
             target
           key: ${{ runner.os }}-cargo-release-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-release-
-      - run: cargo test --workspace --release --locked
+      - run: cargo test --workspace --release --locked --no-fail-fast
