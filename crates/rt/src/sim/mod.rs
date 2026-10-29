@@ -1,4 +1,5 @@
 mod disk;
+mod machine;
 mod net;
 mod rng;
 
@@ -16,6 +17,7 @@ use std::task::Waker;
 use std::time::Duration;
 
 pub use disk::Disk;
+pub use machine::{Machine, Stalls};
 pub use rng::Rng;
 
 use crate::driver::{Completion, Driver, Handle, Op, OpId, Stat, Unpark};
