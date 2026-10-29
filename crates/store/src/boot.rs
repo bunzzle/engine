@@ -9,7 +9,7 @@ use crate::error::Error;
 use crate::journal::Entry;
 use crate::keeper::Keeper;
 use crate::recovery::recover;
-use crate::regions::CHECKPOINT_RESERVE;
+use crate::regions::{CHECKPOINT_RESERVE, COMPACTION_RESERVE};
 use crate::session::{Results, Session};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -55,7 +55,7 @@ pub async fn boot(path: impl AsRef<Path>, setup: Setup) -> Result<Booted, Error>
     }
     let kept = setup
         .reserve
-        .checked_add(CHECKPOINT_RESERVE + u32::from(setup.cores));
+        .checked_add(CHECKPOINT_RESERVE + COMPACTION_RESERVE + u32::from(setup.cores));
     if kept.is_none_or(|kept| kept >= superblock.region_count()) {
         return Err(Error::Config("reserves leave no region for intake"));
     }

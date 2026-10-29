@@ -295,18 +295,21 @@ fn a_failed_sync_fails_the_data_file() {
 
 #[test]
 fn each_claim_stops_at_its_reserve() {
-    let mut regions = Regions::new(6, 2);
+    let mut regions = Regions::new(8, 2);
     assert_eq!(regions.acquire(Claim::Intake).expect("first"), 0);
     assert_eq!(regions.acquire(Claim::Intake).expect("second"), 1);
     assert!(matches!(
         regions.acquire(Claim::Intake),
         Err(Error::Reserve)
     ));
-    assert_eq!(regions.acquire(Claim::Internal).expect("internal"), 2);
-    assert_eq!(regions.acquire(Claim::Internal).expect("internal"), 3);
+    assert_eq!(regions.acquire(Claim::Control).expect("control"), 2);
+    assert_eq!(regions.acquire(Claim::Control).expect("control"), 3);
+    assert!(matches!(regions.acquire(Claim::Control), Err(Error::Full)));
+    assert_eq!(regions.acquire(Claim::Internal).expect("internal"), 4);
+    assert_eq!(regions.acquire(Claim::Internal).expect("internal"), 5);
     assert!(matches!(regions.acquire(Claim::Internal), Err(Error::Full)));
-    assert_eq!(regions.acquire(Claim::Checkpoint).expect("checkpoint"), 4);
-    assert_eq!(regions.acquire(Claim::Checkpoint).expect("checkpoint"), 5);
+    assert_eq!(regions.acquire(Claim::Checkpoint).expect("checkpoint"), 6);
+    assert_eq!(regions.acquire(Claim::Checkpoint).expect("checkpoint"), 7);
     assert!(matches!(
         regions.acquire(Claim::Checkpoint),
         Err(Error::Full)
@@ -318,14 +321,38 @@ fn each_claim_stops_at_its_reserve() {
         regions.acquire(Claim::Intake),
         Err(Error::Reserve)
     ));
+    assert!(matches!(regions.acquire(Claim::Control), Err(Error::Full)));
     assert_eq!(regions.acquire(Claim::Internal).expect("reused"), 0);
     assert_eq!(regions.free(), 2);
-    assert_eq!(regions.count(), 6);
+    assert_eq!(regions.count(), 8);
+}
+
+#[test]
+fn a_compaction_reservation_holds_regions_from_intake_and_control() {
+    let mut regions = Regions::new(10, 1);
+    regions.reserve_internal(3).expect("reserve");
+    assert!(matches!(regions.reserve_internal(6), Err(Error::Full)));
+    regions.acquire(Claim::Intake).expect("intake");
+    regions.acquire(Claim::Intake).expect("intake");
+    assert!(matches!(
+        regions.acquire(Claim::Intake),
+        Err(Error::Reserve)
+    ));
+    regions.acquire(Claim::Control).expect("control");
+    assert!(matches!(regions.acquire(Claim::Control), Err(Error::Full)));
+    regions.acquire(Claim::Internal).expect("internal");
+    assert_eq!(regions.reserved(), 2);
+    assert!(matches!(regions.acquire(Claim::Control), Err(Error::Full)));
+    regions.unreserve_internal(2);
+    assert_eq!(regions.reserved(), 0);
+    regions
+        .acquire(Claim::Control)
+        .expect("control after unreserve");
 }
 
 #[test]
 fn each_session_keeps_one_region_for_state() {
-    let mut regions = Regions::new(7, 1);
+    let mut regions = Regions::new(9, 1);
     regions.add_state_reserve();
     assert_eq!(regions.state_reserve(), 1);
     for _ in 0..3 {
@@ -335,6 +362,9 @@ fn each_session_keeps_one_region_for_state() {
         regions.acquire(Claim::Intake),
         Err(Error::Reserve)
     ));
+    regions.acquire(Claim::Control).expect("control");
+    assert!(matches!(regions.acquire(Claim::Control), Err(Error::Full)));
+    regions.acquire(Claim::Internal).expect("internal");
     regions.acquire(Claim::Internal).expect("internal");
     assert!(matches!(regions.acquire(Claim::Internal), Err(Error::Full)));
     regions.acquire(Claim::State).expect("state");
