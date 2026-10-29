@@ -1,8 +1,10 @@
 use std::path::Path;
+use std::rc::Rc;
 
 use rt::{Buf, File, OpenOptions, sync_dir};
 
 use crate::error::Error;
+use crate::reader::{Pins, Reader};
 use crate::superblock::{
     COPIES, Checkpoint, FORMAT, HEADER_SIZE, MAX_SECTOR_SIZE, MIN_SECTOR_SIZE, SLOT_SIZE, Stored,
     Superblock, ZONE_SIZE, select,
@@ -19,7 +21,7 @@ pub struct Options {
 }
 
 pub struct DataFile {
-    file: File,
+    file: Rc<File>,
     superblock: Superblock,
     checksum: u32,
     failed: bool,
@@ -90,7 +92,7 @@ impl DataFile {
             .unwrap_or(Path::new("."));
         sync_dir(dir).await?;
         Ok(Self {
-            file,
+            file: Rc::new(file),
             superblock,
             checksum,
             failed: false,
@@ -139,7 +141,7 @@ impl DataFile {
             file.sync_data().await?;
         }
         Ok(Self {
-            file,
+            file: Rc::new(file),
             superblock,
             checksum: selected.checksum,
             failed: false,
@@ -160,6 +162,16 @@ impl DataFile {
 
     pub fn is_failed(&self) -> bool {
         self.failed
+    }
+
+    pub(crate) fn reader(&self, pins: Pins) -> Reader {
+        Reader::new(
+            Rc::clone(&self.file),
+            self.superblock.regions_offset,
+            self.superblock.region_size,
+            self.superblock.region_count,
+            pins,
+        )
     }
 
     pub fn region_offset(&self, region: u32) -> u64 {
