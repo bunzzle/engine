@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use rt::Receiver;
+use rt::{Receiver, channel};
 
 use crate::checkpoint::Part;
 use crate::committer::{Client, Location, Reply, Request, Submission};
@@ -33,6 +33,7 @@ pub(crate) struct Answer {
     pub(crate) session: usize,
     pub(crate) sequence: u64,
     pub(crate) parts: Vec<Part>,
+    pub(crate) failed: bool,
 }
 
 pub struct Session {
@@ -74,15 +75,37 @@ impl Session {
     }
 
     pub fn parts(&self, sequence: u64, parts: Vec<Part>) -> Result<(), Error> {
+        self.answer(sequence, parts, false)
+    }
+
+    pub fn fail(&self, sequence: u64) -> Result<(), Error> {
+        self.answer(sequence, Vec::new(), true)
+    }
+
+    fn answer(&self, sequence: u64, parts: Vec<Part>, failed: bool) -> Result<(), Error> {
         let answer = Answer {
             session: self.id,
             sequence,
             parts,
+            failed,
         };
         self.client
             .sender
             .send(Request::Answer(answer))
             .map_err(|_| Error::Failed)
+    }
+
+    pub async fn claim_state(&self) -> Result<(u32, u64), Error> {
+        let (reply, mut answer) = channel();
+        if self
+            .client
+            .sender
+            .send(Request::ClaimState(self.id, reply))
+            .is_err()
+        {
+            return Err(Error::Failed);
+        }
+        answer.recv().await.unwrap_or(Err(Error::Failed))
     }
 }
 

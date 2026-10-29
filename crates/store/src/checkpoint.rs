@@ -8,6 +8,7 @@ use crate::journal::Position;
 use crate::layout::{Fields, FieldsMut};
 use crate::record::{self, FLAG_MORE, Header, Record, SYSTEM_SHARD, record_size};
 use crate::recovery::State;
+use crate::run::{Root, decode_roots};
 use crate::superblock::CheckpointCopy;
 use crate::usage::{Count, Usage};
 use sys::crc32c::checksum;
@@ -340,6 +341,14 @@ pub async fn load(data: &DataFile, reserve: u32) -> Result<Loaded, Error> {
     state.usage = snapshot.usage;
     state.record_sequence = snapshot.record_sequence;
     state.checkpoint = checkpoint.copies.iter().map(|c| c.region).collect();
+    let shards = superblock.shards();
+    for part in snapshot.parts.iter().filter(|p| u32::from(p.tag) < shards) {
+        for root in decode_roots(&part.bytes).ok_or(Error::CheckpointLost)? {
+            if !state.runs.contains(&root.region) {
+                state.runs.push(root.region);
+            }
+        }
+    }
     Ok(Loaded {
         position: snapshot.position,
         state,
@@ -393,15 +402,37 @@ fn consistent(
             .iter()
             .all(|p| p.replay_sequence == position.sequence)
         && parts_valid(&snapshot.parts, shards)
+        && snapshot
+            .parts
+            .iter()
+            .filter(|p| u32::from(p.tag) < shards)
+            .filter_map(|p| decode_roots(&p.bytes))
+            .flatten()
+            .all(|root| root_stored(snapshot, &released, copies, &root))
 }
 
-fn parts_valid(parts: &[Part], shards: u32) -> bool {
+fn root_stored(
+    snapshot: &Snapshot,
+    released: &[bool],
+    copies: &[CheckpointCopy; 2],
+    root: &Root,
+) -> bool {
+    let region = root.region as usize;
+    region < snapshot.used.len()
+        && snapshot.used[region]
+        && !released[region]
+        && snapshot.epochs[region] == root.epoch
+        && snapshot.usage.counts()[region] == Count::default()
+        && copies.iter().all(|c| c.region != root.region)
+}
+
+pub(crate) fn parts_valid(parts: &[Part], shards: u32) -> bool {
     let mut tags: Vec<u16> = parts.iter().map(|p| p.tag).collect();
     tags.sort_unstable();
     tags.windows(2).all(|w| w[0] != w[1])
-        && tags
-            .iter()
-            .all(|&tag| tag >= PART_TAG_OTHER || u32::from(tag) < shards)
+        && parts.iter().all(|p| {
+            p.tag >= PART_TAG_OTHER || u32::from(p.tag) < shards && decode_roots(&p.bytes).is_some()
+        })
 }
 
 #[cfg(test)]

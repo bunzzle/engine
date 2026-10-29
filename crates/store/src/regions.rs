@@ -6,6 +6,7 @@ pub const CHECKPOINT_RESERVE: u32 = 2;
 pub enum Claim {
     Intake,
     Internal,
+    State,
     Checkpoint,
 }
 
@@ -14,6 +15,7 @@ pub struct Regions {
     used: Vec<bool>,
     free: u32,
     reserve: u32,
+    state_reserve: u32,
 }
 
 impl Regions {
@@ -26,6 +28,7 @@ impl Regions {
             used: vec![false; count as usize],
             free: count,
             reserve,
+            state_reserve: 0,
         }
     }
 
@@ -41,6 +44,18 @@ impl Regions {
         self.reserve
     }
 
+    pub fn state_reserve(&self) -> u32 {
+        self.state_reserve
+    }
+
+    pub fn add_state_reserve(&mut self) {
+        assert!(
+            self.reserve + CHECKPOINT_RESERVE + self.state_reserve < self.count(),
+            "reserve exceeds region count"
+        );
+        self.state_reserve += 1;
+    }
+
     pub fn is_used(&self, region: u32) -> bool {
         self.used[region as usize]
     }
@@ -50,8 +65,9 @@ impl Regions {
             return Err(Error::Full);
         }
         let keep = match claim {
-            Claim::Intake => self.reserve + CHECKPOINT_RESERVE,
-            Claim::Internal => CHECKPOINT_RESERVE,
+            Claim::Intake => self.reserve + CHECKPOINT_RESERVE + self.state_reserve,
+            Claim::Internal => CHECKPOINT_RESERVE + self.state_reserve,
+            Claim::State => CHECKPOINT_RESERVE,
             Claim::Checkpoint => 0,
         };
         if self.free <= keep {

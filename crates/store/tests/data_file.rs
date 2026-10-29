@@ -322,3 +322,24 @@ fn each_claim_stops_at_its_reserve() {
     assert_eq!(regions.free(), 2);
     assert_eq!(regions.count(), 6);
 }
+
+#[test]
+fn each_session_keeps_one_region_for_state() {
+    let mut regions = Regions::new(7, 1);
+    regions.add_state_reserve();
+    assert_eq!(regions.state_reserve(), 1);
+    for _ in 0..3 {
+        regions.acquire(Claim::Intake).expect("intake");
+    }
+    assert!(matches!(
+        regions.acquire(Claim::Intake),
+        Err(Error::Reserve)
+    ));
+    regions.acquire(Claim::Internal).expect("internal");
+    assert!(matches!(regions.acquire(Claim::Internal), Err(Error::Full)));
+    regions.acquire(Claim::State).expect("state");
+    assert!(matches!(regions.acquire(Claim::State), Err(Error::Full)));
+    regions.acquire(Claim::Checkpoint).expect("checkpoint");
+    regions.acquire(Claim::Checkpoint).expect("checkpoint");
+    assert_eq!(regions.free(), 0);
+}

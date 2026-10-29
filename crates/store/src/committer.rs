@@ -6,6 +6,7 @@ use std::time::Duration;
 use rt::{Buf, Receiver, Sender, channel};
 
 mod flight;
+mod runs;
 
 use crate::data_file::DataFile;
 use crate::error::Error;
@@ -17,6 +18,7 @@ use crate::regions::{Claim, Regions};
 use crate::session::{Answer, Event, Results, Session};
 use crate::usage::Usage;
 use flight::{Next, Parked, Queues};
+use runs::Runs;
 use sys::crc32c::checksum;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -68,6 +70,7 @@ pub(crate) enum Request {
     Answer(Answer),
     Allocate(Claim, Sender<Result<(u32, u64), Error>>),
     Seal(u32, u64),
+    ClaimState(usize, Sender<Result<(u32, u64), Error>>),
     Checkpoint(Sender<Result<u64, Error>>),
 }
 
@@ -170,6 +173,7 @@ pub struct Committer {
     inbox: Receiver<Request>,
     sessions: Vec<Option<Sender<Event>>>,
     queues: Queues,
+    runs: Runs,
     part_timeout: Duration,
     failed: bool,
 }
@@ -197,6 +201,10 @@ impl Committer {
             inbox,
             sessions: Vec::new(),
             queues: Queues::default(),
+            runs: Runs {
+                regions: state.runs,
+                appending: Vec::new(),
+            },
             part_timeout: PART_TIMEOUT,
             failed: false,
         };
@@ -207,6 +215,8 @@ impl Committer {
         let (events, receiver) = channel();
         let credits = Arc::new(AtomicU32::new(credits));
         self.sessions.push(Some(events));
+        self.runs.appending.push(None);
+        self.regions.add_state_reserve();
         let session = Session {
             id: self.sessions.len() - 1,
             client: client.clone(),
@@ -329,6 +339,14 @@ impl Committer {
                 }
             }
             Request::Answer(answer) => self.answer(answer),
+            Request::ClaimState(session, reply) => {
+                let result = if self.failed {
+                    Err(Error::Failed)
+                } else {
+                    self.claim_state(session)
+                };
+                let _ = reply.send(result);
+            }
             Request::Seal(region, epoch) => {
                 if self.epochs[region as usize] == epoch {
                     self.open[region as usize] = false;
@@ -526,6 +544,7 @@ impl Committer {
             && self.regions.is_used(region)
             && self.epochs[region as usize] == epoch
             && !self.checkpoint.contains(&region)
+            && !self.is_state(region)
             && self.allocations.iter().all(|a| a.region != region)
     }
 
@@ -543,6 +562,7 @@ impl Committer {
                 && self.regions.is_used(range.region)
                 && !self.checkpoint.contains(&range.region)
                 && !self.releasing(range.region)
+                && !self.is_state(range.region)
                 && self.epochs[range.region as usize] == range.epoch
                 && range.length > 0
                 && range.offset.is_multiple_of(sector)
