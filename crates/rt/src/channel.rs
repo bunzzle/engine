@@ -42,6 +42,10 @@ pub struct Sender<T> {
 }
 
 impl<T> Sender<T> {
+    pub fn is_closed(&self) -> bool {
+        !self.chan.lock().receiver_alive
+    }
+
     pub fn send(&self, value: T) -> Result<(), T> {
         let waker = {
             let mut state = self.chan.lock();

@@ -3,19 +3,20 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicU32;
 use std::time::Duration;
 
-use rt::{Buf, Receiver, Sender, channel, timeout};
+use rt::{Buf, Receiver, Sender, channel};
 
-use crate::checkpoint::{Part, Snapshot, encode, write_copy};
+mod flight;
+
 use crate::data_file::DataFile;
 use crate::error::Error;
-use crate::journal::{Allocation, Commit, Dead, Journal, Live, Position, Range};
+use crate::journal::{Allocation, Commit, Dead, Journal, Live, Range};
 use crate::reader::{Pins, Reader};
 use crate::record::{self, Header, MAX_PAYLOAD, record_size};
 use crate::recovery::State;
-use crate::regions::{CHECKPOINT_RESERVE, Claim, Regions};
+use crate::regions::{Claim, Regions};
 use crate::session::{Answer, Event, Results, Session};
-use crate::superblock::Checkpoint;
 use crate::usage::Usage;
+use flight::{Next, Parked, Queues};
 use sys::crc32c::checksum;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -64,6 +65,7 @@ pub(crate) enum Reply {
 
 pub(crate) enum Request {
     Commit(Submission, Reply),
+    Answer(Answer),
     Allocate(Claim, Sender<Result<(u32, u64), Error>>),
     Seal(u32, u64),
     Checkpoint(Sender<Result<u64, Error>>),
@@ -167,8 +169,7 @@ pub struct Committer {
     pins: Pins,
     inbox: Receiver<Request>,
     sessions: Vec<Option<Sender<Event>>>,
-    parts: Receiver<Answer>,
-    part_sender: Sender<Answer>,
+    queues: Queues,
     part_timeout: Duration,
     failed: bool,
 }
@@ -179,7 +180,6 @@ impl Committer {
         assert_eq!(state.regions.count(), count, "region count mismatch");
         assert_eq!(state.epochs.len(), count as usize, "epoch count mismatch");
         let (sender, inbox) = channel();
-        let (part_sender, parts) = channel();
         let committer = Self {
             data,
             journal,
@@ -196,8 +196,7 @@ impl Committer {
             pins: Pins::default(),
             inbox,
             sessions: Vec::new(),
-            parts,
-            part_sender,
+            queues: Queues::default(),
             part_timeout: PART_TIMEOUT,
             failed: false,
         };
@@ -211,7 +210,6 @@ impl Committer {
         let session = Session {
             id: self.sessions.len() - 1,
             client: client.clone(),
-            parts: self.part_sender.clone(),
             credits: Arc::clone(&credits),
         };
         (
@@ -261,28 +259,6 @@ impl Committer {
         }
     }
 
-    async fn collect_parts(&mut self, sequence: u64) -> Result<Vec<Part>, Error> {
-        self.broadcast(|| Event::Cut { sequence });
-        let mut waiting: Vec<usize> = (0..self.sessions.len())
-            .filter(|&s| self.sessions[s].is_some())
-            .collect();
-        let mut parts = Vec::new();
-        while !waiting.is_empty() {
-            let Ok(Some(answer)) = timeout(self.part_timeout, self.parts.recv()).await else {
-                panic!("checkpoint part missing from sessions {waiting:?} at cut {sequence}");
-            };
-            if answer.sequence != sequence || !waiting.contains(&answer.session) {
-                continue;
-            }
-            waiting.retain(|&s| s != answer.session);
-            if answer.parts.iter().any(|p| p.replay_sequence != sequence) {
-                return Err(Error::Invalid("part"));
-            }
-            parts.extend(answer.parts);
-        }
-        Ok(parts)
-    }
-
     pub fn reader(&self) -> Reader {
         self.data.reader(self.pins.clone())
     }
@@ -308,30 +284,34 @@ impl Committer {
     }
 
     pub async fn run(mut self) -> Self {
-        while let Some(first) = self.inbox.recv().await {
+        loop {
+            let first = match self.next_request().await {
+                Next::Request(request) => request,
+                Next::Tick => {
+                    self.settle().await;
+                    continue;
+                }
+                Next::Closed => break,
+            };
             let mut batch = Vec::new();
-            let mut requested = self.handle(first, &mut batch);
-            while requested.is_none()
-                && let Some(next) = self.inbox.try_recv()
-            {
-                requested = self.handle(next, &mut batch);
+            self.handle(first, &mut batch);
+            while let Some(next) = self.try_next_request() {
+                self.handle(next, &mut batch);
             }
             if !batch.is_empty() {
                 self.commit(batch).await;
             }
-            if let Some(reply) = requested {
-                let result = self.checkpoint().await.map(|p| p.sequence);
-                let _ = reply.send(result);
-            }
+            self.settle().await;
         }
+        self.close().await;
         self
     }
 
-    fn handle(
-        &mut self,
-        request: Request,
-        batch: &mut Vec<(Submission, Reply)>,
-    ) -> Option<Sender<Result<u64, Error>>> {
+    fn handle(&mut self, request: Request, batch: &mut Vec<(Submission, Reply)>) {
+        if self.defers(&request) {
+            self.queues.deferred.push_back(request);
+            return;
+        }
         match request {
             Request::Allocate(claim, reply) => {
                 let result = if self.failed {
@@ -348,136 +328,14 @@ impl Committer {
                     batch.push((submission, reply));
                 }
             }
+            Request::Answer(answer) => self.answer(answer),
             Request::Seal(region, epoch) => {
                 if self.epochs[region as usize] == epoch {
                     self.open[region as usize] = false;
                 }
             }
-            Request::Checkpoint(reply) => return Some(reply),
+            Request::Checkpoint(reply) => self.queues.requested.push_back(reply),
         }
-        None
-    }
-
-    pub async fn checkpoint(&mut self) -> Result<Position, Error> {
-        let mut cut = None;
-        let result = self.write_checkpoint(&mut cut).await;
-        if let Some(sequence) = cut {
-            if result.is_ok() {
-                self.broadcast(|| Event::Published { sequence });
-            } else {
-                self.broadcast(|| Event::Abandoned { sequence });
-            }
-        }
-        result
-    }
-
-    fn acquire_checkpoint_regions(&mut self) -> Result<Vec<u32>, Error> {
-        let mut regions = Vec::with_capacity(CHECKPOINT_RESERVE as usize);
-        for _ in 0..CHECKPOINT_RESERVE {
-            match self.regions.acquire(Claim::Checkpoint) {
-                Ok(region) => regions.push(region),
-                Err(e) => {
-                    for region in regions {
-                        self.regions.release(region);
-                    }
-                    return Err(e);
-                }
-            }
-        }
-        Ok(regions)
-    }
-
-    async fn write_checkpoint(&mut self, cut: &mut Option<u64>) -> Result<Position, Error> {
-        if self.failed {
-            return Err(Error::Failed);
-        }
-        let position = self.journal.position();
-        let count = self.regions.count();
-        let mut used: Vec<bool> = (0..count).map(|r| self.regions.is_used(r)).collect();
-        let mut epochs = self.epochs.clone();
-        for allocation in &self.allocations {
-            used[allocation.region as usize] = false;
-            epochs[allocation.region as usize] = allocation.epoch - 1;
-        }
-        let regions = self.acquire_checkpoint_regions()?;
-        *cut = Some(position.sequence);
-        let parts = match self.collect_parts(position.sequence).await {
-            Ok(parts) => parts,
-            Err(e) => {
-                for region in regions {
-                    self.regions.release(region);
-                }
-                return Err(e);
-            }
-        };
-        let pending: Vec<u32> = (0..count)
-            .filter(|&r| {
-                used[r as usize]
-                    && !self.open[r as usize]
-                    && self.usage.is_empty(r)
-                    && !self.usage.is_quarantined(r)
-                    && !self.checkpoint.contains(&r)
-                    && !self.carried.contains(&r)
-                    && !self.pins.is_pinned(r)
-                    && !self.busy.contains(&r)
-                    && !regions.contains(&r)
-            })
-            .collect();
-        for &region in &regions {
-            let epoch = &mut self.epochs[region as usize];
-            *epoch += 1;
-            used[region as usize] = true;
-            epochs[region as usize] = *epoch;
-        }
-        let mut release = self.checkpoint.clone();
-        release.extend_from_slice(&self.carried);
-        release.extend_from_slice(&pending);
-        let blob = encode(&Snapshot {
-            position,
-            record_sequence: self.sequence,
-            used,
-            epochs,
-            usage: self.usage.clone(),
-            release,
-            parts,
-        });
-        let sequence = self.data.superblock().sequence() + 1;
-        let mut copies = Vec::with_capacity(regions.len());
-        for &region in &regions {
-            let epoch = self.epochs[region as usize];
-            match write_copy(&self.data, region, epoch, sequence, &blob).await {
-                Ok(copy) => copies.push(copy),
-                Err(Error::CheckpointTooLarge) => {
-                    for region in regions {
-                        self.regions.release(region);
-                    }
-                    return Err(Error::CheckpointTooLarge);
-                }
-                Err(e) => {
-                    self.failed = true;
-                    return Err(e);
-                }
-            }
-        }
-        if let Err(e) = self.data.file().sync_data().await {
-            self.failed = true;
-            return Err(e.into());
-        }
-        let checkpoint = Checkpoint {
-            position,
-            copies: [copies[0], copies[1]],
-        };
-        let oldest = self.data.superblock().oldest_format();
-        if let Err(e) = self.data.update(Some(checkpoint), oldest).await {
-            self.failed = true;
-            return Err(e);
-        }
-        self.journal.release(position.sequence - 1);
-        for region in std::mem::replace(&mut self.checkpoint, regions) {
-            self.regions.release(region);
-        }
-        self.free_unpinned(pending);
-        Ok(position)
     }
 
     fn free_unpinned(&mut self, pending: Vec<u32>) {
@@ -567,22 +425,48 @@ impl Committer {
         commit.ranges.extend(ranges);
         self.busy = commit.ranges.iter().map(|r| r.region).collect();
         let mut reserved = self.journal.reserve(&commit);
-        if matches!(reserved, Err(Error::JournalFull)) && self.checkpoint().await.is_ok() {
+        if matches!(reserved, Err(Error::JournalFull)) {
+            if !self.checkpoint_in_flight() {
+                self.begin_checkpoint(None);
+                self.settle_flight().await;
+            }
+            if self.checkpoint_in_flight() {
+                self.busy.clear();
+                self.queues.parked = Some(Parked {
+                    commit,
+                    buffers,
+                    accepted,
+                });
+                return;
+            }
             reserved = self.journal.reserve(&commit);
         }
         self.busy.clear();
         if let Err(e) = reserved {
-            self.usage.forget();
-            for entry in accepted {
-                let error = match e {
-                    _ if self.failed => Error::Failed,
-                    Error::JournalFull => Error::JournalFull,
-                    _ => Error::CommitTooLarge,
-                };
-                self.reply(entry.reply, Err(error));
-            }
+            self.refuse(accepted, &e);
             return;
         }
+        self.finish_commit(commit, buffers, accepted).await;
+    }
+
+    fn refuse(&mut self, accepted: Vec<Accepted>, e: &Error) {
+        self.usage.forget();
+        for entry in accepted {
+            let error = match e {
+                _ if self.failed => Error::Failed,
+                Error::JournalFull => Error::JournalFull,
+                _ => Error::CommitTooLarge,
+            };
+            self.reply(entry.reply, Err(error));
+        }
+    }
+
+    async fn finish_commit(
+        &mut self,
+        commit: Commit,
+        buffers: Vec<(u64, Buf)>,
+        accepted: Vec<Accepted>,
+    ) {
         let Ok(sequence) = self.write(buffers, &commit).await else {
             self.usage.forget();
             self.failed = true;
@@ -600,8 +484,8 @@ impl Committer {
             };
             self.reply(entry.reply, Ok(durable));
         }
-        if self.due() {
-            let _ = self.checkpoint().await;
+        if self.due() && !self.checkpoint_in_flight() {
+            self.begin_checkpoint(None);
         }
     }
 
@@ -658,6 +542,7 @@ impl Committer {
             let valid = range.region < superblock.region_count()
                 && self.regions.is_used(range.region)
                 && !self.checkpoint.contains(&range.region)
+                && !self.releasing(range.region)
                 && self.epochs[range.region as usize] == range.epoch
                 && range.length > 0
                 && range.offset.is_multiple_of(sector)
