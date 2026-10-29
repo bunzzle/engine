@@ -3,7 +3,7 @@ use std::collections::VecDeque;
 use rt::{Buf, Sender, now, timeout};
 
 use super::{Accepted, Committer, Request};
-use crate::checkpoint::{Snapshot, encode, write_copy};
+use crate::checkpoint::{Snapshot, encode, parts_valid, write_copy};
 use crate::error::Error;
 use crate::journal::{Commit, Position};
 use crate::regions::{CHECKPOINT_RESERVE, Claim};
@@ -18,6 +18,7 @@ pub(super) struct Flight {
     regions: Vec<u32>,
     pending: Vec<u32>,
     waiting: Vec<usize>,
+    referenced: Vec<u32>,
     invalid: bool,
     deadline: Instant,
     reply: Option<CheckpointReply>,
@@ -56,7 +57,11 @@ impl Committer {
     }
 
     pub(super) fn defers(&self, request: &Request) -> bool {
-        self.queues.parked.is_some() && !matches!(request, Request::Answer(_) | Request::Seal(..))
+        self.queues.parked.is_some()
+            && !matches!(
+                request,
+                Request::Answer(_) | Request::Seal(..) | Request::ClaimState(..)
+            )
     }
 
     pub(super) fn try_next_request(&mut self) -> Option<Request> {
@@ -94,6 +99,7 @@ impl Committer {
     }
 
     pub(super) fn answer(&mut self, answer: Answer) {
+        let referenced = self.referenced(&answer.parts);
         let Some(flight) = self.queues.flight.as_mut() else {
             return;
         };
@@ -102,8 +108,12 @@ impl Committer {
             return;
         }
         flight.waiting.retain(|&s| s != answer.session);
-        if answer.parts.iter().any(|p| p.replay_sequence != cut) {
+        if answer.failed || answer.parts.iter().any(|p| p.replay_sequence != cut) {
             flight.invalid = true;
+        }
+        match referenced {
+            Some(regions) => flight.referenced.extend(regions),
+            None => flight.invalid = true,
         }
         flight.snapshot.parts.extend(answer.parts);
     }
@@ -152,6 +162,7 @@ impl Committer {
                     && self.usage.is_empty(r)
                     && !self.usage.is_quarantined(r)
                     && !self.checkpoint.contains(&r)
+                    && !self.is_state(r)
                     && !self.carried.contains(&r)
                     && !self.pins.is_pinned(r)
                     && !self.busy.contains(&r)
@@ -187,6 +198,7 @@ impl Committer {
                 regions,
                 pending,
                 waiting,
+                referenced: Vec::new(),
                 invalid: false,
                 deadline: Instant::from_nanos(now().as_nanos().saturating_add(
                     u64::try_from(self.part_timeout.as_nanos()).unwrap_or(u64::MAX),
@@ -253,7 +265,8 @@ impl Committer {
         };
         let sequence = flight.snapshot.position.sequence;
         let reply = flight.reply.take();
-        let result = if flight.invalid {
+        let shards = self.data.superblock().shards();
+        let result = if flight.invalid || !parts_valid(&flight.snapshot.parts, shards) {
             for &region in &flight.regions {
                 self.regions.release(region);
             }
@@ -274,11 +287,13 @@ impl Committer {
 
     async fn write_flight(&mut self, flight: Flight) -> Result<Position, Error> {
         let Flight {
-            snapshot,
+            mut snapshot,
             regions,
             pending,
+            referenced,
             ..
         } = flight;
+        self.mark_state(&mut snapshot, &referenced);
         let position = snapshot.position;
         let blob = encode(&snapshot);
         let sequence = self.data.superblock().sequence() + 1;
@@ -317,6 +332,7 @@ impl Committer {
             self.regions.release(region);
         }
         self.free_unpinned(pending);
+        self.release_state(&referenced);
         Ok(position)
     }
 

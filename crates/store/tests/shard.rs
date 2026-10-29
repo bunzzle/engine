@@ -114,7 +114,7 @@ fn frozen_deltas_are_copies_and_restore_under_newer_changes() {
     let mut state = ShardState::default();
     state.apply(&put(1, 1), location(1, 0), 1);
     state.apply(&put(2, 1), location(1, 128), 2);
-    let frozen = state.freeze();
+    let frozen = state.freeze(2);
     assert_eq!(frozen.covered, 2);
     assert_eq!(frozen.changes.len(), 2);
     state.apply(&put(1, 5), location(1, 256), 3);
@@ -130,7 +130,7 @@ fn frozen_deltas_are_copies_and_restore_under_newer_changes() {
         "a frozen delta keeps its values"
     );
     state.restore(frozen);
-    let merged = state.freeze();
+    let merged = state.freeze(4);
     assert_eq!(merged.changes[&1].map(|e| e.delivery.status), Some(5));
     assert_eq!(merged.changes[&2], None);
     assert_eq!(merged.covered, 4);

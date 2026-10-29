@@ -18,6 +18,7 @@ pub struct State {
     pub usage: Usage,
     pub record_sequence: u64,
     pub checkpoint: Vec<u32>,
+    pub runs: Vec<u32>,
 }
 
 impl State {
@@ -28,6 +29,7 @@ impl State {
             usage: Usage::new(count),
             record_sequence: 1,
             checkpoint: Vec::new(),
+            runs: Vec::new(),
         }
     }
 }

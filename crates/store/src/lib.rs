@@ -3,11 +3,13 @@ mod committer;
 mod data_file;
 mod error;
 mod journal;
+mod keeper;
 mod layout;
 mod reader;
 mod record;
 mod recovery;
 mod regions;
+mod run;
 mod session;
 mod shard;
 mod superblock;
@@ -20,6 +22,7 @@ pub use committer::{
 pub use data_file::{DataFile, Options};
 pub use error::Error;
 pub use journal::{Allocation, Commit, Dead, Entry, Journal, KIND_COMMIT, Live, Position, Range};
+pub use keeper::Keeper;
 pub use layout::{Fields, FieldsMut};
 pub use reader::{Owner, Pin, Pins, READ_ATTEMPTS, Reader};
 pub use record::{
@@ -28,6 +31,7 @@ pub use record::{
 };
 pub use recovery::{Recovered, State, recover};
 pub use regions::{CHECKPOINT_RESERVE, Claim, Regions};
+pub use run::{KIND_RUN, MAX_DELTAS, ROOT_SIZE, Root, Run, decode_roots, encode_roots, read_run};
 pub use session::{Event, Results, Session};
 pub use shard::{Change, Delivery, Delta, INDEX_SIZE, Index, Item, ShardState};
 pub use superblock::{

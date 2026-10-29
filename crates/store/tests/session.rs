@@ -62,7 +62,7 @@ fn part(tag: u16, sequence: u64) -> Part {
     Part {
         tag,
         replay_sequence: sequence,
-        bytes: vec![u8::try_from(tag).expect("fits"); 5],
+        bytes: Vec::new(),
     }
 }
 

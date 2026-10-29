@@ -156,7 +156,8 @@ impl ShardState {
         }
     }
 
-    pub fn freeze(&mut self) -> Delta {
+    pub fn freeze(&mut self, covered: u64) -> Delta {
+        self.covered = self.covered.max(covered);
         Delta {
             changes: std::mem::take(&mut self.delta),
             covered: self.covered,
