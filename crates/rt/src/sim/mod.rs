@@ -60,6 +60,7 @@ pub struct Config {
     pub net_latency: (Duration, Duration),
     pub wall_start_ms: u64,
     pub faults: Faults,
+    pub halt_after: Option<u64>,
 }
 
 impl Default for Config {
@@ -71,6 +72,7 @@ impl Default for Config {
             net_latency: (Duration::from_micros(50), Duration::from_millis(20)),
             wall_start_ms: 1_800_000_000_000,
             faults: Faults::default(),
+            halt_after: None,
         }
     }
 }
@@ -108,6 +110,8 @@ struct State {
     pending: BTreeMap<OpId, Pending>,
     waiting: BTreeSet<OpId>,
     done: BTreeMap<OpId, Completion>,
+    disk_ops: u64,
+    halted: bool,
 }
 
 fn bad_handle() -> io::Error {
@@ -190,9 +194,19 @@ impl State {
     }
 
     fn run(&mut self, id: OpId) {
+        if self.halted {
+            return;
+        }
         let Some(op) = self.pending.get_mut(&id).and_then(|p| p.op.take()) else {
             return;
         };
+        if matches!(
+            op,
+            Op::WriteAt { .. } | Op::SyncData { .. } | Op::SyncDir { .. } | Op::Allocate { .. }
+        ) {
+            self.disk_ops += 1;
+            self.halted = self.config.halt_after == Some(self.disk_ops);
+        }
         match self.execute(op) {
             Ok(completion) => {
                 if let Some(pending) = self.pending.remove(&id) {
@@ -528,6 +542,8 @@ impl SimDriver {
                 pending: BTreeMap::new(),
                 waiting: BTreeSet::new(),
                 done: BTreeMap::new(),
+                disk_ops: 0,
+                halted: false,
             }),
         }
     }
@@ -538,6 +554,14 @@ impl SimDriver {
 
     pub fn random(&self) -> u64 {
         self.state.borrow_mut().rng.next_u64()
+    }
+
+    pub fn disk_ops(&self) -> u64 {
+        self.state.borrow().disk_ops
+    }
+
+    pub fn is_halted(&self) -> bool {
+        self.state.borrow().halted
     }
 
     pub fn disk(&self) -> Disk {
@@ -628,6 +652,10 @@ pub fn check(seeds: Range<u64>, test: impl Fn(u64)) {
     let replay = env::var("SIM_SEED")
         .ok()
         .and_then(|s| s.parse::<u64>().ok());
+    let number = |name| env::var(name).ok().and_then(|s| s.parse::<u64>().ok());
+    let scale = number("SIM_SCALE").unwrap_or(1);
+    let start = seeds.start + number("SIM_OFFSET").unwrap_or(0);
+    let seeds = start..start + (seeds.end - seeds.start) * scale;
     let seeds: Vec<u64> = replay.map_or_else(|| seeds.collect(), |seed| vec![seed]);
     for seed in seeds {
         if let Err(failure) = panic::catch_unwind(AssertUnwindSafe(|| test(seed))) {

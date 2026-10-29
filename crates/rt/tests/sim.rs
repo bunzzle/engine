@@ -112,6 +112,42 @@ fn unsynced_data_survives_when_the_crash_keeps_everything() {
 }
 
 #[test]
+fn disk_operations_stop_after_the_halt_point() {
+    let writes = |halt_after| {
+        let config = Config {
+            halt_after,
+            ..faults(|f| f.crash_keep = MILLION)
+        };
+        let driver = Rc::new(SimDriver::new(5, config));
+        let done = Rc::new(RefCell::new(0u64));
+        let out = done.clone();
+        run(&driver, async move {
+            spawn(async move {
+                let file = File::open("/data", &create()).await.expect("open");
+                for step in 0..5u64 {
+                    let (written, _) = file.write_at(Buf::from_slice(b"y"), step).await;
+                    written.expect("write");
+                    *out.borrow_mut() += 1;
+                }
+            });
+            sleep(Duration::from_secs(1)).await;
+        });
+        (
+            driver.disk_ops(),
+            driver.is_halted(),
+            done.take(),
+            driver.crash(),
+        )
+    };
+    let (ops, halted, done, _) = writes(None);
+    assert_eq!((ops, halted, done), (5, false, 5));
+    let (ops, halted, done, disk) = writes(Some(3));
+    assert_eq!((ops, halted), (3, true));
+    assert!(done <= 3);
+    assert_eq!(disk.contents(Path::new("/data")), None);
+}
+
+#[test]
 fn new_files_need_a_directory_sync_to_survive() {
     let driver = Rc::new(SimDriver::new(4, Config::default()));
     run(&driver, async {
@@ -397,7 +433,7 @@ fn a_stalled_simulation_panics() {
 }
 
 #[test]
-#[should_panic(expected = "seed 2")]
+#[should_panic(expected = "bad seed")]
 fn failing_seeds_are_reported() {
-    check(0..5, |seed| assert!(seed != 2, "seed {seed}"));
+    check(0..5, |seed| assert!(seed % 5 != 2, "bad seed"));
 }
