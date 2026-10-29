@@ -4,6 +4,7 @@ use std::fmt;
 pub enum Error {
     Store(store::Error),
     Limit(&'static str),
+    State(&'static str),
 }
 
 impl fmt::Display for Error {
@@ -11,6 +12,7 @@ impl fmt::Display for Error {
         match self {
             Self::Store(e) => write!(f, "{e}"),
             Self::Limit(what) => write!(f, "{what} over the limit"),
+            Self::State(what) => write!(f, "refused: {what}"),
         }
     }
 }

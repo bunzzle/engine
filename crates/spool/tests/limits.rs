@@ -2,7 +2,7 @@ use std::rc::Rc;
 
 use rt::sim::{Config, SimDriver};
 use rt::{Runtime, spawn};
-use spool::{Body, Error, Head, HeadClear, Intake, Limits, Message, MessageId, SLICE, Slice};
+use spool::{Body, Error, Head, HeadClear, Limits, Message, MessageId, SLICE, Slice, Spool};
 use store::{DataFile, INDEX_SIZE, Ids, MAX_PAYLOAD, Options, SLOT_SIZE, Setup, boot, split_key};
 
 const PATH: &str = "/data/store";
@@ -116,7 +116,7 @@ fn intake_refuses_messages_over_the_limits() {
             .open()
             .await
             .expect("open");
-        let (intake, owner) = Intake::new(core, 1, LIMITS).expect("limits");
+        let (intake, owner) = Spool::new(core, 1, LIMITS).expect("limits");
         let owner = spawn(owner.run());
         let id = intake.id(0).await.expect("id");
         let full = SLICE as usize;
@@ -207,7 +207,7 @@ fn ids_take_a_new_boot_when_the_counter_runs_out() {
             .expect("open");
         let first = core.ids.boot(0).expect("boot");
         core.ids = Ids::starting_at(first, &core.shards, u32::MAX);
-        let (intake, owner) = Intake::new(core, 1, LIMITS).expect("limits");
+        let (intake, owner) = Spool::new(core, 1, LIMITS).expect("limits");
         let owner = spawn(owner.run());
         let last = intake.id(0).await.expect("id");
         assert_eq!(split_key(last.key), (first, u32::MAX));

@@ -10,6 +10,7 @@ use crate::bodies::{Writer, Written};
 use crate::error::Error;
 use crate::items::{BODY_ITEM, HeadClear, encode_slice, slice_item};
 use crate::limits::{Bounds, Limits, SLICE};
+use crate::recipients::Table;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct MessageId {
@@ -56,29 +57,31 @@ pub struct Message {
     pub slices: Vec<Slice>,
 }
 
-struct Inner {
-    node: u32,
+pub(crate) struct Inner {
+    pub(crate) node: u32,
     limits: Limits,
     bounds: Bounds,
-    region_size: u64,
-    changes: Changes,
+    pub(crate) region_size: u64,
+    pub(crate) changes: Changes,
     client: Client,
-    ids: RefCell<Ids>,
+    pub(crate) ids: RefCell<Ids>,
     writer: Writer,
+    pub(crate) table: RefCell<Table>,
 }
 
 #[derive(Clone)]
-pub struct Intake {
-    inner: Rc<Inner>,
+pub struct Spool {
+    pub(crate) inner: Rc<Inner>,
 }
 
-impl Intake {
+impl Spool {
     pub fn new(core: Core, node: u32, limits: Limits) -> Result<(Self, Shards), Error> {
         let region_size = core.file.superblock().region_size();
         let bounds = limits.check(region_size)?;
         let client = core.session.client().clone();
         let writer = Writer::new(client.clone(), core.file.clone());
         let ids = RefCell::new(core.ids.clone());
+        let table = RefCell::new(Table::rebuild(&core.keeper, &core.shards)?);
         let (shards, changes) = Shards::new(core);
         let inner = Inner {
             node,
@@ -89,6 +92,7 @@ impl Intake {
             client,
             ids,
             writer,
+            table,
         };
         Ok((
             Self {
@@ -158,7 +162,14 @@ impl Intake {
         let mut bytes = 0;
         let mut records = 0;
         let mut ranges = 0;
+        let mut entries = Vec::with_capacity(messages.len());
         for message in messages {
+            entries.push((
+                message.id,
+                message.tenant,
+                message.head.clear,
+                message.head.expiry,
+            ));
             let (batch, written) = self.batch(message)?;
             held.extend(written.into_iter().flat_map(|w| w.leases));
             bytes += batch
@@ -180,6 +191,10 @@ impl Intake {
         let created = self.inner.changes.create(batches).await;
         drop(held);
         created?;
+        let mut table = self.inner.table.borrow_mut();
+        for (id, tenant, head, expiry) in entries {
+            table.insert(id.shard, id.key, tenant, &head, expiry);
+        }
         Ok(())
     }
 

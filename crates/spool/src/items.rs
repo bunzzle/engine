@@ -71,3 +71,54 @@ pub fn slice_parts(payload: &[u8]) -> Option<(Vec<u32>, &[u8])> {
     let queues = (0..count).map(|n| fields.u32(4 + 4 * n)).collect();
     Some((queues, &payload[start..]))
 }
+
+pub const STATE_CLEAR: usize = 16;
+
+pub fn state_item(recipient: u32) -> u32 {
+    STATE_BASE + recipient
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Stamp {
+    pub boot: u32,
+    pub write: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StateClear {
+    pub class: u8,
+    pub notified: bool,
+    pub stamp: Stamp,
+}
+
+impl StateClear {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = vec![0; STATE_CLEAR];
+        let mut fields = FieldsMut::new(&mut out);
+        fields.put_u8(0, self.class);
+        fields.put_u8(1, u8::from(self.notified));
+        fields.put_u32(4, self.stamp.boot);
+        fields.put_u64(8, self.stamp.write);
+        out
+    }
+
+    pub fn decode(clear: &[u8]) -> Option<Self> {
+        if clear.len() != STATE_CLEAR {
+            return None;
+        }
+        let fields = Fields::new(clear);
+        let notified = match fields.u8(1) {
+            0 => false,
+            1 => true,
+            _ => return None,
+        };
+        (fields.bytes(2, 2) == [0, 0]).then(|| Self {
+            class: fields.u8(0),
+            notified,
+            stamp: Stamp {
+                boot: fields.u32(4),
+                write: fields.u64(8),
+            },
+        })
+    }
+}
