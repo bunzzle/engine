@@ -1,7 +1,7 @@
 use std::fmt;
 
-use crate::crc32c::checksum;
 use crate::layout::{Fields, FieldsMut};
+use sys::crc32c::checksum;
 
 pub const RECORD_HEADER_SIZE: usize = 40;
 pub const RECORD_ALIGN: usize = 8;

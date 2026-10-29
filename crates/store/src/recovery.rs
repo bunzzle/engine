@@ -2,12 +2,12 @@ use std::io;
 
 use rt::Buf;
 
-use crate::crc32c::Hasher;
 use crate::data_file::DataFile;
 use crate::error::Error;
 use crate::journal::{Entry, Journal, Position};
 use crate::regions::Regions;
 use crate::usage::Usage;
+use sys::crc32c::Hasher;
 
 const VERIFY_CHUNK: u64 = 1024 * 1024;
 

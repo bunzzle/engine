@@ -2,7 +2,6 @@ use std::collections::BTreeMap;
 
 use rt::Buf;
 
-use crate::crc32c::checksum;
 use crate::data_file::DataFile;
 use crate::error::Error;
 use crate::journal::Position;
@@ -11,6 +10,7 @@ use crate::record::{self, FLAG_MORE, Header, Record, record_size};
 use crate::recovery::State;
 use crate::superblock::CheckpointCopy;
 use crate::usage::{Count, Usage};
+use sys::crc32c::checksum;
 
 pub const KIND_CHECKPOINT: u8 = 2;
 
