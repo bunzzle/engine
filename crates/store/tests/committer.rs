@@ -380,3 +380,51 @@ fn records_carry_their_shard_and_unknown_shards_are_refused() {
         assert_eq!(Record::decode(&buf).expect("decode").shard(), 3);
     });
 }
+
+#[test]
+fn submissions_past_the_commit_limit_wait_for_the_next_commit() {
+    let driver = created(12);
+    run(&driver, async {
+        let (client, committer) = start(0).await;
+        let lease = client.allocate(Claim::Intake).await.expect("allocate");
+        let range = Range {
+            region: lease.region(),
+            epoch: lease.epoch(),
+            offset: 0,
+            length: 4096,
+            checksum: 0,
+        };
+        let bodies = |count: usize| Submission {
+            bodies: vec![
+                Body {
+                    shard: 0,
+                    tenant: 3,
+                    range,
+                };
+                count
+            ],
+            ..submission(Vec::new())
+        };
+        let sends: Vec<_> = [18_000, 40_000, 18_000]
+            .into_iter()
+            .map(|count| {
+                let client = client.clone();
+                let submission = bodies(count);
+                spawn(async move { client.commit(submission).await })
+            })
+            .collect();
+        let mut results = Vec::new();
+        for send in sends {
+            results.push(send.await);
+        }
+        let first = results[0].as_ref().expect("first fits");
+        assert!(matches!(results[1], Err(Error::CommitTooLarge)));
+        let third = results[2]
+            .as_ref()
+            .expect("third waits for the next commit");
+        assert!(third.sequence > first.sequence);
+        lease.seal();
+        drop(client);
+        drop(committer.await);
+    });
+}

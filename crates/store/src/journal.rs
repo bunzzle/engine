@@ -443,21 +443,20 @@ async fn read_exact(
     Ok((result? == len).then_some(buf))
 }
 
+pub(crate) fn fits(ranges: usize, allocations: usize, live: usize, dead: usize) -> bool {
+    let counts = [ranges, allocations, live, dead];
+    counts.iter().all(|&n| u16::try_from(n).is_ok())
+        && FIXED + ranges * RANGE + allocations * ALLOCATION + live * LIVE + dead * DEAD
+            <= MAX_PAYLOAD
+}
+
 fn commit_payload_size(commit: &Commit) -> Result<usize, Error> {
-    let size = FIXED
-        + commit.ranges.len() * RANGE
-        + commit.allocations.len() * ALLOCATION
-        + commit.live.len() * LIVE
-        + commit.dead.len() * DEAD;
-    if size > MAX_PAYLOAD
-        || u16::try_from(commit.ranges.len()).is_err()
-        || u16::try_from(commit.allocations.len()).is_err()
-        || u16::try_from(commit.live.len()).is_err()
-        || u16::try_from(commit.dead.len()).is_err()
-    {
+    let (ranges, allocations) = (commit.ranges.len(), commit.allocations.len());
+    let (live, dead) = (commit.live.len(), commit.dead.len());
+    if !fits(ranges, allocations, live, dead) {
         return Err(Error::CommitTooLarge);
     }
-    Ok(size)
+    Ok(FIXED + ranges * RANGE + allocations * ALLOCATION + live * LIVE + dead * DEAD)
 }
 
 fn encode_commit(previous: u32, commit: &Commit) -> Result<Vec<u8>, Error> {

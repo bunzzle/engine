@@ -11,7 +11,7 @@ mod runs;
 use crate::core_file::Source;
 use crate::data_file::DataFile;
 use crate::error::Error;
-use crate::journal::{Allocation, Commit, Dead, Journal, Live, Range};
+use crate::journal::{self, Allocation, Commit, Dead, Journal, Live, Range};
 use crate::reader::{Pins, Reader};
 use crate::record::{self, Header, MAX_PAYLOAD, record_size};
 use crate::recovery::State;
@@ -401,13 +401,28 @@ impl Committer {
         let mut live = BTreeMap::<(u32, u32), Live>::new();
         let mut dead = Vec::new();
         let mut accepted = Vec::new();
-        for (submission, reply) in batch {
+        let mut load = Load {
+            allocations: self.allocations.len(),
+            ..Load::default()
+        };
+        let base = load;
+        let mut batch = batch.into_iter();
+        while let Some((submission, reply)) = batch.next() {
+            if !load.add(&submission).fits() {
+                if base.add(&submission).fits() {
+                    self.defer(std::iter::once((submission, reply)).chain(batch));
+                    break;
+                }
+                self.reply(reply, Err(Error::CommitTooLarge));
+                continue;
+            }
             if !self.owns(&reply, &submission) {
                 self.reply(reply, Err(Error::Invalid("owner")));
                 continue;
             }
             match self.pack(&submission, &mut segments) {
                 Ok(locations) => {
+                    load = load.add(&submission);
                     count_live(&submission, &locations, &mut live);
                     ranges.extend(submission.bodies.iter().map(|b| b.range));
                     dead.extend_from_slice(&submission.dead);
@@ -476,6 +491,14 @@ impl Committer {
             return;
         }
         self.finish_commit(commit, buffers, accepted).await;
+    }
+
+    fn defer(&mut self, rest: impl DoubleEndedIterator<Item = (Submission, Reply)>) {
+        for (submission, reply) in rest.rev() {
+            self.queues
+                .deferred
+                .push_front(Request::Commit(submission, reply));
+        }
     }
 
     fn refuse(&mut self, accepted: Vec<Accepted>, e: &Error) {
@@ -675,6 +698,31 @@ impl Committer {
             stream.offset += size as u64;
         }
         Ok(locations)
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+struct Load {
+    ranges: usize,
+    allocations: usize,
+    live: usize,
+    dead: usize,
+}
+
+impl Load {
+    fn add(self, submission: &Submission) -> Self {
+        let bodies = submission.bodies.len();
+        let records = submission.records.len();
+        Self {
+            ranges: self.ranges + bodies + 1,
+            allocations: self.allocations + 1,
+            live: self.live + records + bodies,
+            dead: self.dead + submission.dead.len(),
+        }
+    }
+
+    fn fits(self) -> bool {
+        journal::fits(self.ranges, self.allocations, self.live, self.dead)
     }
 }
 
