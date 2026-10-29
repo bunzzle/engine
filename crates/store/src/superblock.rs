@@ -7,6 +7,7 @@ pub const FORMAT: u16 = 1;
 pub const COPIES: usize = 4;
 pub const SLOT_SIZE: u64 = 64 * 1024;
 pub const ZONE_SIZE: u64 = SLOT_SIZE * COPIES as u64;
+pub const MAX_SHARDS: u32 = 0x8000;
 pub const MIN_SECTOR_SIZE: u32 = 4096;
 pub const MAX_SECTOR_SIZE: u32 = 64 * 1024;
 
@@ -195,6 +196,7 @@ impl Superblock {
         }
         if self.region_count == 0
             || self.shards == 0
+            || self.shards > MAX_SHARDS
             || self.regions_offset != ZONE_SIZE + self.journal_size
         {
             return Err(Error::Invalid("layout"));

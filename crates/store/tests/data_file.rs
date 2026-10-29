@@ -5,8 +5,8 @@ use std::time::Duration;
 use rt::sim::{Config, Disk, Faults, SimDriver, check};
 use rt::{Buf, File, OpenOptions, Runtime, sleep, spawn};
 use store::{
-    Checkpoint, CheckpointCopy, Claim, DataFile, Error, FORMAT, Options, Position, Regions,
-    SLOT_SIZE, ZONE_SIZE,
+    Checkpoint, CheckpointCopy, Claim, DataFile, Error, FORMAT, MAX_SHARDS, Options, Position,
+    Regions, SLOT_SIZE, ZONE_SIZE,
 };
 
 const MILLION: u32 = 1_000_000;
@@ -125,6 +125,13 @@ fn create_refuses_bad_options_and_existing_files() {
             DataFile::create("/data/other", &bad).await,
             Err(Error::Config(_))
         ));
+        for shards in [0, MAX_SHARDS + 1] {
+            let bad = Options { shards, ..OPTIONS };
+            assert!(matches!(
+                DataFile::create("/data/other", &bad).await,
+                Err(Error::Config(_))
+            ));
+        }
         assert!(matches!(
             DataFile::create(PATH, &OPTIONS).await,
             Err(Error::Io(_))

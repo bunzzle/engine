@@ -11,7 +11,7 @@ mod regions;
 mod superblock;
 mod usage;
 
-pub use checkpoint::{KIND_CHECKPOINT, Loaded, Part, load};
+pub use checkpoint::{KIND_CHECKPOINT, Loaded, PART_TAG_OTHER, Part, load};
 pub use committer::{Body, Client, Committer, Durable, Lease, Location, Submission, Write};
 pub use data_file::{DataFile, Options};
 pub use error::Error;
@@ -20,13 +20,13 @@ pub use layout::{Fields, FieldsMut};
 pub use reader::{Owner, Pin, Pins, READ_ATTEMPTS, Reader};
 pub use record::{
     FLAG_MORE, Header, MAX_PAYLOAD, RECORD_ALIGN, RECORD_FORMAT, RECORD_HEADER_SIZE, Record,
-    RecordError, chunks, encode, peek, peek_header, record_size,
+    RecordError, SYSTEM_SHARD, chunks, encode, peek, peek_header, record_size,
 };
 pub use recovery::{Recovered, State, recover};
 pub use regions::{CHECKPOINT_RESERVE, Claim, Regions};
 pub use superblock::{
-    COPIES, Checkpoint, CheckpointCopy, FORMAT, MAX_SECTOR_SIZE, MIN_SECTOR_SIZE, SLOT_SIZE,
-    Superblock, ZONE_SIZE,
+    COPIES, Checkpoint, CheckpointCopy, FORMAT, MAX_SECTOR_SIZE, MAX_SHARDS, MIN_SECTOR_SIZE,
+    SLOT_SIZE, Superblock, ZONE_SIZE,
 };
 pub use sys::crc32c::checksum;
 pub use usage::{Count, Usage};
