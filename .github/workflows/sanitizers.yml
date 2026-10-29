@@ -50,3 +50,4 @@ jobs:
       - run: cargo "+$NIGHTLY" test --locked -Zbuild-std --target "$TARGET" -p sys --lib --test uring
       - run: cargo "+$NIGHTLY" test --locked -Zbuild-std --target "$TARGET" -p rt --test native
       - run: cargo "+$NIGHTLY" test --locked -Zbuild-std --target "$TARGET" -p store --test native
+      - run: cargo "+$NIGHTLY" test --locked -Zbuild-std --target "$TARGET" -p store --test threads

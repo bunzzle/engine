@@ -208,7 +208,11 @@ fn region_after_pinning(seed: u64, pinned: u32, unpinned: u32) -> bool {
         let body = Submission {
             claim: Claim::Intake,
             records: Vec::new(),
-            bodies: vec![Body { tenant: 4, range }],
+            bodies: vec![Body {
+                shard: 0,
+                tenant: 4,
+                range,
+            }],
             dead: Vec::new(),
         };
         client.commit(body).await.expect("commit body");

@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use rt::Buf;
 
 use crate::committer::Location;
-use crate::data_file::DataFile;
+use crate::core_file::CoreFile;
 use crate::error::Error;
 use crate::layout::{Fields, FieldsMut};
 use crate::record::{self, FLAG_MORE, Header, Record, record_size};
@@ -192,7 +192,7 @@ pub(crate) fn disk_size(blob: &[u8], sector: usize) -> usize {
 }
 
 pub(crate) async fn write(
-    data: &DataFile,
+    data: &CoreFile,
     region: u32,
     epoch: u64,
     offset: u64,
@@ -235,7 +235,7 @@ pub(crate) async fn write(
     })
 }
 
-pub async fn read_run(data: &DataFile, root: &Root, shard: u16) -> Result<Run, Error> {
+pub async fn read_run(data: &CoreFile, root: &Root, shard: u16) -> Result<Run, Error> {
     let damaged = Error::Damaged {
         region: root.region,
         offset: root.offset,

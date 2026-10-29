@@ -245,7 +245,11 @@ fn empty_sealed_regions_are_freed_by_the_next_checkpoint() {
         };
         client
             .commit(Submission {
-                bodies: vec![Body { tenant: 4, range }],
+                bodies: vec![Body {
+                    shard: 0,
+                    tenant: 4,
+                    range,
+                }],
                 ..submission(4, Vec::new(), Vec::new())
             })
             .await
@@ -266,7 +270,11 @@ fn empty_sealed_regions_are_freed_by_the_next_checkpoint() {
         client.checkpoint().await.expect("checkpoint");
         let late = client
             .commit(Submission {
-                bodies: vec![Body { tenant: 4, range }],
+                bodies: vec![Body {
+                    shard: 0,
+                    tenant: 4,
+                    range,
+                }],
                 ..submission(4, Vec::new(), Vec::new())
             })
             .await;

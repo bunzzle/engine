@@ -48,7 +48,7 @@ impl fmt::Display for Error {
                 f.write_str("newest superblock does not chain to its parent")
             }
             Self::SequenceSkipped => f.write_str("superblock sequence skipped"),
-            Self::Invalid(why) => write!(f, "invalid superblock: {why}"),
+            Self::Invalid(why) => write!(f, "invalid {why}"),
             Self::UnsupportedSectorSize(size) => write!(f, "unsupported sector size {size}"),
             Self::SectorSizeChanged { stored, found } => {
                 write!(f, "sector size changed from {stored} to {found}")

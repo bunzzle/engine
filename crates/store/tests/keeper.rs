@@ -5,12 +5,13 @@ use std::panic::{self, AssertUnwindSafe};
 use std::rc::Rc;
 use std::time::Duration;
 
-use rt::sim::{Config, Disk, SimDriver, check};
-use rt::{JoinHandle, Runtime, sleep, spawn};
+use rt::sim::{Config, Disk, Machine, SimDriver, Stalls, check};
+use rt::{JoinHandle, Runtime, sleep, spawn, timeout};
 use store::{
-    Body, Change, Claim, Client, Committer, DataFile, Dead, Delivery, Error, Event, Index, Item,
-    KIND_STATE, Keeper, Location, MAX_DELTAS, Options, Part, Range, Results, Root, SLOT_SIZE,
-    Session, ShardState, Submission, Write, encode_roots, load, read_run, recover,
+    Body, Change, Claim, Client, Committer, CoreFile, DataFile, Dead, Delivery, Error, Event,
+    Index, Item, KIND_STATE, Keeper, Location, MAX_DELTAS, Options, Part, Range, Results, Root,
+    SLOT_SIZE, Session, Setup, ShardState, Source, Start, Submission, Write, boot, encode_roots,
+    load, read_run, recover,
 };
 
 const PATH: &str = "/data/store";
@@ -32,7 +33,14 @@ fn run<T: 'static>(seed: u64, future: impl Future<Output = T> + 'static) -> T {
     Runtime::new(driver).block_on(future)
 }
 
-async fn start(sessions: u32) -> (Client, Vec<(Session, Results)>, JoinHandle<Committer>) {
+async fn start(
+    sessions: u32,
+) -> (
+    Client,
+    Vec<(Session, Results)>,
+    Source,
+    JoinHandle<Committer>,
+) {
     let data = DataFile::open(PATH).await.expect("open");
     let loaded = load(&data, 0).await.expect("load");
     let recovered = recover(&data, loaded.position, loaded.state)
@@ -43,29 +51,38 @@ async fn start(sessions: u32) -> (Client, Vec<(Session, Results)>, JoinHandle<Co
     let sessions = (0..sessions)
         .map(|_| committer.session(&client, 8))
         .collect();
-    (client, sessions, spawn(committer.run()))
+    let source = committer.source();
+    (client, sessions, source, spawn(committer.run()))
 }
 
 struct Core {
     session: Session,
     results: Results,
     keeper: Keeper,
-    data: DataFile,
+    data: CoreFile,
     sent: BTreeMap<u64, (u16, Vec<Index>)>,
     tag: u64,
 }
 
 impl Core {
-    async fn new((session, results): (Session, Results)) -> Self {
+    async fn new(pair: (Session, Results), source: &Source) -> Self {
+        Self::owning(pair, source, &ALL).await
+    }
+
+    async fn owning(
+        (session, results): (Session, Results),
+        source: &Source,
+        shards: &[u16],
+    ) -> Self {
         let mut keeper = Keeper::default();
-        for shard in 0..SHARDS {
+        for &shard in shards {
             keeper.insert(shard, ShardState::default(), Vec::new());
         }
         Self {
             session,
             results,
             keeper,
-            data: DataFile::open(PATH).await.expect("open"),
+            data: source.open().await.expect("open"),
             sent: BTreeMap::new(),
             tag: 0,
         }
@@ -140,7 +157,9 @@ impl Core {
 
     async fn check(&self) {
         for shard in 0..SHARDS {
-            let roots = self.keeper.roots(shard).expect("kept");
+            let Some(roots) = self.keeper.roots(shard) else {
+                continue;
+            };
             assert!(roots.len() <= MAX_DELTAS + 1);
             assert!(roots.first().is_none_or(|r| r.base));
             let state = self.keeper.state(shard).expect("kept");
@@ -149,7 +168,7 @@ impl Core {
     }
 }
 
-async fn fold(data: &DataFile, shard: u16, roots: &[Root]) -> BTreeMap<u64, Item> {
+async fn fold(data: &CoreFile, shard: u16, roots: &[Root]) -> BTreeMap<u64, Item> {
     let mut map = BTreeMap::new();
     for root in roots {
         let run = read_run(data, root, shard).await.expect("run");
@@ -189,8 +208,8 @@ fn delete(key: u64) -> Index {
 #[test]
 fn runs_hold_the_shard_state_across_checkpoints_and_restarts() {
     run(21, async {
-        let (client, mut sessions, committer) = start(1).await;
-        let mut core = Core::new(sessions.remove(0)).await;
+        let (client, mut sessions, source, committer) = start(1).await;
+        let mut core = Core::new(sessions.remove(0), &source).await;
         let mut deltas = 0;
         let mut bases = 0;
         for round in 0..60u64 {
@@ -240,6 +259,8 @@ fn runs_hold_the_shard_state_across_checkpoints_and_restarts() {
         drop(committer);
         let data = DataFile::open(PATH).await.expect("reopen");
         let loaded = load(&data, 0).await.expect("load");
+        drop(data);
+        let file = core_file().await;
         assert_ne!(loaded.state.runs.len(), 0);
         for &region in &loaded.state.runs {
             assert!(loaded.state.regions.is_used(region));
@@ -248,7 +269,7 @@ fn runs_hold_the_shard_state_across_checkpoints_and_restarts() {
             let roots = store::decode_roots(&part.bytes).expect("roots");
             let shard = part.tag;
             assert_eq!(
-                fold(&data, shard, &roots).await,
+                fold(&file, shard, &roots).await,
                 expected[usize::from(shard)]
             );
         }
@@ -264,7 +285,14 @@ fn fail_cut(session: Session, mut results: Results, failing: u32) -> JoinHandle<
                 if cuts == failing {
                     session.fail(sequence).expect("fail");
                 } else {
-                    session.parts(sequence, Vec::new()).expect("parts");
+                    let parts = [1, 3]
+                        .map(|tag| Part {
+                            tag,
+                            replay_sequence: sequence,
+                            bytes: encode_roots(&[]),
+                        })
+                        .to_vec();
+                    session.parts(sequence, parts).expect("parts");
                 }
                 cuts += 1;
             }
@@ -275,28 +303,28 @@ fn fail_cut(session: Session, mut results: Results, failing: u32) -> JoinHandle<
 #[test]
 fn an_abandoned_cut_keeps_its_changes_for_the_next_one() {
     run(22, async {
-        let (client, mut sessions, _committer) = start(2).await;
+        let (client, mut sessions, source, _committer) = start(2).await;
         let other = sessions.pop().expect("second");
         let _failing = fail_cut(other.0, other.1, 1);
-        let mut core = Core::new(sessions.remove(0)).await;
+        let mut core = Core::owning(sessions.remove(0), &source, &[0, 2]).await;
         for key in 0..5 {
-            core.change(1, put(key, 1)).await;
+            core.change(2, put(key, 1)).await;
         }
         core.checkpoint(&client).await.expect("checkpoint");
-        let base = core.keeper.roots(1).expect("kept").to_vec();
+        let base = core.keeper.roots(2).expect("kept").to_vec();
         assert_eq!(base.len(), 1);
-        core.change(1, delete(2)).await;
-        core.change(1, put(6, 3)).await;
+        core.change(2, delete(2)).await;
+        core.change(2, put(6, 3)).await;
         assert!(matches!(
             core.checkpoint(&client).await,
             Err(Error::Invalid("part"))
         ));
-        assert_eq!(core.keeper.roots(1).expect("kept"), base.as_slice());
-        core.change(1, put(9, 4)).await;
+        assert_eq!(core.keeper.roots(2).expect("kept"), base.as_slice());
+        core.change(2, put(9, 4)).await;
         core.checkpoint(&client).await.expect("checkpoint");
-        let roots = core.keeper.roots(1).expect("kept");
+        let roots = core.keeper.roots(2).expect("kept");
         assert_eq!(roots.len(), 2, "the next cut writes a delta");
-        let entries = fold(&core.data, 1, roots).await;
+        let entries = fold(&core.data, 2, roots).await;
         let keys: Vec<u64> = entries.keys().copied().collect();
         assert_eq!(keys, vec![0, 1, 3, 4, 6, 9]);
         core.check().await;
@@ -306,7 +334,7 @@ fn an_abandoned_cut_keeps_its_changes_for_the_next_one() {
 #[test]
 fn a_root_outside_the_state_regions_abandons_the_checkpoint() {
     run(23, async {
-        let (client, mut sessions, _committer) = start(1).await;
+        let (client, mut sessions, _source, _committer) = start(1).await;
         let (session, mut results) = sessions.remove(0);
         let answer = spawn(async move {
             while let Some(event) = results.recv().await {
@@ -341,8 +369,8 @@ fn a_root_outside_the_state_regions_abandons_the_checkpoint() {
 #[test]
 fn bodies_and_dead_entries_cannot_point_into_state_regions() {
     run(24, async {
-        let (client, mut sessions, committer) = start(1).await;
-        let mut core = Core::new(sessions.remove(0)).await;
+        let (client, mut sessions, source, committer) = start(1).await;
+        let mut core = Core::new(sessions.remove(0), &source).await;
         core.change(0, put(1, 1)).await;
         core.checkpoint(&client).await.expect("checkpoint");
         let root = core.keeper.roots(0).expect("kept")[0];
@@ -350,6 +378,7 @@ fn bodies_and_dead_entries_cannot_point_into_state_regions() {
             claim: Claim::Intake,
             records: Vec::new(),
             bodies: vec![Body {
+                shard: 0,
                 tenant: 7,
                 range: Range {
                     region: root.region,
@@ -361,9 +390,13 @@ fn bodies_and_dead_entries_cannot_point_into_state_regions() {
             }],
             dead: Vec::new(),
         };
+        core.session.submit(1, body).expect("credit");
         assert!(matches!(
-            client.commit(body).await,
-            Err(Error::Invalid("range"))
+            core.results.recv().await,
+            Some(Event::Rejected {
+                tag: 1,
+                error: Error::Invalid("range")
+            })
         ));
         let dead = Submission {
             claim: Claim::Intake,
@@ -391,8 +424,8 @@ fn bodies_and_dead_entries_cannot_point_into_state_regions() {
 #[test]
 fn a_new_base_follows_the_last_allowed_delta() {
     run(25, async {
-        let (client, mut sessions, _committer) = start(1).await;
-        let mut core = Core::new(sessions.remove(0)).await;
+        let (client, mut sessions, source, _committer) = start(1).await;
+        let mut core = Core::new(sessions.remove(0), &source).await;
         for chunk in 0..4 {
             core.changes(
                 2,
@@ -418,6 +451,16 @@ fn a_new_base_follows_the_last_allowed_delta() {
 
 const ALL: [u16; SHARDS as usize] = [0, 1, 2, 3];
 
+async fn core_file() -> CoreFile {
+    let data = DataFile::open(PATH).await.expect("open");
+    let loaded = load(&data, 0).await.expect("load");
+    let recovered = recover(&data, loaded.position, loaded.state)
+        .await
+        .expect("recover");
+    let (committer, _client) = Committer::new(data, recovered.journal, recovered.state);
+    committer.source().open().await.expect("open")
+}
+
 async fn rebuild(shards: &[u16]) -> Keeper {
     let data = DataFile::open(PATH).await.expect("open");
     let loaded = load(&data, 0).await.expect("load");
@@ -425,7 +468,9 @@ async fn rebuild(shards: &[u16]) -> Keeper {
     let recovered = recover(&data, loaded.position, loaded.state)
         .await
         .expect("recover");
-    Keeper::rebuild(&data, &parts, &recovered.entries, shards)
+    drop(data);
+    let file = core_file().await;
+    Keeper::rebuild(&file, &parts, &recovered.entries, shards)
         .await
         .expect("rebuild")
 }
@@ -447,8 +492,8 @@ fn moved(core: &Core, shard: u16, key: u64) -> Index {
 #[test]
 fn a_restart_rebuilds_runs_and_the_journal_after_them() {
     run(26, async {
-        let (client, mut sessions, committer) = start(1).await;
-        let mut core = Core::new(sessions.remove(0)).await;
+        let (client, mut sessions, source, committer) = start(1).await;
+        let mut core = Core::new(sessions.remove(0), &source).await;
         for round in 0..12u64 {
             let shard = u16::try_from(round % 4).expect("fits");
             core.changes(shard, (0..6).map(|k| put(round + k, 1)).collect())
@@ -478,6 +523,7 @@ fn a_restart_rebuilds_runs_and_the_journal_after_them() {
                 payload: put(99, 9).payload(&[2; 16]),
             }],
             bodies: vec![Body {
+                shard: 0,
                 tenant: 7,
                 range: Range {
                     region: lease.region(),
@@ -528,13 +574,15 @@ fn a_restart_rebuilds_runs_and_the_journal_after_them() {
 #[derive(Clone, Default)]
 struct Model {
     acked: Vec<(u16, Index, Location, u64)>,
-    inflight: Option<(u16, Index)>,
+    inflight: BTreeMap<u16, Index>,
 }
 
 type Shared = Rc<RefCell<Model>>;
 
 const MILLION: u32 = 1_000_000;
 const HORIZON: Duration = Duration::from_secs(60);
+const CORES: u16 = 2;
+const STEPS: u64 = 24;
 
 fn created(seed: u64) -> Disk {
     let setup = Rc::new(SimDriver::new(seed, Config::default()));
@@ -562,18 +610,13 @@ fn step_index(step: u64, state: &ShardState) -> Index {
     }
 }
 
-async fn keep(core: (Session, Results), model: Shared) {
-    let (session, mut results) = core;
-    let Ok(data) = DataFile::open(PATH).await else {
+async fn keep(start: Start, model: Shared) {
+    let Ok(mut core) = start.open().await else {
         return;
     };
-    let mut keeper = Keeper::default();
-    for shard in ALL {
-        keeper.insert(shard, ShardState::default(), Vec::new());
-    }
-    for step in 0..48u64 {
-        let shard = u16::try_from(step % 3).expect("fits");
-        let index = step_index(step, keeper.state(shard).expect("kept"));
+    for step in 0..STEPS {
+        let shard = core.shards[usize::try_from(step).expect("fits") % core.shards.len()];
+        let index = step_index(step, core.keeper.state(shard).expect("kept"));
         let submission = Submission {
             claim: Claim::Intake,
             records: vec![Write {
@@ -585,30 +628,35 @@ async fn keep(core: (Session, Results), model: Shared) {
             bodies: Vec::new(),
             dead: Vec::new(),
         };
-        model.borrow_mut().inflight = Some((shard, index));
-        if session.submit(step, submission).is_err() {
+        model.borrow_mut().inflight.insert(shard, index);
+        if core.session.submit(step, submission).is_err() {
             return;
         }
         loop {
-            match results.recv().await {
+            match core.results.recv().await {
                 Some(Event::Durable {
                     sequence,
                     locations,
                     ..
                 }) => {
-                    keeper.apply(shard, &index, locations[0], sequence);
+                    core.keeper.apply(shard, &index, locations[0], sequence);
                     let mut model = model.borrow_mut();
-                    model.inflight = None;
+                    model.inflight.remove(&shard);
                     model.acked.push((shard, index, locations[0], sequence));
                     break;
                 }
                 Some(Event::Cut { sequence }) => {
-                    if keeper.cut(&session, &data, sequence).await.is_err() {
+                    if core
+                        .keeper
+                        .cut(&core.session, &core.file, sequence)
+                        .await
+                        .is_err()
+                    {
                         return;
                     }
                 }
-                Some(Event::Published { sequence }) => keeper.published(sequence),
-                Some(Event::Abandoned { sequence }) => keeper.abandoned(sequence),
+                Some(Event::Published { sequence }) => core.keeper.published(sequence),
+                Some(Event::Abandoned { sequence }) => core.keeper.abandoned(sequence),
                 Some(Event::Rejected { .. }) | None => return,
             }
         }
@@ -625,34 +673,47 @@ fn workload(seed: u64, halt_after: Option<u64>, disk: Disk) -> (Rc<SimDriver>, M
         ..Config::default()
     };
     let driver = Rc::new(SimDriver::with_disk(seed, config, disk));
+    let stalls = Stalls {
+        per_mille: 100,
+        max: Duration::from_millis(2),
+    };
+    let machine = Machine::new(Rc::clone(&driver), usize::from(CORES) + 1, stalls);
+    let setup = Setup {
+        cores: CORES,
+        credits: 1,
+        reserve: 0,
+    };
+    let Ok(booted) = machine.block_on(0, boot(PATH, setup)) else {
+        return (driver, Model::default());
+    };
     let model = Shared::default();
-    let shared = model.clone();
-    Runtime::new(driver.clone()).block_on(async move {
-        let Ok(data) = DataFile::open(PATH).await else {
-            return;
-        };
-        let Ok(loaded) = load(&data, 0).await else {
-            return;
-        };
-        let Ok(recovered) = recover(&data, loaded.position, loaded.state).await else {
-            return;
-        };
-        let (mut committer, client) = Committer::new(data, recovered.journal, recovered.state);
-        let core = committer.session(&client, 1);
-        let committer = spawn(committer.run());
-        let task = spawn(keep(core, shared));
-        spawn(async move {
+    let committer = machine.spawn_on(0, booted.committer.run());
+    let tasks: Vec<_> = booted
+        .starts
+        .into_iter()
+        .map(|start| {
+            let core = usize::from(start.index()) + 1;
+            machine.spawn_on(core, keep(start, Rc::clone(&model)))
+        })
+        .collect();
+    let client = booted.client;
+    machine.block_on(0, async move {
+        let checkpoints = spawn(async move {
             for _ in 0..6 {
                 sleep(Duration::from_millis(3)).await;
                 if client.checkpoint().await.is_err() {
                     break;
                 }
             }
-            task.await;
-            drop(client);
-            drop(committer.await);
         });
-        sleep(HORIZON).await;
+        let done = async move {
+            for task in tasks {
+                task.await;
+            }
+            checkpoints.await;
+            drop(committer.await);
+        };
+        let _ = timeout(HORIZON, done).await;
     });
     let model = model.borrow().clone();
     (driver, model)
@@ -675,10 +736,10 @@ fn audit(model: &Model, rebuilt: &Keeper) {
         if found == state.entries() {
             continue;
         }
-        let (inflight, index) = model
+        let index = *model
             .inflight
-            .expect("only an unanswered change may differ");
-        assert_eq!(inflight, shard, "shard {shard} differs");
+            .get(&shard)
+            .unwrap_or_else(|| panic!("shard {shard} differs"));
         let location = found.get(&index.key).map_or(
             Location {
                 region: 0,
@@ -719,7 +780,11 @@ fn shard_state_survives_a_crash_at_every_disk_operation() {
         .and_then(|s| s.parse::<u64>().ok());
     check(0..1, |seed| {
         let (driver, model) = workload(seed, None, created(seed));
-        assert_eq!(model.acked.len(), 48, "workload ran");
+        assert_eq!(
+            model.acked.len(),
+            usize::from(CORES) * usize::try_from(STEPS).expect("fits"),
+            "workload ran"
+        );
         let total = driver.disk_ops();
         let points: Vec<u64> = only.map_or_else(|| (1..=total).collect(), |p| vec![p]);
         for point in points {
