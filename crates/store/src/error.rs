@@ -26,6 +26,8 @@ pub enum Error {
     CommitTooLarge,
     Lost { sequence: u64, newer: u64 },
     BadCommit(u64),
+    CheckpointLost,
+    CheckpointTooLarge,
     Record(RecordError),
 }
 
@@ -65,6 +67,8 @@ impl fmt::Display for Error {
             Self::BadCommit(sequence) => {
                 write!(f, "commit {sequence} does not match the recovered state")
             }
+            Self::CheckpointLost => f.write_str("no valid checkpoint copy"),
+            Self::CheckpointTooLarge => f.write_str("checkpoint does not fit in a region"),
             Self::Record(e) => e.fmt(f),
         }
     }

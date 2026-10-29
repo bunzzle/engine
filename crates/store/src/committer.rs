@@ -1,12 +1,14 @@
 use rt::{Buf, Receiver, Sender, channel};
 
+use crate::checkpoint::{Snapshot, encode, write_copy};
 use crate::crc32c::checksum;
 use crate::data_file::DataFile;
 use crate::error::Error;
-use crate::journal::{Allocation, Commit, Journal, Range};
+use crate::journal::{Allocation, Commit, Journal, Position, Range};
 use crate::record::{self, Header, MAX_PAYLOAD, record_size};
 use crate::recovery::State;
-use crate::regions::{Claim, Regions};
+use crate::regions::{CHECKPOINT_RESERVE, Claim, Regions};
+use crate::superblock::Checkpoint;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Write {
@@ -40,6 +42,7 @@ pub struct Durable {
 enum Request {
     Commit(Submission, Sender<Result<Durable, Error>>),
     Allocate(Claim, Sender<Result<(u32, u64), Error>>),
+    Checkpoint(Sender<Result<u64, Error>>),
 }
 
 #[derive(Clone)]
@@ -63,6 +66,14 @@ impl Client {
     pub async fn allocate(&self, claim: Claim) -> Result<(u32, u64), Error> {
         let (reply, mut answer) = channel();
         if self.sender.send(Request::Allocate(claim, reply)).is_err() {
+            return Err(Error::Failed);
+        }
+        answer.recv().await.unwrap_or(Err(Error::Failed))
+    }
+
+    pub async fn checkpoint(&self) -> Result<u64, Error> {
+        let (reply, mut answer) = channel();
+        if self.sender.send(Request::Checkpoint(reply)).is_err() {
             return Err(Error::Failed);
         }
         answer.recv().await.unwrap_or(Err(Error::Failed))
@@ -95,6 +106,7 @@ pub struct Committer {
     stream: Option<Stream>,
     allocations: Vec<Allocation>,
     sequence: u64,
+    checkpoint: Vec<u32>,
     inbox: Receiver<Request>,
     failed: bool,
 }
@@ -113,6 +125,7 @@ impl Committer {
             stream: None,
             allocations: Vec::new(),
             sequence: state.record_sequence,
+            checkpoint: state.checkpoint,
             inbox,
             failed: false,
         };
@@ -138,12 +151,18 @@ impl Committer {
     pub async fn run(mut self) -> Self {
         while let Some(first) = self.inbox.recv().await {
             let mut batch = Vec::new();
-            self.handle(first, &mut batch);
-            while let Some(next) = self.inbox.try_recv() {
-                self.handle(next, &mut batch);
+            let mut requested = self.handle(first, &mut batch);
+            while requested.is_none()
+                && let Some(next) = self.inbox.try_recv()
+            {
+                requested = self.handle(next, &mut batch);
             }
             if !batch.is_empty() {
                 self.commit(batch).await;
+            }
+            if let Some(reply) = requested {
+                let result = self.checkpoint().await.map(|p| p.sequence);
+                let _ = reply.send(result);
             }
         }
         self
@@ -153,7 +172,7 @@ impl Committer {
         &mut self,
         request: Request,
         batch: &mut Vec<(Submission, Sender<Result<Durable, Error>>)>,
-    ) {
+    ) -> Option<Sender<Result<u64, Error>>> {
         match request {
             Request::Allocate(claim, reply) => {
                 let result = if self.failed {
@@ -170,7 +189,89 @@ impl Committer {
                     batch.push((submission, reply));
                 }
             }
+            Request::Checkpoint(reply) => return Some(reply),
         }
+        None
+    }
+
+    pub async fn checkpoint(&mut self) -> Result<Position, Error> {
+        if self.failed {
+            return Err(Error::Failed);
+        }
+        let position = self.journal.position();
+        let count = self.regions.count();
+        let mut used: Vec<bool> = (0..count).map(|r| self.regions.is_used(r)).collect();
+        let mut epochs = self.epochs.clone();
+        for allocation in &self.allocations {
+            used[allocation.region as usize] = false;
+            epochs[allocation.region as usize] = allocation.epoch - 1;
+        }
+        let mut regions = Vec::with_capacity(CHECKPOINT_RESERVE as usize);
+        for _ in 0..CHECKPOINT_RESERVE {
+            match self.regions.acquire(Claim::Checkpoint) {
+                Ok(region) => regions.push(region),
+                Err(e) => {
+                    for region in regions {
+                        self.regions.release(region);
+                    }
+                    return Err(e);
+                }
+            }
+        }
+        for &region in &regions {
+            let epoch = &mut self.epochs[region as usize];
+            *epoch += 1;
+            used[region as usize] = true;
+            epochs[region as usize] = *epoch;
+        }
+        let blob = encode(&Snapshot {
+            position,
+            record_sequence: self.sequence,
+            used,
+            epochs,
+            release: self.checkpoint.clone(),
+            parts: Vec::new(),
+        });
+        let sequence = self.data.superblock().sequence() + 1;
+        let mut copies = Vec::with_capacity(regions.len());
+        for &region in &regions {
+            let epoch = self.epochs[region as usize];
+            match write_copy(&self.data, region, epoch, sequence, &blob).await {
+                Ok(copy) => copies.push(copy),
+                Err(Error::CheckpointTooLarge) => {
+                    for region in regions {
+                        self.regions.release(region);
+                    }
+                    return Err(Error::CheckpointTooLarge);
+                }
+                Err(e) => {
+                    self.failed = true;
+                    return Err(e);
+                }
+            }
+        }
+        if let Err(e) = self.data.file().sync_data().await {
+            self.failed = true;
+            return Err(e.into());
+        }
+        let checkpoint = Checkpoint {
+            position,
+            copies: [copies[0], copies[1]],
+        };
+        let oldest = self.data.superblock().oldest_format();
+        if let Err(e) = self.data.update(Some(checkpoint), oldest).await {
+            self.failed = true;
+            return Err(e);
+        }
+        self.journal.release(position.sequence - 1);
+        for region in std::mem::replace(&mut self.checkpoint, regions) {
+            self.regions.release(region);
+        }
+        Ok(position)
+    }
+
+    fn due(&self) -> bool {
+        self.journal.size() - self.journal.free() >= self.journal.size() / 2
     }
 
     fn allocate(&mut self, claim: Claim) -> Result<(u32, u64), Error> {
@@ -231,13 +332,16 @@ impl Committer {
             ));
         }
         commit.ranges.extend(ranges);
-        if let Err(e) = self.journal.reserve(&commit) {
-            let full = matches!(e, Error::JournalFull);
+        let mut reserved = self.journal.reserve(&commit);
+        if matches!(reserved, Err(Error::JournalFull)) && self.checkpoint().await.is_ok() {
+            reserved = self.journal.reserve(&commit);
+        }
+        if let Err(e) = reserved {
             for entry in accepted {
-                let error = if full {
-                    Error::JournalFull
-                } else {
-                    Error::CommitTooLarge
+                let error = match e {
+                    _ if self.failed => Error::Failed,
+                    Error::JournalFull => Error::JournalFull,
+                    _ => Error::CommitTooLarge,
                 };
                 let _ = entry.reply.send(Err(error));
             }
@@ -256,6 +360,9 @@ impl Committer {
                 sequence,
                 locations: entry.locations,
             }));
+        }
+        if self.due() {
+            let _ = self.checkpoint().await;
         }
     }
 

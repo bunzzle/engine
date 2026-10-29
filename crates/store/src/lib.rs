@@ -1,3 +1,4 @@
+mod checkpoint;
 mod committer;
 mod crc32c;
 mod data_file;
@@ -9,6 +10,7 @@ mod recovery;
 mod regions;
 mod superblock;
 
+pub use checkpoint::{KIND_CHECKPOINT, Loaded, Part, load};
 pub use committer::{Client, Committer, Durable, Location, Submission, Write};
 pub use crc32c::checksum;
 pub use data_file::{DataFile, Options};
@@ -20,7 +22,8 @@ pub use record::{
     RecordError, chunks, encode, peek, peek_header, record_size,
 };
 pub use recovery::{Recovered, State, recover};
-pub use regions::{Claim, Regions};
+pub use regions::{CHECKPOINT_RESERVE, Claim, Regions};
 pub use superblock::{
-    COPIES, Checkpoint, FORMAT, MAX_SECTOR_SIZE, MIN_SECTOR_SIZE, SLOT_SIZE, Superblock, ZONE_SIZE,
+    COPIES, Checkpoint, CheckpointCopy, FORMAT, MAX_SECTOR_SIZE, MIN_SECTOR_SIZE, SLOT_SIZE,
+    Superblock, ZONE_SIZE,
 };

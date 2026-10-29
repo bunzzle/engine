@@ -7,7 +7,7 @@ use rt::sim::{Config, Faults, SimDriver, check};
 use rt::{Buf, File, JoinHandle, OpenOptions, Runtime, sleep, spawn};
 use store::{
     Claim, Client, Committer, DataFile, Durable, Error, Journal, Location, Options, Position,
-    Range, Record, SLOT_SIZE, State, Submission, Write, ZONE_SIZE, checksum, recover,
+    Range, Record, SLOT_SIZE, Submission, Write, ZONE_SIZE, checksum, load, recover,
 };
 
 const MILLION: u32 = 1_000_000;
@@ -36,8 +36,8 @@ fn created(seed: u64) -> Rc<SimDriver> {
 
 async fn start(reserve: u32) -> (Client, JoinHandle<Committer>) {
     let data = DataFile::open(PATH).await.expect("open");
-    let state = State::new(OPTIONS.region_count, reserve);
-    let recovered = recover(&data, Position::START, state)
+    let loaded = load(&data, reserve).await.expect("load");
+    let recovered = recover(&data, loaded.position, loaded.state)
         .await
         .expect("recover");
     assert_eq!(recovered.torn, None);
@@ -236,7 +236,7 @@ fn body_ranges_are_committed_with_their_allocation() {
 fn intake_is_refused_at_the_reserve() {
     let driver = created(4);
     run(&driver, async {
-        let (client, committer) = start(7).await;
+        let (client, committer) = start(5).await;
         client
             .commit(submission(vec![payload(0, 0, 10)]))
             .await
