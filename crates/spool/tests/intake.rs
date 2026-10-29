@@ -8,7 +8,7 @@ use std::time::Duration;
 use rt::sim::{Config, Disk, Faults, Machine, SimDriver, Stalls, check};
 use rt::{JoinHandle, Runtime, sleep, spawn, timeout};
 use spool::{
-    BODY_ITEM, Body, Error, Head, HeadClear, Intake, Limits, Message, MessageId, SLICE, Slice,
+    BODY_ITEM, Body, Error, Head, HeadClear, Limits, Message, MessageId, SLICE, Slice, Spool,
     decode_chunk, slice_item, slice_parts,
 };
 use store::{
@@ -116,7 +116,7 @@ fn chunks(seed: u64, chunk: usize) -> Vec<Vec<u8>> {
         .collect()
 }
 
-async fn draft(intake: &Intake, shard: u16, step: u64) -> Result<(Message, Accepted), Error> {
+async fn draft(intake: &Spool, shard: u16, step: u64) -> Result<(Message, Accepted), Error> {
     let id = intake.id(shard).await?;
     let seed = id.key ^ u64::from(shard) << 40;
     let slices = slices(seed, recipients(step));
@@ -158,7 +158,7 @@ async fn draft(intake: &Intake, shard: u16, step: u64) -> Result<(Message, Accep
     Ok((message, accepted))
 }
 
-async fn work(intake: Intake, shards: Vec<u16>, steps: u64, model: Shared) -> bool {
+async fn work(intake: Spool, shards: Vec<u16>, steps: u64, model: Shared) -> bool {
     let mut step = 0;
     let mut group = 0;
     while step < steps {
@@ -254,7 +254,7 @@ fn workload(seed: u64, steps: u64, halt_after: Option<u64>, disk: Disk, model: &
             };
         };
         let shards = opened.shards.clone();
-        let (intake, owner) = Intake::new(opened, NODE, LIMITS).expect("limits");
+        let (intake, owner) = Spool::new(opened, NODE, LIMITS).expect("limits");
         owners.push(machine.spawn_on(core, owner.run()));
         closers.push(intake.changes().clone());
         workers.push(machine.spawn_on(core, work(intake, shards, steps, Rc::clone(model))));
