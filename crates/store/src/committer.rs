@@ -6,6 +6,7 @@ use crate::checkpoint::{Snapshot, encode, write_copy};
 use crate::data_file::DataFile;
 use crate::error::Error;
 use crate::journal::{Allocation, Commit, Dead, Journal, Live, Position, Range};
+use crate::reader::{Pins, Reader};
 use crate::record::{self, Header, MAX_PAYLOAD, record_size};
 use crate::recovery::State;
 use crate::regions::{CHECKPOINT_RESERVE, Claim, Regions};
@@ -150,6 +151,8 @@ pub struct Committer {
     allocations: Vec<Allocation>,
     sequence: u64,
     checkpoint: Vec<u32>,
+    carried: Vec<u32>,
+    pins: Pins,
     inbox: Receiver<Request>,
     failed: bool,
 }
@@ -172,10 +175,16 @@ impl Committer {
             allocations: Vec::new(),
             sequence: state.record_sequence,
             checkpoint: state.checkpoint,
+            carried: Vec::new(),
+            pins: Pins::default(),
             inbox,
             failed: false,
         };
         (committer, Client { sender })
+    }
+
+    pub fn reader(&self) -> Reader {
+        self.data.reader(self.pins.clone())
     }
 
     pub fn data(&self) -> &DataFile {
@@ -280,6 +289,8 @@ impl Committer {
                     && self.usage.is_empty(r)
                     && !self.usage.is_quarantined(r)
                     && !self.checkpoint.contains(&r)
+                    && !self.carried.contains(&r)
+                    && !self.pins.is_pinned(r)
                     && !self.busy.contains(&r)
                     && !regions.contains(&r)
             })
@@ -291,6 +302,7 @@ impl Committer {
             epochs[region as usize] = *epoch;
         }
         let mut release = self.checkpoint.clone();
+        release.extend_from_slice(&self.carried);
         release.extend_from_slice(&pending);
         let blob = encode(&Snapshot {
             position,
@@ -336,10 +348,20 @@ impl Committer {
         for region in std::mem::replace(&mut self.checkpoint, regions) {
             self.regions.release(region);
         }
-        for region in pending {
-            self.regions.release(region);
-        }
+        self.free_unpinned(pending);
         Ok(position)
+    }
+
+    fn free_unpinned(&mut self, pending: Vec<u32>) {
+        let mut carried = Vec::new();
+        for region in std::mem::take(&mut self.carried).into_iter().chain(pending) {
+            if self.pins.is_pinned(region) {
+                carried.push(region);
+            } else {
+                self.regions.release(region);
+            }
+        }
+        self.carried = carried;
     }
 
     fn due(&self) -> bool {

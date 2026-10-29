@@ -4,6 +4,7 @@ mod data_file;
 mod error;
 mod journal;
 mod layout;
+mod reader;
 mod record;
 mod recovery;
 mod regions;
@@ -16,6 +17,7 @@ pub use data_file::{DataFile, Options};
 pub use error::Error;
 pub use journal::{Allocation, Commit, Dead, Entry, Journal, KIND_COMMIT, Live, Position, Range};
 pub use layout::{Fields, FieldsMut};
+pub use reader::{Owner, Pin, Pins, READ_ATTEMPTS, Reader};
 pub use record::{
     FLAG_MORE, Header, MAX_PAYLOAD, RECORD_ALIGN, RECORD_FORMAT, RECORD_HEADER_SIZE, Record,
     RecordError, chunks, encode, peek, peek_header, record_size,
