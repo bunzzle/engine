@@ -60,6 +60,7 @@ impl Source {
     }
 }
 
+#[derive(Clone)]
 pub struct CoreFile {
     file: Rc<File>,
     superblock: Superblock,

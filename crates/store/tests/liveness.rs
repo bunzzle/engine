@@ -5,11 +5,11 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use rt::sim::{Config, Disk, Faults, Machine, SimDriver, Stalls, check};
-use rt::{JoinHandle, Runtime, sleep, spawn, timeout};
+use rt::{Buf, File, JoinHandle, OpenOptions, Runtime, sleep, spawn, timeout};
 use store::{
     Batch, CHECKPOINT_RESERVE, COMPACTION_RESERVE, Change, Changes, Claim, Client, Committer,
-    DataFile, Delivery, Error, HEAD_ITEM, Index, Keeper, Key, Op, Options, SLOT_SIZE, Setup,
-    Shards, Submission, Usage, Write, boot, load, recover,
+    DataFile, Delivery, Error, HEAD_ITEM, Index, Keeper, Key, Op, Options, Range, SLOT_SIZE, Setup,
+    Shards, Submission, Usage, Write, ZONE_SIZE, boot, checksum, load, recover,
 };
 
 const PATH: &str = "/data/store";
@@ -59,9 +59,13 @@ fn audit(usage: &Usage, keeper: &Keeper) {
     let mut owned = vec![(0u32, 0u64); OPTIONS.region_count as usize];
     for shard in ALL {
         for item in keeper.state(shard).expect("kept").entries().values() {
-            let slot = &mut owned[item.location.region as usize];
-            slot.0 += 1;
-            slot.1 += u64::from(item.location.size);
+            let record = std::iter::once((item.location.region, u64::from(item.location.size)));
+            let bodies = item.bodies.iter().map(|b| (b.region, u64::from(b.length)));
+            for (region, bytes) in record.chain(bodies) {
+                let slot = &mut owned[region as usize];
+                slot.0 += 1;
+                slot.1 += bytes;
+            }
         }
     }
     for (region, (extents, bytes)) in (0u32..).zip(owned) {
@@ -97,6 +101,7 @@ fn batch(shard: u16, key: u64, worker: u64, step: u64) -> Batch {
             item: HEAD_ITEM,
             change: put(key, step).change,
             clear: Vec::new(),
+            bodies: Vec::new(),
             sealed: sealed.clone(),
         });
     }
@@ -104,6 +109,7 @@ fn batch(shard: u16, key: u64, worker: u64, step: u64) -> Batch {
         item: 1 + u32::try_from(step % 3).expect("fits"),
         change: put(key, step).change,
         clear,
+        bodies: Vec::new(),
         sealed,
     });
     Batch {
@@ -419,6 +425,7 @@ fn the_owner_runs_one_batch_per_message() {
             item,
             change,
             clear: vec![9; 5],
+            bodies: Vec::new(),
             sealed: vec![1; 20],
         };
         let message = |ops: Vec<Op>| Batch {
@@ -524,6 +531,7 @@ fn state_changes_go_through_when_intake_is_refused() {
             item: 1,
             change: put(0, 2).change,
             clear: vec![1; 8],
+            bodies: Vec::new(),
             sealed: vec![2; 40],
         };
         let batch = Batch {
@@ -549,4 +557,116 @@ fn sampled(seed: u64, total: u64) -> Vec<u64> {
     (first..=total)
         .step_by(usize::try_from(stride).expect("fits"))
         .collect()
+}
+
+const BODY: u32 = 4096;
+
+async fn zero_bodies(region: u32, count: u32) {
+    let options = OpenOptions {
+        read: true,
+        write: true,
+        ..OpenOptions::default()
+    };
+    let file = File::open(PATH, &options).await.expect("open raw");
+    let at = ZONE_SIZE + OPTIONS.journal_size + u64::from(region) * OPTIONS.region_size;
+    let len = (BODY * count) as usize;
+    let (written, _) = file.write_all_at(Buf::from_slice(&vec![0; len]), at).await;
+    written.expect("write bodies");
+}
+
+fn body_op(item: u32, change: Change, bodies: Vec<Range>) -> Op {
+    Op {
+        item,
+        change,
+        clear: Vec::new(),
+        bodies,
+        sealed: vec![6; 30],
+    }
+}
+
+fn on_message(message: u64, ops: Vec<Op>) -> Batch {
+    Batch {
+        shard: 2,
+        message,
+        tenant: 7,
+        ops,
+    }
+}
+
+#[test]
+fn bodies_are_counted_killed_and_rebuilt_with_their_item() {
+    let driver = Rc::new(SimDriver::with_disk(7, Config::default(), created(7)));
+    Runtime::new(driver).block_on(async {
+        let (changes, owner, client, committer) = owner_on_core_zero().await;
+        let lease = client.allocate(Claim::Intake).await.expect("lease");
+        let (region, epoch) = (lease.region(), lease.epoch());
+        zero_bodies(region, 6).await;
+        let at = |n: u32| Range {
+            region,
+            epoch,
+            offset: u64::from(n * BODY),
+            length: BODY,
+            checksum: checksum(&[0; BODY as usize]),
+        };
+        let delivery = put(9, 1).change;
+        let create = vec![
+            body_op(HEAD_ITEM, delivery, Vec::new()),
+            body_op(1, delivery, vec![at(0), at(1)]),
+        ];
+        changes.apply(on_message(9, create)).await.expect("create");
+        let refusals = [
+            (vec![body_op(1, Change::Delete, vec![at(2)])], "batch"),
+            (vec![body_op(1, delivery, vec![at(2), at(2)])], "range"),
+            (
+                vec![body_op(
+                    2,
+                    delivery,
+                    vec![Range {
+                        epoch: epoch + 1,
+                        ..at(2)
+                    }],
+                )],
+                "range",
+            ),
+        ];
+        for (ops, why) in refusals {
+            let refused = changes.apply(on_message(9, ops)).await;
+            assert!(
+                matches!(refused, Err(Error::Invalid(w)) if w == why),
+                "{refused:?}"
+            );
+        }
+        changes
+            .apply(on_message(
+                9,
+                vec![body_op(1, delivery, vec![at(1), at(2)])],
+            ))
+            .await
+            .expect("replace keeping one body");
+        changes
+            .apply(on_message(9, vec![body_op(2, delivery, vec![at(3)])]))
+            .await
+            .expect("second body item");
+        let other = vec![
+            body_op(HEAD_ITEM, delivery, Vec::new()),
+            body_op(1, delivery, vec![at(4), at(5)]),
+        ];
+        changes.apply(on_message(10, other)).await.expect("other");
+        changes
+            .apply(on_message(
+                10,
+                vec![body_op(HEAD_ITEM, Change::Drop, Vec::new())],
+            ))
+            .await
+            .expect("drop");
+        lease.seal();
+        let keeper = close_and_audit(changes, owner, client, committer).await;
+        let state = keeper.state(2).expect("kept");
+        assert_eq!(
+            &*state.get(Key::new(9, 1)).expect("body").bodies,
+            &[at(1), at(2)]
+        );
+        assert!(state.get(Key::head(10)).is_none());
+        rebuilt_audit().await;
+    });
 }

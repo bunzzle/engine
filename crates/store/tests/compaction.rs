@@ -4,11 +4,14 @@ use std::panic::{self, AssertUnwindSafe};
 use std::rc::Rc;
 use std::time::Duration;
 
+use rt::Buf;
 use rt::sim::{Config, Disk, Faults, Machine, SimDriver, Stalls, check};
 use rt::{JoinHandle, Runtime, sleep, spawn, timeout};
 use store::{
-    Change, Changes, Committer, CoreFile, DataFile, Delivery, Error, INDEX_SIZE, Index, Keeper,
-    Key, Location, Options, Owner, Record, SLOT_SIZE, Setup, Shards, Usage, boot, load, recover,
+    Batch, Change, Changes, Claim, Client, Committer, CoreFile, DataFile, Delivery, Error,
+    HEAD_ITEM, Header, INDEX_SIZE, Index, Item, Keeper, Key, Lease, Location, Op, Options, Owner,
+    Range, Record, SLOT_SIZE, Setup, Shards, Usage, boot, checksum, encode, load, record_size,
+    recover,
 };
 
 const PATH: &str = "/data/store";
@@ -19,6 +22,8 @@ const HOT: u64 = 4;
 const COLD: u64 = 1000;
 const MILLION: u32 = 1_000_000;
 const HORIZON: Duration = Duration::from_secs(30);
+const BODY_ITEM: u32 = 1;
+const KIND_CHUNK: u8 = 9;
 
 const OPTIONS: Options = Options {
     journal_size: 8 * SLOT_SIZE,
@@ -61,15 +66,55 @@ fn put(key: u64, version: u64) -> Index {
     }
 }
 
+fn chunk(key: u64, n: u64) -> Vec<u8> {
+    let len = 900 + usize::try_from((key * 37 + n * 11) % 1500).expect("fits");
+    vec![u8::try_from((key + n) % 251).expect("fits"); len]
+}
+
+fn chunks(key: u64) -> u64 {
+    1 + key % 4
+}
+
+fn body(key: u64, epoch: u64, sector: usize) -> Buf {
+    let size: usize = (0..chunks(key))
+        .map(|n| record_size(chunk(key, n).len()))
+        .sum();
+    let len = size.next_multiple_of(sector);
+    let mut buf = Buf::aligned(len, sector);
+    buf.set_len(len);
+    buf.fill(0);
+    let mut at = 0;
+    for n in 0..chunks(key) {
+        let header = Header {
+            kind: KIND_CHUNK,
+            flags: 0,
+            shard: 0,
+            tenant: 7,
+            epoch,
+            sequence: epoch,
+        };
+        at += encode(&header, &chunk(key, n), &mut buf[at..]);
+    }
+    buf
+}
+
+fn owned(item: &Item) -> impl Iterator<Item = (u32, u64)> + '_ {
+    let record = std::iter::once((item.location.region, u64::from(item.location.size)));
+    record.chain(item.bodies.iter().map(|b| (b.region, u64::from(b.length))))
+}
+
 fn audit(usage: &Usage, keeper: &Keeper) {
-    let mut owned = vec![(0u32, 0u64); OPTIONS.region_count as usize];
+    let mut owned_bytes = vec![(0u32, 0u64); OPTIONS.region_count as usize];
     for shard in ALL {
         for item in keeper.state(shard).expect("kept").entries().values() {
-            let slot = &mut owned[item.location.region as usize];
-            slot.0 += 1;
-            slot.1 += u64::from(item.location.size);
+            for (region, bytes) in owned(item) {
+                let slot = &mut owned_bytes[region as usize];
+                slot.0 += 1;
+                slot.1 += bytes;
+            }
         }
     }
+    let owned = owned_bytes;
     for (region, (extents, bytes)) in (0u32..).zip(owned) {
         let count = usage.count(region);
         assert_eq!(
@@ -80,11 +125,46 @@ fn audit(usage: &Usage, keeper: &Keeper) {
     }
 }
 
-async fn contents(file: &CoreFile, keeper: &Keeper) -> usize {
+async fn check_body(file: &CoreFile, key: u64, item: &Item) -> bool {
+    assert_eq!(item.bodies.len(), 1, "key {key} bodies");
+    let range = item.bodies[0];
+    let buf = file.reader().range(range).await.expect("body range");
+    let mut at = 0;
+    let mut moved = false;
+    for n in 0..chunks(key) {
+        let record = Record::decode(&buf[at..]).expect("chunk");
+        assert_eq!(
+            (record.kind(), record.tenant(), record.epoch()),
+            (KIND_CHUNK, 7, range.epoch),
+            "key {key} chunk {n}"
+        );
+        assert_eq!(
+            record.payload(),
+            chunk(key, n).as_slice(),
+            "key {key} chunk {n}"
+        );
+        moved |= record.sequence() != record.epoch();
+        at += record.size();
+    }
+    assert!(buf[at..].iter().all(|&b| b == 0), "key {key} body padding");
+    moved
+}
+
+async fn contents(file: &CoreFile, keeper: &Keeper) -> (usize, usize) {
     let mut moved = 0;
+    let mut bodies = 0;
     let reader = file.reader();
     for shard in ALL {
-        for (&key, item) in keeper.state(shard).expect("kept").entries() {
+        let state = keeper.state(shard).expect("kept");
+        for (&key, item) in state.entries() {
+            if key.item == BODY_ITEM {
+                assert!(
+                    state.get(Key::head(key.message)).is_some(),
+                    "body without head"
+                );
+                bodies += usize::from(check_body(file, key.message, item).await);
+                continue;
+            }
             let key = key.message;
             let buf = reader
                 .read(item.location, item.tenant, &Nobody)
@@ -105,24 +185,105 @@ async fn contents(file: &CoreFile, keeper: &Keeper) -> usize {
             );
         }
     }
-    moved
+    (moved, bodies)
 }
 
-async fn work(changes: Changes, shards: Vec<u16>, steps: u64) -> bool {
+struct Bodies {
+    client: Client,
+    file: CoreFile,
+    lease: Option<Lease>,
+    offset: u64,
+}
+
+impl Bodies {
+    async fn write(&mut self, key: u64) -> Result<Range, Error> {
+        let sector = self.file.sector_size() as usize;
+        let region_size = self.file.superblock().region_size();
+        let length = body(key, 0, sector).len() as u64;
+        if self.lease.is_none() || self.offset + length > region_size {
+            self.lease = None;
+            self.lease = Some(self.client.allocate(Claim::Intake).await?);
+            self.offset = 0;
+        }
+        let lease = self.lease.as_ref().expect("lease");
+        let buf = body(key, lease.epoch(), sector);
+        let range = Range {
+            region: lease.region(),
+            epoch: lease.epoch(),
+            offset: self.offset,
+            length: u32::try_from(buf.len()).expect("fits"),
+            checksum: checksum(&buf),
+        };
+        let at = self.file.region_offset(range.region) + range.offset;
+        let (written, _) = self.file.file().write_all_at(buf, at).await;
+        written?;
+        self.offset += length;
+        Ok(range)
+    }
+}
+
+fn message(shard: u16, key: u64, range: Range) -> Batch {
+    let op = |item, bodies| Op {
+        item,
+        change: put(key, 0).change,
+        clear: Vec::new(),
+        bodies,
+        sealed: sealed(key, 0),
+    };
+    Batch {
+        shard,
+        message: key,
+        tenant: 7,
+        ops: vec![op(HEAD_ITEM, Vec::new()), op(BODY_ITEM, vec![range])],
+    }
+}
+
+fn drop_message(shard: u16, key: u64) -> Batch {
+    Batch {
+        shard,
+        message: key,
+        tenant: 7,
+        ops: vec![Op {
+            item: HEAD_ITEM,
+            change: Change::Drop,
+            clear: Vec::new(),
+            bodies: Vec::new(),
+            sealed: Vec::new(),
+        }],
+    }
+}
+
+async fn work(changes: Changes, shards: Vec<u16>, steps: u64, mut bodies: Bodies) -> bool {
     let mut cold = 0;
+    let mut last = None;
     for step in 0..steps {
         let shard = shards[usize::try_from(step).expect("fits") % shards.len()];
-        let (key, version) = if step % 6 == 5 {
+        let result = if step % 6 == 5 {
             cold += 1;
-            (COLD + cold, 0)
+            let key = COLD + cold;
+            let created = match bodies.write(key).await {
+                Ok(range) => changes.apply(message(shard, key, range)).await.map(drop),
+                Err(error) => Err(error),
+            };
+            match (created.is_ok(), last.take()) {
+                (true, Some((at, old))) if cold % 2 == 0 => {
+                    changes.apply(drop_message(at, old)).await.map(drop)
+                }
+                (true, _) => {
+                    last = Some((shard, key));
+                    Ok(())
+                }
+                (false, _) => created,
+            }
         } else {
-            (step % HOT, step)
+            let key = step % HOT;
+            changes
+                .change(shard, put(key, step), sealed(key, step))
+                .await
+                .map(drop)
         };
-        match changes
-            .change(shard, put(key, version), sealed(key, version))
-            .await
-        {
-            Ok(_) => {}
+        match result {
+            Ok(()) => {}
             Err(Error::Reserve | Error::Full) => sleep(Duration::from_millis(1)).await,
             Err(_) => return false,
         }
@@ -187,9 +348,15 @@ fn workload(seed: u64, steps: u64, halt_after: Option<u64>, disk: Disk) -> Outco
             return none(driver);
         };
         let shards = opened.shards.clone();
+        let bodies = Bodies {
+            client: opened.session.client().clone(),
+            file: opened.file.clone(),
+            lease: None,
+            offset: 0,
+        };
         let (owner, changes) = Shards::new(opened);
         owners.push(machine.spawn_on(core, owner.run()));
-        workers.push(machine.spawn_on(core, work(changes.clone(), shards, steps)));
+        workers.push(machine.spawn_on(core, work(changes.clone(), shards, steps, bodies)));
         closers.push(changes);
     }
     let client = booted.client;
@@ -268,10 +435,13 @@ fn compaction_moves_live_records_and_frees_their_regions() {
         .iter()
         .map(|&s| {
             let entries = keeper.state(s).expect("kept").entries();
-            entries.keys().filter(|k| k.message > COLD).count()
+            entries
+                .keys()
+                .filter(|k| k.message > COLD && k.item == HEAD_ITEM)
+                .count()
         })
         .sum();
-    assert_eq!(cold, 200);
+    assert_eq!(cold, 100);
     drop(committer);
     let after = Rc::new(SimDriver::with_disk(
         2,
@@ -287,7 +457,9 @@ fn compaction_moves_live_records_and_frees_their_regions() {
                 keeper.state(shard).expect("kept").entries()
             );
         }
-        assert!(contents(&file, &rebuilt).await > 0, "no record was moved");
+        let (records, bodies) = contents(&file, &rebuilt).await;
+        assert!(records > 0, "no record was moved");
+        assert!(bodies > 0, "no body was moved");
     });
 }
 
@@ -365,7 +537,7 @@ fn a_region_with_a_record_nobody_owns_is_never_a_victim() {
             .await
             .expect("open");
         let stray = store::Submission {
-            claim: store::Claim::Intake,
+            claim: Claim::Intake,
             records: vec![store::Write {
                 kind: 9,
                 counted: true,

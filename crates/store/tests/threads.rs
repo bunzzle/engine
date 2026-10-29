@@ -94,7 +94,7 @@ async fn fill(mut core: Core) {
             } => {
                 let (shard, index) = sent.remove(&tag).expect("sent");
                 core.keeper
-                    .apply(shard, &index, &[], locations[0], sequence);
+                    .apply(shard, &index, &[], &[], locations[0], sequence);
                 written.push(locations[0]);
             }
             other => panic!("unexpected {other:?}"),

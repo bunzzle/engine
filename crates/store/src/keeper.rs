@@ -4,6 +4,7 @@ use crate::checkpoint::Part;
 use crate::committer::Location;
 use crate::core_file::CoreFile;
 use crate::error::Error;
+use crate::journal::Range;
 use crate::run::{self, MAX_DELTAS, Root, encode_roots};
 use crate::session::Session;
 use crate::shard::{Delta, Index, ShardState};
@@ -58,11 +59,12 @@ impl Keeper {
         shard: u16,
         index: &Index,
         clear: &[u8],
+        bodies: &[Range],
         location: Location,
         commit: u64,
     ) {
         let kept = self.shards.get_mut(&shard).expect("shard is kept here");
-        kept.state.apply(index, clear, location, commit);
+        kept.state.apply(index, clear, bodies, location, commit);
     }
 
     pub async fn cut(
