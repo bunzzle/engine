@@ -18,10 +18,10 @@ use std::time::Duration;
 pub use disk::Disk;
 pub use rng::Rng;
 
-use crate::buf::Buf;
 use crate::driver::{Completion, Driver, Handle, Op, OpId, Stat, Unpark};
 use crate::time::Instant;
 use net::{Delivery, Net, Socket};
+use sys::buf::Buf;
 
 #[derive(Clone, Debug)]
 pub struct Faults {

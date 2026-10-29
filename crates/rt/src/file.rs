@@ -2,10 +2,10 @@ use std::io;
 use std::path::Path;
 use std::rc::Rc;
 
-use crate::buf::Buf;
 use crate::driver::{Completion, Driver, Handle, Op, OpenOptions, Stat};
 use crate::executor;
 use crate::op::{OpFuture, mismatch};
+use sys::buf::Buf;
 
 pub async fn sync_dir(path: impl AsRef<Path>) -> io::Result<()> {
     let op = Op::SyncDir {
