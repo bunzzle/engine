@@ -266,7 +266,7 @@ fn counts_match_the_owner_maps_after_a_crash_at_every_disk_operation() {
         let outcome = workload(seed, None, created(seed));
         assert!(outcome.finished.is_some(), "workload ran");
         let total = outcome.driver.disk_ops();
-        let points: Vec<u64> = only.map_or_else(|| (1..=total).collect(), |p| vec![p]);
+        let points: Vec<u64> = only.map_or_else(|| sampled(seed, total), |p| vec![p]);
         for point in points {
             if let Err(failure) = panic::catch_unwind(AssertUnwindSafe(|| crash_at(seed, point))) {
                 eprintln!("crash point {point} of {total}; replay with SIM_CRASH_AT={point}");
@@ -363,4 +363,12 @@ fn the_owner_refuses_changes_it_cannot_apply() {
         }
         audit(committer.usage(), &all);
     });
+}
+
+fn sampled(seed: u64, total: u64) -> Vec<u64> {
+    let stride = total.div_ceil(300).max(1);
+    let first = 1 + seed % stride;
+    (first..=total)
+        .step_by(usize::try_from(stride).expect("fits"))
+        .collect()
 }

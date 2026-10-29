@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use rt::{Buf, Receiver, Sender, channel};
 
+mod compaction;
 mod flight;
 mod runs;
 
@@ -16,8 +17,10 @@ use crate::reader::{Pins, Reader};
 use crate::record::{self, Header, MAX_PAYLOAD, record_size};
 use crate::recovery::State;
 use crate::regions::{Claim, Regions};
-use crate::session::{Answer, Event, Results, Session};
+use crate::session::{Answer, Event, Owned, Results, Session};
 use crate::usage::Usage;
+use compaction::Compaction;
+pub use compaction::CompactionStats;
 use flight::{Next, Parked, Queues};
 use runs::Runs;
 use sys::crc32c::checksum;
@@ -75,6 +78,8 @@ pub(crate) enum Request {
     Seal(u32, u64),
     ClaimState(usize, Sender<Result<(u32, u64), Error>>),
     Checkpoint(Sender<Result<u64, Error>>),
+    Survey(usize, u64, Vec<Owned>),
+    Compacted(usize, u32, u64),
 }
 
 pub struct Lease {
@@ -179,6 +184,7 @@ pub struct Committer {
     queues: Queues,
     runs: Runs,
     part_timeout: Duration,
+    compaction: Compaction,
     failed: bool,
 }
 
@@ -211,6 +217,7 @@ impl Committer {
                 appending: Vec::new(),
             },
             part_timeout: PART_TIMEOUT,
+            compaction: Compaction::new(count),
             failed: false,
         };
         (committer, Client { sender })
@@ -361,10 +368,12 @@ impl Committer {
             }
             Request::Seal(region, epoch) => {
                 if self.epochs[region as usize] == epoch {
-                    self.open[region as usize] = false;
+                    self.sealed(region);
                 }
             }
             Request::Checkpoint(reply) => self.queues.requested.push_back(reply),
+            Request::Survey(session, sequence, owned) => self.surveyed(session, sequence, owned),
+            Request::Compacted(session, region, epoch) => self.compacted(session, region, epoch),
         }
     }
 
@@ -601,11 +610,7 @@ impl Committer {
         }
     }
 
-    fn pack(
-        &mut self,
-        submission: &Submission,
-        segments: &mut Vec<Segment>,
-    ) -> Result<Vec<Location>, Error> {
+    fn check_bodies(&self, submission: &Submission) -> Result<(), Error> {
         let superblock = self.data.superblock();
         let region_size = superblock.region_size();
         let sector = u64::from(superblock.sector_size());
@@ -616,6 +621,7 @@ impl Committer {
             let range = &body.range;
             let valid = range.region < superblock.region_count()
                 && self.leased[range.region as usize] == Some(range.epoch)
+                && !self.is_victim(range.region)
                 && self.regions.is_used(range.region)
                 && !self.checkpoint.contains(&range.region)
                 && !self.releasing(range.region)
@@ -629,6 +635,17 @@ impl Committer {
                 return Err(Error::Invalid("range"));
             }
         }
+        Ok(())
+    }
+
+    fn pack(
+        &mut self,
+        submission: &Submission,
+        segments: &mut Vec<Segment>,
+    ) -> Result<Vec<Location>, Error> {
+        self.check_bodies(submission)?;
+        let superblock = self.data.superblock();
+        let region_size = superblock.region_size();
         let mut total = 0u64;
         for write in &submission.records {
             if u32::from(write.shard) >= superblock.shards() {
@@ -658,8 +675,8 @@ impl Committer {
                     return Err(e);
                 }
             };
-            if let Some(old) = &self.streams[class] {
-                self.open[old.region as usize] = false;
+            if let Some(old) = self.streams[class].as_ref().map(|s| s.region) {
+                self.sealed(old);
             }
             self.streams[class] = Some(Stream {
                 region,
@@ -668,18 +685,19 @@ impl Committer {
             });
         }
         let stream = self.streams[class].as_mut().expect("stream allocated");
-        let same = segments
-            .last()
-            .is_some_and(|s: &Segment| s.region == stream.region && s.epoch == stream.epoch);
-        if !same {
+        let found = segments
+            .iter()
+            .position(|s: &Segment| s.region == stream.region && s.epoch == stream.epoch);
+        let at = found.unwrap_or_else(|| {
             segments.push(Segment {
                 region: stream.region,
                 epoch: stream.epoch,
                 offset: stream.offset,
                 bytes: Vec::new(),
             });
-        }
-        let segment = segments.last_mut().expect("segment present");
+            segments.len() - 1
+        });
+        let segment = &mut segments[at];
         let mut locations = Vec::with_capacity(submission.records.len());
         for write in &submission.records {
             let size = record_size(write.payload.len());

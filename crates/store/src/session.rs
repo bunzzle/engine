@@ -27,6 +27,17 @@ pub enum Event {
     Abandoned {
         sequence: u64,
     },
+    Compact {
+        region: u32,
+        epoch: u64,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Owned {
+    pub region: u32,
+    pub extents: u32,
+    pub bytes: u64,
 }
 
 pub(crate) struct Answer {
@@ -76,6 +87,20 @@ impl Session {
 
     pub fn parts(&self, sequence: u64, parts: Vec<Part>) -> Result<(), Error> {
         self.answer(sequence, parts, false)
+    }
+
+    pub fn survey(&self, sequence: u64, owned: Vec<Owned>) -> Result<(), Error> {
+        self.client
+            .sender
+            .send(Request::Survey(self.id, sequence, owned))
+            .map_err(|_| Error::Failed)
+    }
+
+    pub fn compacted(&self, region: u32, epoch: u64) -> Result<(), Error> {
+        self.client
+            .sender
+            .send(Request::Compacted(self.id, region, epoch))
+            .map_err(|_| Error::Failed)
     }
 
     pub fn fail(&self, sequence: u64) -> Result<(), Error> {
