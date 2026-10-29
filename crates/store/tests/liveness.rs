@@ -670,3 +670,58 @@ fn bodies_are_counted_killed_and_rebuilt_with_their_item() {
         rebuilt_audit().await;
     });
 }
+
+#[test]
+fn several_new_messages_commit_in_one_submission() {
+    let driver = Rc::new(SimDriver::with_disk(8, Config::default(), created(8)));
+    Runtime::new(driver).block_on(async {
+        let (changes, owner, client, committer) = owner_on_core_zero().await;
+        let delivery = put(0, 1).change;
+        let new = |message: u64| {
+            on_message(
+                message,
+                vec![
+                    body_op(HEAD_ITEM, delivery, Vec::new()),
+                    body_op(1, delivery, Vec::new()),
+                ],
+            )
+        };
+        let created = changes
+            .create(vec![new(20), new(21), new(22)])
+            .await
+            .expect("create");
+        assert_eq!(created.iter().map(Vec::len).collect::<Vec<_>>(), [2, 2, 2]);
+        let first = created[0][0];
+        assert!(created.iter().flatten().all(|l| l.region == first.region));
+        let again = changes.create(vec![new(23), new(21)]).await;
+        assert!(matches!(again, Err(Error::Invalid("exists"))), "{again:?}");
+        let twice = changes.create(vec![new(24), new(24)]).await;
+        assert!(matches!(twice, Err(Error::Invalid("busy"))), "{twice:?}");
+        let headless = on_message(25, vec![body_op(1, delivery, Vec::new())]);
+        let missing = changes.create(vec![headless]).await;
+        assert!(matches!(missing, Err(Error::NotFound)), "{missing:?}");
+        let foreign = Batch {
+            shard: 1,
+            ..new(26)
+        };
+        let owner_refused = changes.create(vec![new(27), foreign]).await;
+        assert!(matches!(owner_refused, Err(Error::Invalid("owner"))));
+        let empty = changes.create(Vec::new()).await;
+        assert!(matches!(empty, Err(Error::Invalid("batch"))));
+        changes
+            .apply(on_message(
+                21,
+                vec![body_op(HEAD_ITEM, Change::Drop, Vec::new())],
+            ))
+            .await
+            .expect("drop one");
+        let keeper = close_and_audit(changes, owner, client, committer).await;
+        let state = keeper.state(2).expect("kept");
+        for message in [20, 22] {
+            assert_eq!(state.message(message).count(), 2);
+        }
+        for message in [21, 23, 24, 25, 27] {
+            assert_eq!(state.message(message).count(), 0, "message {message}");
+        }
+    });
+}

@@ -20,6 +20,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "spool"
+version = "0.0.0"
+dependencies = [
+ "rt",
+ "store",
+]
+
+[[package]]
 name = "store"
 version = "0.0.0"
 dependencies = [
