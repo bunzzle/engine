@@ -1,7 +1,10 @@
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
+use std::future::poll_fn;
+use std::pin::pin;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::task::Poll;
 use std::time::Duration;
 
 use rt::sim::{Config, Disk, Faults, Machine, SimDriver, Stalls, check};
@@ -150,18 +153,20 @@ fn created(seed: u64) -> Disk {
     setup.crash()
 }
 
-fn message(id: MessageId, now: u64, driver: &SimDriver) -> Message {
+fn message(id: MessageId, now: u64, driver: &SimDriver, expiring: bool) -> Message {
     let tenant = u32::try_from(driver.random() % 3).expect("small");
     let count = 1 + usize::try_from(driver.random() % 40).expect("small");
     let queues: Vec<u32> = (0..count)
         .map(|_| tenant * 10 + u32::try_from(driver.random() % 5).expect("small"))
         .collect();
-    let not_before = if driver.random().is_multiple_of(5) {
+    let not_before = if expiring || driver.random().is_multiple_of(5) {
         now + 1_800_000
     } else {
         0
     };
-    let expiry = if driver.random().is_multiple_of(5) {
+    let expiry = if expiring {
+        now + 600_000
+    } else if driver.random().is_multiple_of(5) {
         now + driver.random() % 7_200_000
     } else {
         u64::MAX / 2
@@ -203,7 +208,7 @@ async fn intake(
         let Ok(id) = spool.id(shard).await else {
             return;
         };
-        let message = message(id, sched.clock().now(), &driver);
+        let message = message(id, sched.clock().now(), &driver, n == 0);
         let arrival = Arrival::of(&message);
         let count = u32::try_from(arrival.queues.len()).expect("small");
         {
@@ -231,7 +236,7 @@ async fn intake(
             sched.enqueue(stale);
         }
         sched.enqueue(arrival);
-        if driver.random().is_multiple_of(6) {
+        if n > 0 && driver.random().is_multiple_of(6) {
             let spool = spool.clone();
             let wait = Duration::from_millis(driver.random() % 3_000);
             world.borrow_mut().cancelling.insert((id.shard, id.key));
@@ -282,6 +287,12 @@ fn ticker(client: Client, running: Rc<Cell<bool>>) -> JoinHandle<()> {
             }
         }
     })
+}
+
+async fn halted(driver: Rc<SimDriver>) {
+    while !driver.is_halted() {
+        sleep(Duration::from_secs(1)).await;
+    }
 }
 
 fn durable(world: &mut World) {
@@ -407,16 +418,25 @@ fn session(driver: &Rc<SimDriver>, world: &Shared, intake_on: bool, limit: Durat
     }
     let client = booted.client;
     let watched = Rc::clone(world);
+    let power = Rc::clone(driver);
     let result = machine.block_on(0, async move {
         let running = Rc::new(Cell::new(true));
         let ticker = ticker(client.clone(), Rc::clone(&running));
-        let work = async {
+        let settled = Rc::clone(&watched);
+        let mut work = pin!(async move {
             for feed in intakes {
                 feed.await;
             }
-            settle(&watched).await;
-        };
-        let finished = timeout(limit, work).await.is_ok();
+            settle(&settled).await;
+        });
+        let mut halt = pin!(halted(Rc::clone(&power)));
+        let race = poll_fn(|cx| {
+            if work.as_mut().poll(cx).is_ready() {
+                return Poll::Ready(true);
+            }
+            halt.as_mut().poll(cx).map(|()| false)
+        });
+        let finished = matches!(timeout(limit, race).await, Ok(true));
         running.set(false);
         let session = Session {
             finished,
@@ -424,6 +444,9 @@ fn session(driver: &Rc<SimDriver>, world: &Shared, intake_on: bool, limit: Durat
             errors: scheds.iter().map(Sched::report_errors).sum(),
             expired: scheds.iter().map(Sched::expired).sum(),
         };
+        if power.is_halted() {
+            return session;
+        }
         let stop = async move {
             ticker.await;
             for sched in &scheds {
