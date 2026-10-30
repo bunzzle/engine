@@ -31,7 +31,10 @@ pub use committer::{
 pub use core_file::{CoreFile, Source};
 pub use data_file::{DataFile, Options};
 pub use error::Error;
-pub use ids::{Ids, message_key, split_key};
+pub use ids::{
+    CONTROL_BOOT, CONTROL_KINDS, Ids, LAST_BOOT, control_key, is_control, message_key, next_boot,
+    split_key,
+};
 pub use journal::{
     Allocation, Commit, Dead, Entry, Journal, KIND_COMMIT, Live, Position, Range, fits,
 };

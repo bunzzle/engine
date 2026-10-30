@@ -7,6 +7,14 @@ name = "bunzzle"
 version = "0.0.0"
 
 [[package]]
+name = "control"
+version = "0.0.0"
+dependencies = [
+ "rt",
+ "store",
+]
+
+[[package]]
 name = "libc"
 version = "0.2.190"
 source = "registry+https://github.com/rust-lang/crates.io-index"

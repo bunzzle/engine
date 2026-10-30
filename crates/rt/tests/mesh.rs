@@ -3,9 +3,9 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
+use rt::Mesh;
 use rt::sim::{Config, Machine, SimDriver, Stalls, check};
 use rt::yield_now;
-use sched::Mesh;
 
 const CORES: u16 = 4;
 

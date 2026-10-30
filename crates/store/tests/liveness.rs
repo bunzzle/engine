@@ -9,7 +9,7 @@ use rt::{Buf, File, JoinHandle, OpenOptions, Runtime, sleep, spawn, timeout};
 use store::{
     Batch, CHECKPOINT_RESERVE, COMPACTION_RESERVE, Change, Changes, Claim, Client, Committer,
     DataFile, Delivery, Error, HEAD_ITEM, Index, Keeper, Key, Op, Options, Range, SLOT_SIZE, Setup,
-    Shards, Submission, Usage, Write, ZONE_SIZE, boot, checksum, load, recover,
+    Shards, Submission, Usage, Write, ZONE_SIZE, boot, checksum, control_key, load, recover,
 };
 
 const PATH: &str = "/data/store";
@@ -527,6 +527,10 @@ fn state_changes_go_through_when_intake_is_refused() {
             }
         }
         assert!(message > 0);
+        changes
+            .change(2, put(control_key(1, 9), 1), vec![5; 2000])
+            .await
+            .expect("new control item on a full disk");
         let state = Op {
             item: 1,
             change: put(0, 2).change,

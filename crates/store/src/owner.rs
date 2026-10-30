@@ -6,6 +6,7 @@ use crate::boot::Core;
 use crate::committer::{Body, Client, Lease, Location, Submission, Write};
 use crate::core_file::CoreFile;
 use crate::error::Error;
+use crate::ids::is_control;
 use crate::journal::{Dead, Range};
 use crate::keeper::Keeper;
 use crate::reader::{Owner, Reader};
@@ -396,7 +397,7 @@ impl Shards {
         }
         let claim = match ops[0].change {
             Change::Move { .. } => Claim::Internal,
-            _ if head.is_none() => Claim::Intake,
+            _ if head.is_none() && !is_control(batch.message) => Claim::Intake,
             _ => Claim::Control,
         };
         Ok(Submission {

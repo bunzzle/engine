@@ -6,7 +6,10 @@ use spool::{
     Body, Done, Error, Head, HeadClear, Limits, Message, MessageId, Outcome, Recipient, Reply,
     Report, Slice, Spool, Stamp, StateClear, Status, state_item,
 };
-use store::{Client, DataFile, Keeper, MAX_PAYLOAD, Options, SLOT_SIZE, Setup, boot};
+use store::{
+    Change, Client, DataFile, Delivery, Index, Keeper, Key, MAX_PAYLOAD, Options, SLOT_SIZE, Setup,
+    boot, control_key,
+};
 
 const PATH: &str = "/data/store";
 
@@ -232,9 +235,7 @@ fn recipients_start_ready_and_take_their_reports() {
         assert_eq!(spool.recipient(id, 0).expect("state").attempts, 2);
         let keeper = node.close().await;
         let state = keeper.state(0).expect("kept");
-        let item = state
-            .get(store::Key::new(id.key, state_item(0)))
-            .expect("state");
+        let item = state.get(Key::new(id.key, state_item(0))).expect("state");
         assert_eq!((item.delivery.status, item.delivery.due), (1, 80));
         assert_eq!(
             StateClear::decode(&item.clear),
@@ -434,6 +435,35 @@ fn reports_larger_than_a_region_are_split_into_several_merges() {
         for r in 0..300 {
             assert_eq!(spool.recipient(id, r).expect("state").attempts, 1);
         }
+        node.close().await;
+    });
+}
+
+#[test]
+fn control_items_are_not_messages_at_start() {
+    let (id, disk) = on(created(), || async {
+        let node = Node::open().await;
+        let id = node.accept(0, 2, 500).await;
+        let control = Index {
+            key: Key::head(control_key(1, 3)),
+            tenant: 7,
+            change: Change::Put(Delivery {
+                status: 0,
+                attempts: 0,
+                due: 0,
+            }),
+        };
+        node.spool
+            .changes()
+            .change(0, control, vec![4; 30])
+            .await
+            .expect("control item");
+        node.close().await;
+        id
+    });
+    on(disk, || async move {
+        let node = Node::open().await;
+        assert_eq!(node.spool.messages(), vec![id]);
         node.close().await;
     });
 }

@@ -5,8 +5,8 @@ use std::time::Duration;
 use rt::sim::{Config, Disk, Faults, SimDriver, check};
 use rt::{JoinHandle, Runtime, sleep, spawn};
 use store::{
-    Client, Committer, DataFile, Ids, Options, SLOT_SIZE, Setup, boot, load, message_key, recover,
-    split_key,
+    CONTROL_BOOT, CONTROL_KINDS, Client, Committer, DataFile, Ids, LAST_BOOT, Options, SLOT_SIZE,
+    Setup, boot, control_key, is_control, load, message_key, next_boot, recover, split_key,
 };
 
 const PATH: &str = "/data/store";
@@ -181,4 +181,17 @@ fn a_running_store_renews_the_boot_at_the_next_checkpoint() {
         drop(committer.await);
         assert_eq!(stored_boot().await, 2);
     });
+}
+
+#[test]
+fn control_keys_sit_above_every_boot() {
+    assert_eq!(next_boot(LAST_BOOT - 1), Some(LAST_BOOT));
+    assert_eq!(next_boot(LAST_BOOT), None);
+    assert!(!is_control(message_key(LAST_BOOT, u32::MAX)));
+    assert!(is_control(control_key(0, 0)));
+    assert!(is_control(control_key(u8::MAX, 0)));
+    assert_eq!(split_key(control_key(u8::MAX, 0)).0, LAST_BOOT + 1);
+    assert_eq!(split_key(control_key(3, 42)), (CONTROL_BOOT - 3, 42));
+    assert_eq!(CONTROL_KINDS, 256);
+    assert_ne!(control_key(1, 5), control_key(2, 5));
 }

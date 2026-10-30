@@ -8,10 +8,8 @@ use std::task::Poll;
 use std::time::Duration;
 
 use rt::sim::{Config, Disk, Faults, Machine, SimDriver, Stalls, check};
-use rt::{JoinHandle, Runtime, sleep, spawn, timeout};
-use sched::{
-    Answer, Answered, Arrival, Attempt, Clock, Kind, Limits, Mesh, Note, Sched, Transport,
-};
+use rt::{JoinHandle, Mesh, Runtime, sleep, spawn, timeout};
+use sched::{Answer, Answered, Arrival, Attempt, Clock, Kind, Limits, Note, Sched, Transport};
 use spool::{Body, Head, HeadClear, Message, MessageId, SLICE, Slice, Spool};
 use store::{Client, DataFile, Keeper, Options, SLOT_SIZE, Setup, boot};
 

@@ -178,6 +178,9 @@ impl Table {
         for &shard in shards {
             let state = keeper.state(shard).ok_or(store::Error::Invalid("owner"))?;
             for (key, item) in state.entries() {
+                if store::is_control(key.message) {
+                    continue;
+                }
                 if key.item == HEAD_ITEM {
                     let head = HeadClear::decode(&item.clear).ok_or(Error::State("head"))?;
                     let entry = Entry::new(item.tenant, &head, item.delivery.due);
