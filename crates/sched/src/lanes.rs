@@ -31,6 +31,7 @@ impl Default for Limits {
 pub struct Entry {
     pub message: MessageId,
     pub recipients: Vec<Range<u32>>,
+    pub forced: bool,
 }
 
 impl Entry {
@@ -213,7 +214,8 @@ impl Lanes {
             return;
         };
         let entries = std::mem::take(&mut state.entries);
-        for (_, entry) in entries {
+        for (_, mut entry) in entries {
+            entry.forced = true;
             self.seq += 1;
             let seq = self.seq;
             let state = self.queues.get_mut(&queue).expect("queue");
@@ -258,6 +260,7 @@ impl Lanes {
             let taken = split(&mut entry.recipients, want);
             let n: u32 = taken.iter().map(|r| r.end - r.start).sum();
             let message = entry.message;
+            let forced = entry.forced;
             if entry.recipients.is_empty() {
                 first.remove();
                 self.bytes -= before;
@@ -269,6 +272,7 @@ impl Lanes {
             entries.push(Entry {
                 message,
                 recipients: taken,
+                forced,
             });
         }
         if count == 0 {

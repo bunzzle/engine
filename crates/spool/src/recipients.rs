@@ -102,6 +102,7 @@ struct Entry {
     pending: Vec<Call>,
     ending: Vec<Waiter>,
     flushing: bool,
+    dropping: bool,
 }
 
 impl Entry {
@@ -118,6 +119,7 @@ impl Entry {
             pending: Vec::new(),
             ending: Vec::new(),
             flushing: false,
+            dropping: false,
         }
     }
 
@@ -289,7 +291,7 @@ impl Spool {
             .messages
             .get_mut(&(id.shard, id.key))
             .ok_or(Error::State("message"))?;
-        if !entry.ending.is_empty() {
+        if !entry.ending.is_empty() || entry.dropping {
             return Err(Error::State("ending"));
         }
         let current = entry
@@ -302,6 +304,21 @@ impl Spool {
             return Err(Error::State("claimed"));
         }
         Ok(current)
+    }
+
+    pub fn release(&self, id: MessageId, recipients: &[u32]) {
+        let mut table = self.inner.table.borrow_mut();
+        let Some(entry) = table.messages.get_mut(&(id.shard, id.key)) else {
+            return;
+        };
+        for r in recipients {
+            if !entry.reported.contains(r) {
+                entry.claimed.remove(r);
+            }
+        }
+        if !entry.ending.is_empty() {
+            self.start(entry, id);
+        }
     }
 
     pub async fn report(&self, id: MessageId, reports: Vec<Report>) -> Result<Done, Error> {
@@ -443,6 +460,7 @@ impl Spool {
                 })
                 .collect()
         };
+        entry.dropping = completing;
         let ending = if completing {
             mem::take(&mut entry.ending)
         } else {
@@ -486,6 +504,7 @@ impl Spool {
                 Err(e) => Err(e),
             };
             if let Some(entry) = table.messages.get_mut(&key) {
+                entry.dropping = false;
                 for report in merge.calls.iter().flat_map(|c| c.reports.iter()) {
                     entry.claimed.remove(&report.recipient);
                     entry.reported.remove(&report.recipient);
