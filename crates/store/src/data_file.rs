@@ -5,6 +5,7 @@ use rt::{Buf, File, OpenOptions, sync_dir};
 
 use crate::core_file::Source;
 use crate::error::Error;
+use crate::ids;
 use crate::reader::{Pins, Reader};
 use crate::superblock::{
     COPIES, Checkpoint, FORMAT, HEADER_SIZE, MAX_SECTOR_SIZE, MAX_SHARDS, MIN_SECTOR_SIZE,
@@ -235,11 +236,7 @@ impl DataFile {
     }
 
     pub async fn next_boot(&mut self) -> Result<u32, Error> {
-        let boot = self
-            .superblock
-            .boot
-            .checked_add(1)
-            .ok_or(Error::Invalid("boot"))?;
+        let boot = ids::next_boot(self.superblock.boot).ok_or(Error::Invalid("boot"))?;
         let checkpoint = self.superblock.checkpoint;
         let oldest = self.superblock.oldest_format;
         self.update(checkpoint, oldest, boot).await?;

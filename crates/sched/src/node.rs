@@ -6,13 +6,11 @@ use std::pin::pin;
 use std::rc::Rc;
 use std::task::Poll;
 
-use rt::{JoinHandle, sleep_until, spawn};
+use rt::{Ends, JoinHandle, Notify, Peers, sleep_until, spawn};
 use spool::{Done, Error, Message, MessageId, Outcome, Pending, Reply, Report, Spool, Stamp};
 
 use crate::clock::Clock;
 use crate::lanes::{Entry, Lanes, Limits, QueueId, Take, ranges};
-use crate::mesh::{Ends, Peers};
-use crate::notify::Notify;
 use crate::policy::{Answer, BACKOFF, Kind, clamp, delay};
 use crate::transport::{Answered, Attempt, Claimed, Transport};
 

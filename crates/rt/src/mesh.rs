@@ -3,8 +3,8 @@ use std::mem;
 use std::rc::Rc;
 use std::sync::{Mutex, PoisonError};
 
-use rt::{JoinHandle, Receiver, Sender, channel, spawn, yield_now};
-
+use crate::channel::{Receiver, Sender, channel};
+use crate::executor::{JoinHandle, spawn, yield_now};
 use crate::notify::Notify;
 
 pub struct Mesh<T> {

@@ -54,3 +54,19 @@ pub fn split_key(key: u64) -> (u32, u32) {
     let counter = u32::try_from(key & u64::from(u32::MAX)).expect("low half fits in u32");
     (boot, counter)
 }
+
+pub const CONTROL_BOOT: u32 = u32::MAX;
+pub const CONTROL_KINDS: u32 = 256;
+pub const LAST_BOOT: u32 = CONTROL_BOOT - CONTROL_KINDS;
+
+pub fn control_key(kind: u8, id: u32) -> u64 {
+    message_key(CONTROL_BOOT - u32::from(kind), id)
+}
+
+pub fn is_control(key: u64) -> bool {
+    split_key(key).0 > LAST_BOOT
+}
+
+pub fn next_boot(boot: u32) -> Option<u32> {
+    boot.checked_add(1).filter(|&next| next <= LAST_BOOT)
+}
