@@ -1,5 +1,6 @@
 mod cache;
 mod error;
+mod leases;
 mod names;
 mod queue;
 mod record;
@@ -9,6 +10,7 @@ mod writer;
 
 pub use cache::{Cache, CacheStats};
 pub use error::Error;
+pub use leases::{Ask, Gcra, IDLE, LIFETIME, LeaseStats, Leases, Taken, Tokens, WAIT, limit_core};
 pub use names::{Call, Loaded as LoadedQueues, Naming, NamingStats, Queues};
 pub use queue::{
     Label, MAX_DOMAIN, Name, Queue, Sealer, Tenancy, domain_ok, mix, naming_shard, queue_shard,
