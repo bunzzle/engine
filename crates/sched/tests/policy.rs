@@ -1,5 +1,6 @@
 use sched::{
-    BACKOFF, CLASS_FULL, CLASS_GREYLIST, CLASS_RETRY_AFTER, CLASS_THROTTLE, Kind, LONGEST, delay,
+    BACKOFF, CLASS_FULL, CLASS_GREYLIST, CLASS_RETRY_AFTER, CLASS_THROTTLE, Kind, LONGEST, clamp,
+    delay,
 };
 
 const MINUTE: u64 = 60_000;
@@ -31,4 +32,11 @@ fn each_reply_kind_has_its_own_delay() {
         delay(Kind::RetryAfter(LONGEST * 3), 1),
         (LONGEST, CLASS_RETRY_AFTER)
     );
+}
+
+#[test]
+fn due_times_past_the_longest_delay_are_clamped() {
+    assert_eq!(clamp(500, 1_000), 500);
+    assert_eq!(clamp(1_000 + LONGEST, 1_000), 1_000 + LONGEST);
+    assert_eq!(clamp(u64::MAX, 1_000), 1_000 + LONGEST);
 }

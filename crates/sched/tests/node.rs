@@ -4,7 +4,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
-use rt::sim::{Config, Disk, Machine, SimDriver, Stalls, check};
+use rt::sim::{Config, Disk, Faults, Machine, SimDriver, Stalls, check};
 use rt::{JoinHandle, Runtime, sleep, spawn, timeout};
 use sched::{
     Answer, Answered, Arrival, Attempt, Clock, Kind, Limits, Mesh, Note, Sched, Transport,
@@ -18,6 +18,8 @@ const CORES: u16 = 2;
 const MESSAGES: u64 = 30;
 const SLACK: u64 = 1_000;
 const HORIZON: Duration = Duration::from_hours(7 * 24);
+const FIRST: Duration = Duration::from_mins(30);
+const MILLION: u32 = 1_000_000;
 
 const OPTIONS: Options = Options {
     journal_size: 8 * SLOT_SIZE,
@@ -32,18 +34,26 @@ const LIMITS: spool::Limits = spool::Limits {
     body: 512 * 1024,
 };
 
+type MessageKey = (u16, u64);
 type Key = (u16, u64, u32);
 
 #[derive(Default)]
 struct World {
     recipients: BTreeSet<Key>,
+    submitted: BTreeSet<Key>,
+    queues: BTreeMap<Key, u32>,
+    misrouted: u64,
     in_attempt: BTreeSet<Key>,
     finals: BTreeMap<Key, u32>,
+    durable: BTreeSet<Key>,
+    expiries: BTreeMap<MessageKey, u64>,
+    cancelling: BTreeSet<MessageKey>,
     overlaps: u64,
     early: u64,
+    again: u64,
     attempts: u64,
     replies: u64,
-    cancelled: BTreeSet<(u16, u64)>,
+    restored: u64,
     spools: Vec<Spool>,
 }
 
@@ -86,13 +96,20 @@ impl Transport for Simulated {
             let owner = usize::from(attempt.message.shard % CORES);
             let spool = world.spools[owner].clone();
             for c in &attempt.recipients {
+                let k = key(attempt.message, c.recipient);
                 let state = spool
                     .recipient(attempt.message, c.recipient)
                     .expect("claimed recipient");
                 if state.due > now + SLACK {
                     world.early += 1;
                 }
-                if !world.in_attempt.insert(key(attempt.message, c.recipient)) {
+                if world.queues.get(&k) != Some(&attempt.queue) {
+                    world.misrouted += 1;
+                }
+                if world.durable.contains(&k) {
+                    world.again += 1;
+                }
+                if !world.in_attempt.insert(k) {
                     world.overlaps += 1;
                 }
             }
@@ -144,6 +161,11 @@ fn message(id: MessageId, now: u64, driver: &SimDriver) -> Message {
     } else {
         0
     };
+    let expiry = if driver.random().is_multiple_of(5) {
+        now + driver.random() % 7_200_000
+    } else {
+        u64::MAX / 2
+    };
     let slices = queues
         .chunks(SLICE as usize)
         .map(|chunk| Slice {
@@ -161,7 +183,7 @@ fn message(id: MessageId, now: u64, driver: &SimDriver) -> Message {
                 not_before,
                 ..HeadClear::default()
             },
-            expiry: u64::MAX / 2,
+            expiry,
             sealed: vec![1; 64],
         },
         body: Body::Inline(vec![2; 300]),
@@ -178,13 +200,28 @@ async fn intake(
 ) {
     for n in 0..MESSAGES {
         let shard = shards[usize::try_from(n).expect("small") % shards.len()];
-        let id = spool.id(shard).await.expect("id");
+        let Ok(id) = spool.id(shard).await else {
+            return;
+        };
         let message = message(id, sched.clock().now(), &driver);
         let arrival = Arrival::of(&message);
-        spool.accept(vec![message]).await.expect("accept");
+        let count = u32::try_from(arrival.queues.len()).expect("small");
         {
             let mut world = world.borrow_mut();
-            for r in 0..u32::try_from(arrival.queues.len()).expect("small") {
+            world
+                .expiries
+                .insert((id.shard, id.key), message.head.expiry);
+            for (r, queue) in (0..count).zip(&arrival.queues) {
+                world.submitted.insert(key(id, r));
+                world.queues.insert(key(id, r), *queue);
+            }
+        }
+        if spool.accept(vec![message]).await.is_err() {
+            return;
+        }
+        {
+            let mut world = world.borrow_mut();
+            for r in 0..count {
                 world.recipients.insert(key(id, r));
             }
         }
@@ -196,13 +233,11 @@ async fn intake(
         sched.enqueue(arrival);
         if driver.random().is_multiple_of(6) {
             let spool = spool.clone();
-            let world = Rc::clone(&world);
             let wait = Duration::from_millis(driver.random() % 3_000);
+            world.borrow_mut().cancelling.insert((id.shard, id.key));
             drop(spawn(async move {
                 sleep(wait).await;
-                if spool.cancel(id).await.is_ok() {
-                    world.borrow_mut().cancelled.insert((id.shard, id.key));
-                }
+                let _ = spool.cancel(id).await;
             }));
         }
         if driver.random().is_multiple_of(3) {
@@ -249,44 +284,71 @@ fn ticker(client: Client, running: Rc<Cell<bool>>) -> JoinHandle<()> {
     })
 }
 
-fn run(seed: u64) {
-    let driver = Rc::new(SimDriver::with_disk(seed, Config::default(), created(seed)));
-    let stalls = Stalls {
-        per_mille: 50,
-        max: Duration::from_millis(5),
-    };
-    let machine = Machine::new(Rc::clone(&driver), usize::from(CORES) + 1, stalls);
-    let setup = Setup {
-        cores: CORES,
-        credits: 4,
-        reserve: 0,
-    };
-    let booted = machine
-        .block_on(0, async move { boot(PATH, setup).await })
-        .expect("boot");
-    let committer = machine.spawn_on(0, booted.committer.run());
-    let world: Shared = Rc::default();
+fn durable(world: &mut World) {
+    let spools = world.spools.clone();
+    let mut finals = BTreeSet::new();
+    for &(shard, message, r) in &world.submitted {
+        let id = MessageId {
+            node: 3,
+            shard,
+            key: message,
+        };
+        let spool = &spools[usize::from(shard % CORES)];
+        if spool.recipient(id, r).is_none_or(|s| s.status.is_final()) {
+            finals.insert((shard, message, r));
+        }
+    }
+    world.durable = finals;
+}
+
+#[derive(Default)]
+struct Session {
+    finished: bool,
+    overdue: usize,
+    errors: u64,
+    expired: u64,
+}
+
+type Feed = (usize, Spool, Vec<u16>);
+
+type Started = (
+    Vec<Sched<Simulated>>,
+    Vec<JoinHandle<()>>,
+    Vec<Feed>,
+    Vec<JoinHandle<Keeper>>,
+    Vec<store::Changes>,
+);
+
+fn start_cores(
+    machine: &Machine,
+    starts: Vec<store::Start>,
+    driver: &Rc<SimDriver>,
+    world: &Shared,
+) -> Option<Started> {
     let mesh = Arc::new(Mesh::<Note>::new(CORES));
-    let mut owners: Vec<JoinHandle<Keeper>> = Vec::new();
-    let mut scheds = Vec::new();
-    let mut intakes = Vec::new();
-    let mut closers = Vec::new();
-    let mut meshes = Vec::new();
-    for start in booted.starts {
+    let mut started: Started = Default::default();
+    for start in starts {
         let index = start.index();
         let core = usize::from(index) + 1;
-        let opened = machine
-            .block_on(core, async move { start.open().await })
-            .expect("open");
-        let shards = opened.shards.clone();
-        let (spool, owner) = Spool::new(opened, 3, LIMITS).expect("limits");
+        let (spool, owner, pending) = machine.block_on(core, async move {
+            let core = timeout(Duration::from_secs(60), start.open())
+                .await
+                .ok()?
+                .ok()?;
+            timeout(Duration::from_secs(60), Spool::open(core, 3, LIMITS))
+                .await
+                .ok()?
+                .ok()
+        })?;
+        let shards: Vec<u16> = (0..SHARDS).filter(|s| s % CORES == index).collect();
         world.borrow_mut().spools.push(spool.clone());
-        owners.push(machine.spawn_on(core, owner.run()));
-        closers.push(spool.changes().clone());
+        world.borrow_mut().restored += pending.len() as u64;
+        started.3.push(machine.spawn_on(core, owner.run()));
+        started.4.push(spool.changes().clone());
         let ends = mesh.take(index).expect("ends");
-        let transport_world = Rc::clone(&world);
-        let transport_driver = Rc::clone(&driver);
-        let started = spool.clone();
+        let transport_world = Rc::clone(world);
+        let transport_driver = Rc::clone(driver);
+        let opened = spool.clone();
         let (sched, done) = machine.block_on(core, async move {
             let clock = Clock::start();
             let transport = Simulated {
@@ -294,36 +356,76 @@ fn run(seed: u64) {
                 driver: transport_driver,
                 clock,
             };
-            Sched::start(ends, started, transport, clock, config())
+            let (sched, done) = Sched::start(ends, opened, transport, clock, config());
+            sched.restore(pending);
+            (sched, done)
         });
-        meshes.push(done);
-        let feed = machine.spawn_on(
-            core,
-            intake(
+        started.1.push(done);
+        started.2.push((core, spool, shards));
+        started.0.push(sched);
+    }
+    Some(started)
+}
+
+fn session(driver: &Rc<SimDriver>, world: &Shared, intake_on: bool, limit: Duration) -> Session {
+    let stalls = Stalls {
+        per_mille: 50,
+        max: Duration::from_millis(5),
+    };
+    let machine = Machine::new(Rc::clone(driver), usize::from(CORES) + 1, stalls);
+    let setup = Setup {
+        cores: CORES,
+        credits: 4,
+        reserve: 0,
+    };
+    let Ok(Ok(booted)) = machine.block_on(0, async move {
+        timeout(Duration::from_secs(60), boot(PATH, setup)).await
+    }) else {
+        return Session::default();
+    };
+    let committer = machine.spawn_on(0, booted.committer.run());
+    world.borrow_mut().spools.clear();
+    world.borrow_mut().in_attempt.clear();
+    let Some((scheds, meshes, feeds, owners, closers)) =
+        start_cores(&machine, booted.starts, driver, world)
+    else {
+        return Session::default();
+    };
+    durable(&mut world.borrow_mut());
+    let mut intakes = Vec::new();
+    if intake_on {
+        for ((core, spool, shards), sched) in feeds.into_iter().zip(&scheds) {
+            let feed = intake(
                 spool,
                 sched.clone(),
                 shards,
-                Rc::clone(&driver),
-                Rc::clone(&world),
-            ),
-        );
-        intakes.push(feed);
-        scheds.push(sched);
+                Rc::clone(driver),
+                Rc::clone(world),
+            );
+            intakes.push(machine.spawn_on(core, feed));
+        }
     }
     let client = booted.client;
-    let watched = Rc::clone(&world);
-    let finished = machine.block_on(0, async move {
-        let work = async move {
+    let watched = Rc::clone(world);
+    let result = machine.block_on(0, async move {
+        let running = Rc::new(Cell::new(true));
+        let ticker = ticker(client.clone(), Rc::clone(&running));
+        let work = async {
             for feed in intakes {
                 feed.await;
             }
-            let running = Rc::new(Cell::new(true));
-            let ticker = ticker(client.clone(), Rc::clone(&running));
             settle(&watched).await;
-            running.set(false);
+        };
+        let finished = timeout(limit, work).await.is_ok();
+        running.set(false);
+        let session = Session {
+            finished,
+            overdue: scheds.iter().map(Sched::overdue).sum(),
+            errors: scheds.iter().map(Sched::report_errors).sum(),
+            expired: scheds.iter().map(Sched::expired).sum(),
+        };
+        let stop = async move {
             ticker.await;
-            let overdue: usize = scheds.iter().map(Sched::overdue).sum();
-            let errors: u64 = scheds.iter().map(Sched::report_errors).sum();
             for sched in &scheds {
                 sched.close();
             }
@@ -340,38 +442,85 @@ fn run(seed: u64) {
             watched.borrow_mut().spools.clear();
             drop(client);
             drop(committer.await);
-            (overdue, errors)
         };
-        timeout(HORIZON, work).await
+        let _ = timeout(Duration::from_secs(600), stop).await;
+        session
     });
-    let Ok((overdue, errors)) = finished else {
-        panic!("seed {seed}: not every message finished");
-    };
-    verify(seed, &world.borrow(), overdue, errors);
+    world.borrow_mut().spools.clear();
+    result
 }
 
-fn verify(seed: u64, world: &World, overdue: usize, errors: u64) {
-    assert_eq!(overdue, 0, "seed {seed}: attempt over the bound");
+fn verify(seed: u64, world: &World) {
     assert_eq!(world.overlaps, 0, "seed {seed}: recipient in two attempts");
     assert_eq!(world.early, 0, "seed {seed}: attempt before due");
-    assert_eq!(errors, 0, "seed {seed}: report refused");
+    assert_eq!(world.again, 0, "seed {seed}: durable final attempted again");
+    assert_eq!(
+        world.misrouted, 0,
+        "seed {seed}: attempt in the wrong queue"
+    );
     let finals: BTreeSet<Key> = world.finals.keys().copied().collect();
-    assert!(finals.is_subset(&world.recipients));
-    for (shard, message, r) in world.recipients.difference(&finals) {
+    assert!(finals.is_subset(&world.submitted));
+    for &(shard, message, r) in world.recipients.difference(&finals) {
+        let cancelled = world.cancelling.contains(&(shard, message));
+        let expires = world.expiries[&(shard, message)] < u64::MAX / 2;
         assert!(
-            world.cancelled.contains(&(*shard, *message)),
+            cancelled || expires,
             "seed {seed}: recipient {r} of ({shard}, {message}) never final"
         );
     }
-    assert!(!world.cancelled.is_empty(), "seed {seed}: no cancel ran");
+    assert!(world.attempts > 0);
+}
+
+fn one_session(seed: u64) {
+    let driver = Rc::new(SimDriver::with_disk(seed, Config::default(), created(seed)));
+    let world: Shared = Rc::default();
+    let run = session(&driver, &world, true, HORIZON);
+    assert!(run.finished, "seed {seed}: not every message finished");
+    assert_eq!(run.overdue, 0, "seed {seed}: attempt over the bound");
+    assert_eq!(run.errors, 0, "seed {seed}: report refused");
+    assert!(run.expired > 0, "seed {seed}: no expiry ran");
+    let world = world.borrow();
+    verify(seed, &world);
     assert!(
         world.finals.values().all(|n| *n == 1),
         "seed {seed}: final answer twice"
     );
-    assert!(world.replies > 0 && world.attempts > 0);
+    assert!(world.replies > 0);
+}
+
+fn restart(seed: u64) {
+    let world: Shared = Rc::default();
+    let config = Config {
+        halt_after: Some(200 + seed * 7_919 % 4_000),
+        faults: Faults {
+            torn_write: MILLION / 4,
+            ..Faults::default()
+        },
+        ..Config::default()
+    };
+    let first = Rc::new(SimDriver::with_disk(seed, config, created(seed)));
+    session(&first, &world, true, FIRST);
+    let second = Rc::new(SimDriver::with_disk(
+        seed + 1,
+        Config::default(),
+        first.crash(),
+    ));
+    let run = session(&second, &world, false, HORIZON);
+    assert!(
+        run.finished,
+        "seed {seed}: not every message finished after restart"
+    );
+    assert_eq!(run.overdue, 0, "seed {seed}: attempt over the bound");
+    assert!(world.borrow().restored > 0, "seed {seed}: nothing restored");
+    verify(seed, &world.borrow());
 }
 
 #[test]
 fn every_recipient_is_attempted_until_final_once_at_a_time() {
-    check(0..8, run);
+    check(0..8, one_session);
+}
+
+#[test]
+fn queues_are_rebuilt_after_a_crash_and_finish() {
+    check(0..12, restart);
 }

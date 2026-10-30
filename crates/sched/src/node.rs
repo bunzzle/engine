@@ -1,5 +1,5 @@
 use std::cell::{Cell, OnceCell, RefCell};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::future::poll_fn;
 use std::ops::Range;
 use std::pin::pin;
@@ -7,13 +7,13 @@ use std::rc::Rc;
 use std::task::Poll;
 
 use rt::{JoinHandle, sleep_until, spawn};
-use spool::{Done, Error, Message, MessageId, Outcome, Reply, Report, Spool, Stamp};
+use spool::{Done, Error, Message, MessageId, Outcome, Pending, Reply, Report, Spool, Stamp};
 
 use crate::clock::Clock;
 use crate::lanes::{Entry, Lanes, Limits, QueueId, Take, ranges};
 use crate::mesh::{Ends, Peers};
 use crate::notify::Notify;
-use crate::policy::{Answer, BACKOFF, Kind, delay};
+use crate::policy::{Answer, BACKOFF, Kind, clamp, delay};
 use crate::transport::{Answered, Attempt, Claimed, Transport};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -130,6 +130,9 @@ struct Inner<T> {
     lanes: RefCell<Lanes>,
     peers: OnceCell<Peers<Note>>,
     notify: Notify,
+    expiry: Notify,
+    expiring: RefCell<BTreeSet<MessageId>>,
+    expired: Cell<u64>,
     closed: Cell<bool>,
     attempts: RefCell<BTreeMap<u64, u64>>,
     next_attempt: Cell<u64>,
@@ -165,6 +168,9 @@ impl<T: Transport + 'static> Sched<T> {
             lanes: RefCell::new(Lanes::new(config.limits)),
             peers: OnceCell::new(),
             notify: Notify::default(),
+            expiry: Notify::default(),
+            expiring: RefCell::new(BTreeSet::new()),
+            expired: Cell::new(0),
             closed: Cell::new(false),
             attempts: RefCell::new(BTreeMap::new()),
             next_attempt: Cell::new(0),
@@ -176,8 +182,11 @@ impl<T: Transport + 'static> Sched<T> {
         let _ = sched.inner.peers.set(peers);
         let runner = sched.clone();
         let run = spawn(async move { runner.run().await });
+        let expirer = sched.clone();
+        let expiry = spawn(async move { expirer.expire().await });
         let done = spawn(async move {
             run.await;
+            expiry.await;
             mesh.await;
         });
         (sched, done)
@@ -237,11 +246,54 @@ impl<T: Transport + 'static> Sched<T> {
                 },
             );
         }
+        self.inner.expiry.notify();
+    }
+
+    pub fn restore(&self, pending: Vec<Pending>) {
+        let now = self.inner.clock.now();
+        for message in pending {
+            let mut groups: BTreeMap<(QueueId, u64), Vec<u32>> = BTreeMap::new();
+            for open in message.recipients {
+                let due = clamp(open.due, now);
+                groups
+                    .entry((open.queue, due))
+                    .or_default()
+                    .push(open.recipient);
+            }
+            for ((queue, due), recipients) in groups {
+                let entry = Entry {
+                    message: message.id,
+                    recipients: ranges(recipients),
+                    forced: false,
+                };
+                self.send(
+                    queue_core(queue, self.inner.config.shards, self.inner.cores),
+                    Note::Enqueue {
+                        queue,
+                        tenant: message.tenant,
+                        entry,
+                        due,
+                    },
+                );
+            }
+        }
+        self.inner.expiry.notify();
+    }
+
+    pub fn retry_tenant(&self, tenant: u32) {
+        let now = self.inner.clock.now();
+        self.inner.lanes.borrow_mut().retry_tenant(tenant, now);
+        self.inner.notify.notify();
+    }
+
+    pub fn expired(&self) -> u64 {
+        self.inner.expired.get()
     }
 
     pub fn close(&self) {
         self.inner.closed.set(true);
         self.inner.notify.notify();
+        self.inner.expiry.notify();
         if let Some(peers) = self.inner.peers.get() {
             peers.close();
         }
@@ -501,6 +553,49 @@ impl<T: Transport + 'static> Sched<T> {
         }
     }
 
+    async fn expire(&self) {
+        let inner = &self.inner;
+        while !inner.closed.get() {
+            let now = inner.clock.now();
+            for id in inner.spool.expired(now) {
+                if !inner.expiring.borrow_mut().insert(id) {
+                    continue;
+                }
+                let sched = self.clone();
+                drop(spawn(async move {
+                    let inner = &sched.inner;
+                    if inner.spool.expire(id, now).await.is_ok() {
+                        inner.expired.set(inner.expired.get() + 1);
+                    } else {
+                        rt::sleep(std::time::Duration::from_millis(inner.config.ending)).await;
+                    }
+                    inner.expiring.borrow_mut().remove(&id);
+                    inner.expiry.notify();
+                }));
+            }
+            let next = inner.spool.next_expiry(now);
+            self.wait(&inner.expiry, next).await;
+        }
+    }
+
+    async fn wait(&self, notify: &Notify, deadline: Option<u64>) {
+        let mut wake = pin!(notify.wait());
+        match deadline {
+            None => wake.await,
+            Some(at) => {
+                let mut timer = pin!(sleep_until(self.inner.clock.instant(at)));
+                poll_fn(|cx| {
+                    if wake.as_mut().poll(cx).is_ready() || timer.as_mut().poll(cx).is_ready() {
+                        Poll::Ready(())
+                    } else {
+                        Poll::Pending
+                    }
+                })
+                .await;
+            }
+        }
+    }
+
     async fn run(&self) {
         let inner = &self.inner;
         while !inner.closed.get() {
@@ -511,21 +606,7 @@ impl<T: Transport + 'static> Sched<T> {
                 self.dispatch(&take);
             }
             let deadline = inner.lanes.borrow().deadline();
-            let mut wake = pin!(inner.notify.wait());
-            match deadline {
-                None => wake.await,
-                Some(at) => {
-                    let mut timer = pin!(sleep_until(inner.clock.instant(at)));
-                    poll_fn(|cx| {
-                        if wake.as_mut().poll(cx).is_ready() || timer.as_mut().poll(cx).is_ready() {
-                            Poll::Ready(())
-                        } else {
-                            Poll::Pending
-                        }
-                    })
-                    .await;
-                }
-            }
+            self.wait(&inner.notify, deadline).await;
         }
     }
 }

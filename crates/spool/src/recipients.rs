@@ -168,6 +168,7 @@ struct Merge {
 #[derive(Default)]
 pub(crate) struct Table {
     messages: BTreeMap<(u16, u64), Entry>,
+    expiries: BTreeSet<(u64, u16, u64)>,
     writes: BTreeMap<u16, u64>,
 }
 
@@ -180,6 +181,9 @@ impl Table {
                 if key.item == HEAD_ITEM {
                     let head = HeadClear::decode(&item.clear).ok_or(Error::State("head"))?;
                     let entry = Entry::new(item.tenant, &head, item.delivery.due);
+                    table
+                        .expiries
+                        .insert((item.delivery.due, shard, key.message));
                     table.messages.insert((shard, key.message), entry);
                     continue;
                 }
@@ -225,8 +229,25 @@ impl Table {
         head: &HeadClear,
         expiry: u64,
     ) {
+        self.expiries.insert((expiry, shard, message));
         self.messages
             .insert((shard, message), Entry::new(tenant, head, expiry));
+    }
+
+    fn remove(&mut self, key: (u16, u64)) {
+        if let Some(entry) = self.messages.remove(&key) {
+            self.expiries.remove(&(entry.expiry, key.0, key.1));
+        }
+    }
+
+    pub(crate) fn open(&self) -> impl Iterator<Item = (u16, u64, u32, Vec<(u32, Recipient)>)> + '_ {
+        self.messages.iter().filter_map(|(&(shard, key), entry)| {
+            let open: Vec<(u32, Recipient)> = (0..entry.recipients)
+                .filter_map(|r| entry.recipient(r).map(|state| (r, state)))
+                .filter(|(_, state)| !state.status.is_final())
+                .collect();
+            (!open.is_empty()).then_some((shard, key, entry.tenant, open))
+        })
     }
 }
 
@@ -270,11 +291,21 @@ impl Spool {
     pub fn expired(&self, now: u64) -> Vec<MessageId> {
         let table = self.inner.table.borrow();
         table
-            .messages
+            .expiries
             .iter()
-            .filter(|(_, entry)| entry.expiry <= now)
-            .map(|(&(shard, key), _)| self.message_id(shard, key))
+            .take_while(|(expiry, _, _)| *expiry <= now)
+            .map(|&(_, shard, key)| self.message_id(shard, key))
             .collect()
+    }
+
+    pub fn next_expiry(&self, after: u64) -> Option<u64> {
+        let table = self.inner.table.borrow();
+        let start = after.checked_add(1)?;
+        table
+            .expiries
+            .range((start, 0, 0)..)
+            .next()
+            .map(|(expiry, _, _)| *expiry)
     }
 
     fn message_id(&self, shard: u16, key: u64) -> MessageId {
@@ -487,7 +518,7 @@ impl Spool {
             let key = (shard, message);
             let answer = match result {
                 Ok(_) if merge.completing => {
-                    table.messages.remove(&key);
+                    table.remove(key);
                     Ok(Done::Dropped)
                 }
                 Ok(_) => {

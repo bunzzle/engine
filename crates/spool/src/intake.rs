@@ -10,6 +10,7 @@ use crate::bodies::{Writer, Written};
 use crate::error::Error;
 use crate::items::{BODY_ITEM, HeadClear, encode_slice, slice_item};
 use crate::limits::{Bounds, Limits, SLICE};
+use crate::pending::{self, Pending};
 use crate::recipients::Table;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -76,12 +77,29 @@ pub struct Spool {
 
 impl Spool {
     pub fn new(core: Core, node: u32, limits: Limits) -> Result<(Self, Shards), Error> {
+        let table = Table::rebuild(&core.keeper, &core.shards)?;
+        Self::build(core, node, limits, table)
+    }
+
+    pub async fn open(
+        core: Core,
+        node: u32,
+        limits: Limits,
+    ) -> Result<(Self, Shards, Vec<Pending>), Error> {
+        limits.check(core.file.superblock().region_size())?;
+        let table = Table::rebuild(&core.keeper, &core.shards)?;
+        let pending = pending::read(&core, &table, node).await?;
+        let (spool, shards) = Self::build(core, node, limits, table)?;
+        Ok((spool, shards, pending))
+    }
+
+    fn build(core: Core, node: u32, limits: Limits, table: Table) -> Result<(Self, Shards), Error> {
         let region_size = core.file.superblock().region_size();
         let bounds = limits.check(region_size)?;
         let client = core.session.client().clone();
         let writer = Writer::new(client.clone(), core.file.clone());
         let ids = RefCell::new(core.ids.clone());
-        let table = RefCell::new(Table::rebuild(&core.keeper, &core.shards)?);
+        let table = RefCell::new(table);
         let (shards, changes) = Shards::new(core);
         let inner = Inner {
             node,
