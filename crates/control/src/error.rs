@@ -6,6 +6,7 @@ pub enum Error {
     Invalid(&'static str),
     Full,
     Refused,
+    Busy,
 }
 
 impl fmt::Display for Error {
@@ -15,6 +16,7 @@ impl fmt::Display for Error {
             Self::Invalid(what) => write!(f, "invalid {what}"),
             Self::Full => write!(f, "control records over their budget"),
             Self::Refused => write!(f, "refused"),
+            Self::Busy => write!(f, "over the limit, try again later"),
         }
     }
 }
