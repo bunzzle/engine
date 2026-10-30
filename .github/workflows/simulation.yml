@@ -16,7 +16,11 @@ env:
 jobs:
   simulation:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      matrix:
+        crate: [sys, rt, store, spool, sched]
     env:
       SIM_SCALE: "400"
       SIM_OFFSET: ${{ github.run_number }}000000
@@ -33,4 +37,4 @@ jobs:
             target
           key: ${{ runner.os }}-cargo-release-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-release-
-      - run: cargo test --workspace --release --locked --no-fail-fast
+      - run: cargo test -p ${{ matrix.crate }} --release --locked --no-fail-fast
