@@ -48,6 +48,7 @@ pub enum Ask<K> {
         key: K,
         slots: u64,
     },
+    Opened,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -189,6 +190,9 @@ struct Inner<K> {
     stats: Cell<LeaseStats>,
     closed: Cell<bool>,
     tick: Notify,
+    cores: u16,
+    opened: Cell<u16>,
+    opening: Notify,
 }
 
 pub struct Leases<K> {
@@ -218,6 +222,9 @@ impl<K: Ord + Clone + Send + 'static> Leases<K> {
             stats: Cell::new(LeaseStats::default()),
             closed: Cell::new(false),
             tick: Notify::default(),
+            cores: ends.cores(),
+            opened: Cell::new(0),
+            opening: Notify::default(),
         });
         let leases = Self { inner };
         let handler = leases.clone();
@@ -245,6 +252,15 @@ impl<K: Ord + Clone + Send + 'static> Leases<K> {
                 .or_insert_with(|| Lease::new(now))
                 .used += slots;
             self.send((self.inner.owner)(&key), Ask::Open { key, slots });
+        }
+        for core in 0..self.inner.cores {
+            self.send(core, Ask::Opened);
+        }
+    }
+
+    pub async fn opened(&self) {
+        while self.inner.opened.get() < self.inner.cores && !self.inner.closed.get() {
+            self.inner.opening.wait().await;
         }
     }
 
@@ -274,13 +290,11 @@ impl<K: Ord + Clone + Send + 'static> Leases<K> {
     }
 
     pub fn give_back(&self, key: &K, taken: Taken) {
-        let now = rt::now();
         let mut leases = self.inner.leases.borrow_mut();
         let Some(lease) = leases.get_mut(key) else {
             return;
         };
         if let Some(until) = taken.token
-            && until > now
             && let Some(batch) = lease.batches.iter_mut().find(|b| b.0 == until)
         {
             batch.1 += 1;
@@ -335,6 +349,7 @@ impl<K: Ord + Clone + Send + 'static> Leases<K> {
     pub fn close(&self) {
         self.inner.closed.set(true);
         self.inner.tick.notify();
+        self.inner.opening.notify();
         for lease in self.inner.leases.borrow_mut().values_mut() {
             lease.waiters.clear();
         }
@@ -474,6 +489,10 @@ impl<K: Ord + Clone + Send + 'static> Leases<K> {
                 let entry = owned.entry(key).or_default();
                 *entry.held.entry(from).or_default() += slots;
                 entry.granted += slots;
+            }
+            Ask::Opened => {
+                self.inner.opened.set(self.inner.opened.get() + 1);
+                self.inner.opening.notify();
             }
         }
     }

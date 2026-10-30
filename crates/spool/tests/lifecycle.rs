@@ -37,6 +37,7 @@ type Key = (u16, u64);
 #[derive(Default)]
 struct Model {
     accepted: BTreeMap<Key, u32>,
+    tenants: BTreeMap<Key, u32>,
     submitted: BTreeSet<Key>,
     attempts: BTreeMap<(Key, u32), u16>,
     finals: BTreeSet<(Key, u32)>,
@@ -108,7 +109,7 @@ async fn accept(
         .collect();
     let message = Message {
         id,
-        tenant: 7,
+        tenant: 7 + u32::from(shard.is_multiple_of(3)),
         head: Head {
             clear: HeadClear {
                 recipients: u32::try_from(count).expect("fits"),
@@ -122,6 +123,7 @@ async fn accept(
         slices,
     };
     model.borrow_mut().submitted.insert(key(id));
+    model.borrow_mut().tenants.insert(key(id), message.tenant);
     spool.accept(vec![message]).await?;
     Ok((id, u32::try_from(count).expect("fits")))
 }
@@ -239,9 +241,29 @@ async fn round(spool: &Spool, id: MessageId, step: u64, rng: &mut Rng, model: &S
     ok
 }
 
+fn recount(spool: &Spool, model: &Model) -> Vec<(u32, u64)> {
+    let mut open: BTreeMap<u32, u64> = BTreeMap::new();
+    for id in spool.messages() {
+        let tenant = model.tenants[&key(id)];
+        let count = (0..)
+            .map_while(|r| spool.recipient(id, r))
+            .filter(|s| !s.status.is_final())
+            .count();
+        *open.entry(tenant).or_default() += count as u64;
+    }
+    open.into_iter().filter(|(_, n)| *n > 0).collect()
+}
+
 async fn work(spool: Spool, shards: Vec<u16>, steps: u64, seed: u64, model: Shared) -> bool {
     let mut rng = Rng(seed ^ u64::from(shards[0]) << 32);
     let mut live: Vec<MessageId> = Vec::new();
+    let closed: Rc<RefCell<BTreeMap<u32, u64>>> = Rc::default();
+    let mut opened: BTreeMap<u32, u64> = BTreeMap::new();
+    let closing = Rc::clone(&closed);
+    spool.on_close(move |tenant, n| *closing.borrow_mut().entry(tenant).or_default() += n);
+    for (tenant, n) in spool.open_counts() {
+        *opened.entry(tenant).or_default() += n;
+    }
     for step in 0..steps {
         live.retain(|id| spool.recipient(*id, 0).is_some());
         if live.len() < 3 || rng.below(3) == 0 {
@@ -249,6 +271,8 @@ async fn work(spool: Spool, shards: Vec<u16>, steps: u64, seed: u64, model: Shar
             match accept(&spool, shard, step, &mut rng, &model).await {
                 Ok((id, count)) => {
                     assert!(spool.recipient(id, count - 1).is_some());
+                    let tenant = model.borrow().tenants[&key(id)];
+                    *opened.entry(tenant).or_default() += u64::from(count);
                     model.borrow_mut().accepted.insert(key(id), count);
                     live.push(id);
                 }
@@ -271,6 +295,13 @@ async fn work(spool: Spool, shards: Vec<u16>, steps: u64, seed: u64, model: Shar
             return false;
         }
     }
+    let left: Vec<(u32, u64)> = opened
+        .iter()
+        .map(|(t, n)| (*t, n - closed.borrow().get(t).copied().unwrap_or(0)))
+        .filter(|(_, n)| *n > 0)
+        .collect();
+    assert_eq!(spool.open_counts(), left, "open counts against closes");
+    assert_eq!(spool.open_counts(), recount(&spool, &model.borrow()));
     true
 }
 
@@ -393,6 +424,11 @@ async fn verify(model: &Model) {
         }
         let (spool, owner) = Spool::new(core, 3, LIMITS).expect("rebuild");
         let owner = spawn(owner.run());
+        assert_eq!(
+            spool.open_counts(),
+            recount(&spool, model),
+            "open counts after start"
+        );
         for id in spool.messages() {
             seen.insert(key(id));
             assert!(model.submitted.contains(&key(id)), "unknown message {id:?}");

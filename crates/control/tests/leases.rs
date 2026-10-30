@@ -252,16 +252,36 @@ fn rate_and_queued_together() {
     check(0..4, |seed| queued(seed, BOTH));
 }
 
-#[test]
-fn counts_at_start_take_their_slots() {
-    let node = Node::start(1);
+fn counts_at_start(seed: u64) {
+    let node = Node::start(seed);
+    let mut opened = Vec::new();
+    for (core, lease) in node.leases.iter().enumerate() {
+        let lease = lease.clone();
+        let slots = 100 * u64::try_from(core).expect("small");
+        let late = Duration::from_millis(3 * slots / 100);
+        opened.push(node.machine.spawn_on(core, async move {
+            sleep(late).await;
+            lease.restore([(QUEUED, slots / 2), (RATED, 5)]);
+            lease.opened().await;
+            if usize::from(limit_core(QUEUED, SHARDS, CORES)) == core {
+                assert_eq!(
+                    lease.granted(&QUEUED),
+                    300,
+                    "owner opened before every count"
+                );
+            }
+        }));
+    }
     let leases = node.leases.clone();
-    let (taken, busy) = node.machine.block_on(1, async move {
-        leases[1].restore([(QUEUED, 300), (RATED, 5)]);
+    let hot = usize::try_from(seed % u64::from(CORES)).expect("small");
+    let (taken, busy) = node.machine.block_on(hot, async move {
+        for done in opened {
+            done.await;
+        }
         let mut taken = 0;
         let mut busy = 0;
         for _ in 0..200 {
-            match leases[2].take(&QUEUED).await {
+            match leases[hot].take(&QUEUED).await {
                 Ok(_) => taken += 1,
                 Err(Error::Busy) => busy += 1,
                 Err(e) => panic!("{e}"),
@@ -269,10 +289,21 @@ fn counts_at_start_take_their_slots() {
         }
         (taken, busy)
     });
-    assert_eq!(taken, 100);
-    assert_eq!(busy, 100);
-    assert_eq!(node.leases[1].used(&QUEUED), 300);
+    assert_eq!(taken, 100, "seed {seed}");
+    assert_eq!(busy, 100, "seed {seed}");
+    let cold = (hot + 1) % usize::from(CORES);
+    assert_eq!(
+        node.leases[cold].used(&QUEUED),
+        50 * u64::try_from(cold).expect("small")
+    );
+    let owner = usize::from(limit_core(QUEUED, SHARDS, CORES));
+    assert_eq!(node.leases[owner].granted(&QUEUED), LIMIT);
     node.stop();
+}
+
+#[test]
+fn counts_at_start_take_their_slots() {
+    check(0..8, counts_at_start);
 }
 
 #[test]

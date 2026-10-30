@@ -58,6 +58,8 @@ pub struct Message {
     pub slices: Vec<Slice>,
 }
 
+type Closer = Rc<dyn Fn(u32, u64)>;
+
 pub(crate) struct Inner {
     pub(crate) node: u32,
     limits: Limits,
@@ -68,6 +70,7 @@ pub(crate) struct Inner {
     pub(crate) ids: RefCell<Ids>,
     writer: Writer,
     pub(crate) table: RefCell<Table>,
+    closer: RefCell<Option<Closer>>,
 }
 
 #[derive(Clone)]
@@ -111,6 +114,7 @@ impl Spool {
             ids,
             writer,
             table,
+            closer: RefCell::new(None),
         };
         Ok((
             Self {
@@ -122,6 +126,21 @@ impl Spool {
 
     pub fn changes(&self) -> &Changes {
         &self.inner.changes
+    }
+
+    pub fn open_counts(&self) -> Vec<(u32, u64)> {
+        self.inner.table.borrow().counts()
+    }
+
+    pub fn on_close(&self, closer: impl Fn(u32, u64) + 'static) {
+        *self.inner.closer.borrow_mut() = Some(Rc::new(closer));
+    }
+
+    pub(crate) fn closed(&self, tenant: u32, count: u64) {
+        let closer = self.inner.closer.borrow().clone();
+        if let Some(closer) = closer {
+            closer(tenant, count);
+        }
     }
 
     pub fn limits(&self) -> Limits {
