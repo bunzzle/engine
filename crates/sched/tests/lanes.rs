@@ -71,7 +71,7 @@ fn the_active_limit_bounds_every_take() {
 #[test]
 fn tenants_share_the_core_whatever_their_queue_count() {
     let mut lanes = Lanes::new(limits(1_000, 1_000, 10));
-    lanes.enqueue(0, 1, entry(0, 0..1_000), 0, 0);
+    lanes.enqueue(0, 1, entry(0, 0..10_000), 0, 0);
     for q in 1..=1_000 {
         lanes.enqueue(q, 2, entry(u64::from(q), 0..10), 0, 0);
     }
@@ -115,13 +115,13 @@ fn lane_bytes_are_counted_and_returned() {
     assert_eq!(lanes.bytes(), 0);
     assert_eq!(lanes.entries(), 0);
     assert_eq!(lanes.recipients(), 0);
-    assert!(lanes.queues(1).is_empty());
+    assert_eq!(lanes.queues(1), Vec::<u32>::new());
 }
 
 #[test]
 fn ranges_merge_neighbours() {
     assert_eq!(ranges([0, 1, 2, 5, 6, 9]), vec![0..3, 5..7, 9..10]);
-    assert!(ranges([]).is_empty());
+    assert_eq!(ranges([]), Vec::new());
 }
 
 fn model(seed: u64) {
