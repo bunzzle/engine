@@ -55,6 +55,10 @@ pub fn delay(kind: Kind, attempts: u16) -> (u64, u8) {
     }
 }
 
+pub fn clamp(due: u64, now: u64) -> u64 {
+    due.min(now.saturating_add(LONGEST))
+}
+
 fn backoff(step: usize) -> (u64, u8) {
     let index = step.min(BACKOFF.len() - 1);
     let class = u8::try_from(index + 1).expect("class fits");

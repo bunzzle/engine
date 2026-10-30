@@ -3,6 +3,7 @@ mod error;
 mod intake;
 mod items;
 mod limits;
+mod pending;
 mod recipients;
 
 pub use bodies::{KIND_BODY_CHUNK, Written, decode_chunk};
@@ -13,4 +14,5 @@ pub use items::{
     slice_item, slice_parts, state_item,
 };
 pub use limits::{Limits, SLICE};
+pub use pending::{Open, Pending};
 pub use recipients::{Done, Outcome, Recipient, Reply, Report, Status};
