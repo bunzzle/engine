@@ -20,6 +20,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "sched"
+version = "0.0.0"
+dependencies = [
+ "rt",
+]
+
+[[package]]
 name = "spool"
 version = "0.0.0"
 dependencies = [
