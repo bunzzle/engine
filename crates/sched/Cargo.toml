@@ -10,8 +10,6 @@ publish.workspace = true
 control = { path = "../control" }
 rt = { path = "../rt" }
 spool = { path = "../spool" }
-
-[dev-dependencies]
 store = { path = "../store" }
 
 [lints]

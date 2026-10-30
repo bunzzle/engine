@@ -170,6 +170,7 @@ pub(crate) struct Table {
     messages: BTreeMap<(u16, u64), Entry>,
     expiries: BTreeSet<(u64, u16, u64)>,
     writes: BTreeMap<u16, u64>,
+    open: BTreeMap<u32, u64>,
 }
 
 impl Table {
@@ -221,6 +222,10 @@ impl Table {
                 );
             }
         }
+        for entry in table.messages.values() {
+            *table.open.entry(entry.tenant).or_default() +=
+                u64::from(entry.recipients - entry.finals);
+        }
         Ok(table)
     }
 
@@ -233,14 +238,30 @@ impl Table {
         expiry: u64,
     ) {
         self.expiries.insert((expiry, shard, message));
+        *self.open.entry(tenant).or_default() += u64::from(head.recipients);
         self.messages
             .insert((shard, message), Entry::new(tenant, head, expiry));
     }
 
-    fn remove(&mut self, key: (u16, u64)) {
-        if let Some(entry) = self.messages.remove(&key) {
-            self.expiries.remove(&(entry.expiry, key.0, key.1));
+    fn remove(&mut self, key: (u16, u64)) -> Option<(u32, u64)> {
+        let entry = self.messages.remove(&key)?;
+        self.expiries.remove(&(entry.expiry, key.0, key.1));
+        let closed = u64::from(entry.recipients - entry.finals);
+        Some((entry.tenant, self.close(entry.tenant, closed)))
+    }
+
+    fn close(&mut self, tenant: u32, closed: u64) -> u64 {
+        if let Some(open) = self.open.get_mut(&tenant) {
+            *open = open.saturating_sub(closed);
+            if *open == 0 {
+                self.open.remove(&tenant);
+            }
         }
+        closed
+    }
+
+    pub(crate) fn counts(&self) -> Vec<(u32, u64)> {
+        self.open.iter().map(|(t, n)| (*t, *n)).collect()
     }
 
     pub(crate) fn open(&self) -> impl Iterator<Item = (u16, u64, u32, Vec<(u32, Recipient)>)> + '_ {
@@ -519,20 +540,25 @@ impl Spool {
             let result = self.inner.changes.apply(merge.batch).await;
             let mut table = self.inner.table.borrow_mut();
             let key = (shard, message);
+            let mut closed = None;
             let answer = match result {
                 Ok(_) if merge.completing => {
-                    table.remove(key);
+                    closed = table.remove(key);
                     Ok(Done::Dropped)
                 }
                 Ok(_) => {
                     let entry = table.messages.get_mut(&key).expect("flushed message");
+                    let mut finals = 0;
                     for report in merge.calls.iter().flat_map(|c| c.reports.iter()) {
                         let next = entry.next(report);
                         if next.status.is_final() {
                             entry.finals += 1;
+                            finals += 1;
                         }
                         entry.states.insert(report.recipient, next);
                     }
+                    let tenant = entry.tenant;
+                    closed = Some((tenant, table.close(tenant, finals)));
                     Ok(Done::Kept)
                 }
                 Err(e) => Err(e),
@@ -545,6 +571,9 @@ impl Spool {
                 }
             }
             drop(table);
+            if let Some((tenant, count)) = closed.filter(|c| c.1 > 0) {
+                self.closed(tenant, count);
+            }
             let waiters = merge.calls.iter().map(|c| &c.waiter).chain(&merge.ending);
             for waiter in waiters {
                 let _ = waiter.send(clone_answer(&answer));

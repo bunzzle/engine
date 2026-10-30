@@ -1,14 +1,20 @@
 mod clock;
+mod error;
+mod intake;
 mod lanes;
 mod node;
 mod policy;
+mod start;
 mod transport;
 
 pub use clock::Clock;
+pub use error::{Error, Refusal};
+pub use intake::{Draft, Suppressions, domain_of};
 pub use lanes::{Entry, Lanes, Limits, QueueId, Take, ranges};
 pub use node::{Arrival, Claim, Config, Note, Route, Sched, queue_core};
 pub use policy::{
     Answer, BACKOFF, CLASS_FULL, CLASS_GREYLIST, CLASS_RETRY_AFTER, CLASS_THROTTLE, Kind, LONGEST,
     clamp, delay,
 };
+pub use start::{CONTROL_SHARD, Links, Meshes, Node, Parts, Running, Settings};
 pub use transport::{Answered, Attempt, Claimed, Transport};
