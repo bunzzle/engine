@@ -1,11 +1,11 @@
 use std::cell::{Cell, RefCell};
-use std::future::poll_fn;
 use std::mem;
 use std::rc::Rc;
 use std::sync::{Mutex, PoisonError};
-use std::task::{Poll, Waker};
 
 use rt::{JoinHandle, Receiver, Sender, channel, spawn, yield_now};
+
+use crate::notify::Notify;
 
 pub struct Mesh<T> {
     ends: Mutex<Vec<Option<Ends<T>>>>,
@@ -172,31 +172,5 @@ impl<T: Send> Peers<T> {
         self.inner.send_all();
         self.inner.senders.borrow_mut().take();
         self.inner.notify.notify();
-    }
-}
-
-#[derive(Default)]
-struct Notify {
-    set: Cell<bool>,
-    waker: Cell<Option<Waker>>,
-}
-
-impl Notify {
-    fn notify(&self) {
-        self.set.set(true);
-        if let Some(waker) = self.waker.take() {
-            waker.wake();
-        }
-    }
-
-    async fn wait(&self) {
-        poll_fn(|cx| {
-            if self.set.replace(false) {
-                return Poll::Ready(());
-            }
-            self.waker.set(Some(cx.waker().clone()));
-            Poll::Pending
-        })
-        .await;
     }
 }

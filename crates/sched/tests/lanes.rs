@@ -16,6 +16,7 @@ fn entry(n: u64, recipients: std::ops::Range<u32>) -> Entry {
     Entry {
         message: id(n),
         recipients: vec![recipients],
+        forced: false,
     }
 }
 
@@ -93,8 +94,16 @@ fn retry_now_makes_waiting_entries_due() {
     assert!(lanes.next(100).is_none());
     lanes.retry_tenant(9, 100);
     assert_eq!(lanes.deadline(), None);
-    let mut counts = vec![lanes.next(100).expect("due").count];
-    counts.push(lanes.next(100).expect("due").count);
+    let first = lanes.next(100).expect("due");
+    let second = lanes.next(100).expect("due");
+    assert!(
+        first
+            .entries
+            .iter()
+            .chain(&second.entries)
+            .all(|e| e.forced)
+    );
+    let mut counts = vec![first.count, second.count];
     counts.sort_unstable();
     assert_eq!(counts, vec![1, 2]);
 }
@@ -153,6 +162,7 @@ fn model(seed: u64) {
                 let entry = Entry {
                     message: id(message),
                     recipients: ranges(picked),
+                    forced: false,
                 };
                 lanes.enqueue(queue, queue % 3, entry, at, now);
             }

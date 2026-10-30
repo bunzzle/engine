@@ -366,6 +366,48 @@ fn cancel_and_expiry_wait_for_open_claims() {
 }
 
 #[test]
+fn released_claims_let_a_cancel_finish_and_no_claim_slips_into_its_drop() {
+    let ((), disk) = on(created(), || async {
+        let node = Node::open().await;
+        let spool = &node.spool;
+        let released = node.accept(0, 3, 500).await;
+        spool.claim(released, 0).expect("claim");
+        spool.claim(released, 1).expect("claim");
+        let cancel = {
+            let spool = spool.clone();
+            spawn(async move { spool.cancel(released).await })
+        };
+        rt::sleep(std::time::Duration::from_millis(5)).await;
+        spool.release(released, &[0, 1]);
+        cancel.await.expect("cancel after release");
+        refused(spool.claim(released, 2), "message");
+        let busy = node.accept(1, 3, 500).await;
+        spool.claim(busy, 0).expect("claim");
+        let cancel = {
+            let spool = spool.clone();
+            spawn(async move { spool.cancel(busy).await })
+        };
+        rt::sleep(std::time::Duration::from_millis(5)).await;
+        let report = {
+            let spool = spool.clone();
+            spawn(async move { spool.report(busy, vec![deferred(0, 9)]).await })
+        };
+        for _ in 0..3 {
+            rt::yield_now().await;
+        }
+        refused(spool.claim(busy, 1), "ending");
+        assert_eq!(report.await.expect("report"), Done::Dropped);
+        cancel.await.expect("cancel busy");
+        node.close().await;
+    });
+    on(disk, || async {
+        let node = Node::open().await;
+        assert_eq!(node.spool.messages(), vec![]);
+        node.close().await;
+    });
+}
+
+#[test]
 fn reports_larger_than_a_region_are_split_into_several_merges() {
     on(created(), || async {
         let node = Node::open().await;
