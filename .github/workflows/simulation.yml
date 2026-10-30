@@ -20,7 +20,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        crate: [sys, rt, store, spool, sched]
+        crate: [sys, rt, store, spool, control, sched]
     env:
       SIM_SCALE: "400"
       SIM_OFFSET: ${{ github.run_number }}000000
