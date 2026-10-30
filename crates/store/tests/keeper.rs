@@ -1,8 +1,11 @@
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::env;
+use std::future::poll_fn;
 use std::panic::{self, AssertUnwindSafe};
+use std::pin::pin;
 use std::rc::Rc;
+use std::task::Poll;
 use std::time::Duration;
 
 use rt::sim::{Config, Disk, Machine, SimDriver, Stalls, check};
@@ -670,6 +673,12 @@ async fn keep(start: Start, model: Shared) {
     }
 }
 
+async fn halted(driver: Rc<SimDriver>) {
+    while !driver.is_halted() {
+        sleep(Duration::from_millis(100)).await;
+    }
+}
+
 fn workload(seed: u64, halt_after: Option<u64>, disk: Disk) -> (Rc<SimDriver>, Model) {
     let config = Config {
         halt_after,
@@ -706,6 +715,7 @@ fn workload(seed: u64, halt_after: Option<u64>, disk: Disk) -> (Rc<SimDriver>, M
         })
         .collect();
     let client = booted.client;
+    let power = Rc::clone(&driver);
     machine.block_on(0, async move {
         let checkpoints = spawn(async move {
             for _ in 0..6 {
@@ -715,14 +725,22 @@ fn workload(seed: u64, halt_after: Option<u64>, disk: Disk) -> (Rc<SimDriver>, M
                 }
             }
         });
-        let done = async move {
+        let mut done = pin!(async move {
             for task in tasks {
                 task.await;
             }
             checkpoints.await;
             drop(committer.await);
-        };
-        let _ = timeout(HORIZON, done).await;
+        });
+        let mut halt = pin!(halted(power));
+        let race = poll_fn(|cx| {
+            if done.as_mut().poll(cx).is_ready() || halt.as_mut().poll(cx).is_ready() {
+                Poll::Ready(())
+            } else {
+                Poll::Pending
+            }
+        });
+        let _ = timeout(HORIZON, race).await;
     });
     let model = model.borrow().clone();
     (driver, model)
