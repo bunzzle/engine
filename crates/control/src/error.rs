@@ -5,6 +5,7 @@ pub enum Error {
     Store(store::Error),
     Invalid(&'static str),
     Full,
+    Refused,
 }
 
 impl fmt::Display for Error {
@@ -13,6 +14,7 @@ impl fmt::Display for Error {
             Self::Store(e) => write!(f, "{e}"),
             Self::Invalid(what) => write!(f, "invalid {what}"),
             Self::Full => write!(f, "control records over their budget"),
+            Self::Refused => write!(f, "refused"),
         }
     }
 }

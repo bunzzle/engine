@@ -6,6 +6,7 @@ use std::pin::pin;
 use std::rc::Rc;
 use std::task::Poll;
 
+use control::{Tenancy, queue_shard};
 use rt::{Ends, JoinHandle, Notify, Peers, sleep_until, spawn};
 use spool::{Done, Error, Message, MessageId, Outcome, Pending, Reply, Report, Spool, Stamp};
 
@@ -59,6 +60,7 @@ pub enum Note {
     Enqueue {
         queue: QueueId,
         tenant: u32,
+        generation: u32,
         entry: Entry,
         due: u64,
     },
@@ -86,16 +88,18 @@ pub enum Note {
 pub struct Arrival {
     pub id: MessageId,
     pub tenant: u32,
+    pub generation: u32,
     pub due: u64,
     pub queues: Vec<QueueId>,
 }
 
 impl Arrival {
-    pub fn of(message: &Message) -> Self {
+    pub fn of(message: &Message, generation: u32) -> Self {
         let clear = &message.head.clear;
         Self {
             id: message.id,
             tenant: message.tenant,
+            generation,
             due: clear.accepted.max(clear.not_before),
             queues: message
                 .slices
@@ -107,16 +111,7 @@ impl Arrival {
 }
 
 pub fn queue_core(queue: QueueId, shards: u32, cores: u16) -> u16 {
-    let shard = mix(queue) % shards;
-    u16::try_from(shard % u32::from(cores)).expect("core fits in u16")
-}
-
-fn mix(mut x: u32) -> u32 {
-    x ^= x >> 16;
-    x = x.wrapping_mul(0x85eb_ca6b);
-    x ^= x >> 13;
-    x = x.wrapping_mul(0xc2b2_ae35);
-    x ^ (x >> 16)
+    queue_shard(queue, shards) % cores
 }
 
 struct Inner<T> {
@@ -125,6 +120,7 @@ struct Inner<T> {
     clock: Clock,
     spool: Spool,
     transport: T,
+    tenancy: Rc<dyn Tenancy>,
     lanes: RefCell<Lanes>,
     peers: OnceCell<Peers<Note>>,
     notify: Notify,
@@ -135,6 +131,7 @@ struct Inner<T> {
     attempts: RefCell<BTreeMap<u64, u64>>,
     next_attempt: Cell<u64>,
     report_errors: Cell<u64>,
+    refused: Cell<u64>,
 }
 
 pub struct Sched<T> {
@@ -154,6 +151,7 @@ impl<T: Transport + 'static> Sched<T> {
         ends: Ends<Note>,
         spool: Spool,
         transport: T,
+        tenancy: Rc<dyn Tenancy>,
         clock: Clock,
         config: Config,
     ) -> (Self, JoinHandle<()>) {
@@ -163,6 +161,7 @@ impl<T: Transport + 'static> Sched<T> {
             clock,
             spool,
             transport,
+            tenancy,
             lanes: RefCell::new(Lanes::new(config.limits)),
             peers: OnceCell::new(),
             notify: Notify::default(),
@@ -173,6 +172,7 @@ impl<T: Transport + 'static> Sched<T> {
             attempts: RefCell::new(BTreeMap::new()),
             next_attempt: Cell::new(0),
             report_errors: Cell::new(0),
+            refused: Cell::new(0),
         });
         let sched = Self { inner };
         let handler = sched.clone();
@@ -217,6 +217,10 @@ impl<T: Transport + 'static> Sched<T> {
         self.inner.report_errors.get()
     }
 
+    pub fn refused(&self) -> u64 {
+        self.inner.refused.get()
+    }
+
     pub fn retry_now(&self, queue: QueueId) {
         let now = self.inner.clock.now();
         self.inner.lanes.borrow_mut().retry_now(queue, now);
@@ -239,6 +243,7 @@ impl<T: Transport + 'static> Sched<T> {
                 Note::Enqueue {
                     queue,
                     tenant: arrival.tenant,
+                    generation: arrival.generation,
                     entry,
                     due: arrival.due,
                 },
@@ -247,9 +252,13 @@ impl<T: Transport + 'static> Sched<T> {
         self.inner.expiry.notify();
     }
 
-    pub fn restore(&self, pending: Vec<Pending>) {
+    pub fn restore(&self, pending: Vec<Pending>, generation: impl Fn(u32) -> Option<u32>) {
         let now = self.inner.clock.now();
         for message in pending {
+            let Some(generation) = generation(message.tenant) else {
+                self.refuse();
+                continue;
+            };
             let mut groups: BTreeMap<(QueueId, u64), Vec<u32>> = BTreeMap::new();
             for open in message.recipients {
                 let due = clamp(open.due, now);
@@ -269,6 +278,7 @@ impl<T: Transport + 'static> Sched<T> {
                     Note::Enqueue {
                         queue,
                         tenant: message.tenant,
+                        generation,
                         entry,
                         due,
                     },
@@ -303,6 +313,10 @@ impl<T: Transport + 'static> Sched<T> {
         }
     }
 
+    fn refuse(&self) {
+        self.inner.refused.set(self.inner.refused.get() + 1);
+    }
+
     fn owner(&self, message: MessageId) -> u16 {
         message.shard % self.inner.cores
     }
@@ -312,9 +326,14 @@ impl<T: Transport + 'static> Sched<T> {
             Note::Enqueue {
                 queue,
                 tenant,
+                generation,
                 entry,
                 due,
             } => {
+                if self.inner.tenancy.holder(queue) != Some((tenant, generation)) {
+                    self.refuse();
+                    return;
+                }
                 let now = self.inner.clock.now();
                 self.inner
                     .lanes

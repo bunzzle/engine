@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::task::Poll;
 use std::time::Duration;
 
+use control::Tenancy;
 use rt::sim::{Config, Disk, Faults, Machine, SimDriver, Stalls, check};
 use rt::{JoinHandle, Mesh, Runtime, sleep, spawn, timeout};
 use sched::{Answer, Answered, Arrival, Attempt, Clock, Kind, Limits, Note, Sched, Transport};
@@ -62,6 +63,14 @@ type Shared = Rc<RefCell<World>>;
 
 fn key(id: MessageId, r: u32) -> Key {
     (id.shard, id.key, r)
+}
+
+struct Tens;
+
+impl Tenancy for Tens {
+    fn holder(&self, queue: u32) -> Option<(u32, u32)> {
+        Some((queue / 10, 1))
+    }
 }
 
 struct Simulated {
@@ -207,7 +216,7 @@ async fn intake(
             return;
         };
         let message = message(id, sched.clock().now(), &driver, n == 0);
-        let arrival = Arrival::of(&message);
+        let arrival = Arrival::of(&message, 1);
         let count = u32::try_from(arrival.queues.len()).expect("small");
         {
             let mut world = world.borrow_mut();
@@ -316,6 +325,7 @@ struct Session {
     overdue: usize,
     errors: u64,
     expired: u64,
+    refused: u64,
 }
 
 type Feed = (usize, Spool, Vec<u16>);
@@ -365,8 +375,9 @@ fn start_cores(
                 driver: transport_driver,
                 clock,
             };
-            let (sched, done) = Sched::start(ends, opened, transport, clock, config());
-            sched.restore(pending);
+            let (sched, done) =
+                Sched::start(ends, opened, transport, Rc::new(Tens), clock, config());
+            sched.restore(pending, |_| Some(1));
             (sched, done)
         });
         started.1.push(done);
@@ -440,6 +451,7 @@ fn session(driver: &Rc<SimDriver>, world: &Shared, intake_on: bool, limit: Durat
             finished,
             overdue: scheds.iter().map(Sched::overdue).sum(),
             errors: scheds.iter().map(Sched::report_errors).sum(),
+            refused: scheds.iter().map(Sched::refused).sum(),
             expired: scheds.iter().map(Sched::expired).sum(),
         };
         if power.is_halted() {
@@ -499,6 +511,7 @@ fn one_session(seed: u64) {
     assert!(run.finished, "seed {seed}: not every message finished");
     assert_eq!(run.overdue, 0, "seed {seed}: attempt over the bound");
     assert_eq!(run.errors, 0, "seed {seed}: report refused");
+    assert_eq!(run.refused, 0, "seed {seed}: enqueue refused");
     assert!(run.expired > 0, "seed {seed}: no expiry ran");
     let world = world.borrow();
     verify(seed, &world);
@@ -532,6 +545,7 @@ fn restart(seed: u64) {
         "seed {seed}: not every message finished after restart"
     );
     assert_eq!(run.overdue, 0, "seed {seed}: attempt over the bound");
+    assert_eq!(run.refused, 0, "seed {seed}: enqueue refused");
     assert!(world.borrow().restored > 0, "seed {seed}: nothing restored");
     verify(seed, &world.borrow());
 }
