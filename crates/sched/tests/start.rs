@@ -295,7 +295,9 @@ async fn recipients(
     let mut domains = Vec::new();
     for r in 0..count {
         let domain = DOMAINS[usize::try_from(driver.random() % 10).expect("small")];
-        let address = if driver.random().is_multiple_of(50) {
+        let blocked = driver.random().is_multiple_of(50)
+            || !world.borrow().refusals.contains_key("Suppressed");
+        let address = if blocked {
             format!("blocked{r}@{domain}")
         } else {
             format!("r{r}@{}", domain.to_ascii_uppercase())
@@ -388,22 +390,28 @@ async fn intake(node: Node<Simulated>, shards: Vec<u16>, driver: Rc<SimDriver>, 
         };
         let message = message(id, &draft, node.sched().clock().now());
         let queues = draft.queues().to_vec();
-        world
-            .borrow_mut()
-            .tenants
-            .insert((id.shard, id.key), tenant);
+        {
+            let mut world = world.borrow_mut();
+            world.tenants.insert((id.shard, id.key), tenant);
+            for (r, (domain, queue)) in (0..).zip(domains.into_iter().zip(queues)) {
+                world.accepted.insert(key(id, r), (tenant, domain, queue));
+            }
+        }
         match node.accept(draft, message).await {
             Ok(()) => {
                 let mut world = world.borrow_mut();
-                for (r, (domain, queue)) in (0..).zip(domains.into_iter().zip(queues)) {
-                    world.accepted.insert(key(id, r), (tenant, domain, queue));
-                }
                 let limit = queued_limit(tenant);
                 if limit > 0 && open_total(&world, tenant) > limit {
                     world.over += 1;
                 }
             }
-            Err(refusal) => refused(&world, refusal),
+            Err(refusal) => {
+                world
+                    .borrow_mut()
+                    .accepted
+                    .retain(|&(shard, k, _), _| (shard, k) != (id.shard, id.key));
+                refused(&world, refusal);
+            }
         }
         if driver.random().is_multiple_of(3) {
             sleep(Duration::from_millis(driver.random() % 500)).await;
