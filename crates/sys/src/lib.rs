@@ -5,6 +5,7 @@ pub mod epoll;
 pub mod fs;
 #[cfg(target_os = "macos")]
 pub mod kqueue;
+pub mod mem;
 pub mod net;
 #[cfg(target_os = "linux")]
 pub mod uring;
