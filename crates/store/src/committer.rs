@@ -319,6 +319,10 @@ impl Committer {
         &self.usage
     }
 
+    pub fn held(&self, session: usize) -> &[u32] {
+        self.runs.held.get(session).map_or(&[], Vec::as_slice)
+    }
+
     pub fn is_failed(&self) -> bool {
         self.failed
     }

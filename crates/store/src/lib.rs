@@ -9,6 +9,7 @@ mod indexes;
 mod journal;
 mod keeper;
 mod layout;
+mod merge;
 mod owner;
 mod reader;
 mod rebuild;
@@ -43,6 +44,7 @@ pub use journal::{
 };
 pub use keeper::Keeper;
 pub use layout::{Fields, FieldsMut};
+pub use merge::{DELAY_RUNS, Done, Job, REFUSE_RUNS, Retain, Tiering, merge};
 pub use owner::{Batch, Changes, Op, Shards};
 pub use reader::{Owner, Pin, Pins, READ_ATTEMPTS, Reader};
 pub use record::{

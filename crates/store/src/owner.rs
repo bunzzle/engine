@@ -9,6 +9,7 @@ use crate::error::Error;
 use crate::ids::is_control;
 use crate::journal::{Dead, Range};
 use crate::keeper::Keeper;
+use crate::merge::{Done, merge};
 use crate::reader::{Owner, Reader};
 use crate::record::{Record, rebase};
 use crate::regions::Claim;
@@ -108,6 +109,7 @@ enum Input {
     Change(Request),
     Event(Event),
     Copied(Copied),
+    Merged(Done),
     Close,
 }
 
@@ -182,6 +184,7 @@ pub struct Shards {
     sent: BTreeMap<u64, Request>,
     tag: u64,
     compacting: Option<Compacting>,
+    merging: bool,
     closing: bool,
 }
 
@@ -210,6 +213,7 @@ impl Shards {
             sent: BTreeMap::new(),
             tag: 0,
             compacting: None,
+            merging: false,
             closing: false,
         };
         (owner, Changes { sender })
@@ -237,6 +241,11 @@ impl Shards {
                 Input::Change(request) => self.request(request),
                 Input::Event(event) => self.event(event).await,
                 Input::Copied(copied) => self.copied(copied),
+                Input::Merged(done) => {
+                    self.merging = false;
+                    let _ = self.keeper.merged(done);
+                    self.start_merge();
+                }
                 Input::Close => self.closing = true,
             }
             self.flush();
@@ -452,7 +461,10 @@ impl Shards {
                 let _ = self.keeper.cut(&self.session, &self.file, sequence).await;
             }
             Event::Compact { region, epoch } => self.compact(region, epoch),
-            Event::Published { sequence } => self.keeper.published(sequence),
+            Event::Published { sequence } => {
+                self.keeper.published(sequence);
+                self.start_merge();
+            }
             Event::Abandoned { sequence } => self.keeper.abandoned(sequence),
         }
     }
@@ -558,6 +570,26 @@ impl Shards {
                 leases,
             };
             let _ = sender.send(Input::Copied(copied));
+        });
+    }
+
+    fn start_merge(&mut self) {
+        if self.merging || self.closing {
+            return;
+        }
+        let Some(job) = self.keeper.plan(&self.file) else {
+            return;
+        };
+        self.merging = true;
+        let task = merge(
+            job,
+            self.file.clone(),
+            self.session.clone(),
+            self.keeper.tiering().clone(),
+        );
+        let sender = self.sender.clone();
+        spawn(async move {
+            let _ = sender.send(Input::Merged(task.await));
         });
     }
 

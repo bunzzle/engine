@@ -48,6 +48,7 @@ pub(crate) struct Answer {
     pub(crate) failed: bool,
 }
 
+#[derive(Clone)]
 pub struct Session {
     pub(crate) id: usize,
     pub(crate) client: Client,
