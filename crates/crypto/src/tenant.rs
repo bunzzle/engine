@@ -9,11 +9,13 @@ impl Tenant {
         Self(Prk::from_secret(key))
     }
 
+    pub fn data_secret(&self, generation: u32, version: u8) -> Secret<32> {
+        self.0
+            .expand(&[b"data", &generation.to_le_bytes(), &[version]])
+    }
+
     pub fn data_key(&self, generation: u32, version: u8) -> DataKey {
-        let key = self
-            .0
-            .expand::<32>(&[b"data", &generation.to_le_bytes(), &[version]]);
-        DataKey::new(&key, version)
+        DataKey::new(&self.data_secret(generation, version), version)
     }
 
     pub fn hash_key(&self, generation: u32) -> Secret<16> {

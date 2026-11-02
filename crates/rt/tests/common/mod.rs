@@ -112,6 +112,13 @@ impl MemDriver {
             Op::SyncData { .. } | Op::SyncDir { .. } | Op::Shutdown { .. } => {
                 Completion::Unit(Ok(()))
             }
+            Op::Rename { from, to } => match state.files.remove(&from) {
+                Some(data) => {
+                    state.files.insert(to, data);
+                    Completion::Unit(Ok(()))
+                }
+                None => Completion::Unit(Err(io::ErrorKind::NotFound.into())),
+            },
             Op::Allocate { handle, len } => {
                 let mut data = state.open[&handle].borrow_mut();
                 let len = usize::try_from(len).unwrap_or(usize::MAX);

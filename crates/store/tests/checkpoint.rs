@@ -100,6 +100,7 @@ const OPTIONS_RW: OpenOptions = OpenOptions {
     create: false,
     create_new: false,
     truncate: false,
+    mode: None,
 };
 
 fn used(recovered: &Recovered) -> BTreeSet<u32> {

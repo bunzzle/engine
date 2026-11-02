@@ -204,7 +204,11 @@ impl State {
         };
         if matches!(
             op,
-            Op::WriteAt { .. } | Op::SyncData { .. } | Op::SyncDir { .. } | Op::Allocate { .. }
+            Op::WriteAt { .. }
+                | Op::SyncData { .. }
+                | Op::SyncDir { .. }
+                | Op::Rename { .. }
+                | Op::Allocate { .. }
         ) {
             self.disk_ops += 1;
             self.halted = self.config.halt_after == Some(self.disk_ops);
@@ -285,6 +289,7 @@ impl State {
                 self.disk.sync_dir(&path);
                 Completion::Unit(Ok(()))
             }
+            Op::Rename { from, to } => Completion::Unit(self.disk.rename(&from, &to)),
             Op::Allocate { handle, len } => Completion::Unit(match self.file(handle) {
                 Some(path) => {
                     self.disk.allocate(&path, len);

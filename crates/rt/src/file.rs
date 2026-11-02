@@ -17,6 +17,17 @@ pub async fn sync_dir(path: impl AsRef<Path>) -> io::Result<()> {
     }
 }
 
+pub async fn rename(from: impl AsRef<Path>, to: impl AsRef<Path>) -> io::Result<()> {
+    let op = Op::Rename {
+        from: from.as_ref().to_path_buf(),
+        to: to.as_ref().to_path_buf(),
+    };
+    match OpFuture::with_driver(executor::driver(), op).await {
+        Completion::Unit(result) => result,
+        _ => Err(mismatch()),
+    }
+}
+
 pub struct File {
     driver: Rc<dyn Driver>,
     handle: Option<Handle>,

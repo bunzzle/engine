@@ -8,7 +8,7 @@ use std::{fs, io, process, thread};
 
 use rt::{
     Buf, File, Native, OpenOptions, Runtime, TcpListener, TcpStream, UdpSocket, channel, now,
-    sleep, spawn, sync_dir, timeout,
+    rename, sleep, spawn, sync_dir, timeout,
 };
 
 fn run<T: 'static>(future: impl Future<Output = T> + 'static) -> T {
@@ -40,6 +40,47 @@ fn scratch(name: &str) -> PathBuf {
 
 fn local() -> SocketAddr {
     SocketAddr::from((Ipv4Addr::LOCALHOST, 0))
+}
+
+#[test]
+fn files_are_created_with_the_given_mode() {
+    use std::os::unix::fs::PermissionsExt;
+    for (name, driver) in drivers() {
+        let dir = scratch(&format!("mode-{name}"));
+        let path = dir.join("secret");
+        let target = path.clone();
+        Runtime::new(Rc::new(driver)).block_on(async move {
+            let options = OpenOptions {
+                mode: Some(0o600),
+                ..options()
+            };
+            File::open(&target, &options).await.expect("open");
+        });
+        let mode = fs::metadata(&path).expect("metadata").permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
+}
+
+#[test]
+fn rename_replaces_a_file() {
+    for (name, driver) in drivers() {
+        let dir = scratch(&format!("rename-{name}"));
+        let (temp, target) = (dir.join("temp"), dir.join("target"));
+        fs::write(&target, b"old").expect("std write");
+        let (from, to) = (temp.clone(), target.clone());
+        Runtime::new(Rc::new(driver)).block_on(async move {
+            let file = File::open(&from, &options()).await.expect("open");
+            let (written, _) = file.write_all_at(Buf::from_slice(b"new"), 0).await;
+            written.expect("write");
+            file.sync_data().await.expect("sync");
+            rename(&from, &to).await.expect("rename");
+            sync_dir(to.parent().expect("parent"))
+                .await
+                .expect("sync dir");
+        });
+        assert_eq!(fs::read(&target).expect("std read"), b"new");
+        assert!(!temp.exists());
+    }
 }
 
 #[test]
