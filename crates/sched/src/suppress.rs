@@ -217,12 +217,7 @@ impl Suppressions {
     }
 
     pub fn owner(&self, tenant: u32, hash: &Hash) -> u16 {
-        let naming = &self.inner.parts.naming;
-        let mut data = [0; 20];
-        data[..4].copy_from_slice(&tenant.to_le_bytes());
-        data[4..].copy_from_slice(hash);
-        u16::try_from(siphash(&naming.key, &data) % u64::from(naming.shards))
-            .expect("shard fits in u16")
+        owner_shard(&self.inner.parts.naming, tenant, hash)
     }
 
     pub fn hash(&self, tenant: u32, address: &str) -> Option<Hash> {
@@ -605,6 +600,14 @@ impl Suppressions {
     }
 }
 
+pub(crate) fn owner_shard(naming: &Naming, tenant: u32, hash: &Hash) -> u16 {
+    let mut data = [0; 20];
+    data[..4].copy_from_slice(&tenant.to_le_bytes());
+    data[4..].copy_from_slice(hash);
+    u16::try_from(siphash(&naming.key, &data) % u64::from(naming.shards))
+        .expect("shard fits in u16")
+}
+
 fn label(tenant: u32, generation: u32) -> Label {
     Label {
         tenant,
@@ -624,7 +627,7 @@ fn next(mut key: Key) -> Option<Key> {
     None
 }
 
-fn refusal(error: &store::Error) -> Refusal {
+pub(crate) fn refusal(error: &store::Error) -> Refusal {
     match error {
         store::Error::Busy => Refusal::Busy,
         _ => Refusal::Failed,

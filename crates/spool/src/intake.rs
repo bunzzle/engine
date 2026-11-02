@@ -2,8 +2,8 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use store::{
-    Batch, Change, Changes, Client, Core, Delivery, HEAD_ITEM, INDEX_SIZE, Ids, MAX_PAYLOAD, Op,
-    Shards, fits, record_size, split_key,
+    Batch, Change, Changes, Client, Core, Delivery, HEAD_ITEM, INDEX_SIZE, Ids, IndexRecord,
+    MAX_PAYLOAD, Op, Shards, fits, message_key, record_size, split_key,
 };
 
 use crate::bodies::{Writer, Written};
@@ -29,6 +29,15 @@ impl MessageId {
         out[8..12].copy_from_slice(&boot.to_le_bytes());
         out[12..16].copy_from_slice(&counter.to_le_bytes());
         out
+    }
+
+    pub fn from_bytes(bytes: [u8; 16]) -> Self {
+        let word = |at: usize| u32::from_le_bytes(bytes[at..at + 4].try_into().expect("4 bytes"));
+        Self {
+            node: word(0),
+            shard: u16::from_le_bytes([bytes[4], bytes[5]]),
+            key: message_key(word(8), word(12)),
+        }
     }
 }
 
@@ -194,6 +203,14 @@ impl Spool {
     }
 
     pub async fn accept(&self, messages: Vec<Message>) -> Result<(), Error> {
+        self.accept_indexed(messages, None).await
+    }
+
+    pub async fn accept_indexed(
+        &self,
+        messages: Vec<Message>,
+        index: Option<(u16, Vec<IndexRecord>)>,
+    ) -> Result<(), Error> {
         let mut batches = Vec::with_capacity(messages.len());
         let mut held = Vec::new();
         let mut bytes = 0;
@@ -222,10 +239,17 @@ impl Spool {
             ranges += batch.ops.iter().map(|op| op.bodies.len()).sum::<usize>();
             batches.push(batch);
         }
+        if let Some((_, extra)) = &index {
+            bytes += extra
+                .iter()
+                .map(|r| record_size(r.encode().len()) as u64)
+                .sum::<u64>();
+            records += extra.len();
+        }
         if bytes > self.inner.region_size || !fits(1 + ranges, 1, records + ranges, 0) {
             return Err(Error::Limit("submission"));
         }
-        let created = self.inner.changes.create(batches).await;
+        let created = self.inner.changes.create_indexed(batches, index).await;
         drop(held);
         created?;
         let mut table = self.inner.table.borrow_mut();

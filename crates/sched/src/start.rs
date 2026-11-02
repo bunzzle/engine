@@ -12,6 +12,7 @@ use store::{Changes, Core, Keeper};
 use crate::clock::Clock;
 use crate::error::Error;
 use crate::node::{Config, Note, Sched};
+use crate::requests::{KIND_REQUEST, RequestInputs, Requests, retain_request};
 use crate::suppress::{self, Hasher, Inputs, KIND_SUPPRESS, Suppressions};
 use crate::transport::Transport;
 
@@ -84,6 +85,7 @@ pub(crate) struct Inner<T> {
     pub(crate) leases: Leases<u32>,
     pub(crate) table: Rc<RefCell<Table>>,
     pub(crate) suppressions: Suppressions,
+    pub(crate) requests: Requests,
     config: Peers<control::Note>,
     writer: RefCell<Option<Writer>>,
     writing: Cell<bool>,
@@ -155,18 +157,17 @@ impl<T: Transport + 'static> Node<T> {
             loaded.writer(changes.clone())
         });
 
-        let (suppressions, lists_done) = Suppressions::start(
-            links.suppress,
-            Inputs {
-                hasher: parts.hasher,
-                sealer: Rc::clone(&parts.sealer),
-                changes: changes.clone(),
-                table: Rc::clone(&table),
-                clock,
-                naming: settings.naming,
-                shards: kept,
-            },
-        );
+        let inputs = Inputs {
+            hasher: Rc::clone(&parts.hasher),
+            sealer: Rc::clone(&parts.sealer),
+            changes: changes.clone(),
+            table: Rc::clone(&table),
+            clock,
+            naming: settings.naming,
+            shards: kept,
+        };
+        let (suppressions, requests, mut index_done) =
+            index_services(links.suppress, inputs).await?;
         let (queues, names_done) = loaded.start(links.names, changes.clone(), parts.sealer);
 
         let shards = settings.naming.shards;
@@ -209,13 +210,17 @@ impl<T: Transport + 'static> Node<T> {
             leases,
             table,
             suppressions,
+            requests,
             config,
             writer: RefCell::new(writer),
             writing: Cell::new(false),
             restored,
         };
         let running = Running {
-            done: vec![config_done, names_done, leases_done, sched_done, lists_done],
+            done: {
+                index_done.extend([config_done, names_done, leases_done, sched_done]);
+                index_done
+            },
             owner,
             changes,
         };
@@ -243,6 +248,10 @@ impl<T: Transport + 'static> Node<T> {
 
     pub fn leases(&self) -> &Leases<u32> {
         &self.inner.leases
+    }
+
+    pub fn requests(&self) -> &Requests {
+        &self.inner.requests
     }
 
     pub fn suppressions(&self) -> &Suppressions {
@@ -297,15 +306,40 @@ impl<T: Transport + 'static> Node<T> {
         inner.queues.close();
         inner.leases.close();
         inner.suppressions.close();
+        inner.requests.close();
         inner.config.close();
     }
+}
+
+async fn index_services(
+    ends: Ends<suppress::Ask>,
+    inputs: Inputs,
+) -> Result<(Suppressions, Requests, Vec<JoinHandle<()>>), Error> {
+    let request_inputs = RequestInputs {
+        hasher: Rc::clone(&inputs.hasher),
+        changes: inputs.changes.clone(),
+        table: Rc::clone(&inputs.table),
+        clock: inputs.clock,
+        naming: inputs.naming,
+        shards: inputs.shards.clone(),
+    };
+    let (suppressions, lists_done) = Suppressions::start(ends, inputs);
+    let (requests, requests_done) = Requests::start(request_inputs)
+        .await
+        .map_err(spool::Error::from)?;
+    Ok((suppressions, requests, vec![lists_done, requests_done]))
 }
 
 fn retain_current(core: &mut Core, table: &Rc<RefCell<Table>>, clock: Clock) {
     let rules = Rc::clone(table);
     core.keeper.set_tiering(Tiering {
         retain: Rc::new(move |kind, entry, oldest| {
-            kind != KIND_SUPPRESS || suppress::retain(&rules.borrow(), clock.now(), entry, oldest)
+            let table = rules.borrow();
+            match kind {
+                KIND_SUPPRESS => suppress::retain(&table, clock.now(), entry, oldest),
+                KIND_REQUEST => retain_request(&table, clock.now(), entry),
+                _ => true,
+            }
         }),
         ..core.keeper.tiering().clone()
     });
