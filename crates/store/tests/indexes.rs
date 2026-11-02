@@ -533,6 +533,15 @@ fn lookups_see_frozen_entries_while_a_cut_is_pending() {
         while !matches!(core.pump().await, Event::Cut { .. }) {}
         assert_eq!(core.keeper.index_roots(3).expect("kept"), Vec::new());
         verify(&core.keeper, &core.data, &core.model).await;
+        let keys: Vec<[u8; 20]> = core.model[&(3, (1, 0))].keys().copied().collect();
+        let (from, to) = (keys[10], keys[30]);
+        let ranged = core
+            .keeper
+            .range(&core.data, 3, (1, 0), from..to, usize::MAX)
+            .await
+            .expect("range");
+        let ranged: Vec<[u8; 20]> = ranged.iter().map(|e| e.key).collect();
+        assert_eq!(ranged, keys[10..30]);
         while !matches!(core.pump().await, Event::Published { .. }) {}
         request.await.expect("checkpoint");
         assert_eq!(core.keeper.index_roots(3).expect("kept").len(), 1);

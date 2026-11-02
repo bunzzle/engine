@@ -44,6 +44,10 @@ impl Memtable {
         self.map.values()
     }
 
+    pub fn range(&self, from: Key) -> impl Iterator<Item = &Entry> {
+        self.map.range(from..).map(|(_, entry)| entry)
+    }
+
     pub fn put(&mut self, entry: Entry) -> Result<(), Error> {
         self.shape.check(&entry)?;
         self.bytes += self.size(&entry);

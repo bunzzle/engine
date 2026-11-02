@@ -6,12 +6,13 @@ use control::{
     limit_core,
 };
 use rt::{Ends, JoinHandle, Mesh, Notify, Peers, spawn};
+use store::Tiering;
 use store::{Changes, Core, Keeper};
 
 use crate::clock::Clock;
 use crate::error::Error;
-use crate::intake::Suppressions;
 use crate::node::{Config, Note, Sched};
+use crate::suppress::{self, Hasher, Inputs, KIND_SUPPRESS, Suppressions};
 use crate::transport::Transport;
 
 pub const CONTROL_SHARD: u16 = 0;
@@ -21,6 +22,7 @@ pub struct Meshes {
     names: Mesh<Call>,
     leases: Mesh<Ask<u32>>,
     sched: Mesh<Note>,
+    suppress: Mesh<suppress::Ask>,
     steps: Mesh<()>,
 }
 
@@ -31,6 +33,7 @@ impl Meshes {
             names: Mesh::new(cores),
             leases: Mesh::new(cores),
             sched: Mesh::new(cores),
+            suppress: Mesh::new(cores),
             steps: Mesh::new(cores),
         }
     }
@@ -41,6 +44,7 @@ impl Meshes {
             names: self.names.take(core)?,
             leases: self.leases.take(core)?,
             sched: self.sched.take(core)?,
+            suppress: self.suppress.take(core)?,
             steps: self.steps.take(core)?,
         })
     }
@@ -51,6 +55,7 @@ pub struct Links {
     names: Ends<Call>,
     leases: Ends<Ask<u32>>,
     sched: Ends<Note>,
+    suppress: Ends<suppress::Ask>,
     steps: Ends<()>,
 }
 
@@ -65,7 +70,7 @@ pub struct Settings {
 
 pub struct Parts<T> {
     pub sealer: Rc<dyn Sealer>,
-    pub suppressions: Rc<dyn Suppressions>,
+    pub hasher: Rc<dyn Hasher>,
     pub transport: T,
     pub clock: Clock,
 }
@@ -78,7 +83,7 @@ pub(crate) struct Inner<T> {
     pub(crate) queues: Queues,
     pub(crate) leases: Leases<u32>,
     pub(crate) table: Rc<RefCell<Table>>,
-    pub(crate) suppressions: Rc<dyn Suppressions>,
+    pub(crate) suppressions: Suppressions,
     config: Peers<control::Note>,
     writer: RefCell<Option<Writer>>,
     writing: Cell<bool>,
@@ -115,7 +120,7 @@ impl Running {
 
 impl<T: Transport + 'static> Node<T> {
     pub async fn start(
-        core: Core,
+        mut core: Core,
         links: Links,
         settings: Settings,
         parts: Parts<T>,
@@ -127,12 +132,15 @@ impl<T: Transport + 'static> Node<T> {
             None
         };
         let loaded = Queues::load(&core, settings.naming, parts.sealer.as_ref()).await?;
+        let table = Rc::new(RefCell::new(Table::default()));
+        let clock = parts.clock;
+        retain_current(&mut core, &table, clock);
+        let kept = core.shards.clone();
         let (spool, shards, pending) =
             spool::Spool::open(core, settings.node, settings.spool).await?;
         let owner = spawn(shards.run());
         let changes = spool.changes().clone();
 
-        let table = Rc::new(RefCell::new(Table::default()));
         let applied = Rc::new(Notify::default());
         let (config, config_done) = {
             let table = Rc::clone(&table);
@@ -147,6 +155,18 @@ impl<T: Transport + 'static> Node<T> {
             loaded.writer(changes.clone())
         });
 
+        let (suppressions, lists_done) = Suppressions::start(
+            links.suppress,
+            Inputs {
+                hasher: parts.hasher,
+                sealer: Rc::clone(&parts.sealer),
+                changes: changes.clone(),
+                table: Rc::clone(&table),
+                clock,
+                naming: settings.naming,
+                shards: kept,
+            },
+        );
         let (queues, names_done) = loaded.start(links.names, changes.clone(), parts.sealer);
 
         let shards = settings.naming.shards;
@@ -188,14 +208,14 @@ impl<T: Transport + 'static> Node<T> {
             queues,
             leases,
             table,
-            suppressions: parts.suppressions,
+            suppressions,
             config,
             writer: RefCell::new(writer),
             writing: Cell::new(false),
             restored,
         };
         let running = Running {
-            done: vec![config_done, names_done, leases_done, sched_done],
+            done: vec![config_done, names_done, leases_done, sched_done, lists_done],
             owner,
             changes,
         };
@@ -223,6 +243,10 @@ impl<T: Transport + 'static> Node<T> {
 
     pub fn leases(&self) -> &Leases<u32> {
         &self.inner.leases
+    }
+
+    pub fn suppressions(&self) -> &Suppressions {
+        &self.inner.suppressions
     }
 
     pub fn table(&self) -> Ref<'_, Table> {
@@ -272,8 +296,19 @@ impl<T: Transport + 'static> Node<T> {
         inner.sched.close();
         inner.queues.close();
         inner.leases.close();
+        inner.suppressions.close();
         inner.config.close();
     }
+}
+
+fn retain_current(core: &mut Core, table: &Rc<RefCell<Table>>, clock: Clock) {
+    let rules = Rc::clone(table);
+    core.keeper.set_tiering(Tiering {
+        retain: Rc::new(move |kind, entry, oldest| {
+            kind != KIND_SUPPRESS || suppress::retain(&rules.borrow(), clock.now(), entry, oldest)
+        }),
+        ..core.keeper.tiering().clone()
+    });
 }
 
 async fn barrier(ends: Ends<()>) {

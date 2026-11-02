@@ -39,6 +39,7 @@ name = "sched"
 version = "0.0.0"
 dependencies = [
  "control",
+ "index",
  "rt",
  "spool",
  "store",

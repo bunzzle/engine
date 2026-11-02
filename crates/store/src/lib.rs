@@ -45,7 +45,7 @@ pub use journal::{
 pub use keeper::Keeper;
 pub use layout::{Fields, FieldsMut};
 pub use merge::{DELAY_RUNS, Done, Job, REFUSE_RUNS, Retain, Tiering, merge};
-pub use owner::{Batch, Changes, Op, Shards};
+pub use owner::{Batch, Changes, Found, Op, Shards};
 pub use reader::{Owner, Pin, Pins, READ_ATTEMPTS, Reader};
 pub use record::{
     FLAG_MORE, Header, MAX_PAYLOAD, RECORD_ALIGN, RECORD_FORMAT, RECORD_HEADER_SIZE, Record,
