@@ -11,8 +11,8 @@ use control::{Label, Limits as TenantLimits, Name, Naming, Object, Pool, Sealer,
 use rt::sim::{Config, Disk, Faults, Machine, SimDriver, Stalls, check};
 use rt::{JoinHandle, Runtime, sleep, spawn, timeout};
 use sched::{
-    Answer, Answered, Attempt, Clock, Draft, Kind, Limits, Meshes, Node, Parts, Refusal, Running,
-    Settings, Suppressions, Transport,
+    Answer, Answered, Attempt, Clock, Draft, Hash, Hasher, Kind, Limits, Meshes, Node, Parts,
+    Reason, Refusal, Running, Settings, Transport,
 };
 use spool::{Body, Head, HeadClear, Message, MessageId, SLICE, Slice};
 use store::{Client, DataFile, Options, SLOT_SIZE, Setup, boot};
@@ -144,11 +144,11 @@ impl Sealer for Toy {
     }
 }
 
-struct Blocked;
+struct Keyed;
 
-impl Suppressions for Blocked {
-    fn suppressed(&self, _: u32, address: &str) -> bool {
-        address.starts_with("blocked")
+impl Hasher for Keyed {
+    fn hash(&self, tenant: u32, data: &[u8]) -> Hash {
+        index::siphash128(&[7; 16], &[&tenant.to_le_bytes()[..], data].concat())
     }
 }
 
@@ -298,7 +298,7 @@ async fn recipients(
         let blocked = driver.random().is_multiple_of(50)
             || !world.borrow().refusals.contains_key("Suppressed");
         let address = if blocked {
-            format!("blocked{r}@{domain}")
+            format!("blocked@{domain}")
         } else {
             format!("r{r}@{}", domain.to_ascii_uppercase())
         };
@@ -504,6 +504,22 @@ async fn setup(node: &Node<Simulated>, world: &Shared) -> bool {
         }
         world.borrow_mut().writes += 1;
     }
+    for tenant in TENANTS {
+        for domain in DOMAINS {
+            let address = format!("Blocked@{}", domain.to_ascii_uppercase());
+            loop {
+                let added = node
+                    .suppressions()
+                    .add(tenant, &address, Reason::Manual, None)
+                    .await;
+                match added {
+                    Ok(()) => break,
+                    Err(Refusal::Tenant | Refusal::Busy) => sleep(Duration::from_millis(10)).await,
+                    Err(_) => return false,
+                }
+            }
+        }
+    }
     true
 }
 
@@ -587,7 +603,7 @@ fn start(
             let shards = core.shards.clone();
             let parts = Parts {
                 sealer: Rc::new(Toy),
-                suppressions: Rc::new(Blocked),
+                hasher: Rc::new(Keyed),
                 transport,
                 clock: Clock::start(),
             };

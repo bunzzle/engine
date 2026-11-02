@@ -287,7 +287,7 @@ impl Partition {
         if let Some(entry) = newer.or(frozen) {
             return Ok(Some((entry.op, entry.value.clone())));
         }
-        for stored in self.runs.iter().rev() {
+        for stored in self.view().iter().rev() {
             let Some((segment, range)) = stored.run.probe(key) else {
                 continue;
             };
@@ -300,6 +300,49 @@ impl Partition {
             }
         }
         Ok(None)
+    }
+
+    pub(crate) async fn range(
+        &self,
+        data: &CoreFile,
+        from: Key,
+        to: Key,
+        limit: usize,
+    ) -> Result<Vec<Entry>, Error> {
+        let live: Vec<Entry> = self
+            .live
+            .as_ref()
+            .map(|l| l.range(from).take_while(|e| e.key < to).cloned().collect())
+            .unwrap_or_default();
+        let start = self.frozen.partition_point(|e| e.key < from);
+        let frozen: Vec<Entry> = self.frozen[start..]
+            .iter()
+            .take_while(|e| e.key < to)
+            .cloned()
+            .collect();
+        let mut sources = vec![
+            Source::Entries(live.into_iter()),
+            Source::Entries(frozen.into_iter()),
+        ];
+        let view = self.view();
+        let runs: Vec<&Stored> = view.iter().rev().collect();
+        sources.extend(runs.iter().map(|s| Source::Run(Cursor::seek(&s.run, from))));
+        let mut merge = Merge::new(sources, false);
+        let mut out = Vec::new();
+        while out.len() < limit {
+            match merge.step().map_err(|_| Error::Invalid("index order"))? {
+                Merged::Entry(entry) if entry.key < to => out.push(entry),
+                Merged::Entry(_) | Merged::Done => break,
+                Merged::Need(source, segment, range) => {
+                    let place = &runs[source - 2].places[segment];
+                    let bytes = read(data, place, range).await?;
+                    merge
+                        .feed(source, bytes)
+                        .map_err(|_| damaged(place, range))?;
+                }
+            }
+        }
+        Ok(out)
     }
 
     pub(crate) async fn scan(&self, data: &CoreFile) -> Result<Vec<Entry>, Error> {

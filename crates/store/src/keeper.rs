@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use index::{Key, Op};
+use index::{Key, Op, Shape};
 
 use crate::checkpoint::Part;
 use crate::committer::Location;
@@ -123,6 +123,24 @@ impl Keeper {
             Some(found) => found.scan(data).await,
             None => Ok(Vec::new()),
         }
+    }
+
+    pub async fn range(
+        &self,
+        data: &CoreFile,
+        shard: u16,
+        partition: (u8, u32),
+        keys: std::ops::Range<Key>,
+        limit: usize,
+    ) -> Result<Vec<index::Entry>, Error> {
+        match self.partition(shard, partition) {
+            Some(found) => found.range(data, keys.start, keys.end, limit).await,
+            None => Ok(Vec::new()),
+        }
+    }
+
+    pub fn index_shape(&self, shard: u16, partition: (u8, u32)) -> Option<Shape> {
+        self.partition(shard, partition)?.shape()
     }
 
     fn partition(&self, shard: u16, partition: (u8, u32)) -> Option<&Partition> {

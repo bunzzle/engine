@@ -1,15 +1,18 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::ops::Range as Keys;
+use std::time::Duration;
 
-use rt::{Receiver, Sender, channel, spawn};
+use rt::{Receiver, Sender, channel, sleep, spawn};
 
 use crate::boot::Core;
 use crate::committer::{Body, Client, Lease, Location, Submission, Write};
 use crate::core_file::CoreFile;
 use crate::error::Error;
 use crate::ids::is_control;
+use crate::indexes::IndexRecord;
 use crate::journal::{Dead, Range};
 use crate::keeper::Keeper;
-use crate::merge::{Done, merge};
+use crate::merge::{DELAY_RUNS, Done, REFUSE_RUNS, merge};
 use crate::reader::{Owner, Reader};
 use crate::record::{Record, rebase};
 use crate::regions::Claim;
@@ -105,8 +108,37 @@ impl Request {
     }
 }
 
+pub type Found = Option<(index::Op, Vec<u8>)>;
+
+const DELAY_STEP: Duration = Duration::from_millis(10);
+
+struct Indexing {
+    shard: u16,
+    claim: Claim,
+    records: Vec<IndexRecord>,
+    delayed: bool,
+    reply: Sender<Result<(), Error>>,
+}
+
+struct Lookup {
+    partition: (u8, u32),
+    keys: Vec<(u16, index::Key)>,
+    reply: Sender<Result<Vec<Found>, Error>>,
+}
+
+struct Scan {
+    shard: u16,
+    partition: (u8, u32),
+    keys: Keys<index::Key>,
+    limit: usize,
+    reply: Sender<Result<Vec<index::Entry>, Error>>,
+}
+
 enum Input {
     Change(Request),
+    Index(Indexing),
+    Lookup(Lookup),
+    Scan(Scan),
     Event(Event),
     Copied(Copied),
     Merged(Done),
@@ -165,6 +197,64 @@ impl Changes {
         answer.recv().await.unwrap_or(Err(Error::Failed))
     }
 
+    pub async fn index(
+        &self,
+        shard: u16,
+        claim: Claim,
+        records: Vec<IndexRecord>,
+    ) -> Result<(), Error> {
+        let (reply, mut answer) = channel();
+        let indexing = Indexing {
+            shard,
+            claim,
+            records,
+            delayed: false,
+            reply,
+        };
+        if self.sender.send(Input::Index(indexing)).is_err() {
+            return Err(Error::Failed);
+        }
+        answer.recv().await.unwrap_or(Err(Error::Failed))
+    }
+
+    pub async fn lookup(
+        &self,
+        partition: (u8, u32),
+        keys: Vec<(u16, index::Key)>,
+    ) -> Result<Vec<Found>, Error> {
+        let (reply, mut answer) = channel();
+        let lookup = Lookup {
+            partition,
+            keys,
+            reply,
+        };
+        if self.sender.send(Input::Lookup(lookup)).is_err() {
+            return Err(Error::Failed);
+        }
+        answer.recv().await.unwrap_or(Err(Error::Failed))
+    }
+
+    pub async fn scan(
+        &self,
+        shard: u16,
+        partition: (u8, u32),
+        keys: Keys<index::Key>,
+        limit: usize,
+    ) -> Result<Vec<index::Entry>, Error> {
+        let (reply, mut answer) = channel();
+        let scan = Scan {
+            shard,
+            partition,
+            keys,
+            limit,
+            reply,
+        };
+        if self.sender.send(Input::Scan(scan)).is_err() {
+            return Err(Error::Failed);
+        }
+        answer.recv().await.unwrap_or(Err(Error::Failed))
+    }
+
     pub fn close(&self) {
         let _ = self.sender.send(Input::Close);
     }
@@ -182,6 +272,7 @@ pub struct Shards {
     waiting: VecDeque<(u64, Submission)>,
     held: VecDeque<Request>,
     sent: BTreeMap<u64, Request>,
+    indexed: BTreeMap<u64, Indexing>,
     tag: u64,
     compacting: Option<Compacting>,
     merging: bool,
@@ -211,6 +302,7 @@ impl Shards {
             waiting: VecDeque::new(),
             held: VecDeque::new(),
             sent: BTreeMap::new(),
+            indexed: BTreeMap::new(),
             tag: 0,
             compacting: None,
             merging: false,
@@ -230,7 +322,11 @@ impl Shards {
                 }
             });
         }
-        while !(self.closing && self.busy.is_empty() && self.held.is_empty()) {
+        while !(self.closing
+            && self.busy.is_empty()
+            && self.held.is_empty()
+            && self.indexed.is_empty())
+        {
             let Some(input) = self.inputs.recv().await else {
                 break;
             };
@@ -239,6 +335,9 @@ impl Shards {
                     self.held.push_back(request);
                 }
                 Input::Change(request) => self.request(request),
+                Input::Index(indexing) => self.index(indexing),
+                Input::Lookup(lookup) => self.lookup(lookup).await,
+                Input::Scan(scan) => self.scan(scan).await,
                 Input::Event(event) => self.event(event).await,
                 Input::Copied(copied) => self.copied(copied),
                 Input::Merged(done) => {
@@ -293,6 +392,113 @@ impl Shards {
         }
         self.busy.insert(key, VecDeque::new());
         self.start(request);
+    }
+
+    fn index(&mut self, indexing: Indexing) {
+        if let Err(error) = self.index_valid(&indexing) {
+            let _ = indexing.reply.send(Err(error));
+            return;
+        }
+        let runs = indexing
+            .records
+            .iter()
+            .map(|r| self.keeper.runs(indexing.shard, (r.kind, r.partition)))
+            .max()
+            .unwrap_or(0);
+        if runs >= REFUSE_RUNS {
+            let _ = indexing.reply.send(Err(Error::Busy));
+            return;
+        }
+        if runs > DELAY_RUNS && !indexing.delayed {
+            let steps = u32::try_from(runs - DELAY_RUNS).expect("runs fit in u32");
+            let sender = self.sender.clone();
+            spawn(async move {
+                sleep(DELAY_STEP * steps).await;
+                let _ = sender.send(Input::Index(Indexing {
+                    delayed: true,
+                    ..indexing
+                }));
+            });
+            return;
+        }
+        let submission = Submission {
+            claim: indexing.claim,
+            records: indexing
+                .records
+                .iter()
+                .map(|r| r.write(indexing.shard))
+                .collect(),
+            bodies: Vec::new(),
+            dead: Vec::new(),
+        };
+        self.tag += 1;
+        self.indexed.insert(self.tag, indexing);
+        self.waiting.push_back((self.tag, submission));
+    }
+
+    fn index_valid(&self, indexing: &Indexing) -> Result<(), Error> {
+        if self.closing {
+            return Err(Error::Failed);
+        }
+        if !self.owned.contains(&indexing.shard) {
+            return Err(Error::Invalid("owner"));
+        }
+        if indexing.records.is_empty() {
+            return Err(Error::Invalid("batch"));
+        }
+        let mut shapes = BTreeMap::new();
+        for record in &indexing.records {
+            let partition = (record.kind, record.partition);
+            let shape = index::Shape {
+                value: u16::try_from(record.entry.value.len())
+                    .map_err(|_| Error::Invalid("index shape"))?,
+            };
+            let kept = self.keeper.index_shape(indexing.shard, partition);
+            let first = *shapes.entry(partition).or_insert(kept.unwrap_or(shape));
+            if first != shape || shape.check(&record.entry).is_err() {
+                return Err(Error::Invalid("index shape"));
+            }
+        }
+        Ok(())
+    }
+
+    async fn lookup(&self, lookup: Lookup) {
+        let mut found = Vec::with_capacity(lookup.keys.len());
+        for (shard, key) in &lookup.keys {
+            if !self.owned.contains(shard) {
+                let _ = lookup.reply.send(Err(Error::Invalid("owner")));
+                return;
+            }
+            match self
+                .keeper
+                .lookup(&self.file, *shard, lookup.partition, key)
+                .await
+            {
+                Ok(entry) => found.push(entry),
+                Err(error) => {
+                    let _ = lookup.reply.send(Err(error));
+                    return;
+                }
+            }
+        }
+        let _ = lookup.reply.send(Ok(found));
+    }
+
+    async fn scan(&self, scan: Scan) {
+        let result = if self.owned.contains(&scan.shard) {
+            self.keeper
+                .range(
+                    &self.file,
+                    scan.shard,
+                    scan.partition,
+                    scan.keys,
+                    scan.limit,
+                )
+                .await
+        } else {
+            Err(Error::Invalid("owner"))
+        };
+        let _ = scan.reply.send(result);
     }
 
     fn start(&mut self, request: Request) {
@@ -422,6 +628,10 @@ impl Shards {
             && let Some((tag, submission)) = self.waiting.pop_front()
         {
             if let Err(error) = self.session.submit(tag, submission) {
+                if let Some(indexing) = self.indexed.remove(&tag) {
+                    let _ = indexing.reply.send(Err(error));
+                    continue;
+                }
                 let request = self.sent.remove(&tag).expect("sent");
                 self.finish(request, Err(error));
             }
@@ -430,6 +640,20 @@ impl Shards {
 
     async fn event(&mut self, event: Event) {
         match event {
+            Event::Durable { tag, .. } if self.indexed.contains_key(&tag) => {
+                let indexing = self.indexed.remove(&tag).expect("indexed");
+                let mut result = Ok(());
+                for record in indexing.records {
+                    if let Err(error) = self.keeper.apply_index(indexing.shard, record) {
+                        result = Err(error);
+                    }
+                }
+                let _ = indexing.reply.send(result);
+            }
+            Event::Rejected { tag, error } if self.indexed.contains_key(&tag) => {
+                let indexing = self.indexed.remove(&tag).expect("indexed");
+                let _ = indexing.reply.send(Err(error));
+            }
             Event::Durable {
                 tag,
                 sequence,

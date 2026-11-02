@@ -6,10 +6,6 @@ use crate::node::Arrival;
 use crate::start::Node;
 use crate::transport::Transport;
 
-pub trait Suppressions {
-    fn suppressed(&self, tenant: u32, address: &str) -> bool;
-}
-
 pub struct Draft {
     tenant: u32,
     generation: u32,
@@ -70,15 +66,57 @@ impl<T: Transport + 'static> Node<T> {
     }
 
     pub async fn recipient(&self, draft: &mut Draft, address: &str) -> Result<u32, Refusal> {
+        let mut added = self.recipients(draft, &[address]).await;
+        added.pop().unwrap_or(Err(Refusal::Failed))
+    }
+
+    pub async fn recipients(
+        &self,
+        draft: &mut Draft,
+        addresses: &[&str],
+    ) -> Vec<Result<u32, Refusal>> {
+        let mut out: Vec<Result<u32, Refusal>> = Vec::with_capacity(addresses.len());
+        let mut domains = Vec::new();
+        for address in addresses {
+            match domain_of(address) {
+                Some(domain) => {
+                    domains.push((out.len(), *address, domain));
+                    out.push(Ok(0));
+                }
+                None => out.push(Err(Refusal::Address)),
+            }
+        }
+        let valid: Vec<&str> = domains.iter().map(|(_, address, _)| *address).collect();
+        let checked = match self.current(draft) {
+            Ok(()) if valid.is_empty() => Ok(Vec::new()),
+            Ok(()) => self.inner.suppressions.check(draft.tenant, &valid).await,
+            Err(refusal) => Err(refusal),
+        };
+        let suppressed = match checked {
+            Ok(suppressed) => suppressed,
+            Err(refusal) => {
+                for (at, _, _) in domains {
+                    out[at] = Err(refusal);
+                }
+                return out;
+            }
+        };
+        for ((at, _, domain), suppressed) in domains.into_iter().zip(suppressed) {
+            out[at] = if suppressed {
+                Err(Refusal::Suppressed)
+            } else {
+                self.named(draft, domain).await
+            };
+        }
+        out
+    }
+
+    async fn named(&self, draft: &mut Draft, domain: Box<str>) -> Result<u32, Refusal> {
         let inner = &self.inner;
         if draft.queues.len() >= inner.settings.spool.recipients as usize {
             return Err(Refusal::Recipients);
         }
-        let domain = domain_of(address).ok_or(Refusal::Address)?;
         self.current(draft)?;
-        if inner.suppressions.suppressed(draft.tenant, address) {
-            return Err(Refusal::Suppressed);
-        }
         let taken = match inner.leases.take(&draft.tenant).await {
             Ok(taken) => taken,
             Err(control::Error::Busy) => return Err(Refusal::Busy),
