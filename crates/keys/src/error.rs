@@ -14,6 +14,9 @@ pub enum Error {
     Gone,
     Retention,
     Open,
+    Busy,
+    Bad,
+    Closed,
     Crypto(crypto::Error),
 }
 
@@ -44,6 +47,9 @@ impl fmt::Display for Error {
             Self::Gone => write!(f, "day key shredded"),
             Self::Retention => write!(f, "retention out of range"),
             Self::Open => write!(f, "batch key did not open"),
+            Self::Busy => write!(f, "unwrap limit reached"),
+            Self::Bad => write!(f, "malformed keys request"),
+            Self::Closed => write!(f, "keys connection closed"),
             Self::Crypto(error) => write!(f, "{error}"),
         }
     }
