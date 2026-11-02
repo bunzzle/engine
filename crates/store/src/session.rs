@@ -6,6 +6,7 @@ use rt::{Receiver, channel};
 use crate::checkpoint::Part;
 use crate::committer::{Client, Location, Reply, Request, Submission};
 use crate::error::Error;
+use crate::regions::Claim;
 
 #[derive(Debug)]
 pub enum Event {
@@ -121,16 +122,47 @@ impl Session {
     }
 
     pub async fn claim_state(&self) -> Result<(u32, u64), Error> {
+        self.claim(Claim::State).await
+    }
+
+    pub async fn claim(&self, claim: Claim) -> Result<(u32, u64), Error> {
         let (reply, mut answer) = channel();
         if self
             .client
             .sender
-            .send(Request::ClaimState(self.id, reply))
+            .send(Request::ClaimRun(self.id, claim, reply))
             .is_err()
         {
             return Err(Error::Failed);
         }
         answer.recv().await.unwrap_or(Err(Error::Failed))
+    }
+
+    pub fn unhold(&self, region: u32) -> Result<(), Error> {
+        self.client
+            .sender
+            .send(Request::Unhold(self.id, region))
+            .map_err(|_| Error::Failed)
+    }
+
+    pub async fn reserve_index(&self, regions: u32) -> Result<(), Error> {
+        let (reply, mut answer) = channel();
+        if self
+            .client
+            .sender
+            .send(Request::ReserveIndex(self.id, regions, reply))
+            .is_err()
+        {
+            return Err(Error::Failed);
+        }
+        answer.recv().await.unwrap_or(Err(Error::Failed))
+    }
+
+    pub fn unreserve_index(&self, regions: u32) -> Result<(), Error> {
+        self.client
+            .sender
+            .send(Request::UnreserveIndex(self.id, regions))
+            .map_err(|_| Error::Failed)
     }
 }
 

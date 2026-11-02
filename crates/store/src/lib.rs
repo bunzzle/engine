@@ -5,6 +5,7 @@ mod core_file;
 mod data_file;
 mod error;
 mod ids;
+mod indexes;
 mod journal;
 mod keeper;
 mod layout;
@@ -14,6 +15,7 @@ mod rebuild;
 mod record;
 mod recovery;
 mod regions;
+mod roots;
 mod run;
 mod session;
 mod shard;
@@ -35,6 +37,7 @@ pub use ids::{
     CONTROL_BOOT, CONTROL_KINDS, Ids, LAST_BOOT, control_key, is_control, message_key, next_boot,
     split_key,
 };
+pub use indexes::{IndexRecord, KIND_INDEX};
 pub use journal::{
     Allocation, Commit, Dead, Entry, Journal, KIND_COMMIT, Live, Position, Range, fits,
 };
@@ -48,6 +51,7 @@ pub use record::{
 };
 pub use recovery::{Recovered, State, recover};
 pub use regions::{CHECKPOINT_RESERVE, COMPACTION_RESERVE, Claim, Regions};
+pub use roots::{INDEX_ROOT_SIZE, IndexRoot, Roots, decode_part, encode_part};
 pub use run::{KIND_RUN, MAX_DELTAS, ROOT_SIZE, Root, Run, decode_roots, encode_roots, read_run};
 pub use session::{Event, Owned, Results, Session};
 pub use shard::{

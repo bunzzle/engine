@@ -711,6 +711,7 @@ fn session(
         cores,
         credits: 4,
         reserve: 4,
+        flush: 0,
     };
     let Ok(Ok(booted)) = machine.block_on(0, async move {
         timeout(Duration::from_secs(60), boot(PATH, setup_store)).await
@@ -950,6 +951,7 @@ fn intake_refuses_what_the_rules_forbid() {
         cores: 2,
         credits: 4,
         reserve: 4,
+        flush: 0,
     };
     let booted = machine.block_on(0, boot(PATH, setup_store)).expect("boot");
     let committer = machine.spawn_on(0, booted.committer.run());

@@ -327,6 +327,7 @@ fn workload(seed: u64, steps: u64, halt_after: Option<u64>, disk: Disk) -> Outco
         cores: CORES,
         credits: 4,
         reserve: 0,
+        flush: 0,
     };
     let none = |driver| Outcome {
         driver,
@@ -524,6 +525,7 @@ fn a_region_with_a_record_nobody_owns_is_never_a_victim() {
             cores: 1,
             credits: 4,
             reserve: 0,
+            flush: 0,
         };
         let booted = boot(PATH, setup).await.expect("boot");
         let committer = spawn(booted.committer.run());
@@ -599,6 +601,7 @@ fn compaction_keeps_intake_running_on_a_small_disk() {
             cores: 1,
             credits: 8,
             reserve: 1,
+            flush: 0,
         };
         let booted = boot(PATH, setup).await.expect("boot");
         let committer = spawn(booted.committer.run());

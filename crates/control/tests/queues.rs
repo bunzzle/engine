@@ -207,6 +207,7 @@ impl Node {
             cores,
             credits: 4,
             reserve: 0,
+            flush: 0,
         };
         let booted = machine
             .block_on(0, async move {

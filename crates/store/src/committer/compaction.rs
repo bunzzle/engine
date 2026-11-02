@@ -1,5 +1,5 @@
 use super::{Committer, Location, Submission};
-use crate::regions::{CHECKPOINT_RESERVE, COMPACTION_RESERVE, Claim};
+use crate::regions::Claim;
 use crate::session::{Event, Owned};
 use crate::usage::Usage;
 
@@ -66,10 +66,7 @@ impl Committer {
     }
 
     fn low_space(&self) -> bool {
-        let held = COMPACTION_RESERVE
-            + self.regions.reserved()
-            + CHECKPOINT_RESERVE
-            + self.regions.state_reserve();
+        let held = self.regions.held();
         let margin = (self.regions.count() / LOW_SHARE).max(2);
         self.regions.free() < self.regions.reserve() + held + margin
     }

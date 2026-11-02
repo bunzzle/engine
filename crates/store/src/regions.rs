@@ -9,6 +9,8 @@ pub enum Claim {
     Control,
     Internal,
     State,
+    Flush,
+    Index,
     Checkpoint,
 }
 
@@ -18,7 +20,9 @@ pub struct Regions {
     free: u32,
     reserve: u32,
     state_reserve: u32,
+    flush_reserve: u32,
     reserved: u32,
+    merging: u32,
 }
 
 impl Regions {
@@ -32,7 +36,9 @@ impl Regions {
             free: count,
             reserve,
             state_reserve: 0,
+            flush_reserve: 0,
             reserved: 0,
+            merging: 0,
         }
     }
 
@@ -54,11 +60,30 @@ impl Regions {
 
     pub fn add_state_reserve(&mut self) {
         assert!(
-            self.reserve + COMPACTION_RESERVE + CHECKPOINT_RESERVE + self.state_reserve
-                < self.count(),
+            self.reserve + COMPACTION_RESERVE + self.floor() < self.count(),
             "reserve exceeds region count"
         );
         self.state_reserve += 1;
+    }
+
+    pub fn flush_reserve(&self) -> u32 {
+        self.flush_reserve
+    }
+
+    pub fn add_flush_reserve(&mut self, regions: u32) {
+        assert!(
+            self.reserve + COMPACTION_RESERVE + self.floor() + regions <= self.count(),
+            "reserve exceeds region count"
+        );
+        self.flush_reserve += regions;
+    }
+
+    pub fn floor(&self) -> u32 {
+        CHECKPOINT_RESERVE + self.state_reserve + self.flush_reserve
+    }
+
+    pub fn held(&self) -> u32 {
+        COMPACTION_RESERVE + self.reserved + self.merging + self.floor()
     }
 
     pub fn reserved(&self) -> u32 {
@@ -66,8 +91,7 @@ impl Regions {
     }
 
     pub fn reserve_internal(&mut self, regions: u32) -> Result<(), Error> {
-        let floor = CHECKPOINT_RESERVE + self.state_reserve;
-        if self.free < self.reserved + regions + floor {
+        if self.free < self.reserved + self.merging + regions + self.floor() {
             return Err(Error::Full);
         }
         self.reserved += regions;
@@ -78,6 +102,23 @@ impl Regions {
         self.reserved = self.reserved.saturating_sub(regions);
     }
 
+    pub fn merging(&self) -> u32 {
+        self.merging
+    }
+
+    pub fn reserve_index(&mut self, regions: u32) -> Result<(), Error> {
+        if self.free < self.held() + regions {
+            return Err(Error::Full);
+        }
+        self.merging += regions;
+        Ok(())
+    }
+
+    pub fn unreserve_index(&mut self, regions: u32) {
+        assert!(regions <= self.merging, "index reservation underflow");
+        self.merging -= regions;
+    }
+
     pub fn is_used(&self, region: u32) -> bool {
         self.used[region as usize]
     }
@@ -86,13 +127,17 @@ impl Regions {
         if self.free == 0 {
             return Err(Error::Full);
         }
-        let floor = CHECKPOINT_RESERVE + self.state_reserve;
-        let held = COMPACTION_RESERVE + self.reserved + floor;
+        if claim == Claim::Index && self.merging == 0 {
+            return Err(Error::Full);
+        }
+        let held = self.held();
         let keep = match claim {
             Claim::Intake => self.reserve + held,
             Claim::Control => held,
-            Claim::Internal => floor,
+            Claim::Internal => self.floor() + self.merging,
             Claim::State => CHECKPOINT_RESERVE,
+            Claim::Flush => CHECKPOINT_RESERVE + self.state_reserve,
+            Claim::Index => self.floor() + self.reserved + self.merging - 1,
             Claim::Checkpoint => 0,
         };
         if self.free <= keep {
@@ -109,8 +154,10 @@ impl Regions {
             .expect("free count matches the bitmap");
         self.used[index] = true;
         self.free -= 1;
-        if claim == Claim::Internal {
-            self.reserved = self.reserved.saturating_sub(1);
+        match claim {
+            Claim::Internal => self.reserved = self.reserved.saturating_sub(1),
+            Claim::Index => self.merging -= 1,
+            _ => {}
         }
         Ok(u32::try_from(index).expect("region count fits in u32"))
     }

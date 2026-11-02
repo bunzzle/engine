@@ -24,6 +24,7 @@ const SETUP: Setup = Setup {
     cores: 3,
     credits: 4,
     reserve: 0,
+    flush: 0,
 };
 
 struct Nobody;

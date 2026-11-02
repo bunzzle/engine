@@ -105,6 +105,7 @@ fn intake_refuses_messages_over_the_limits() {
             cores: 1,
             credits: 4,
             reserve: 0,
+            flush: 0,
         };
         let booted = boot(PATH, setup).await.expect("boot");
         let committer = spawn(booted.committer.run());
@@ -194,6 +195,7 @@ fn ids_take_a_new_boot_when_the_counter_runs_out() {
             cores: 1,
             credits: 4,
             reserve: 0,
+            flush: 0,
         };
         let booted = boot(PATH, setup).await.expect("boot");
         let committer = spawn(booted.committer.run());

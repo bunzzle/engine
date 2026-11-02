@@ -48,6 +48,7 @@ fn enqueue_with_another_tenant_or_generation_is_refused() {
             cores: 1,
             credits: 4,
             reserve: 0,
+            flush: 0,
         };
         let booted = boot(PATH, setup).await.expect("boot");
         let committer = spawn(async move { drop(booted.committer.run().await) });
