@@ -405,8 +405,9 @@ impl Shards {
                 Input::Copied(copied) => self.copied(copied),
                 Input::Merged(done) => {
                     self.merging = false;
-                    let _ = self.keeper.merged(done);
-                    self.start_merge();
+                    if self.keeper.merged(done).is_ok() {
+                        self.start_merge();
+                    }
                 }
                 Input::Close => self.closing = true,
             }
