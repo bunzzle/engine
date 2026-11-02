@@ -6,8 +6,8 @@ use index::{Entry, Op, Shape};
 use rt::sim::{Config, SimDriver};
 use rt::{Runtime, now, spawn};
 use store::{
-    Changes, Claim, Client, Committer, DataFile, Error, IndexRecord, Keeper, Options, SLOT_SIZE,
-    Setup, Shards, Tiering, boot,
+    Batch, Change, Changes, Claim, Client, Committer, DataFile, Delivery, Error, HEAD_ITEM,
+    IndexRecord, Keeper, Key, Op as StoreOp, Options, SLOT_SIZE, Setup, Shards, Tiering, boot,
 };
 
 const PATH: &str = "/data/owner";
@@ -100,6 +100,25 @@ fn delete(n: u64) -> IndexRecord {
         kind: KIND,
         partition: 0,
         entry: Entry::delete(key(n), SHAPE),
+    }
+}
+
+fn batch(message: u64) -> Batch {
+    Batch {
+        shard: 0,
+        message,
+        tenant: 1,
+        ops: vec![StoreOp {
+            item: HEAD_ITEM,
+            change: Change::Put(Delivery {
+                status: 0,
+                attempts: 0,
+                due: 0,
+            }),
+            clear: vec![1; 8],
+            bodies: Vec::new(),
+            sealed: vec![2; 16],
+        }],
     }
 }
 
@@ -299,7 +318,15 @@ fn many_runs_delay_index_writes_then_refuse_them() {
         let node = open(Some(tiering)).await;
         for n in 0..store::REFUSE_RUNS as u64 {
             let started = now();
-            let result = node.changes.index(0, Claim::Control, vec![put(n, 5)]).await;
+            let result = if n % 2 == 0 {
+                node.changes.index(0, Claim::Control, vec![put(n, 5)]).await
+            } else {
+                let index = Some((0, vec![put(n, 5)]));
+                node.changes
+                    .create_indexed(vec![batch(100 + n)], index)
+                    .await
+                    .map(drop)
+            };
             let waited = now().saturating_duration_since(started);
             let runs = usize::try_from(n).expect("fits");
             assert!(result.is_ok(), "write {n}: {result:?}");
@@ -316,6 +343,11 @@ fn many_runs_delay_index_writes_then_refuse_them() {
             .index(0, Claim::Control, vec![put(99, 5)])
             .await;
         assert!(matches!(refused, Err(Error::Busy)), "{refused:?}");
+        let created = node
+            .changes
+            .create_indexed(vec![batch(9)], Some((0, vec![put(99, 5)])))
+            .await;
+        assert!(matches!(created, Err(Error::Busy)), "{created:?}");
         let other = IndexRecord {
             partition: 1,
             ..put(99, 5)
@@ -381,4 +413,119 @@ fn lookups_and_scans_match_a_model_while_merges_and_cuts_run() {
             assert!((1..8).contains(&runs), "seed {seed}: {runs} runs");
         });
     }
+}
+
+#[test]
+fn a_create_carries_index_records_in_the_same_submission() {
+    let driver = Rc::new(SimDriver::with_disk(6, Config::default(), created(6)));
+    Runtime::new(driver).block_on(async {
+        let node = open(None).await;
+        let created = node
+            .changes
+            .create_indexed(vec![batch(1)], Some((0, vec![put(1, 1)])))
+            .await
+            .expect("create");
+        assert_eq!(created.len(), 1);
+        assert_eq!(created[0].len(), 1);
+        let found = node
+            .changes
+            .lookup(PARTITION, vec![(0, key(1))])
+            .await
+            .expect("lookup");
+        assert_eq!(found, vec![Some((Op::Put, put(1, 1).entry.value))]);
+        let mut wide = put(2, 1);
+        wide.entry.value.push(0);
+        let refused = node
+            .changes
+            .create_indexed(vec![batch(2)], Some((0, vec![wide])))
+            .await;
+        assert!(matches!(refused, Err(Error::Invalid("index shape"))));
+        let foreign = node
+            .changes
+            .create_indexed(vec![batch(3)], Some((5, vec![put(3, 1)])))
+            .await;
+        assert!(matches!(foreign, Err(Error::Invalid("owner"))));
+        let found = node
+            .changes
+            .lookup(PARTITION, vec![(0, key(2)), (0, key(3))])
+            .await
+            .expect("lookup");
+        assert_eq!(found, vec![None, None]);
+        let keeper = node.stop().await;
+        let state = keeper.state(0).expect("kept");
+        assert!(state.get(Key::head(1)).is_some());
+        assert!(state.get(Key::head(2)).is_none());
+        assert!(state.get(Key::head(3)).is_none());
+    });
+}
+
+#[test]
+fn retire_closes_and_drops_partitions_of_one_kind() {
+    let driver = Rc::new(SimDriver::with_disk(7, Config::default(), created(7)));
+    Runtime::new(driver).block_on(async {
+        let tiering = Tiering {
+            flush_size: 1,
+            ..Tiering::default()
+        };
+        let node = open(Some(tiering)).await;
+        for round in 0..2u64 {
+            for day in 5..8 {
+                let record = IndexRecord {
+                    partition: day,
+                    ..put(u64::from(day) + 10 * round, 7)
+                };
+                node.changes
+                    .index(0, Claim::Control, vec![record])
+                    .await
+                    .expect("put");
+            }
+            node.client.checkpoint().await.expect("checkpoint");
+        }
+        let other = IndexRecord {
+            kind: KIND + 1,
+            partition: 1,
+            ..put(1, 7)
+        };
+        node.changes
+            .index(0, Claim::Control, vec![other])
+            .await
+            .expect("other kind");
+        node.client.checkpoint().await.expect("checkpoint");
+        let mut kept = node.changes.partitions(KIND).await.expect("partitions");
+        kept.sort_unstable();
+        assert_eq!(kept, vec![(0, 5), (0, 6), (0, 7)]);
+        node.changes.retire(KIND, 7, 6).await.expect("retire");
+        for _ in 0..6 {
+            node.client.checkpoint().await.expect("checkpoint");
+            rt::sleep(Duration::from_millis(50)).await;
+        }
+        let mut kept = node.changes.partitions(KIND).await.expect("partitions");
+        kept.sort_unstable();
+        assert_eq!(kept, vec![(0, 6), (0, 7)]);
+        assert_eq!(
+            node.changes.partitions(KIND + 1).await.expect("other"),
+            vec![(0, 1)]
+        );
+        let gone = node
+            .changes
+            .lookup((KIND, 5), vec![(0, key(5))])
+            .await
+            .expect("lookup");
+        assert_eq!(gone, vec![None]);
+        let closed = node
+            .changes
+            .lookup((KIND, 6), vec![(0, key(6)), (0, key(16))])
+            .await
+            .expect("lookup");
+        assert_eq!(
+            closed,
+            vec![
+                Some((Op::Put, put(6, 7).entry.value)),
+                Some((Op::Put, put(16, 7).entry.value))
+            ]
+        );
+        let keeper = node.stop().await;
+        assert_eq!(keeper.runs(0, (KIND, 6)), 1);
+        assert_eq!(keeper.runs(0, (KIND, 7)), 2);
+    });
 }

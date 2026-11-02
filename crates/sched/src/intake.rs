@@ -1,9 +1,12 @@
 use control::{Leases, Name, State, Taken, Tenant, domain_ok};
 use spool::Message;
+use store::IndexRecord;
 
 use crate::error::Refusal;
 use crate::node::Arrival;
+use crate::requests::{Begun, Ticket};
 use crate::start::Node;
+use crate::suppress::Hash;
 use crate::transport::Transport;
 
 pub struct Draft {
@@ -137,7 +140,44 @@ impl<T: Transport + 'static> Node<T> {
         Ok(queue)
     }
 
-    pub async fn accept(&self, mut draft: Draft, message: Message) -> Result<(), Refusal> {
+    pub async fn accept(&self, draft: Draft, message: Message) -> Result<(), Refusal> {
+        self.accepted(draft, message, None).await
+    }
+
+    pub fn request_shard(&self, tenant: u32, key: &[u8]) -> u16 {
+        self.inner.requests.shard(tenant, key)
+    }
+
+    pub async fn begin(&self, tenant: u32, key: &[u8], digest: Hash) -> Result<Begun, Refusal> {
+        self.inner.requests.begin(tenant, key, digest).await
+    }
+
+    pub async fn accept_once(
+        &self,
+        ticket: Ticket,
+        draft: Draft,
+        message: Message,
+    ) -> Result<(), Refusal> {
+        if ticket.tenant() != draft.tenant || message.id.shard != ticket.shard() {
+            return Err(Refusal::Message);
+        }
+        let record = self
+            .inner
+            .requests
+            .record(&ticket, draft.generation, &[message.id])?;
+        let result = self
+            .accepted(draft, message, Some((ticket.shard(), vec![record])))
+            .await;
+        drop(ticket);
+        result
+    }
+
+    async fn accepted(
+        &self,
+        mut draft: Draft,
+        message: Message,
+        index: Option<(u16, Vec<IndexRecord>)>,
+    ) -> Result<(), Refusal> {
         let queues = message.slices.iter().flat_map(|s| s.queues.iter().copied());
         if message.tenant != draft.tenant
             || draft.queues.is_empty()
@@ -149,9 +189,12 @@ impl<T: Transport + 'static> Node<T> {
         let arrival = Arrival::of(&message, draft.generation);
         self.inner
             .spool
-            .accept(vec![message])
+            .accept_indexed(vec![message], index)
             .await
-            .map_err(|_| Refusal::Failed)?;
+            .map_err(|e| match e {
+                spool::Error::Store(store::Error::Busy) => Refusal::Busy,
+                _ => Refusal::Failed,
+            })?;
         draft.taken.clear();
         self.inner.sched.enqueue(arrival);
         Ok(())

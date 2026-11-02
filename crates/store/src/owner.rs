@@ -97,8 +97,15 @@ impl Owner for Itself {
     }
 }
 
+struct Attached {
+    shard: u16,
+    records: Vec<IndexRecord>,
+    delayed: bool,
+}
+
 struct Request {
     batches: Vec<Batch>,
+    index: Option<Attached>,
     reply: Reply,
 }
 
@@ -111,6 +118,10 @@ impl Request {
 pub type Found = Option<(index::Op, Vec<u8>)>;
 
 const DELAY_STEP: Duration = Duration::from_millis(10);
+
+fn delay(runs: usize) -> Duration {
+    DELAY_STEP * u32::try_from(runs.saturating_sub(DELAY_RUNS)).expect("runs fit in u32")
+}
 
 struct Indexing {
     shard: u16,
@@ -134,11 +145,20 @@ struct Scan {
     reply: Sender<Result<Vec<index::Entry>, Error>>,
 }
 
+struct Retire {
+    kind: u8,
+    close: u32,
+    drop: u32,
+    reply: Sender<()>,
+}
+
 enum Input {
     Change(Request),
     Index(Indexing),
     Lookup(Lookup),
     Scan(Scan),
+    Partitions(u8, Sender<Vec<(u16, u32)>>),
+    Retire(Retire),
     Event(Event),
     Copied(Copied),
     Merged(Done),
@@ -177,6 +197,7 @@ impl Changes {
         let (reply, mut answer) = channel();
         let request = Request {
             batches: vec![batch],
+            index: None,
             reply: Reply::Caller(reply),
         };
         if self.sender.send(Input::Change(request)).is_err() {
@@ -186,9 +207,22 @@ impl Changes {
     }
 
     pub async fn create(&self, batches: Vec<Batch>) -> Result<Vec<Vec<Location>>, Error> {
+        self.create_indexed(batches, None).await
+    }
+
+    pub async fn create_indexed(
+        &self,
+        batches: Vec<Batch>,
+        index: Option<(u16, Vec<IndexRecord>)>,
+    ) -> Result<Vec<Vec<Location>>, Error> {
         let (reply, mut answer) = channel();
         let request = Request {
             batches,
+            index: index.map(|(shard, records)| Attached {
+                shard,
+                records,
+                delayed: false,
+            }),
             reply: Reply::Created(reply),
         };
         if self.sender.send(Input::Change(request)).is_err() {
@@ -253,6 +287,28 @@ impl Changes {
             return Err(Error::Failed);
         }
         answer.recv().await.unwrap_or(Err(Error::Failed))
+    }
+
+    pub async fn partitions(&self, kind: u8) -> Result<Vec<(u16, u32)>, Error> {
+        let (reply, mut answer) = channel();
+        if self.sender.send(Input::Partitions(kind, reply)).is_err() {
+            return Err(Error::Failed);
+        }
+        answer.recv().await.ok_or(Error::Failed)
+    }
+
+    pub async fn retire(&self, kind: u8, close: u32, drop: u32) -> Result<(), Error> {
+        let (reply, mut answer) = channel();
+        let retire = Retire {
+            kind,
+            close,
+            drop,
+            reply,
+        };
+        if self.sender.send(Input::Retire(retire)).is_err() {
+            return Err(Error::Failed);
+        }
+        answer.recv().await.ok_or(Error::Failed)
     }
 
     pub fn close(&self) {
@@ -338,6 +394,13 @@ impl Shards {
                 Input::Index(indexing) => self.index(indexing),
                 Input::Lookup(lookup) => self.lookup(lookup).await,
                 Input::Scan(scan) => self.scan(scan).await,
+                Input::Partitions(kind, reply) => {
+                    let _ = reply.send(self.kept_partitions(kind));
+                }
+                Input::Retire(retire) => {
+                    self.retire(&retire);
+                    let _ = retire.reply.send(());
+                }
                 Input::Event(event) => self.event(event).await,
                 Input::Copied(copied) => self.copied(copied),
                 Input::Merged(done) => {
@@ -370,6 +433,30 @@ impl Shards {
             request.reply.refuse(error);
             return;
         }
+        if let Some(attached) = &request.index {
+            let checked = self.index_valid(attached.shard, &attached.records);
+            let runs = self.most_runs(attached.shard, &attached.records);
+            if let Err(error) = checked {
+                request.reply.refuse(error);
+                return;
+            }
+            if runs >= REFUSE_RUNS {
+                request.reply.refuse(Error::Busy);
+                return;
+            }
+            if runs > DELAY_RUNS && !attached.delayed {
+                let sender = self.sender.clone();
+                let mut request = request;
+                if let Some(attached) = request.index.as_mut() {
+                    attached.delayed = true;
+                }
+                spawn(async move {
+                    sleep(delay(runs)).await;
+                    let _ = sender.send(Input::Change(request));
+                });
+                return;
+            }
+        }
         if matches!(request.reply, Reply::Created(_)) {
             let mut keys = BTreeSet::new();
             let free = request
@@ -395,25 +482,24 @@ impl Shards {
     }
 
     fn index(&mut self, indexing: Indexing) {
-        if let Err(error) = self.index_valid(&indexing) {
+        let checked = if self.closing {
+            Err(Error::Failed)
+        } else {
+            self.index_valid(indexing.shard, &indexing.records)
+        };
+        if let Err(error) = checked {
             let _ = indexing.reply.send(Err(error));
             return;
         }
-        let runs = indexing
-            .records
-            .iter()
-            .map(|r| self.keeper.runs(indexing.shard, (r.kind, r.partition)))
-            .max()
-            .unwrap_or(0);
+        let runs = self.most_runs(indexing.shard, &indexing.records);
         if runs >= REFUSE_RUNS {
             let _ = indexing.reply.send(Err(Error::Busy));
             return;
         }
         if runs > DELAY_RUNS && !indexing.delayed {
-            let steps = u32::try_from(runs - DELAY_RUNS).expect("runs fit in u32");
             let sender = self.sender.clone();
             spawn(async move {
-                sleep(DELAY_STEP * steps).await;
+                sleep(delay(runs)).await;
                 let _ = sender.send(Input::Index(Indexing {
                     delayed: true,
                     ..indexing
@@ -436,24 +522,29 @@ impl Shards {
         self.waiting.push_back((self.tag, submission));
     }
 
-    fn index_valid(&self, indexing: &Indexing) -> Result<(), Error> {
-        if self.closing {
-            return Err(Error::Failed);
-        }
-        if !self.owned.contains(&indexing.shard) {
+    fn most_runs(&self, shard: u16, records: &[IndexRecord]) -> usize {
+        records
+            .iter()
+            .map(|r| self.keeper.runs(shard, (r.kind, r.partition)))
+            .max()
+            .unwrap_or(0)
+    }
+
+    fn index_valid(&self, shard: u16, records: &[IndexRecord]) -> Result<(), Error> {
+        if !self.owned.contains(&shard) {
             return Err(Error::Invalid("owner"));
         }
-        if indexing.records.is_empty() {
+        if records.is_empty() {
             return Err(Error::Invalid("batch"));
         }
         let mut shapes = BTreeMap::new();
-        for record in &indexing.records {
+        for record in records {
             let partition = (record.kind, record.partition);
             let shape = index::Shape {
                 value: u16::try_from(record.entry.value.len())
                     .map_err(|_| Error::Invalid("index shape"))?,
             };
-            let kept = self.keeper.index_shape(indexing.shard, partition);
+            let kept = self.keeper.index_shape(shard, partition);
             let first = *shapes.entry(partition).or_insert(kept.unwrap_or(shape));
             if first != shape || shape.check(&record.entry).is_err() {
                 return Err(Error::Invalid("index shape"));
@@ -482,6 +573,28 @@ impl Shards {
             }
         }
         let _ = lookup.reply.send(Ok(found));
+    }
+
+    fn kept_partitions(&self, kind: u8) -> Vec<(u16, u32)> {
+        let mut found = Vec::new();
+        for &shard in &self.owned {
+            for (k, partition) in self.keeper.partitions(shard) {
+                if k == kind {
+                    found.push((shard, partition));
+                }
+            }
+        }
+        found
+    }
+
+    fn retire(&mut self, retire: &Retire) {
+        for (shard, partition) in self.kept_partitions(retire.kind) {
+            if partition < retire.drop {
+                self.keeper.drop_partition(shard, (retire.kind, partition));
+            } else if partition < retire.close {
+                self.keeper.close_partition(shard, (retire.kind, partition));
+            }
+        }
     }
 
     async fn scan(&self, scan: Scan) {
@@ -526,7 +639,13 @@ impl Shards {
                 }
             }
         }
-        merged.ok_or(Error::Invalid("batch"))
+        let mut merged = merged.ok_or(Error::Invalid("batch"))?;
+        if let Some(attached) = &request.index {
+            merged
+                .records
+                .extend(attached.records.iter().map(|r| r.write(attached.shard)));
+        }
+        Ok(merged)
     }
 
     fn submission(&self, batch: &Batch, create: bool) -> Result<Submission, Error> {
@@ -659,7 +778,9 @@ impl Shards {
                 sequence,
                 locations,
             } => {
-                let request = self.sent.remove(&tag).expect("result for a sent change");
+                let mut request = self.sent.remove(&tag).expect("result for a sent change");
+                let attached = request.index.take();
+                let mut locations = locations;
                 let ops = request
                     .batches
                     .iter()
@@ -673,6 +794,12 @@ impl Shards {
                         location,
                         sequence,
                     );
+                }
+                if let Some(attached) = attached {
+                    locations.truncate(locations.len() - attached.records.len());
+                    for record in attached.records {
+                        let _ = self.keeper.apply_index(attached.shard, record);
+                    }
                 }
                 self.finish(request, Ok(locations));
             }
@@ -695,7 +822,7 @@ impl Shards {
 
     fn finish(&mut self, request: Request, result: Result<Vec<Location>, Error>) {
         let keys: Vec<(u16, u64)> = request.keys().collect();
-        let Request { batches, reply } = request;
+        let Request { batches, reply, .. } = request;
         match reply {
             Reply::Caller(reply) => {
                 let _ = reply.send(result);
@@ -830,6 +957,7 @@ impl Shards {
         for batch in copied.batches {
             self.request(Request {
                 batches: vec![batch],
+                index: None,
                 reply: Reply::Move,
             });
         }

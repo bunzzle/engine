@@ -7,9 +7,11 @@ use index::{Entry, Op};
 use rt::sim::{Config, Disk, Machine, SimDriver, Stalls};
 use rt::{JoinHandle, Runtime, sleep};
 use sched::{
-    Answered, Attempt, Clock, Hash, Hasher, KIND_SUPPRESS, Meshes, Node, Parts, Reason, Refusal,
-    Running, SHAPE, Settings, Suppression, Transport, normalize, punycode, retain,
+    Answered, Attempt, Begun, Clock, DAY, Draft, Hash, Hasher, KIND_REQUEST, KIND_SUPPRESS, Meshes,
+    Node, Parts, Reason, Refusal, Running, SHAPE, Settings, Suppression, Ticket, Transport,
+    normalize, punycode, retain, retain_request,
 };
+use spool::{Body, Head, HeadClear, Message, MessageId, SLICE, Slice};
 use store::{Client, Committer, DataFile, Options, SLOT_SIZE, Setup, boot};
 
 const PATH: &str = "/data/store";
@@ -135,6 +137,10 @@ fn tenant(id: u32, generation: u32, state: State) -> Object {
 }
 
 fn started(driver: &Rc<SimDriver>, cores: u16) -> Cluster {
+    started_behind(driver, cores, 0)
+}
+
+fn started_behind(driver: &Rc<SimDriver>, cores: u16, behind: u64) -> Cluster {
     let machine = Machine::new(Rc::clone(driver), usize::from(cores) + 1, Stalls::default());
     let setup = Setup {
         cores,
@@ -155,7 +161,7 @@ fn started(driver: &Rc<SimDriver>, cores: u16) -> Cluster {
                 sealer: Rc::new(Toy),
                 hasher: Rc::new(Keyed),
                 transport: Idle,
-                clock: Clock::start(),
+                clock: Clock::at(rt::wall_ms().saturating_sub(behind), rt::now()),
             };
             Node::start(core, links, settings(), parts)
                 .await
@@ -555,4 +561,340 @@ fn acknowledged_suppressions_survive_a_crash() {
         assert_eq!(page.listed.len(), kept.len());
     });
     restarted.stop();
+}
+
+fn message(id: MessageId, draft: &Draft) -> Message {
+    let queues = draft.queues();
+    let slices = queues
+        .chunks(SLICE as usize)
+        .map(|chunk| Slice {
+            queues: chunk.to_vec(),
+            sealed: vec![6; 4 * chunk.len()],
+        })
+        .collect();
+    Message {
+        id,
+        tenant: draft.tenant(),
+        head: Head {
+            clear: HeadClear {
+                recipients: u32::try_from(queues.len()).expect("fits"),
+                ..HeadClear::default()
+            },
+            expiry: u64::MAX / 2,
+            sealed: vec![1; 64],
+        },
+        body: Body::Inline(vec![2; 300]),
+        slices,
+    }
+}
+
+fn owner<'a>(nodes: &'a [Node<Idle>], tenant: u32, key: &[u8]) -> (&'a Node<Idle>, u16) {
+    let shard = nodes[0].request_shard(tenant, key);
+    let core = usize::from(shard) % nodes.len();
+    (&nodes[core], shard)
+}
+
+async fn fresh(node: &Node<Idle>, tenant: u32, key: &[u8], digest: Hash) -> Ticket {
+    match node.begin(tenant, key, digest).await {
+        Ok(Begun::Fresh(ticket)) => ticket,
+        Ok(Begun::Replay(ids)) => panic!("replayed {ids:?}"),
+        Err(refusal) => panic!("refused {refusal:?}"),
+    }
+}
+
+async fn replayed(node: &Node<Idle>, tenant: u32, key: &[u8], digest: Hash) -> Vec<MessageId> {
+    match node.begin(tenant, key, digest).await {
+        Ok(Begun::Replay(ids)) => ids,
+        Ok(Begun::Fresh(_)) => panic!("fresh"),
+        Err(refusal) => panic!("refused {refusal:?}"),
+    }
+}
+
+async fn accept(node: &Node<Idle>, ticket: Ticket, shard: u16, address: &str) -> MessageId {
+    let mut draft = node.draft(ticket.tenant(), None).expect("draft");
+    node.recipient(&mut draft, address)
+        .await
+        .expect("recipient");
+    let id = node.spool().id(shard).await.expect("id");
+    let built = message(id, &draft);
+    node.accept_once(ticket, draft, built)
+        .await
+        .expect("accept");
+    id
+}
+
+#[test]
+fn a_retry_gets_the_first_answer_and_another_request_is_refused() {
+    let driver = Rc::new(SimDriver::with_disk(11, Config::default(), created(11)));
+    let cluster = started(&driver, 4);
+    let nodes = cluster.nodes.clone();
+    cluster.run(async move {
+        ready(&nodes).await;
+        let key = b"order-1".as_slice();
+        let (node, shard) = owner(&nodes, 1, key);
+        let ticket = fresh(node, 1, key, [1; 16]).await;
+        let id = accept(node, ticket, shard, "a@example.org").await;
+        assert_eq!(replayed(node, 1, key, [1; 16]).await, vec![id]);
+        assert_eq!(
+            node.begin(1, key, [2; 16]).await.err(),
+            Some(Refusal::Conflict)
+        );
+        let (other, _) = owner(&nodes, 2, key);
+        drop(fresh(other, 2, key, [1; 16]).await);
+        let (elsewhere, _) = owner(&nodes, 1, b"order-2");
+        let wrong = nodes
+            .iter()
+            .find(|n| !std::ptr::eq(*n, elsewhere))
+            .expect("another core");
+        assert_eq!(
+            wrong.begin(1, b"order-2", [1; 16]).await.err(),
+            Some(Refusal::Message)
+        );
+        let (node, shard) = owner(&nodes, 1, b"order-3");
+        let ticket = fresh(node, 1, b"order-3", [3; 16]).await;
+        let mut draft = node.draft(1, None).expect("draft");
+        node.recipient(&mut draft, "b@example.org")
+            .await
+            .expect("recipient");
+        let foreign = (0..SHARDS).find(|s| *s != shard).expect("shard");
+        let id = node.spool().id(shard).await.expect("id");
+        let mut moved = message(id, &draft);
+        moved.id.shard = foreign;
+        assert_eq!(
+            node.accept_once(ticket, draft, moved).await,
+            Err(Refusal::Message)
+        );
+        let _ = fresh(node, 1, b"order-3", [3; 16]).await;
+        assert_eq!(node.requests().in_flight(), 0);
+    });
+    cluster.stop();
+}
+
+#[test]
+fn concurrent_requests_with_one_key_are_accepted_once() {
+    let driver = Rc::new(SimDriver::with_disk(12, Config::default(), created(12)));
+    let cluster = started(&driver, 2);
+    let nodes = cluster.nodes.clone();
+    cluster.run(async move {
+        ready(&nodes).await;
+        let key = b"same".as_slice();
+        let (node, shard) = owner(&nodes, 1, key);
+        let first = fresh(node, 1, key, [5; 16]).await;
+        let waiters: Vec<_> = (0..3)
+            .map(|_| {
+                let node = node.clone();
+                rt::spawn(async move { node.begin(1, b"same", [5; 16]).await })
+            })
+            .collect();
+        sleep(Duration::from_millis(5)).await;
+        assert_eq!(node.requests().in_flight(), 1);
+        assert_eq!(
+            node.begin(1, key, [6; 16]).await.err(),
+            Some(Refusal::Conflict)
+        );
+        let id = accept(node, first, shard, "c@example.org").await;
+        for waiter in waiters {
+            match waiter.await {
+                Ok(Begun::Replay(ids)) => assert_eq!(ids, vec![id]),
+                Ok(Begun::Fresh(_)) => panic!("accepted twice"),
+                Err(refusal) => panic!("refused {refusal:?}"),
+            }
+        }
+
+        let racers: Vec<_> = (0..3)
+            .map(|n| {
+                let node = owner(&nodes, 1, b"race").0.clone();
+                rt::spawn(async move {
+                    match node.begin(1, b"race", [2; 16]).await {
+                        Ok(Begun::Fresh(ticket)) => {
+                            let shard = ticket.shard();
+                            let address = format!("race{n}@example.org");
+                            (true, vec![accept(&node, ticket, shard, &address).await])
+                        }
+                        Ok(Begun::Replay(ids)) => (false, ids),
+                        Err(refusal) => panic!("refused {refusal:?}"),
+                    }
+                })
+            })
+            .collect();
+        let mut answers = Vec::new();
+        for racer in racers {
+            answers.push(racer.await);
+        }
+        assert_eq!(answers.iter().filter(|(fresh, _)| *fresh).count(), 1);
+        assert!(answers.iter().all(|(_, ids)| *ids == answers[0].1));
+
+        let key = b"failing".as_slice();
+        let (node, shard) = owner(&nodes, 1, key);
+        let first = fresh(node, 1, key, [7; 16]).await;
+        let waiter = {
+            let node = node.clone();
+            rt::spawn(async move { node.begin(1, b"failing", [7; 16]).await })
+        };
+        sleep(Duration::from_millis(5)).await;
+        drop(first);
+        let Ok(Begun::Fresh(second)) = waiter.await else {
+            panic!("waiter did not run as a new request");
+        };
+        let id = accept(node, second, shard, "d@example.org").await;
+        assert_eq!(replayed(node, 1, key, [7; 16]).await, vec![id]);
+        assert_eq!(node.requests().in_flight(), 0);
+    });
+    cluster.stop();
+}
+
+async fn at_day_offset(offset: u64) {
+    let now = Clock::start().now();
+    let mut target = now / DAY * DAY + offset;
+    if target <= now {
+        target += DAY;
+    }
+    sleep(Duration::from_millis(target - now)).await;
+}
+
+#[test]
+fn records_last_a_day_and_old_days_are_dropped() {
+    let driver = Rc::new(SimDriver::with_disk(13, Config::default(), created(13)));
+    let cluster = started(&driver, 2);
+    let nodes = cluster.nodes.clone();
+    let client = cluster.client.clone();
+    cluster.run(async move {
+        ready(&nodes).await;
+        let early = b"early".as_slice();
+        let late = b"late".as_slice();
+        at_day_offset(1_000).await;
+        let (node, shard) = owner(&nodes, 1, early);
+        let first = accept(
+            node,
+            fresh(node, 1, early, [8; 16]).await,
+            shard,
+            "e@example.org",
+        )
+        .await;
+        let day = node.requests().today();
+        let kept = node
+            .spool()
+            .changes()
+            .partitions(KIND_REQUEST)
+            .await
+            .expect("partitions");
+        assert!(kept.contains(&(shard, day)));
+        sleep(Duration::from_millis(DAY / 2)).await;
+        assert_eq!(replayed(node, 1, early, [8; 16]).await, vec![first]);
+        at_day_offset(DAY - 1_800_000).await;
+        let (late_node, late_shard) = owner(&nodes, 1, late);
+        let ticket = fresh(late_node, 1, late, [3; 16]).await;
+        let second = accept(late_node, ticket, late_shard, "g@example.org").await;
+        at_day_offset(60_000).await;
+        assert_eq!(late_node.requests().today(), day + 1);
+        assert_eq!(replayed(late_node, 1, late, [3; 16]).await, vec![second]);
+        drop(fresh(node, 1, early, [9; 16]).await);
+        client.checkpoint().await.expect("checkpoint");
+        at_day_offset(60_000).await;
+        for _ in 0..2 {
+            client.checkpoint().await.expect("checkpoint");
+        }
+        for node in &nodes {
+            let today = node.requests().today();
+            let kept = node
+                .spool()
+                .changes()
+                .partitions(KIND_REQUEST)
+                .await
+                .expect("partitions");
+            assert!(kept.iter().all(|(_, d)| *d + 1 >= today), "{kept:?}");
+        }
+        assert_eq!(late_node.begin(1, late, [4; 16]).await.err(), None);
+    });
+    cluster.stop();
+}
+
+#[test]
+fn a_new_generation_forgets_old_requests() {
+    let driver = Rc::new(SimDriver::with_disk(14, Config::default(), created(14)));
+    let cluster = started(&driver, 2);
+    let nodes = cluster.nodes.clone();
+    cluster.run(async move {
+        ready(&nodes).await;
+        let key = b"gen".as_slice();
+        let (node, shard) = owner(&nodes, 1, key);
+        let ticket = fresh(node, 1, key, [4; 16]).await;
+        accept(node, ticket, shard, "f@example.org").await;
+        configure(&nodes, vec![tenant(1, 2, State::Active)]).await;
+        wait_for(&nodes, 1, 2, State::Active).await;
+        drop(fresh(node, 1, key, [4; 16]).await);
+        configure(&nodes, vec![tenant(1, 2, State::Suspended)]).await;
+        wait_for(&nodes, 1, 2, State::Suspended).await;
+        assert_eq!(
+            node.begin(1, key, [4; 16]).await.err(),
+            Some(Refusal::Tenant)
+        );
+    });
+    cluster.stop();
+}
+
+#[test]
+fn accepted_requests_survive_a_crash_with_the_same_answer() {
+    let driver = Rc::new(SimDriver::with_disk(15, Config::default(), created(15)));
+    let cluster = started(&driver, 2);
+    let nodes = cluster.nodes.clone();
+    let client = cluster.client.clone();
+    let answers: Vec<(Vec<u8>, MessageId)> = cluster.run(async move {
+        ready(&nodes).await;
+        let mut answers = Vec::new();
+        for n in 0..12u8 {
+            let key = vec![b'k', n];
+            let (node, shard) = owner(&nodes, 1, &key);
+            let ticket = fresh(node, 1, &key, [n; 16]).await;
+            let id = accept(node, ticket, shard, &format!("r{n}@example.org")).await;
+            answers.push((key, id));
+            if n == 5 {
+                client.checkpoint().await.expect("checkpoint");
+            }
+        }
+        answers
+    });
+    drop(cluster);
+    let driver = Rc::new(SimDriver::with_disk(16, Config::default(), driver.crash()));
+    let restarted = started_behind(&driver, 2, 2 * DAY);
+    let nodes = restarted.nodes.clone();
+    restarted.run(async move {
+        wait_for(&nodes, 1, 1, State::Active).await;
+        for (n, (key, id)) in (0u8..).zip(&answers) {
+            let (node, _) = owner(&nodes, 1, key);
+            assert_eq!(replayed(node, 1, key, [n; 16]).await, vec![*id]);
+            assert_eq!(
+                node.begin(1, key, [n + 100; 16]).await.err(),
+                Some(Refusal::Conflict)
+            );
+        }
+    });
+    restarted.stop();
+}
+
+#[test]
+fn retain_request_drops_old_generations_and_records_past_a_day() {
+    let mut table = Table::default();
+    table.take(control::Note::Snapshot(control::Snapshot {
+        version: 1,
+        objects: vec![tenant(1, 2, State::Active)],
+    }));
+    let entry = |tenant: u32, generation: u32, accepted: u64| {
+        let mut value = generation.to_le_bytes().to_vec();
+        value.extend_from_slice(&accepted.to_le_bytes());
+        value.extend_from_slice(&[0; 16]);
+        value.push(1);
+        value.extend_from_slice(&[0; 32]);
+        Entry::put(index::key(tenant, [2; 16]), value, Vec::new())
+    };
+    let now = 3 * DAY;
+    assert!(retain_request(&table, now, &entry(1, 2, now - 10)));
+    assert!(!retain_request(&table, now, &entry(1, 1, now - 10)));
+    assert!(!retain_request(&table, now, &entry(1, 2, now - DAY)));
+    assert!(retain_request(&table, now, &entry(9, 1, now - 10)));
+    assert!(retain_request(
+        &table,
+        now,
+        &Entry::delete(index::key(1, [2; 16]), sched::REQUEST_SHAPE)
+    ));
 }
