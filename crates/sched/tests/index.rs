@@ -1,18 +1,22 @@
-use std::collections::BTreeSet;
+use std::cell::{Cell, RefCell};
+use std::collections::{BTreeMap, BTreeSet};
+use std::future::poll_fn;
+use std::pin::pin;
 use std::rc::Rc;
+use std::task::Poll;
 use std::time::Duration;
 
 use control::{Label, Naming, Object, Pool, Sealer, State, Table, Tenant};
 use index::{Entry, Op};
-use rt::sim::{Config, Disk, Machine, SimDriver, Stalls};
-use rt::{JoinHandle, Runtime, sleep};
+use rt::sim::{Config, Disk, Faults, Machine, SimDriver, Stalls, check};
+use rt::{JoinHandle, Runtime, sleep, spawn, timeout};
 use sched::{
     Answered, Attempt, Begun, Clock, DAY, Draft, Hash, Hasher, KIND_REQUEST, KIND_SUPPRESS, Meshes,
     Node, Parts, Reason, Refusal, Running, SHAPE, Settings, Suppression, Ticket, Transport,
     normalize, punycode, retain, retain_request,
 };
 use spool::{Body, Head, HeadClear, Message, MessageId, SLICE, Slice};
-use store::{Client, Committer, DataFile, Options, SLOT_SIZE, Setup, boot};
+use store::{Client, Committer, DataFile, Options, SLOT_SIZE, Setup, Tiering, boot};
 
 const PATH: &str = "/data/store";
 const SHARDS: u16 = 8;
@@ -100,12 +104,23 @@ impl Cluster {
 }
 
 fn created(seed: u64) -> Disk {
+    created_with(seed, OPTIONS)
+}
+
+fn created_with(seed: u64, options: Options) -> Disk {
     let setup = Rc::new(SimDriver::new(seed, Config::default()));
-    Runtime::new(setup.clone()).block_on(async {
-        DataFile::create(PATH, &OPTIONS).await.expect("create");
+    Runtime::new(setup.clone()).block_on(async move {
+        DataFile::create(PATH, &options).await.expect("create");
     });
     setup.crash()
 }
+
+const SMALL: Options = Options {
+    journal_size: 8 * SLOT_SIZE,
+    region_size: 2 * SLOT_SIZE,
+    region_count: 24,
+    shards: SHARDS as u32,
+};
 
 fn settings() -> Settings {
     Settings {
@@ -141,6 +156,24 @@ fn started(driver: &Rc<SimDriver>, cores: u16) -> Cluster {
 }
 
 fn started_behind(driver: &Rc<SimDriver>, cores: u16, behind: u64) -> Cluster {
+    started_tuned(driver, cores, behind, None)
+}
+
+fn started_tuned(
+    driver: &Rc<SimDriver>,
+    cores: u16,
+    behind: u64,
+    tuning: Option<(u64, usize)>,
+) -> Cluster {
+    try_started(driver, cores, behind, tuning).expect("start")
+}
+
+fn try_started(
+    driver: &Rc<SimDriver>,
+    cores: u16,
+    behind: u64,
+    tuning: Option<(u64, usize)>,
+) -> Option<Cluster> {
     let machine = Machine::new(Rc::clone(driver), usize::from(cores) + 1, Stalls::default());
     let setup = Setup {
         cores,
@@ -148,7 +181,12 @@ fn started_behind(driver: &Rc<SimDriver>, cores: u16, behind: u64) -> Cluster {
         reserve: 4,
         flush: 1,
     };
-    let booted = machine.block_on(0, boot(PATH, setup)).expect("boot");
+    let booted = machine
+        .block_on(0, async move {
+            timeout(Duration::from_secs(60), boot(PATH, setup)).await
+        })
+        .ok()?
+        .ok()?;
     let committer = machine.spawn_on(0, booted.committer.run());
     let meshes = std::sync::Arc::new(Meshes::new(cores));
     let mut tasks = Vec::new();
@@ -156,16 +194,27 @@ fn started_behind(driver: &Rc<SimDriver>, cores: u16, behind: u64) -> Cluster {
         let index = start.index();
         let links = meshes.take(index).expect("links");
         tasks.push(machine.spawn_on(usize::from(index) + 1, async move {
-            let core = start.open().await.expect("open");
+            let mut core = timeout(Duration::from_secs(60), start.open())
+                .await
+                .ok()?
+                .ok()?;
+            if let Some((flush_size, fan_in)) = tuning {
+                core.keeper.set_tiering(Tiering {
+                    flush_size,
+                    fan_in,
+                    bytes_per_tick: 64 * 1024,
+                    tick: Duration::from_millis(1),
+                    ..Tiering::default()
+                });
+            }
             let parts = Parts {
                 sealer: Rc::new(Toy),
                 hasher: Rc::new(Keyed),
                 transport: Idle,
                 clock: Clock::at(rt::wall_ms().saturating_sub(behind), rt::now()),
             };
-            Node::start(core, links, settings(), parts)
-                .await
-                .expect("start")
+            let started = Node::start(core, links, settings(), parts);
+            timeout(Duration::from_secs(60), started).await.ok()?.ok()
         }));
     }
     let started = machine.block_on(0, async move {
@@ -175,14 +224,18 @@ fn started_behind(driver: &Rc<SimDriver>, cores: u16, behind: u64) -> Cluster {
         }
         started
     });
-    let (nodes, runnings) = started.into_iter().unzip();
-    Cluster {
+    let (nodes, runnings) = started
+        .into_iter()
+        .collect::<Option<Vec<_>>>()?
+        .into_iter()
+        .unzip();
+    Some(Cluster {
         machine,
         nodes,
         runnings,
         client: booted.client,
         committer,
-    }
+    })
 }
 
 async fn configure(nodes: &[Node<Idle>], objects: Vec<Object>) {
@@ -209,15 +262,21 @@ async fn ready(nodes: &[Node<Idle>]) {
         id: 1,
         addresses: vec![(std::net::IpAddr::from([192, 0, 2, 1]), 1)],
     });
-    configure(
-        nodes,
-        vec![
-            pool,
-            tenant(1, 1, State::Active),
-            tenant(2, 1, State::Active),
-        ],
-    )
-    .await;
+    let missing: Vec<Object> = {
+        let control = nodes.iter().find(|n| n.controls()).expect("control core");
+        let table = control.table();
+        let mut objects = Vec::new();
+        if table.pool(1).is_none() {
+            objects.push(pool);
+        }
+        for id in [1, 2] {
+            if table.tenant(id).is_none() {
+                objects.push(tenant(id, 1, State::Active));
+            }
+        }
+        objects
+    };
+    configure(nodes, missing).await;
     wait_for(nodes, 1, 1, State::Active).await;
     wait_for(nodes, 2, 1, State::Active).await;
 }
@@ -683,7 +742,7 @@ fn concurrent_requests_with_one_key_are_accepted_once() {
         let waiters: Vec<_> = (0..3)
             .map(|_| {
                 let node = node.clone();
-                rt::spawn(async move { node.begin(1, b"same", [5; 16]).await })
+                spawn(async move { node.begin(1, b"same", [5; 16]).await })
             })
             .collect();
         sleep(Duration::from_millis(5)).await;
@@ -704,7 +763,7 @@ fn concurrent_requests_with_one_key_are_accepted_once() {
         let racers: Vec<_> = (0..3)
             .map(|n| {
                 let node = owner(&nodes, 1, b"race").0.clone();
-                rt::spawn(async move {
+                spawn(async move {
                     match node.begin(1, b"race", [2; 16]).await {
                         Ok(Begun::Fresh(ticket)) => {
                             let shard = ticket.shard();
@@ -729,7 +788,7 @@ fn concurrent_requests_with_one_key_are_accepted_once() {
         let first = fresh(node, 1, key, [7; 16]).await;
         let waiter = {
             let node = node.clone();
-            rt::spawn(async move { node.begin(1, b"failing", [7; 16]).await })
+            spawn(async move { node.begin(1, b"failing", [7; 16]).await })
         };
         sleep(Duration::from_millis(5)).await;
         drop(first);
@@ -897,4 +956,320 @@ fn retain_request_drops_old_generations_and_records_past_a_day() {
         now,
         &Entry::delete(index::key(1, [2; 16]), sched::REQUEST_SHAPE)
     ));
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Want {
+    Present(Reason),
+    Absent,
+    Unknown,
+}
+
+#[derive(Default)]
+struct Model {
+    lists: BTreeMap<(u32, String), Want>,
+    accepted: BTreeMap<Vec<u8>, Vec<MessageId>>,
+    doubtful: BTreeSet<Vec<u8>>,
+    refused: BTreeSet<MessageId>,
+    acked: u64,
+    accepts: u64,
+    replays: u64,
+}
+
+type Shared = Rc<RefCell<Model>>;
+
+const REASONS: [Reason; 4] = [
+    Reason::Bounce,
+    Reason::Complaint,
+    Reason::Unsubscribe,
+    Reason::Manual,
+];
+
+fn digest(key: &[u8]) -> Hash {
+    [key[1]; 16]
+}
+
+async fn change_list(node: &Node<Idle>, model: &Shared, driver: &SimDriver, worker: u64) {
+    let tenant = 1 + u32::try_from(driver.random() % 2).expect("small");
+    let n = driver.random() % 12;
+    let address = format!("w{worker}a{n}@d{}.example", n % 3);
+    let slot = (tenant, address.clone());
+    let lists = node.suppressions();
+    if driver.random().is_multiple_of(5) {
+        let checked = lists.check(tenant, &[address.as_str()]).await;
+        let want = model.borrow().lists.get(&slot).copied();
+        match (want, checked) {
+            (Some(Want::Present(_)), Ok(found)) => assert_eq!(found, vec![true], "{address}"),
+            (None | Some(Want::Absent), Ok(found)) => assert_eq!(found, vec![false], "{address}"),
+            _ => {}
+        }
+        return;
+    }
+    model.borrow_mut().lists.insert(slot.clone(), Want::Unknown);
+    let (want, result) = if driver.random().is_multiple_of(3) {
+        (Want::Absent, lists.remove(tenant, &address).await.map(drop))
+    } else {
+        let reason = REASONS[usize::try_from(driver.random() % 4).expect("small")];
+        (
+            Want::Present(reason),
+            lists.add(tenant, &address, reason, None).await,
+        )
+    };
+    let mut model = model.borrow_mut();
+    if result.is_ok() {
+        model.lists.insert(slot, want);
+        model.acked += 1;
+    }
+}
+
+async fn request(nodes: &[Node<Idle>], model: &Shared, driver: &SimDriver) {
+    let key = vec![b'k', u8::try_from(driver.random() % 40).expect("small")];
+    let right = digest(&key);
+    let honest = !driver.random().is_multiple_of(8);
+    let digest = if honest { right } else { [0xee; 16] };
+    let (node, shard) = owner(nodes, 1, &key);
+    let begun = node.begin(1, &key, digest).await;
+    let known = model.borrow().accepted.get(&key).cloned();
+    let ticket = match begun {
+        Ok(Begun::Replay(ids)) => {
+            assert!(honest, "replayed another digest");
+            let mut model = model.borrow_mut();
+            assert!(
+                ids.iter().all(|id| !model.refused.contains(id)),
+                "refused ids came back"
+            );
+            if let Some(first) = known {
+                assert_eq!(ids, first, "another answer");
+            } else {
+                assert!(model.doubtful.contains(&key), "a record from nowhere");
+                model.accepted.insert(key.clone(), ids);
+            }
+            model.replays += 1;
+            return;
+        }
+        Ok(Begun::Fresh(ticket)) => {
+            assert!(known.is_none(), "a second accept for one key");
+            ticket
+        }
+        Err(_) => return,
+    };
+    if !honest {
+        drop(ticket);
+        return;
+    }
+    let Ok(mut draft) = node.draft(1, None) else {
+        return;
+    };
+    if node.recipient(&mut draft, "to@example.org").await.is_err() {
+        return;
+    }
+    let Ok(id) = node.spool().id(shard).await else {
+        return;
+    };
+    let built = message(id, &draft);
+    model.borrow_mut().doubtful.insert(key.clone());
+    let result = node.accept_once(ticket, draft, built).await;
+    let mut model = model.borrow_mut();
+    match result {
+        Ok(()) => {
+            assert!(
+                model.accepted.insert(key.clone(), vec![id]).is_none(),
+                "accepted twice"
+            );
+            model.doubtful.remove(&key);
+            model.accepts += 1;
+        }
+        Err(Refusal::Failed) => {}
+        Err(_) => {
+            model.refused.insert(id);
+            model.doubtful.remove(&key);
+        }
+    }
+}
+
+async fn work(
+    nodes: Vec<Node<Idle>>,
+    model: Shared,
+    driver: Rc<SimDriver>,
+    worker: u64,
+    steps: u64,
+) {
+    for step in 0..steps {
+        if driver.is_halted() {
+            return;
+        }
+        let node = &nodes[usize::try_from((worker + step) % nodes.len() as u64).expect("small")];
+        let op = async {
+            if driver.random().is_multiple_of(2) {
+                change_list(node, &model, &driver, worker).await;
+            } else {
+                request(&nodes, &model, &driver).await;
+            }
+        };
+        if timeout(Duration::from_secs(120), op).await.is_err() {
+            return;
+        }
+        sleep(Duration::from_millis(driver.random() % 3)).await;
+    }
+}
+
+async fn verify_model(nodes: &[Node<Idle>], model: &Shared) {
+    let (lists, accepted) = {
+        let model = model.borrow();
+        (model.lists.clone(), model.accepted.clone())
+    };
+    for ((tenant, address), want) in lists {
+        let found = nodes[0]
+            .suppressions()
+            .get(tenant, &address)
+            .await
+            .expect("get");
+        match want {
+            Want::Present(reason) => {
+                assert_eq!(found.map(|s| s.reason), Some(reason), "{address}");
+            }
+            Want::Absent => assert_eq!(found, None, "{address}"),
+            Want::Unknown => {
+                let settled = found.map_or(Want::Absent, |s| Want::Present(s.reason));
+                model.borrow_mut().lists.insert((tenant, address), settled);
+            }
+        }
+    }
+    for (key, ids) in accepted {
+        let (node, _) = owner(nodes, 1, &key);
+        assert_eq!(replayed(node, 1, &key, digest(&key)).await, ids);
+    }
+}
+
+async fn unless_halted<T>(driver: &Rc<SimDriver>, work: impl Future<Output = T>) -> Option<T> {
+    let mut work = pin!(work);
+    let watched = Rc::clone(driver);
+    let mut halt = pin!(async move {
+        while !watched.is_halted() {
+            sleep(Duration::from_millis(100)).await;
+        }
+    });
+    poll_fn(|cx| {
+        if let Poll::Ready(value) = work.as_mut().poll(cx) {
+            return Poll::Ready(Some(value));
+        }
+        halt.as_mut().poll(cx).map(|()| None)
+    })
+    .await
+}
+
+fn index_session(
+    driver: &Rc<SimDriver>,
+    model: &Shared,
+    cores: u16,
+    tuning: (u64, usize),
+    second: bool,
+) -> bool {
+    let Some(cluster) = try_started(driver, cores, 0, Some(tuning)) else {
+        return false;
+    };
+    let nodes = cluster.nodes.clone();
+    let client = cluster.client.clone();
+    let model = Rc::clone(model);
+    let power = Rc::clone(driver);
+    let finished = cluster.run(async move {
+        if unless_halted(&power, ready(&nodes)).await.is_none() {
+            return false;
+        }
+        if second {
+            verify_model(&nodes, &model).await;
+        }
+        let ticking = Rc::clone(&power);
+        let running = Rc::new(Cell::new(true));
+        let still = Rc::clone(&running);
+        let ticker = spawn(async move {
+            while still.get() && !ticking.is_halted() {
+                if client.checkpoint().await.is_err() {
+                    return;
+                }
+                sleep(Duration::from_millis(4)).await;
+            }
+        });
+        let workers: Vec<_> = (0..3)
+            .map(|w| {
+                spawn(work(
+                    nodes.clone(),
+                    Rc::clone(&model),
+                    Rc::clone(&power),
+                    w,
+                    150,
+                ))
+            })
+            .collect();
+        let all = async move {
+            for worker in workers {
+                worker.await;
+            }
+        };
+        if unless_halted(&power, all).await.is_none() {
+            return false;
+        }
+        running.set(false);
+        if unless_halted(&power, ticker).await.is_none() {
+            return false;
+        }
+        unless_halted(&power, verify_model(&nodes, &model))
+            .await
+            .is_some()
+    });
+    if second && finished {
+        cluster.stop();
+    }
+    finished
+}
+
+fn index_crash(seed: u64, cores: u16) {
+    let small = seed % 4 == 3;
+    let tuning = if seed.is_multiple_of(2) || small {
+        (1, 2)
+    } else {
+        (1, 64)
+    };
+    let model: Shared = Rc::default();
+    let config = Config {
+        halt_after: Some(200 + seed * 7_919 % 1_200),
+        faults: Faults {
+            torn_write: 250_000,
+            ..Faults::default()
+        },
+        ..Config::default()
+    };
+    let options = if small { SMALL } else { OPTIONS };
+    let first = Rc::new(SimDriver::with_disk(
+        seed,
+        config,
+        created_with(seed, options),
+    ));
+    index_session(&first, &model, cores, tuning, false);
+    let second = Rc::new(SimDriver::with_disk(
+        seed + 1,
+        Config::default(),
+        first.crash(),
+    ));
+    assert!(
+        index_session(&second, &model, cores, tuning, true),
+        "seed {seed}: second session did not finish"
+    );
+    let model = model.borrow();
+    assert!(
+        model.acked > 0,
+        "seed {seed}: no suppression change acknowledged"
+    );
+    assert!(model.accepts > 0, "seed {seed}: nothing accepted");
+    assert!(model.replays > 0, "seed {seed}: nothing replayed");
+}
+
+#[test]
+fn index_survives_crashes_on_two_cores() {
+    check(0..4, |seed| index_crash(seed, 2));
+}
+
+#[test]
+fn index_survives_crashes_on_four_cores() {
+    check(0..4, |seed| index_crash(seed, 4));
 }
