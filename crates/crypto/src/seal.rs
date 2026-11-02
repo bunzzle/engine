@@ -13,7 +13,7 @@ pub struct DataKey {
 impl DataKey {
     pub fn new(key: &Secret<32>, version: u8) -> Self {
         Self {
-            prk: Prk::extract(b"bunzzle data v1", key.expose()),
+            prk: Prk::from_secret(key),
             version,
         }
     }
@@ -132,7 +132,7 @@ pub(crate) mod tests {
         let sealed = key().seal_salted(&Secret::new([9; 16]), b"label", b"payload");
         assert_eq!(
             hex(&sealed),
-            "010109090909090909090909090909090909b7e258daa39e15ab92d7ef6fd7e9532ad572f316de0b9a"
+            "010109090909090909090909090909090909b22afa31fa07d43717b3065e6b5bf8ed8d1e48eaf45d53"
         );
     }
 }

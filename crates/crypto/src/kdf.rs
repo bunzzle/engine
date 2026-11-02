@@ -1,4 +1,4 @@
-use aws_lc_rs::hkdf::{self, HKDF_SHA256, KeyType, Salt};
+use aws_lc_rs::hkdf::{self, HKDF_SHA256, KeyType};
 use aws_lc_rs::hmac;
 
 use crate::Secret;
@@ -14,10 +14,6 @@ impl KeyType for Len {
 }
 
 impl Prk {
-    pub fn extract(salt: &[u8], ikm: &[u8]) -> Self {
-        Self(Salt::new(HKDF_SHA256, salt).extract(ikm))
-    }
-
     pub fn from_secret(prk: &Secret<32>) -> Self {
         Self(hkdf::Prk::new_less_safe(HKDF_SHA256, prk.expose()))
     }
@@ -61,11 +57,11 @@ mod tests {
         extract_into(&salt, &[&ikm], &mut out);
         assert_eq!(out.expose().to_vec(), hex(prk));
         let half = info.len() / 2;
-        let from_secret = Prk::from_secret(&out).expand::<82>(&[&info[..half], &info[half..]]);
-        let from_extract = Prk::extract(&salt, &ikm).expand::<82>(&[&info]);
+        let split = Prk::from_secret(&out).expand::<82>(&[&info[..half], &info[half..]]);
+        let whole = Prk::from_secret(&out).expand::<82>(&[&info]);
         let okm = hex(okm);
-        assert_eq!(&from_secret.expose()[..okm.len()], &okm[..]);
-        assert_eq!(&from_extract.expose()[..okm.len()], &okm[..]);
+        assert_eq!(&split.expose()[..okm.len()], &okm[..]);
+        assert_eq!(&whole.expose()[..okm.len()], &okm[..]);
     }
 
     #[test]

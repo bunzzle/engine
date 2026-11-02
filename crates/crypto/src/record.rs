@@ -16,7 +16,7 @@ pub struct BatchKey(Prk);
 
 impl BatchKey {
     pub fn new(key: &Secret<32>) -> Self {
-        Self(Prk::extract(b"bunzzle batch v1", key.expose()))
+        Self(Prk::from_secret(key))
     }
 
     pub fn record(&self, message: &[u8; 16], item: u32, label: u8) -> ChunkKey {
@@ -125,8 +125,8 @@ mod tests {
             hex(&a),
             "0100000002000000090909090909090909090909090909090300000004"
         );
-        assert_eq!(hex(&record), "14f9aa6033a6abd0dd5bf912ea5f274ac1fc9c00");
-        assert_eq!(hex(&stamped), "b5c8b945641521a9143c97308c1fcab8ea2983f5");
+        assert_eq!(hex(&record), "1b9347725b06f249d26d863f8358d6f098fcd316");
+        assert_eq!(hex(&stamped), "133fe15b76a88bd2ec5df6497c8aa6987c1b9669");
     }
 
     #[test]

@@ -6,7 +6,7 @@ pub struct Tenant(Prk);
 
 impl Tenant {
     pub fn new(key: &Secret<32>) -> Self {
-        Self(Prk::extract(b"bunzzle tenant v1", key.expose()))
+        Self(Prk::from_secret(key))
     }
 
     pub fn data_key(&self, generation: u32, version: u8) -> DataKey {
@@ -93,15 +93,15 @@ mod tests {
         let salt = Secret::new([9; 16]);
         assert_eq!(
             hex(&tenant.dkim_key(1, 2).seal_salted(&salt, b"l", b"x")),
-            "0102090909090909090909090909090909095c397a009c2622f042f5c99065cde2f81d"
+            "01020909090909090909090909090909090966e7e02f90d6036e2516e9cffc8c7ded9f"
         );
         assert_eq!(
             hex(&tenant.data_key(1, 2).seal_salted(&salt, b"l", b"x")),
-            "010209090909090909090909090909090909d0461269a4e67724afd0e461da02457fcb"
+            "010209090909090909090909090909090909426a9010bf18588b98810316c1536395d0"
         );
         assert_eq!(
             hex(tenant.hash_key(1).expose()),
-            "2b8579f4c13a81d279842e26bccef023"
+            "bd7f2bae6ff8c12b0d35b5e12a9ebeb7"
         );
     }
 
