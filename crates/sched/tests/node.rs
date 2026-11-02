@@ -397,6 +397,7 @@ fn session(driver: &Rc<SimDriver>, world: &Shared, intake_on: bool, limit: Durat
         cores: CORES,
         credits: 4,
         reserve: 0,
+        flush: 0,
     };
     let Ok(Ok(booted)) = machine.block_on(0, async move {
         timeout(Duration::from_secs(60), boot(PATH, setup)).await

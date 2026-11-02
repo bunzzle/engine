@@ -65,7 +65,10 @@ impl Committer {
                 request,
                 Request::Answer(_)
                     | Request::Seal(..)
-                    | Request::ClaimState(..)
+                    | Request::ClaimRun(..)
+                    | Request::Unhold(..)
+                    | Request::ReserveIndex(..)
+                    | Request::UnreserveIndex(..)
                     | Request::Survey(..)
                     | Request::Compacted(..)
             )
@@ -141,10 +144,11 @@ impl Committer {
     }
 
     fn prune_waiting(&mut self) {
-        for (slot, appending) in self.sessions.iter_mut().zip(&mut self.runs.appending) {
+        for session in 0..self.sessions.len() {
+            let slot = &mut self.sessions[session];
             if slot.as_ref().is_none_or(Sender::is_closed) {
                 *slot = None;
-                *appending = None;
+                self.drop_session_runs(session);
             }
         }
         let sessions = &self.sessions;

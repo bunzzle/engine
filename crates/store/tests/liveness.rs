@@ -175,6 +175,7 @@ fn workload(seed: u64, halt_after: Option<u64>, disk: Disk) -> Outcome {
         cores: CORES,
         credits: 2,
         reserve: 0,
+        flush: 0,
     };
     let Ok(Ok(booted)) =
         machine.block_on(0, async move { timeout(HORIZON, boot(PATH, setup)).await })
@@ -353,6 +354,7 @@ async fn owner_on_core_zero() -> (Changes, JoinHandle<Keeper>, Client, JoinHandl
         cores: CORES,
         credits: 2,
         reserve: 0,
+        flush: 0,
     };
     let booted = boot(PATH, setup).await.expect("boot");
     let committer = spawn(booted.committer.run());
@@ -500,6 +502,7 @@ fn state_changes_go_through_when_intake_is_refused() {
             cores: 1,
             credits: 2,
             reserve,
+            flush: 0,
         };
         let booted = boot(PATH, setup).await.expect("boot");
         let committer = spawn(booted.committer.run());

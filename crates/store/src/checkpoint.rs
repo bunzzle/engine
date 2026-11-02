@@ -8,14 +8,14 @@ use crate::journal::Position;
 use crate::layout::{Fields, FieldsMut};
 use crate::record::{self, FLAG_MORE, Header, Record, SYSTEM_SHARD, record_size};
 use crate::recovery::State;
-use crate::run::{Root, decode_roots};
+use crate::roots::decode_part;
 use crate::superblock::CheckpointCopy;
 use crate::usage::{Count, Usage};
 use sys::crc32c::checksum;
 
 pub const KIND_CHECKPOINT: u8 = 2;
 
-const BLOB_FORMAT: u32 = 2;
+const BLOB_FORMAT: u32 = 3;
 const HEAD: usize = 48;
 const PART_HEAD: usize = 24;
 const TENANT: usize = 16;
@@ -343,9 +343,11 @@ pub async fn load(data: &DataFile, reserve: u32) -> Result<Loaded, Error> {
     state.checkpoint = checkpoint.copies.iter().map(|c| c.region).collect();
     let shards = superblock.shards();
     for part in snapshot.parts.iter().filter(|p| u32::from(p.tag) < shards) {
-        for root in decode_roots(&part.bytes).ok_or(Error::CheckpointLost)? {
-            if !state.runs.contains(&root.region) {
-                state.runs.push(root.region);
+        let roots = decode_part(&part.bytes).ok_or(Error::CheckpointLost)?;
+        let found = roots.state.iter().map(|r| r.region);
+        for region in found.chain(roots.index.iter().map(|r| r.region)) {
+            if !state.runs.contains(&region) {
+                state.runs.push(region);
             }
         }
     }
@@ -406,24 +408,28 @@ fn consistent(
             .parts
             .iter()
             .filter(|p| u32::from(p.tag) < shards)
-            .filter_map(|p| decode_roots(&p.bytes))
-            .flatten()
-            .all(|root| root_stored(snapshot, &released, copies, &root))
+            .filter_map(|p| decode_part(&p.bytes))
+            .all(|roots| {
+                let state = roots.state.iter().map(|r| (r.region, r.epoch));
+                let mut found = state.chain(roots.index.iter().map(|r| (r.region, r.epoch)));
+                found.all(|(region, epoch)| root_stored(snapshot, &released, copies, region, epoch))
+            })
 }
 
 fn root_stored(
     snapshot: &Snapshot,
     released: &[bool],
     copies: &[CheckpointCopy; 2],
-    root: &Root,
+    region: u32,
+    epoch: u64,
 ) -> bool {
-    let region = root.region as usize;
-    region < snapshot.used.len()
-        && snapshot.used[region]
-        && !released[region]
-        && snapshot.epochs[region] == root.epoch
-        && snapshot.usage.counts()[region] == Count::default()
-        && copies.iter().all(|c| c.region != root.region)
+    let at = region as usize;
+    at < snapshot.used.len()
+        && snapshot.used[at]
+        && !released[at]
+        && snapshot.epochs[at] == epoch
+        && snapshot.usage.counts()[at] == Count::default()
+        && copies.iter().all(|c| c.region != region)
 }
 
 pub(crate) fn parts_valid(parts: &[Part], shards: u32) -> bool {
@@ -431,7 +437,7 @@ pub(crate) fn parts_valid(parts: &[Part], shards: u32) -> bool {
     tags.sort_unstable();
     tags.windows(2).all(|w| w[0] != w[1])
         && parts.iter().all(|p| {
-            p.tag >= PART_TAG_OTHER || u32::from(p.tag) < shards && decode_roots(&p.bytes).is_some()
+            p.tag >= PART_TAG_OTHER || u32::from(p.tag) < shards && decode_part(&p.bytes).is_some()
         })
 }
 
@@ -441,6 +447,7 @@ mod tests {
 
     use super::{PART_TAG_OTHER, Part, Snapshot, decode, encode, parts_valid};
     use crate::journal::Position;
+    use crate::roots::encode_part;
     use crate::usage::{Count, Usage};
 
     fn snapshot() -> Snapshot {
@@ -503,7 +510,7 @@ mod tests {
         Part {
             tag,
             replay_sequence: 1,
-            bytes: Vec::new(),
+            bytes: encode_part(&[], &[]),
         }
     }
 
@@ -513,5 +520,8 @@ mod tests {
         assert!(!parts_valid(&[part(4)], 4));
         assert!(!parts_valid(&[part(2), part(2)], 4));
         assert!(parts_valid(&[part(u16::MAX)], 4));
+        let mut empty = part(1);
+        empty.bytes.clear();
+        assert!(!parts_valid(&[empty], 4));
     }
 }

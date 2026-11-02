@@ -76,7 +76,10 @@ pub(crate) enum Request {
     Answer(Answer),
     Allocate(Claim, Sender<Result<(u32, u64), Error>>),
     Seal(u32, u64),
-    ClaimState(usize, Sender<Result<(u32, u64), Error>>),
+    ClaimRun(usize, Claim, Sender<Result<(u32, u64), Error>>),
+    Unhold(usize, u32),
+    ReserveIndex(usize, u32, Sender<Result<(), Error>>),
+    UnreserveIndex(usize, u32),
     Checkpoint(Sender<Result<u64, Error>>),
     Boot(Sender<Result<u32, Error>>),
     Survey(usize, u64, Vec<Owned>),
@@ -223,7 +226,7 @@ impl Committer {
             queues: Queues::default(),
             runs: Runs {
                 regions: state.runs,
-                appending: Vec::new(),
+                ..Runs::default()
             },
             part_timeout: PART_TIMEOUT,
             compaction: Compaction::new(count),
@@ -232,12 +235,14 @@ impl Committer {
         (committer, Client { sender })
     }
 
-    pub fn session(&mut self, client: &Client, credits: u32) -> (Session, Results) {
+    pub fn session(&mut self, client: &Client, credits: u32, flush: u32) -> (Session, Results) {
         let (events, receiver) = channel();
         let credits = Arc::new(AtomicU32::new(credits));
         self.sessions.push(Some(events));
-        self.runs.appending.push(None);
+        self.runs.held.push(Vec::new());
+        self.runs.merging.push(0);
         self.regions.add_state_reserve();
+        self.regions.add_flush_reserve(flush);
         let session = Session {
             id: self.sessions.len() - 1,
             client: client.clone(),
@@ -367,14 +372,24 @@ impl Committer {
                 }
             }
             Request::Answer(answer) => self.answer(answer),
-            Request::ClaimState(session, reply) => {
+            Request::ClaimRun(session, claim, reply) => {
                 let result = if self.failed {
                     Err(Error::Failed)
                 } else {
-                    self.claim_state(session)
+                    self.claim_run(session, claim)
                 };
                 let _ = reply.send(result);
             }
+            Request::Unhold(session, region) => self.unhold(session, region),
+            Request::ReserveIndex(session, regions, reply) => {
+                let result = if self.failed {
+                    Err(Error::Failed)
+                } else {
+                    self.reserve_index(session, regions)
+                };
+                let _ = reply.send(result);
+            }
+            Request::UnreserveIndex(session, regions) => self.unreserve_index(session, regions),
             Request::Seal(region, epoch) => {
                 if self.epochs[region as usize] == epoch {
                     self.sealed(region);
@@ -404,6 +419,9 @@ impl Committer {
     }
 
     fn allocate(&mut self, claim: Claim) -> Result<(u32, u64), Error> {
+        if matches!(claim, Claim::State | Claim::Flush | Claim::Index) {
+            return Err(Error::Invalid("claim"));
+        }
         let region = self.regions.acquire(claim)?;
         assert!(
             self.usage.is_empty(region),

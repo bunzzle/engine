@@ -373,3 +373,57 @@ fn each_session_keeps_one_region_for_state() {
     regions.acquire(Claim::Checkpoint).expect("checkpoint");
     assert_eq!(regions.free(), 0);
 }
+
+#[test]
+fn flushes_and_merges_keep_their_own_reserves() {
+    let mut regions = Regions::new(12, 1);
+    regions.add_state_reserve();
+    regions.add_flush_reserve(2);
+    assert_eq!((regions.floor(), regions.held()), (5, 7));
+    for _ in 0..4 {
+        regions.acquire(Claim::Intake).expect("intake");
+    }
+    assert!(matches!(
+        regions.acquire(Claim::Intake),
+        Err(Error::Reserve)
+    ));
+    regions.acquire(Claim::Control).expect("control");
+    assert!(matches!(regions.acquire(Claim::Control), Err(Error::Full)));
+    assert!(matches!(regions.reserve_index(1), Err(Error::Full)));
+    regions.acquire(Claim::Internal).expect("internal");
+    regions.acquire(Claim::Internal).expect("internal");
+    assert!(matches!(regions.acquire(Claim::Internal), Err(Error::Full)));
+    regions.acquire(Claim::Flush).expect("flush");
+    regions.acquire(Claim::Flush).expect("flush");
+    assert!(matches!(regions.acquire(Claim::Flush), Err(Error::Full)));
+    regions.acquire(Claim::State).expect("state");
+    assert!(matches!(regions.acquire(Claim::State), Err(Error::Full)));
+    regions.acquire(Claim::Checkpoint).expect("checkpoint");
+    regions.acquire(Claim::Checkpoint).expect("checkpoint");
+    assert_eq!(regions.free(), 0);
+}
+
+#[test]
+fn merges_claim_only_what_they_reserved() {
+    let mut regions = Regions::new(14, 0);
+    regions.add_flush_reserve(1);
+    assert!(matches!(regions.acquire(Claim::Index), Err(Error::Full)));
+    regions.reserve_index(9).expect("reserve");
+    assert!(matches!(regions.reserve_index(1), Err(Error::Full)));
+    assert!(matches!(regions.acquire(Claim::Control), Err(Error::Full)));
+    regions.acquire(Claim::Internal).expect("internal");
+    regions.acquire(Claim::Internal).expect("internal");
+    assert!(matches!(regions.acquire(Claim::Internal), Err(Error::Full)));
+    for _ in 0..9 {
+        regions.acquire(Claim::Index).expect("index");
+    }
+    assert_eq!((regions.merging(), regions.free()), (0, regions.floor()));
+    assert!(matches!(regions.acquire(Claim::Index), Err(Error::Full)));
+    for region in 0..3 {
+        regions.release(region);
+    }
+    regions.reserve_index(1).expect("reserve");
+    assert!(matches!(regions.acquire(Claim::Control), Err(Error::Full)));
+    regions.unreserve_index(1);
+    regions.acquire(Claim::Control).expect("control");
+}

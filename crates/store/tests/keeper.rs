@@ -14,7 +14,7 @@ use store::{
     Body, Change, Claim, Client, Committer, CoreFile, DataFile, Dead, Delivery, Error, Event,
     Index, Item, KIND_STATE, Keeper, Key, Location, MAX_DELTAS, Options, Part, Range, Results,
     Root, SLOT_SIZE, Session, Setup, ShardState, Source, Start, Submission, Write, boot,
-    encode_roots, load, read_run, recover,
+    encode_part, load, read_run, recover,
 };
 
 const PATH: &str = "/data/store";
@@ -52,7 +52,7 @@ async fn start(
     let (mut committer, client) = Committer::new(data, recovered.journal, recovered.state);
     committer.set_part_timeout(Duration::from_secs(5));
     let sessions = (0..sessions)
-        .map(|_| committer.session(&client, 8))
+        .map(|_| committer.session(&client, 8, 0))
         .collect();
     let source = committer.source();
     (client, sessions, source, spawn(committer.run()))
@@ -242,7 +242,7 @@ fn runs_hold_the_shard_state_across_checkpoints_and_restarts() {
             let data = DataFile::open(PATH).await.expect("open");
             let loaded = load(&data, 0).await.expect("load");
             for part in &loaded.parts {
-                let roots = store::decode_roots(&part.bytes).expect("roots");
+                let roots = store::decode_part(&part.bytes).expect("roots").state;
                 assert_eq!(roots, core.keeper.roots(part.tag).expect("kept"));
             }
         }
@@ -272,7 +272,7 @@ fn runs_hold_the_shard_state_across_checkpoints_and_restarts() {
             assert!(loaded.state.regions.is_used(region));
         }
         for part in &loaded.parts {
-            let roots = store::decode_roots(&part.bytes).expect("roots");
+            let roots = store::decode_part(&part.bytes).expect("roots").state;
             let shard = part.tag;
             assert_eq!(
                 fold(&file, shard, &roots).await,
@@ -295,7 +295,7 @@ fn fail_cut(session: Session, mut results: Results, failing: u32) -> JoinHandle<
                         .map(|tag| Part {
                             tag,
                             replay_sequence: sequence,
-                            bytes: encode_roots(&[]),
+                            bytes: encode_part(&[], &[]),
                         })
                         .to_vec();
                     session.parts(sequence, parts).expect("parts");
@@ -357,7 +357,7 @@ fn a_root_outside_the_state_regions_abandons_the_checkpoint() {
                     let part = Part {
                         tag: 0,
                         replay_sequence: sequence,
-                        bytes: encode_roots(&[root]),
+                        bytes: encode_part(&[root], &[]),
                     };
                     session.parts(sequence, vec![part]).expect("parts");
                     return;
@@ -698,6 +698,7 @@ fn workload(seed: u64, halt_after: Option<u64>, disk: Disk) -> (Rc<SimDriver>, M
         cores: CORES,
         credits: 1,
         reserve: 0,
+        flush: 0,
     };
     let Ok(Ok(booted)) =
         machine.block_on(0, async move { timeout(HORIZON, boot(PATH, setup)).await })

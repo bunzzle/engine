@@ -6,16 +6,20 @@ use crate::checkpoint::Part;
 use crate::committer::Location;
 use crate::core_file::CoreFile;
 use crate::error::Error;
+use crate::indexes::{self, IndexRecord, KIND_INDEX, Partition};
 use crate::journal::{Entry, Range};
 use crate::keeper::Keeper;
 use crate::record::Record;
-use crate::run::{Root, decode_roots, read_run};
+use crate::roots::{Roots, decode_part};
+use crate::run::{Root, read_run};
 use crate::shard::{Index, KIND_STATE, ShardState};
 
 struct Rebuilding {
     state: ShardState,
     roots: Vec<Root>,
     covered: u64,
+    indexes: BTreeMap<(u8, u32), Partition>,
+    index_covered: BTreeMap<(u8, u32), u64>,
 }
 
 impl Keeper {
@@ -28,20 +32,24 @@ impl Keeper {
         let mut rebuilding = BTreeMap::new();
         for &shard in shards {
             let roots = match parts.iter().find(|p| p.tag == shard) {
-                Some(part) => decode_roots(&part.bytes).ok_or(Error::CheckpointLost)?,
-                None => Vec::new(),
+                Some(part) => decode_part(&part.bytes).ok_or(Error::CheckpointLost)?,
+                None => Roots::default(),
             };
             let mut state = ShardState::default();
-            for root in &roots {
+            for root in &roots.state {
                 state.load_run(read_run(data, root, shard).await?);
             }
             let covered = state.covered();
+            let indexes = indexes::load(data, &roots.index).await?;
+            let index_covered = indexes.iter().map(|(&k, p)| (k, p.covered())).collect();
             rebuilding.insert(
                 shard,
                 Rebuilding {
                     state,
-                    roots,
+                    roots: roots.state,
                     covered,
+                    indexes,
+                    index_covered,
                 },
             );
         }
@@ -53,7 +61,7 @@ impl Keeper {
         }
         let mut keeper = Self::default();
         for (shard, rebuilt) in rebuilding {
-            keeper.insert(shard, rebuilt.state, rebuilt.roots);
+            keeper.insert_indexed(shard, rebuilt.state, rebuilt.roots, rebuilt.indexes);
         }
         Ok(keeper)
     }
@@ -86,7 +94,20 @@ async fn replay(
             return Err(bad);
         };
         let size = record.size();
-        if record.kind() == KIND_STATE
+        if record.kind() == KIND_INDEX
+            && let Some(shard) = rebuilding.get_mut(&record.shard())
+        {
+            let found = IndexRecord::decode(record.payload()).ok_or(Error::BadCommit(commit))?;
+            let key = (found.kind, found.partition);
+            if commit > shard.index_covered.get(&key).copied().unwrap_or(0) {
+                shard
+                    .indexes
+                    .entry(key)
+                    .or_default()
+                    .apply(found.entry)
+                    .map_err(|_| Error::BadCommit(commit))?;
+            }
+        } else if record.kind() == KIND_STATE
             && let Some(shard) = rebuilding.get_mut(&record.shard())
             && commit > shard.covered
         {

@@ -23,6 +23,7 @@ const SETUP: Setup = Setup {
     cores: 2,
     credits: 2,
     reserve: 0,
+    flush: 0,
 };
 
 fn created(seed: u64) -> Disk {

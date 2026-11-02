@@ -5,7 +5,8 @@ use rt::sim::{Config, SimDriver};
 use rt::{Buf, File, JoinHandle, OpenOptions, Receiver, Runtime, channel, now, sleep, spawn};
 use store::{
     Body, Claim, Client, Committer, DataFile, Dead, Error, Event, Location, Options, Part, Range,
-    Results, SLOT_SIZE, Session, Submission, Write, ZONE_SIZE, checksum, load, recover,
+    Results, SLOT_SIZE, Session, Submission, Write, ZONE_SIZE, checksum, encode_part, load,
+    recover,
 };
 
 const PATH: &str = "/data/store";
@@ -39,7 +40,7 @@ async fn start(
     let (mut committer, client) = Committer::new(data, recovered.journal, recovered.state);
     committer.set_part_timeout(part_timeout);
     let sessions = (0..sessions)
-        .map(|_| committer.session(&client, credits))
+        .map(|_| committer.session(&client, credits, 0))
         .collect();
     (client, sessions, spawn(committer.run()))
 }
@@ -63,7 +64,7 @@ fn part(tag: u16, sequence: u64) -> Part {
     Part {
         tag,
         replay_sequence: sequence,
-        bytes: Vec::new(),
+        bytes: encode_part(&[], &[]),
     }
 }
 

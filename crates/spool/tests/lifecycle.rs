@@ -329,6 +329,7 @@ fn workload(seed: u64, steps: u64, halt_after: Option<u64>, disk: Disk, model: &
         cores: CORES,
         credits: 4,
         reserve: 0,
+        flush: 0,
     };
     let Ok(Ok(booted)) =
         machine.block_on(0, async move { timeout(HORIZON, boot(PATH, setup)).await })
@@ -404,6 +405,7 @@ async fn verify(model: &Model) {
         cores: CORES,
         credits: 4,
         reserve: 0,
+        flush: 0,
     };
     let booted = boot(PATH, setup).await.expect("boot");
     let committer = spawn(booted.committer.run());

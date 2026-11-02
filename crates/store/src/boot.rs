@@ -18,6 +18,7 @@ pub struct Setup {
     pub cores: u16,
     pub credits: u32,
     pub reserve: u32,
+    pub flush: u32,
 }
 
 pub struct Booted {
@@ -57,8 +58,11 @@ pub async fn boot(path: impl AsRef<Path>, setup: Setup) -> Result<Booted, Error>
         ));
     }
     let kept = setup
-        .reserve
-        .checked_add(CHECKPOINT_RESERVE + COMPACTION_RESERVE + u32::from(setup.cores));
+        .flush
+        .checked_add(1)
+        .and_then(|per_core| per_core.checked_mul(u32::from(setup.cores)))
+        .and_then(|cores| cores.checked_add(setup.reserve))
+        .and_then(|kept| kept.checked_add(CHECKPOINT_RESERVE + COMPACTION_RESERVE));
     if kept.is_none_or(|kept| kept >= superblock.region_count()) {
         return Err(Error::Config("reserves leave no region for intake"));
     }
@@ -71,7 +75,7 @@ pub async fn boot(path: impl AsRef<Path>, setup: Setup) -> Result<Booted, Error>
     let source = committer.source();
     let starts = (0..setup.cores)
         .map(|index| {
-            let (session, results) = committer.session(&client, setup.credits);
+            let (session, results) = committer.session(&client, setup.credits, setup.flush);
             Start {
                 index,
                 boot,
