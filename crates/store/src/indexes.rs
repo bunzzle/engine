@@ -1,8 +1,9 @@
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use index::{
     BLOCK, Cursor, Entry, Footer, Key, Memtable, Merge, Merged, Op, Range, Run, Segment, Shape,
-    Source, Writer, find, footer_range,
+    Source, find, footer_range,
 };
 use rt::Buf;
 
@@ -104,9 +105,31 @@ pub(crate) struct Place {
     pub(crate) checksum: u32,
 }
 
+#[derive(Clone)]
 pub(crate) struct Stored {
-    pub(crate) run: Run,
-    pub(crate) places: Vec<Place>,
+    pub(crate) run: Arc<Run>,
+    pub(crate) places: Arc<[Place]>,
+}
+
+impl Stored {
+    pub(crate) fn bytes(&self) -> u64 {
+        self.places.iter().map(|p| u64::from(p.length)).sum()
+    }
+
+    pub(crate) fn same(&self, other: &Stored) -> bool {
+        Arc::ptr_eq(&self.run, &other.run)
+    }
+}
+
+pub(crate) struct Swap {
+    pub(crate) inputs: Vec<Stored>,
+    pub(crate) output: Option<Stored>,
+    pub(crate) regions: Vec<u32>,
+}
+
+pub(crate) struct Flushed {
+    pub(crate) replaces: bool,
+    pub(crate) output: Option<Stored>,
 }
 
 #[derive(Default)]
@@ -114,7 +137,28 @@ pub(crate) struct Partition {
     pub(crate) live: Option<Memtable>,
     pub(crate) frozen: Vec<Entry>,
     pub(crate) runs: Vec<Stored>,
-    pub(crate) flushed: Option<Stored>,
+    pub(crate) flushed: Option<Flushed>,
+    pub(crate) merged: Vec<Swap>,
+    pub(crate) cut_merges: Vec<Swap>,
+    pub(crate) merging: bool,
+    pub(crate) closed: Closed,
+    pub(crate) dropped: Dropped,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum Closed {
+    #[default]
+    Open,
+    Whole,
+    Tiered,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum Dropped {
+    #[default]
+    Kept,
+    Asked,
+    InCut,
 }
 
 impl Partition {
@@ -122,7 +166,7 @@ impl Partition {
         self.runs.last().map_or(0, |s| s.run.covered())
     }
 
-    fn shape(&self) -> Option<Shape> {
+    pub(crate) fn shape(&self) -> Option<Shape> {
         self.live
             .as_ref()
             .map(Memtable::shape)
@@ -142,17 +186,61 @@ impl Partition {
     pub(crate) fn freeze(&mut self) {
         assert!(self.frozen.is_empty(), "index frozen twice");
         self.frozen = self.live.as_mut().map(Memtable::take).unwrap_or_default();
+        self.cut_merges = std::mem::take(&mut self.merged);
+        if self.dropped == Dropped::Asked {
+            self.dropped = Dropped::InCut;
+        }
     }
 
-    pub(crate) fn published(&mut self) {
+    pub(crate) fn merged_runs(&self) -> Vec<Stored> {
+        let mut runs = self.runs.clone();
+        for swap in &self.cut_merges {
+            let Some(at) = runs.iter().position(|r| r.same(&swap.inputs[0])) else {
+                continue;
+            };
+            let end = at + swap.inputs.len();
+            let contiguous = runs
+                .get(at..end)
+                .is_some_and(|found| found.iter().zip(&swap.inputs).all(|(a, b)| a.same(b)));
+            if contiguous {
+                runs.splice(at..end, swap.output.iter().cloned());
+            }
+        }
+        runs
+    }
+
+    fn view(&self) -> Vec<Stored> {
+        if self.dropped == Dropped::InCut {
+            return Vec::new();
+        }
+        let mut runs = self.merged_runs();
+        if let Some(flushed) = &self.flushed {
+            if flushed.replaces {
+                runs.pop();
+            }
+            runs.extend(flushed.output.iter().cloned());
+        }
+        runs
+    }
+
+    pub(crate) fn published(&mut self, unhold: &mut Vec<u32>) {
+        self.runs = self.view();
         self.frozen.clear();
-        if let Some(stored) = self.flushed.take() {
-            self.runs.push(stored);
+        self.flushed = None;
+        for swap in std::mem::take(&mut self.cut_merges) {
+            unhold.extend(swap.regions);
+            self.merging = false;
         }
     }
 
     pub(crate) fn abandoned(&mut self) {
         self.flushed = None;
+        if self.dropped == Dropped::InCut {
+            self.dropped = Dropped::Asked;
+        }
+        let mut merged = std::mem::take(&mut self.cut_merges);
+        merged.append(&mut self.merged);
+        self.merged = merged;
         let frozen = std::mem::take(&mut self.frozen);
         if let Some(live) = self.live.as_mut() {
             live.restore(frozen);
@@ -160,9 +248,13 @@ impl Partition {
     }
 
     pub(crate) fn roots(&self, (kind, partition): (u8, u32), pending: bool) -> Vec<IndexRoot> {
+        let runs = if pending {
+            self.view()
+        } else {
+            self.runs.clone()
+        };
         let mut roots = Vec::new();
-        let flushed = self.flushed.iter().filter(|_| pending);
-        for (run, stored) in self.runs.iter().chain(flushed).enumerate() {
+        for (run, stored) in runs.iter().enumerate() {
             for (segment, place) in stored.places.iter().enumerate() {
                 roots.push(IndexRoot {
                     kind,
@@ -240,14 +332,14 @@ impl Partition {
     }
 }
 
-fn damaged(place: &Place, range: Range) -> Error {
+pub(crate) fn damaged(place: &Place, range: Range) -> Error {
     Error::Damaged {
         region: place.region,
         offset: place.offset + range.offset,
     }
 }
 
-async fn read(data: &CoreFile, place: &Place, range: Range) -> Result<Vec<u8>, Error> {
+pub(crate) async fn read(data: &CoreFile, place: &Place, range: Range) -> Result<Vec<u8>, Error> {
     let sector = u64::from(data.sector_size());
     let start = place.offset + range.offset;
     let end = start + u64::from(range.length);
@@ -268,34 +360,6 @@ async fn read(data: &CoreFile, place: &Place, range: Range) -> Result<Vec<u8>, E
     }
     let at = usize::try_from(start - from).expect("offset fits in usize");
     Ok(buf[at..at + range.length as usize].to_vec())
-}
-
-pub(crate) fn segments(
-    shape: Shape,
-    covered: u64,
-    entries: &[Entry],
-    region_size: u64,
-) -> Vec<Vec<u8>> {
-    let mut out = Vec::new();
-    let mut writer = Writer::new(shape, covered);
-    for entry in entries {
-        if !writer.is_empty() && writer.length_with(entry) > region_size {
-            let full = std::mem::replace(&mut writer, Writer::new(shape, covered));
-            out.extend(full.finish().map(|b| b.bytes));
-        }
-        writer
-            .push(entry)
-            .expect("memtable entries are sorted and checked");
-    }
-    out.extend(writer.finish().map(|b| b.bytes));
-    out
-}
-
-pub(crate) fn built(bytes: &[u8]) -> Segment {
-    let footer = Footer::decode(&bytes[bytes.len() - BLOCK..]).expect("built footer");
-    let meta = footer.meta();
-    let at = usize::try_from(meta.offset).expect("meta fits in usize");
-    Segment::load(footer, &bytes[at..at + meta.length as usize]).expect("built segment")
 }
 
 pub(crate) fn footer_checksum(bytes: &[u8]) -> u32 {
@@ -337,7 +401,10 @@ pub(crate) async fn load(
         {
             return Err(damaged(&places[0], whole(&places[0])));
         }
-        partition.runs.push(Stored { run, places });
+        partition.runs.push(Stored {
+            run: Arc::new(run),
+            places: places.into(),
+        });
         at = end;
     }
     Ok(partitions)

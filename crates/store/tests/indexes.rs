@@ -7,8 +7,8 @@ use rt::sim::{Config, SimDriver};
 use rt::{JoinHandle, Runtime, spawn};
 use store::{
     Claim, Client, Committer, CoreFile, DataFile, Error, Event, IndexRecord, IndexRoot, Keeper,
-    Options, Part, Results, SLOT_SIZE, Session, ShardState, Source, Submission, decode_part,
-    encode_part, load, recover,
+    Options, Part, Results, SLOT_SIZE, Session, ShardState, Source, Submission, Tiering,
+    decode_part, encode_part, load, recover,
 };
 
 const PATH: &str = "/data/indexes";
@@ -183,6 +183,18 @@ impl Core {
         event
     }
 
+    async fn merge_once(&mut self) -> Option<Result<(), Error>> {
+        let job = self.keeper.plan(&self.data)?;
+        let task = store::merge(
+            job,
+            self.data.clone(),
+            self.session.clone(),
+            self.keeper.tiering().clone(),
+        );
+        let done = spawn(task).await;
+        Some(self.keeper.merged(done))
+    }
+
     async fn checkpoint(&mut self, client: &Client) -> Result<u64, Error> {
         let client = client.clone();
         let request = spawn(async move { client.checkpoint().await });
@@ -199,9 +211,16 @@ impl Core {
 
 async fn verify(keeper: &Keeper, data: &CoreFile, model: &Model) {
     for (&(shard, partition), entries) in model {
-        let scanned = keeper.scan(data, shard, partition).await.expect("scan");
+        let scanned: Vec<Entry> = keeper
+            .scan(data, shard, partition)
+            .await
+            .expect("scan")
+            .into_iter()
+            .filter(|e| e.op == Op::Put)
+            .collect();
         let expected: Vec<Entry> = entries
             .iter()
+            .filter(|(_, (op, _, _))| *op == Op::Put)
             .map(|(key, (op, value, payload))| Entry {
                 key: *key,
                 op: *op,
@@ -211,8 +230,14 @@ async fn verify(keeper: &Keeper, data: &CoreFile, model: &Model) {
             .collect();
         assert_eq!(scanned, expected, "shard {shard} partition {partition:?}");
         for (key, (op, value, _)) in entries {
-            let found = keeper.lookup(data, shard, partition, key).await;
-            assert_eq!(found.expect("lookup"), Some((*op, value.clone())));
+            let found = keeper
+                .lookup(data, shard, partition, key)
+                .await
+                .expect("lookup");
+            match op {
+                Op::Put => assert_eq!(found, Some((Op::Put, value.clone()))),
+                Op::Delete => assert!(found.is_none_or(|(op, _)| op == Op::Delete)),
+            }
         }
         let mut absent = *entries.keys().next().expect("entries");
         absent[19] ^= 0xFF;
@@ -418,8 +443,8 @@ fn an_abandoned_cut_keeps_index_changes_for_the_next_one() {
         core.write(2, vec![put(1, 0, 9, 2), put(1, 0, 6, 3)]).await;
         core.checkpoint(&client).await.expect("checkpoint");
         let roots = core.keeper.index_roots(2).expect("kept");
-        assert_eq!(roots.len(), 2, "one new run after the abandoned cut");
-        assert_eq!(roots[0], first[0]);
+        assert_eq!(roots.len(), 1, "the small run is rewritten");
+        assert_ne!(roots[0], first[0]);
         verify(&core.keeper, &core.data, &core.model).await;
     });
 }
@@ -638,5 +663,403 @@ fn a_damaged_index_root_fails_the_rebuild() {
                 "damage {damage}"
             );
         }
+    });
+}
+
+fn tiny_flushes(core: &mut Core) {
+    core.keeper.set_tiering(Tiering {
+        flush_size: 1,
+        bytes_per_tick: 64 * 1024,
+        tick: Duration::from_millis(1),
+        ..Tiering::default()
+    });
+}
+
+async fn rounds(core: &mut Core, client: &Client, shard: u16, partition: (u8, u32), count: u64) {
+    for round in 0..count {
+        let records = (0..60)
+            .map(|i| {
+                let n = (round * 37 + i * 11) % 300;
+                if (n + round).is_multiple_of(5) {
+                    delete(partition.0, partition.1, n)
+                } else {
+                    put(partition.0, partition.1, n, round)
+                }
+            })
+            .collect();
+        core.write(shard, records).await;
+        core.checkpoint(client).await.expect("checkpoint");
+    }
+}
+
+#[test]
+fn small_flushes_rewrite_the_newest_run_and_drop_its_tombstones() {
+    run(50, async {
+        let (client, mut sessions, source, _committer) = start(1, 2).await;
+        let mut core = Core::owning(sessions.remove(0), &source, &ALL).await;
+        rounds(&mut core, &client, 1, (1, 0), 5).await;
+        assert_eq!(core.keeper.runs(1, (1, 0)), 1);
+        let scanned = core.keeper.scan(&core.data, 1, (1, 0)).await.expect("scan");
+        assert!(
+            scanned.iter().all(|e| e.op == Op::Put),
+            "the only run holds no tombstones"
+        );
+        verify(&core.keeper, &core.data, &core.model).await;
+    });
+}
+
+#[test]
+fn tiered_merges_replace_neighbouring_runs_and_survive_restarts() {
+    run(51, async {
+        let (client, mut sessions, source, committer) = start(1, 2).await;
+        let mut core = Core::owning(sessions.remove(0), &source, &ALL).await;
+        tiny_flushes(&mut core);
+        rounds(&mut core, &client, 2, (1, 0), 7).await;
+        assert_eq!(core.keeper.runs(2, (1, 0)), 7);
+        assert_eq!(core.keeper.most_runs(), 7);
+        let job = core.keeper.plan(&core.data).expect("a merge is due");
+        assert_eq!((job.shard(), job.partition(), job.runs()), (2, (1, 0), 4));
+        core.keeper.cancel(&job);
+        let mut fresh = Keeper::default();
+        fresh.insert(0, ShardState::default(), Vec::new());
+        assert!(fresh.plan(&core.data).is_none());
+        verify(&core.keeper, &core.data, &core.model).await;
+        drop(client);
+        drop(core);
+        drop(committer.await);
+        let (client, mut core, committer) = restart(2, Model::new()).await;
+        tiny_flushes(&mut core);
+        core.model = model_of(&core).await;
+        let before = core.keeper.runs(2, (1, 0));
+        core.merge_once().await.expect("planned").expect("merged");
+        assert_eq!(
+            core.keeper.runs(2, (1, 0)),
+            before,
+            "the swap waits for a cut"
+        );
+        verify(&core.keeper, &core.data, &core.model).await;
+        core.checkpoint(&client).await.expect("checkpoint");
+        assert_eq!(core.keeper.runs(2, (1, 0)), before - 3);
+        verify(&core.keeper, &core.data, &core.model).await;
+        let model = core.model.clone();
+        drop(client);
+        drop(core);
+        drop(committer.await);
+        let (keeper, file) = reopen().await;
+        assert_eq!(keeper.runs(2, (1, 0)), before - 3);
+        verify(&keeper, &file, &model).await;
+    });
+}
+
+async fn model_of(core: &Core) -> Model {
+    let mut model = Model::new();
+    for &shard in &ALL {
+        for partition in core.keeper.partitions(shard) {
+            let scanned = core
+                .keeper
+                .scan(&core.data, shard, partition)
+                .await
+                .expect("scan");
+            let entries = model.entry((shard, partition)).or_default();
+            for entry in scanned {
+                entries.insert(entry.key, (entry.op, entry.value, entry.payload));
+            }
+        }
+    }
+    model
+}
+
+#[test]
+fn merges_drop_what_the_caller_does_not_retain() {
+    run(52, async {
+        let (client, mut sessions, source, _committer) = start(1, 2).await;
+        let mut core = Core::owning(sessions.remove(0), &source, &ALL).await;
+        tiny_flushes(&mut core);
+        rounds(&mut core, &client, 0, (2, 7), 4).await;
+        core.keeper.close_partition(0, (2, 7));
+        let expected = model_of(&core).await;
+        core.keeper.set_tiering(Tiering {
+            retain: Rc::new(|kind, entry, oldest| {
+                assert_eq!(kind, 2);
+                !(oldest && entry.value[0] % 2 == 1)
+            }),
+            ..core.keeper.tiering().clone()
+        });
+        core.merge_once().await.expect("planned").expect("merged");
+        core.checkpoint(&client).await.expect("checkpoint");
+        assert_eq!(core.keeper.runs(0, (2, 7)), 1);
+        let scanned = core.keeper.scan(&core.data, 0, (2, 7)).await.expect("scan");
+        let kept: Vec<_> = expected[&(0, (2, 7))]
+            .iter()
+            .filter(|(_, (op, value, _))| *op == Op::Put && value[0] % 2 == 0)
+            .map(|(key, _)| *key)
+            .collect();
+        assert_eq!(scanned.iter().map(|e| e.key).collect::<Vec<_>>(), kept);
+        assert!(scanned.iter().all(|e| e.op == Op::Put));
+    });
+}
+
+#[test]
+fn a_closed_partition_merges_whole_unless_space_is_short() {
+    run(53, async {
+        let (client, mut sessions, source, _committer) = start(1, 2).await;
+        let mut core = Core::owning(sessions.remove(0), &source, &ALL).await;
+        tiny_flushes(&mut core);
+        rounds(&mut core, &client, 1, (2, 3), 3).await;
+        rounds(&mut core, &client, 3, (2, 1), 5).await;
+        core.keeper.close_partition(1, (2, 3));
+        let newest = core
+            .keeper
+            .index_roots(1)
+            .expect("kept")
+            .last()
+            .expect("root")
+            .covered;
+        core.merge_once().await.expect("planned").expect("merged");
+        core.checkpoint(&client).await.expect("checkpoint");
+        assert_eq!(core.keeper.runs(1, (2, 3)), 1);
+        let roots = core.keeper.index_roots(1).expect("kept");
+        assert!(
+            roots.iter().all(|r| r.covered == newest),
+            "a merge keeps the newest covered"
+        );
+        core.keeper.close_partition(3, (2, 1));
+        let job = core.keeper.plan(&core.data).expect("whole merge");
+        assert_eq!((job.shard(), job.runs()), (3, 5));
+        let regions = job.regions();
+        core.keeper.cancel(&job);
+        let taken = squeeze(&core.session).await;
+        core.session
+            .unreserve_index(regions - 1)
+            .expect("unreserve");
+        let refused = core.merge_once().await.expect("planned");
+        assert!(matches!(refused, Err(Error::Full)));
+        core.session
+            .unreserve_index(taken - (regions - 1))
+            .expect("unreserve");
+        let job = core.keeper.plan(&core.data).expect("tiered merge");
+        assert_eq!(
+            (job.shard(), job.runs()),
+            (3, 4),
+            "a refused day keeps tiered merges"
+        );
+        core.keeper.cancel(&job);
+        core.merge_once().await.expect("planned").expect("merged");
+        core.checkpoint(&client).await.expect("checkpoint");
+        assert_eq!(core.keeper.runs(3, (2, 1)), 2);
+        verify(&core.keeper, &core.data, &core.model).await;
+    });
+}
+
+async fn squeeze(session: &Session) -> u32 {
+    for n in (1..OPTIONS.region_count).rev() {
+        if session.reserve_index(n).await.is_ok() {
+            return n;
+        }
+    }
+    panic!("no region to reserve");
+}
+
+#[test]
+fn a_dropped_partition_leaves_at_the_next_publish() {
+    run(54, async {
+        let (client, mut sessions, source, _committer) = start(2, 2).await;
+        let other = sessions.pop().expect("second");
+        let _failing = fail_cut(other.0, other.1, 1);
+        let mut core = Core::owning(sessions.remove(0), &source, &[0, 2]).await;
+        core.write(2, (0..30).map(|n| put(2, 19_999, n, 0)).collect())
+            .await;
+        core.write(2, (0..30).map(|n| put(2, 20_000, n, 0)).collect())
+            .await;
+        core.checkpoint(&client).await.expect("checkpoint");
+        core.keeper.drop_partition(2, (2, 19_999));
+        assert!(core.keeper.plan(&core.data).is_none());
+        assert!(core.checkpoint(&client).await.is_err());
+        assert_eq!(core.keeper.partitions(2), vec![(2, 19_999), (2, 20_000)]);
+        core.checkpoint(&client).await.expect("checkpoint");
+        assert_eq!(core.keeper.partitions(2), vec![(2, 20_000)]);
+        core.model.remove(&(2, (2, 19_999)));
+        verify(&core.keeper, &core.data, &core.model).await;
+        let keeper = from_disk(&core.data).await;
+        assert_eq!(keeper.partitions(2), vec![(2, 20_000)]);
+        verify(&keeper, &core.data, &core.model).await;
+    });
+}
+
+async fn from_disk(file: &CoreFile) -> Keeper {
+    let data = DataFile::open(PATH).await.expect("open");
+    let loaded = load(&data, 0).await.expect("load");
+    drop(data);
+    Keeper::rebuild(file, &loaded.parts, &[], &ALL)
+        .await
+        .expect("rebuild")
+}
+
+#[test]
+fn a_finished_merge_waits_through_an_abandoned_cut() {
+    run(55, async {
+        let (client, mut sessions, source, _committer) = start(2, 2).await;
+        let other = sessions.pop().expect("second");
+        let _failing = fail_cut(other.0, other.1, 6);
+        let mut core = Core::owning(sessions.remove(0), &source, &[0, 2]).await;
+        tiny_flushes(&mut core);
+        rounds(&mut core, &client, 0, (1, 0), 6).await;
+        core.merge_once().await.expect("planned").expect("merged");
+        assert!(core.checkpoint(&client).await.is_err());
+        assert_eq!(core.keeper.runs(0, (1, 0)), 6);
+        verify(&core.keeper, &core.data, &core.model).await;
+        core.checkpoint(&client).await.expect("checkpoint");
+        assert_eq!(core.keeper.runs(0, (1, 0)), 3);
+        verify(&core.keeper, &core.data, &core.model).await;
+        assert!(
+            core.merge_once().await.is_none(),
+            "too few similar runs left"
+        );
+    });
+}
+
+#[test]
+fn merged_regions_are_given_back_and_the_reservation_returned() {
+    run(56, async {
+        let (client, mut sessions, source, committer) = start(1, 2).await;
+        let mut core = Core::owning(sessions.remove(0), &source, &ALL).await;
+        tiny_flushes(&mut core);
+        rounds(&mut core, &client, 1, (1, 0), 5).await;
+        core.merge_once().await.expect("planned").expect("merged");
+        core.checkpoint(&client).await.expect("checkpoint");
+        core.checkpoint(&client).await.expect("checkpoint");
+        assert_eq!(core.keeper.runs(1, (1, 0)), 2);
+        let Core {
+            session, results, ..
+        } = core;
+        drop(session);
+        drop(client);
+        let committer = committer.await;
+        assert!(committer.held(0).len() <= 1, "held {:?}", committer.held(0));
+        assert_eq!(committer.regions().merging(), 0);
+        drop(results);
+    });
+}
+
+#[test]
+fn merges_leave_the_newest_run_to_flushes() {
+    run(57, async {
+        let (client, mut sessions, source, _committer) = start(1, 2).await;
+        let mut core = Core::owning(sessions.remove(0), &source, &ALL).await;
+        tiny_flushes(&mut core);
+        for round in 0..4u64 {
+            let records = (0..300).map(|n| put(1, 0, round * 1_000 + n, round));
+            core.write(2, records.collect()).await;
+            core.checkpoint(&client).await.expect("checkpoint");
+        }
+        core.write(2, (0..160).map(|n| put(1, 0, 9_000 + n, 9)).collect())
+            .await;
+        core.checkpoint(&client).await.expect("checkpoint");
+        let newest: Vec<IndexRoot> = core
+            .keeper
+            .index_roots(2)
+            .expect("kept")
+            .into_iter()
+            .filter(|r| r.run == 4)
+            .collect();
+        core.merge_once().await.expect("planned").expect("merged");
+        core.checkpoint(&client).await.expect("checkpoint");
+        let roots = core.keeper.index_roots(2).expect("kept");
+        let last: Vec<IndexRoot> = roots.iter().filter(|r| r.run == 1).copied().collect();
+        assert_eq!(last.len(), newest.len());
+        for (a, b) in last.iter().zip(&newest) {
+            assert_eq!(
+                (a.region, a.offset, a.checksum),
+                (b.region, b.offset, b.checksum)
+            );
+        }
+        verify(&core.keeper, &core.data, &core.model).await;
+    });
+}
+
+#[test]
+fn a_tombstone_in_a_middle_merge_still_hides_older_puts() {
+    run(58, async {
+        let (client, mut sessions, source, _committer) = start(1, 2).await;
+        let mut core = Core::owning(sessions.remove(0), &source, &ALL).await;
+        tiny_flushes(&mut core);
+        core.write(0, (0..400).map(|n| put(1, 0, n, 0)).collect())
+            .await;
+        core.checkpoint(&client).await.expect("checkpoint");
+        for round in 1..6u64 {
+            let mut records: Vec<IndexRecord> = (0..60)
+                .map(|n| put(1, 0, 1_000 + round * 100 + n, round))
+                .collect();
+            if round == 1 {
+                records.push(delete(1, 0, 7));
+            }
+            core.write(0, records).await;
+            core.checkpoint(&client).await.expect("checkpoint");
+        }
+        let job = core.keeper.plan(&core.data).expect("planned");
+        assert_eq!(job.runs(), 4);
+        core.keeper.cancel(&job);
+        core.merge_once().await.expect("planned").expect("merged");
+        core.checkpoint(&client).await.expect("checkpoint");
+        assert_eq!(core.keeper.runs(0, (1, 0)), 3);
+        let found = core.keeper.lookup(&core.data, 0, (1, 0), &key(3, 7)).await;
+        assert_eq!(found.expect("lookup"), Some((Op::Delete, vec![0; 8])));
+        verify(&core.keeper, &core.data, &core.model).await;
+    });
+}
+
+#[test]
+fn a_long_merge_keeps_its_regions_across_publishes() {
+    run(59, async {
+        let (client, mut sessions, source, _committer) = start(1, 2).await;
+        let mut core = Core::owning(sessions.remove(0), &source, &ALL).await;
+        core.keeper.set_tiering(Tiering {
+            flush_size: 1,
+            bytes_per_tick: 8 * 1024,
+            tick: Duration::from_millis(2),
+            ..Tiering::default()
+        });
+        for round in 0..5u64 {
+            for batch in 0..8u64 {
+                let records = (0..250)
+                    .map(|i| put(1, 0, round * 10_000 + batch * 250 + i, round))
+                    .collect();
+                core.write(3, records).await;
+            }
+            core.checkpoint(&client).await.expect("checkpoint");
+        }
+        let job = core.keeper.plan(&core.data).expect("planned");
+        assert!(job.regions() > 2, "{} regions", job.regions());
+        let finished = Rc::new(std::cell::Cell::new(false));
+        let task = {
+            let finished = Rc::clone(&finished);
+            let merge = store::merge(
+                job,
+                core.data.clone(),
+                core.session.clone(),
+                core.keeper.tiering().clone(),
+            );
+            spawn(async move {
+                let done = merge.await;
+                finished.set(true);
+                done
+            })
+        };
+        let mut round = 0u64;
+        while !finished.get() {
+            let records = (0..20)
+                .map(|i| put(2, 1, round * 1_000 + i, round))
+                .collect();
+            core.write(3, records).await;
+            core.checkpoint(&client).await.expect("checkpoint");
+            round += 1;
+        }
+        assert!(round > 4, "{round} publishes during the merge");
+        core.keeper.merged(task.await).expect("merged");
+        core.checkpoint(&client).await.expect("checkpoint");
+        assert_eq!(core.keeper.runs(3, (1, 0)), 2);
+        verify(&core.keeper, &core.data, &core.model).await;
+        let keeper = from_disk(&core.data).await;
+        verify(&keeper, &core.data, &core.model).await;
     });
 }
