@@ -7,7 +7,7 @@ use crypto::{Plain, Secret, seal_batch};
 use keys::proto::{Answer, Frames, Request};
 use keys::{Audit, Client, Error, Rate, Server, Settings, Vault};
 use rt::sim::{Config, SimDriver};
-use rt::{Buf, Runtime, TcpListener, TcpStream, sleep, spawn};
+use rt::{Buf, Runtime, TcpListener, TcpStream, UnixListener, sleep, spawn};
 
 const DIR: &str = "/keys";
 const DAY: u32 = 20_833;
@@ -373,4 +373,45 @@ fn a_malformed_request_is_refused_and_the_connection_stays() {
         assert!(matches!(answers[0], (3, Answer::Refused(Error::Bad))));
         assert!(matches!(answers[1], (4, Answer::Done)));
     });
+}
+
+#[test]
+fn the_unix_socket_serves_only_the_engine_user() {
+    const KEYS: u32 = 70;
+    const ENGINE: u32 = 80;
+    let driver = Rc::new(SimDriver::new(9, quiet()));
+    let control = Rc::clone(&driver);
+    run(&driver, async move {
+        let socket = Path::new("/run/keys.sock");
+        control.set_uid(KEYS);
+        let vault = Vault::init(Path::new(DIR), DAY).await.expect("init");
+        let audit = Audit::open(Path::new(DIR)).await.expect("audit");
+        let server = Server::start(vault, audit, Settings::default());
+        server.listen(UnixListener::bind(socket).await.expect("bind"), ENGINE);
+
+        control.set_uid(ENGINE);
+        let engine = Client::connect(socket, KEYS).await.expect("connect");
+        assert_eq!(day(&engine).await, DAY);
+        assert_eq!(
+            Client::connect(socket, ENGINE).await.err(),
+            Some(Error::Peer)
+        );
+
+        control.set_uid(90);
+        let stranger = Client::connect(socket, KEYS).await.expect("connect");
+        let refused = stranger.call(&Request::Hello { node: 1 }).await;
+        assert_eq!(refused.err(), Some(Error::Closed));
+        assert_eq!(server.stats().refused, 1);
+        assert_eq!(day(&engine).await, DAY);
+        sleep(Duration::from_secs(1)).await;
+    });
+    let text = String::from_utf8(
+        driver
+            .disk()
+            .contents(&Path::new(DIR).join("audit"))
+            .expect("audit")
+            .to_vec(),
+    )
+    .expect("text");
+    assert!(text.contains(&format!(" refused 90 0 {DAY} 1\n")), "{text}");
 }

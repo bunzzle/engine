@@ -29,6 +29,11 @@ dependencies = [
 [[package]]
 name = "bunzzle"
 version = "0.0.0"
+dependencies = [
+ "keys",
+ "rt",
+ "sys",
+]
 
 [[package]]
 name = "cc"

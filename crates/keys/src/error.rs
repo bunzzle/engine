@@ -17,6 +17,7 @@ pub enum Error {
     Busy,
     Bad,
     Closed,
+    Peer,
     Crypto(crypto::Error),
 }
 
@@ -50,6 +51,7 @@ impl fmt::Display for Error {
             Self::Busy => write!(f, "unwrap limit reached"),
             Self::Bad => write!(f, "malformed keys request"),
             Self::Closed => write!(f, "keys connection closed"),
+            Self::Peer => write!(f, "keys socket belongs to another user"),
             Self::Crypto(error) => write!(f, "{error}"),
         }
     }

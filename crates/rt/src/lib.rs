@@ -18,7 +18,7 @@ pub use file::{File, rename, sync_dir};
 pub use mesh::{Ends, Mesh, Peers};
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 pub use native::Native;
-pub use net::{TcpListener, TcpStream, UdpSocket};
+pub use net::{TcpListener, TcpStream, UdpSocket, UnixListener, UnixStream};
 pub use notify::Notify;
 pub use sys::buf::Buf;
 pub use time::{Elapsed, Instant, Sleep, Timeout, now, sleep, sleep_until, timeout, wall_ms};

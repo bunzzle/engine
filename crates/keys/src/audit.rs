@@ -19,6 +19,7 @@ pub enum Op {
     Day,
     Shred,
     Forced,
+    Refused,
 }
 
 impl Op {
@@ -33,6 +34,7 @@ impl Op {
             Self::Day => "day",
             Self::Shred => "shred",
             Self::Forced => "forced",
+            Self::Refused => "refused",
         }
     }
 }

@@ -151,6 +151,9 @@ impl MemDriver {
             Op::Connect { .. } | Op::BindUdp { .. } => {
                 Completion::Handle(Err(io::ErrorKind::Unsupported.into()))
             }
+            Op::ListenUnix { .. } | Op::AcceptUnix { .. } | Op::ConnectUnix { .. } => {
+                Completion::Peer(Err(io::ErrorKind::Unsupported.into()))
+            }
             Op::Send { buf, .. } | Op::SendTo { buf, .. } => Completion::Bytes(Ok(buf.len()), buf),
             Op::RecvFrom { buf, .. } => {
                 Completion::From(Ok((0, SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))), buf)

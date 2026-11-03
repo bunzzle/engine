@@ -1,5 +1,6 @@
 use std::io;
 use std::net::SocketAddr;
+use std::path::Path;
 use std::rc::Rc;
 
 use crate::driver::{Completion, Driver, Handle, Op};
@@ -21,6 +22,14 @@ impl Socket {
         }
     }
 
+    async fn with_peer(op: Op) -> io::Result<(Self, u32)> {
+        let driver = executor::driver();
+        match OpFuture::with_driver(Rc::clone(&driver), op).await {
+            Completion::Peer(result) => result.map(|(handle, uid)| (Self { driver, handle }, uid)),
+            _ => Err(mismatch()),
+        }
+    }
+
     fn op(&self, op: Op) -> OpFuture {
         OpFuture::with_driver(Rc::clone(&self.driver), op)
     }
@@ -37,6 +46,48 @@ impl Socket {
             Completion::Unit(result) => result,
             _ => Err(mismatch()),
         }
+    }
+
+    async fn read(&self, buf: Buf) -> (io::Result<usize>, Buf) {
+        let op = Op::Recv {
+            handle: self.handle,
+            buf,
+        };
+        self.bytes(op).await
+    }
+
+    async fn write(&self, buf: Buf) -> (io::Result<usize>, Buf) {
+        let op = Op::Send {
+            handle: self.handle,
+            buf,
+        };
+        self.bytes(op).await
+    }
+
+    async fn write_all(&self, buf: Buf) -> (io::Result<()>, Buf) {
+        let total = buf.len();
+        let (result, buf) = self.write(buf).await;
+        let mut done = match result {
+            Ok(n) => n,
+            Err(e) => return (Err(e), buf),
+        };
+        while done < total {
+            let rest = Buf::from_slice(&buf[done..]);
+            let (result, _) = self.write(rest).await;
+            match result {
+                Ok(0) => return (Err(io::ErrorKind::WriteZero.into()), buf),
+                Ok(n) => done += n,
+                Err(e) => return (Err(e), buf),
+            }
+        }
+        (Ok(()), buf)
+    }
+
+    async fn shutdown(&self) -> io::Result<()> {
+        self.unit(Op::Shutdown {
+            handle: self.handle,
+        })
+        .await
     }
 
     async fn local_addr(&self) -> io::Result<SocketAddr> {
@@ -100,50 +151,83 @@ impl TcpStream {
     }
 
     pub async fn read(&self, buf: Buf) -> (io::Result<usize>, Buf) {
-        let op = Op::Recv {
-            handle: self.socket.handle,
-            buf,
-        };
-        self.socket.bytes(op).await
+        self.socket.read(buf).await
     }
 
     pub async fn write(&self, buf: Buf) -> (io::Result<usize>, Buf) {
-        let op = Op::Send {
-            handle: self.socket.handle,
-            buf,
-        };
-        self.socket.bytes(op).await
+        self.socket.write(buf).await
     }
 
     pub async fn write_all(&self, buf: Buf) -> (io::Result<()>, Buf) {
-        let total = buf.len();
-        let (result, buf) = self.write(buf).await;
-        let mut done = match result {
-            Ok(n) => n,
-            Err(e) => return (Err(e), buf),
-        };
-        while done < total {
-            let rest = Buf::from_slice(&buf[done..]);
-            let (result, _) = self.write(rest).await;
-            match result {
-                Ok(0) => return (Err(io::ErrorKind::WriteZero.into()), buf),
-                Ok(n) => done += n,
-                Err(e) => return (Err(e), buf),
-            }
-        }
-        (Ok(()), buf)
+        self.socket.write_all(buf).await
     }
 
     pub async fn shutdown(&self) -> io::Result<()> {
-        self.socket
-            .unit(Op::Shutdown {
-                handle: self.socket.handle,
-            })
-            .await
+        self.socket.shutdown().await
     }
 
     pub async fn local_addr(&self) -> io::Result<SocketAddr> {
         self.socket.local_addr().await
+    }
+}
+
+pub struct UnixListener {
+    socket: Socket,
+}
+
+impl UnixListener {
+    pub async fn bind(path: &Path) -> io::Result<Self> {
+        let socket = Socket::create(Op::ListenUnix {
+            path: path.to_path_buf(),
+        })
+        .await?;
+        Ok(Self { socket })
+    }
+
+    pub async fn accept(&self) -> io::Result<(UnixStream, u32)> {
+        let op = Op::AcceptUnix {
+            handle: self.socket.handle,
+        };
+        match self.socket.op(op).await {
+            Completion::Peer(result) => result.map(|(handle, uid)| {
+                let socket = Socket {
+                    driver: Rc::clone(&self.socket.driver),
+                    handle,
+                };
+                (UnixStream { socket }, uid)
+            }),
+            _ => Err(mismatch()),
+        }
+    }
+}
+
+pub struct UnixStream {
+    socket: Socket,
+}
+
+impl UnixStream {
+    pub async fn connect(path: &Path) -> io::Result<(Self, u32)> {
+        let (socket, uid) = Socket::with_peer(Op::ConnectUnix {
+            path: path.to_path_buf(),
+        })
+        .await?;
+        Ok((Self { socket }, uid))
+    }
+
+    pub async fn read(&self, buf: Buf) -> (io::Result<usize>, Buf) {
+        self.socket.read(buf).await
+    }
+
+    pub async fn write(&self, buf: Buf) -> (io::Result<usize>, Buf) {
+        self.socket.write(buf).await
+    }
+
+    pub async fn write_all(&self, buf: Buf) -> (io::Result<()>, Buf) {
+        self.socket.write_all(buf).await
+    }
+
+    pub async fn shutdown(&self) -> io::Result<()> {
+        self.socket.shutdown().await
     }
 }
 
