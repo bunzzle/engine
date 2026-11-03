@@ -22,7 +22,7 @@ pub enum Call {
     Name(Name),
     Named {
         name: Name,
-        id: Option<u32>,
+        id: Result<u32, Unnamed>,
     },
     Forget {
         tenant: u32,
@@ -41,16 +41,25 @@ pub struct Naming {
     pub cache: usize,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Unnamed {
+    Refused,
+    Failed,
+    Keys(KeyError),
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct NamingStats {
     pub cache: CacheStats,
     pub allocated: u64,
     pub failed: u64,
+    pub keys: u64,
     pub refused: u64,
     pub skipped: u64,
 }
 
 type Lock = (u32, Box<str>);
+type Named = Result<u32, Unnamed>;
 
 struct Ready {
     name: Name,
@@ -204,7 +213,7 @@ struct Inner {
     changes: Changes,
     owned: RefCell<Owned>,
     cache: RefCell<Cache>,
-    waiting: RefCell<BTreeMap<Name, Vec<Sender<Option<u32>>>>>,
+    waiting: RefCell<BTreeMap<Name, Vec<Sender<Named>>>>,
     forgetting: RefCell<BTreeMap<u64, (u16, Sender<()>)>>,
     tickets: Cell<u64>,
     peers: OnceCell<Peers<Call>>,
@@ -266,8 +275,13 @@ impl Queues {
                         hidden: parts.sealed.to_vec(),
                     })
                 });
+                let fits = |head: &Head| {
+                    head.id == id
+                        && head.tenant == item.tenant
+                        && queue_shard(id, naming.shards) == shard
+                };
                 match stored {
-                    Some(stored) if stored.head.id == id => found
+                    Some(stored) if fits(&stored.head) => found
                         .entry((stored.head.tenant, stored.head.generation))
                         .or_default()
                         .push(stored),
@@ -324,7 +338,15 @@ impl Queues {
             let core = self.naming_core(name.tenant, &name.domain);
             self.send(core, Call::Name(name.clone()));
         }
-        answer.recv().await.flatten().ok_or(Error::Refused)
+        match answer.recv().await {
+            Some(Ok(id)) => Ok(id),
+            Some(Err(Unnamed::Keys(error))) => Err(Error::Keys {
+                tenant: name.tenant,
+                generation: name.generation,
+                error,
+            }),
+            _ => Err(Error::Refused),
+        }
     }
 
     pub async fn rebind(&self, name: &Name, pool: u32) -> Result<u32, Error> {
@@ -443,7 +465,7 @@ impl Queues {
         match call {
             Call::Name(name) => self.asked(name, from),
             Call::Named { name, id } => {
-                if let Some(id) = id {
+                if let Ok(id) = id {
                     self.inner.cache.borrow_mut().put(name.clone(), id);
                 }
                 let waiting = self.inner.waiting.borrow_mut().remove(&name);
@@ -495,7 +517,7 @@ impl Queues {
             let mut owned = self.inner.owned.borrow_mut();
             if let Some(&id) = owned.names.get(&name) {
                 drop(owned);
-                self.send(from, Call::Named { name, id: Some(id) });
+                self.send(from, Call::Named { name, id: Ok(id) });
                 return false;
             }
             let shard = naming_shard(&naming.key, name.tenant, &name.domain, naming.shards);
@@ -507,7 +529,13 @@ impl Queues {
         };
         let Some((shard, id)) = id else {
             self.count(|s| s.refused += 1);
-            self.send(from, Call::Named { name, id: None });
+            self.send(
+                from,
+                Call::Named {
+                    name,
+                    id: Err(Unnamed::Refused),
+                },
+            );
             return false;
         };
         self.inner.ready.borrow_mut().push_back(Ready {
@@ -574,13 +602,20 @@ impl Queues {
             name: name.clone(),
             draining: false,
         };
-        let id = if self.write(shard, &queue).await.is_ok() {
-            self.inner.owned.borrow_mut().insert(queue);
-            self.count(|s| s.allocated += 1);
-            Some(id)
-        } else {
-            self.count(|s| s.failed += 1);
-            None
+        let id = match self.write(shard, &queue).await {
+            Ok(()) => {
+                self.inner.owned.borrow_mut().insert(queue);
+                self.count(|s| s.allocated += 1);
+                Ok(id)
+            }
+            Err(Error::Keys { error, .. }) => {
+                self.count(|s| s.keys += 1);
+                Err(Unnamed::Keys(error))
+            }
+            Err(_) => {
+                self.count(|s| s.failed += 1);
+                Err(Unnamed::Failed)
+            }
         };
         self.send(from, Call::Named { name, id });
         drop(held);

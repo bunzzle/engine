@@ -11,7 +11,7 @@ mod writer;
 pub use cache::{Cache, CacheStats};
 pub use error::Error;
 pub use leases::{Ask, Gcra, IDLE, LIFETIME, LeaseStats, Leases, Taken, Tokens, WAIT, limit_core};
-pub use names::{Call, Loaded as LoadedQueues, Naming, NamingStats, Queues};
+pub use names::{Call, Loaded as LoadedQueues, Naming, NamingStats, Queues, Unnamed};
 pub use queue::{
     KeyError, KeySource, LABEL_SIZE, Label, MAX_DOMAIN, Name, Queue, Ready, Tenancy, domain_ok,
     mix, naming_shard, queue_shard, tenant_keys,

@@ -19,6 +19,7 @@ pub enum Error {
     Closed,
     Timeout,
     Peer,
+    Changed,
     Crypto(crypto::Error),
 }
 
@@ -54,6 +55,7 @@ impl fmt::Display for Error {
             Self::Closed => write!(f, "keys connection closed"),
             Self::Timeout => write!(f, "keys call timed out"),
             Self::Peer => write!(f, "keys socket belongs to another user"),
+            Self::Changed => write!(f, "keys serve another vault than before"),
             Self::Crypto(error) => write!(f, "{error}"),
         }
     }

@@ -1,9 +1,9 @@
-use std::rc::Rc;
+use std::sync::Arc;
 
 use crate::{DataKey, Error, Secret, Tenant};
 
 #[derive(Clone)]
-pub struct TenantKeys(Rc<Held>);
+pub struct TenantKeys(Arc<Held>);
 
 struct Held {
     tenant: u32,
@@ -20,7 +20,7 @@ impl TenantKeys {
         version: u8,
         hash: Secret<16>,
     ) -> Self {
-        Self(Rc::new(Held {
+        Self(Arc::new(Held {
             tenant,
             generation,
             data: DataKey::new(data, version),

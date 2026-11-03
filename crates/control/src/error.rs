@@ -27,19 +27,15 @@ impl fmt::Display for Error {
             Self::Keys {
                 tenant,
                 generation,
-                error: KeyError::Unavailable,
-            } => write!(
-                f,
-                "keys unavailable for tenant {tenant} generation {generation}"
-            ),
-            Self::Keys {
-                tenant,
-                generation,
-                error: KeyError::Unknown,
-            } => write!(
-                f,
-                "keys do not know tenant {tenant} generation {generation}"
-            ),
+                error,
+            } => {
+                let what = match error {
+                    KeyError::Unavailable => "unavailable",
+                    KeyError::Unknown => "unknown",
+                    KeyError::Failed => "failed",
+                };
+                write!(f, "keys {what} for tenant {tenant} generation {generation}")
+            }
         }
     }
 }

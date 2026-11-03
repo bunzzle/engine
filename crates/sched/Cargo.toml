@@ -10,6 +10,7 @@ publish.workspace = true
 control = { path = "../control" }
 crypto = { path = "../crypto" }
 index = { path = "../index" }
+keys = { path = "../keys" }
 rt = { path = "../rt" }
 spool = { path = "../spool" }
 store = { path = "../store" }

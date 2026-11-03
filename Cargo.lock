@@ -166,6 +166,7 @@ dependencies = [
  "control",
  "crypto",
  "index",
+ "keys",
  "rt",
  "spool",
  "store",

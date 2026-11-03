@@ -16,6 +16,7 @@ const CONNECT_TRIES: u32 = 8;
 const CONNECT_PAUSE: Duration = Duration::from_millis(10);
 
 pub struct Client {
+    close: Box<dyn Fn()>,
     next: Cell<u32>,
     waiting: Rc<RefCell<HashMap<u32, Sender<Answer>>>>,
     frames: Sender<Plain>,
@@ -29,8 +30,24 @@ impl Client {
         let closed = Rc::new(Cell::new(false));
         let (frames, outgoing) = rt::channel();
         rt::spawn(writer(Rc::clone(&stream), outgoing, Rc::clone(&closed)));
-        rt::spawn(reader(stream, Rc::clone(&waiting), Rc::clone(&closed)));
+        rt::spawn(reader(
+            Rc::clone(&stream),
+            Rc::clone(&waiting),
+            Rc::clone(&closed),
+        ));
+        let close = {
+            let closed = Rc::clone(&closed);
+            let shut = Cell::new(false);
+            Box::new(move || {
+                closed.set(true);
+                if !shut.replace(true) {
+                    let stream = Rc::clone(&stream);
+                    rt::spawn(async move { drop(stream.shutdown().await) });
+                }
+            })
+        };
         Self {
+            close,
             next: Cell::new(0),
             waiting,
             frames,
@@ -57,6 +74,10 @@ impl Client {
 
     pub fn is_closed(&self) -> bool {
         self.closed.get()
+    }
+
+    pub fn close(&self) {
+        (self.close)();
     }
 
     pub async fn call(&self, request: &Request) -> Result<Answer, Error> {
@@ -89,6 +110,14 @@ impl Client {
             return Err(Error::Closed);
         }
         Ok((id, answer))
+    }
+}
+
+impl Drop for Client {
+    fn drop(&mut self) {
+        if rt::in_runtime() {
+            self.close();
+        }
     }
 }
 
