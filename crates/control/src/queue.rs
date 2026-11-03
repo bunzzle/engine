@@ -145,13 +145,16 @@ pub enum KeyError {
     Unavailable,
     Unknown,
     Failed,
+    Conflict,
 }
 
 pub type Ready<'a> = Pin<Box<dyn Future<Output = Result<TenantKeys, KeyError>> + 'a>>;
+pub type Created<'a> = Pin<Box<dyn Future<Output = Result<(), KeyError>> + 'a>>;
 
 pub trait KeySource {
     fn get(&self, tenant: u32, generation: u32) -> Option<TenantKeys>;
     fn ready(&self, tenant: u32, generation: u32) -> Ready<'_>;
+    fn create(&self, tenant: u32, generation: u32) -> Created<'_>;
 }
 
 pub async fn tenant_keys(

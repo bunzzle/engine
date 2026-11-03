@@ -5,6 +5,7 @@ use crate::error::Error;
 pub const KIND_TENANT: u8 = 1;
 pub const KIND_POOL: u8 = 2;
 pub const KIND_QUEUE: u8 = 3;
+pub const KIND_NODE: u8 = 4;
 pub const SYSTEM: u32 = 0;
 pub const MAX_POOLS: usize = 16;
 pub const MAX_ADDRESSES: usize = 64;

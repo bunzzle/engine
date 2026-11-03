@@ -8,7 +8,8 @@ use std::task::Poll;
 use std::time::Duration;
 
 use control::{
-    KeyError, KeySource, Limits as TenantLimits, Name, Naming, Object, Pool, Ready, State, Tenant,
+    Created, KeyError, KeySource, Limits as TenantLimits, Name, Naming, Object, Pool, Ready, State,
+    Tenant,
 };
 use crypto::{Secret, Tenant as Root, TenantKeys};
 use rt::sim::{Config, Disk, Faults, Machine, SimDriver, Stalls, check};
@@ -131,6 +132,10 @@ impl KeySource for Toy {
             [u8::try_from(tenant % 200).expect("small"); 32],
         ));
         Some(TenantKeys::derive(tenant, generation, &root, 1))
+    }
+
+    fn create(&self, _: u32, _: u32) -> Created<'_> {
+        Box::pin(std::future::ready(Ok(())))
     }
 
     fn ready(&self, tenant: u32, generation: u32) -> Ready<'_> {

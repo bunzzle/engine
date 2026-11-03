@@ -52,6 +52,7 @@ pub enum Fault {
     Unavailable,
     Unknown,
     Failed,
+    Conflict,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -219,9 +220,46 @@ impl Ring {
         }
     }
 
+    pub async fn create(&self, tenant: u32, generation: u32, retention: u16) -> Result<(), Fault> {
+        let request = Request::Create {
+            tenant,
+            generation,
+            retention,
+        };
+        let working = self.answered(tenant, generation, self.call(&request).await)?;
+        let request = Request::Retention {
+            tenant,
+            generation,
+            days: retention,
+        };
+        match self.call(&request).await {
+            Ok(Answer::Done) => {}
+            Ok(Answer::Refused(refused)) => return Err(self.fault(None, Some(refused))),
+            Ok(_) => return Err(self.fault(None, None)),
+            Err(error) => return Err(self.fault(Some(error), None)),
+        }
+        if !self.failed() {
+            self.inner
+                .tenants
+                .borrow_mut()
+                .put((tenant, generation), working);
+        }
+        Ok(())
+    }
+
     async fn fetch(&self, tenant: u32, generation: u32) -> Result<Working, Fault> {
         self.count(|s| s.opens += 1);
-        match self.call(&Request::Open { tenant, generation }).await {
+        let answer = self.call(&Request::Open { tenant, generation }).await;
+        self.answered(tenant, generation, answer)
+    }
+
+    fn answered(
+        &self,
+        tenant: u32,
+        generation: u32,
+        answer: Result<Answer, Error>,
+    ) -> Result<Working, Fault> {
+        match answer {
             Ok(Answer::Keys {
                 day,
                 oldest,
@@ -240,20 +278,26 @@ impl Ring {
                     tomorrow,
                 })
             }
-            Ok(Answer::Refused(Error::Unknown | Error::Generation)) => {
-                self.count(|s| s.unknown += 1);
-                Err(Fault::Unknown)
-            }
-            Ok(Answer::Refused(Error::Failed | Error::Unreadable))
-            | Err(Error::Failed | Error::Changed) => {
-                self.count(|s| s.failed += 1);
-                Err(Fault::Failed)
-            }
-            _ => {
-                self.count(|s| s.unavailable += 1);
-                Err(Fault::Unavailable)
-            }
+            Ok(Answer::Refused(refused)) => Err(self.fault(None, Some(refused))),
+            Ok(_) => Err(self.fault(None, None)),
+            Err(error) => Err(self.fault(Some(error), None)),
         }
+    }
+
+    fn fault(&self, error: Option<Error>, refused: Option<Error>) -> Fault {
+        let fault = match (error, refused) {
+            (_, Some(Error::Unknown)) => Fault::Unknown,
+            (_, Some(Error::Generation)) => Fault::Conflict,
+            (_, Some(Error::Failed | Error::Unreadable))
+            | (Some(Error::Failed | Error::Changed), _) => Fault::Failed,
+            _ => Fault::Unavailable,
+        };
+        self.count(|s| match fault {
+            Fault::Unknown | Fault::Conflict => s.unknown += 1,
+            Fault::Failed => s.failed += 1,
+            Fault::Unavailable => s.unavailable += 1,
+        });
+        fault
     }
 
     async fn client(&self) -> Result<Rc<Client>, Error> {

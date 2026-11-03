@@ -7,8 +7,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use control::{
-    Cache, Call, Error, KIND_QUEUE, KeyError, KeySource, LABEL_SIZE, Label, LoadedQueues, Name,
-    Naming, Queue, Queues, Ready, Tenancy, domain_ok, naming_shard, queue_shard, siphash,
+    Cache, Call, Created, Error, KIND_QUEUE, KeyError, KeySource, LABEL_SIZE, Label, LoadedQueues,
+    Name, Naming, Queue, Queues, Ready, Tenancy, domain_ok, naming_shard, queue_shard, siphash,
 };
 use crypto::{Secret, Tenant, TenantKeys};
 use rt::sim::{Config, Disk, Machine, SimDriver, Stalls, check};
@@ -81,6 +81,10 @@ impl Toy {
 impl KeySource for Toy {
     fn get(&self, _: u32, _: u32) -> Option<TenantKeys> {
         None
+    }
+
+    fn create(&self, _: u32, _: u32) -> Created<'_> {
+        Box::pin(std::future::ready(Ok(())))
     }
 
     fn ready(&self, tenant: u32, generation: u32) -> Ready<'_> {

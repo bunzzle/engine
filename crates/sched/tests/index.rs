@@ -8,10 +8,9 @@ use std::rc::Rc;
 use std::task::Poll;
 use std::time::Duration;
 
-use control::{KeyError, KeySource, Naming, Object, Pool, Ready, State, Table, Tenant};
+use control::{Created, KeyError, KeySource, Naming, Object, Pool, Ready, State, Table, Tenant};
 use crypto::{Secret, Tenant as Root, TenantKeys};
 use index::{Entry, Op};
-use keys::proto::{Answer as KeyAnswer, Request};
 use keys::{
     Audit, Client as KeyClient, Connect, Ring, RingSettings, Server, Settings as KeySettings, Vault,
 };
@@ -38,6 +37,7 @@ const OPTIONS: Options = Options {
 struct Toy;
 
 const KEYLESS: u32 = 199;
+const NO_CREATE: u32 = 198;
 
 impl KeySource for Toy {
     fn get(&self, tenant: u32, generation: u32) -> Option<TenantKeys> {
@@ -48,6 +48,15 @@ impl KeySource for Toy {
             [u8::try_from(tenant % 200).expect("small"); 32],
         ));
         Some(TenantKeys::derive(tenant, generation, &root, 1))
+    }
+
+    fn create(&self, tenant: u32, _: u32) -> Created<'_> {
+        let created = if tenant == NO_CREATE {
+            Err(KeyError::Unavailable)
+        } else {
+            Ok(())
+        };
+        Box::pin(std::future::ready(created))
     }
 
     fn ready(&self, tenant: u32, generation: u32) -> Ready<'_> {
@@ -124,7 +133,9 @@ const SMALL: Options = Options {
     shards: SHARDS as u32,
 };
 
-fn settings() -> Settings {
+const NAMING: [u8; 16] = *b"naming key 16 by";
+
+fn settings_named(key: [u8; 16]) -> Settings {
     Settings {
         node: 3,
         spool: spool::Limits {
@@ -133,7 +144,7 @@ fn settings() -> Settings {
             body: 64 * 1024,
         },
         naming: Naming {
-            key: *b"naming key 16 by",
+            key,
             shards: u32::from(SHARDS),
             cache: 16,
         },
@@ -167,11 +178,11 @@ fn started_tuned(
     behind: u64,
     tuning: Option<(u64, usize)>,
 ) -> Cluster {
-    try_started(driver, cores, behind, tuning, false).expect("start")
+    try_started(driver, cores, behind, tuning, false, NAMING).expect("start")
 }
 
 fn started_with_keys(driver: &Rc<SimDriver>, cores: u16) -> Cluster {
-    try_started(driver, cores, 0, None, true).expect("start")
+    try_started(driver, cores, 0, None, true, NAMING).expect("start")
 }
 
 const KEYS_DIR: &str = "/keys";
@@ -196,32 +207,17 @@ fn keys_up(machine: &Machine) {
 fn keyring() -> Rc<dyn KeySource> {
     let connect: Connect =
         Rc::new(|| Box::pin(async { Ok(KeyClient::new(TcpStream::connect(KEYS_AT).await?)) }));
-    Rc::new(Keyring::new(Ring::new(connect, RingSettings::new(1))))
+    Rc::new(Keyring::new(Ring::new(connect, RingSettings::new(1)), 30))
 }
 
-async fn create_keys(tenant: u32, generation: u32) {
-    let mut tries = 0;
-    let stream = loop {
-        match TcpStream::connect(KEYS_AT).await {
-            Ok(stream) => break stream,
-            Err(_) if tries < 100 => {
-                tries += 1;
-                sleep(Duration::from_millis(10)).await;
-            }
-            Err(error) => panic!("connect: {error}"),
+async fn keys_listening() {
+    for _ in 0..100 {
+        if TcpStream::connect(KEYS_AT).await.is_ok() {
+            return;
         }
-    };
-    let client = KeyClient::new(stream);
-    let create = Request::Create {
-        tenant,
-        generation,
-        retention: 30,
-    };
-    assert!(matches!(
-        client.call(&create).await.expect("create"),
-        KeyAnswer::Keys { .. }
-    ));
-    client.close();
+        sleep(Duration::from_millis(10)).await;
+    }
+    panic!("keys not listening");
 }
 
 fn try_started(
@@ -230,6 +226,7 @@ fn try_started(
     behind: u64,
     tuning: Option<(u64, usize)>,
     real_keys: bool,
+    naming: [u8; 16],
 ) -> Option<Cluster> {
     let machine = Machine::new(Rc::clone(driver), usize::from(cores) + 1, Stalls::default());
     let setup = Setup {
@@ -273,7 +270,7 @@ fn try_started(
                 transport: Idle,
                 clock: Clock::at(rt::wall_ms().saturating_sub(behind), rt::now()),
             };
-            let started = Node::start(core, links, settings(), parts);
+            let started = Node::start(core, links, settings_named(naming), parts);
             timeout(Duration::from_secs(60), started).await.ok()?.ok()
         }));
     }
@@ -605,6 +602,20 @@ fn missing_keys_refuse_for_now_and_never_answer_not_suppressed() {
             Err(Refusal::Keys)
         );
         assert!(Refusal::Keys.temporary());
+        let control = nodes.iter().find(|n| n.controls()).expect("control core");
+        assert!(matches!(
+            control.write(tenant(NO_CREATE, 1, State::Active)).await,
+            Err(sched::Error::Control(control::Error::Keys {
+                tenant: NO_CREATE,
+                generation: 1,
+                error: KeyError::Unavailable,
+            }))
+        ));
+        assert!(control.table().tenant(NO_CREATE).is_none());
+        assert!(matches!(
+            control.write(tenant(7, 3, State::Active)).await,
+            Err(sched::Error::Control(control::Error::Refused))
+        ));
     });
     cluster.stop();
 }
@@ -615,8 +626,7 @@ fn suppressions_and_queues_use_keys_from_the_keys_process() {
     let cluster = started_with_keys(&driver, 2);
     let nodes = cluster.nodes.clone();
     let queue = cluster.run(async move {
-        create_keys(1, 1).await;
-        create_keys(2, 1).await;
+        keys_listening().await;
         ready(&nodes).await;
         let lists = nodes[0].suppressions();
         lists
@@ -635,12 +645,20 @@ fn suppressions_and_queues_use_keys_from_the_keys_process() {
         );
         let page = lists.list(1, None, 10).await.expect("list");
         assert_eq!(page.listed[0].address, "kept@example.org");
+        let control = nodes.iter().find(|n| n.controls()).expect("control core");
+        assert!(matches!(
+            control.write(tenant(1, 2, State::Active)).await,
+            Err(sched::Error::Control(control::Error::Refused))
+        ));
+        assert!(matches!(
+            control.write(tenant(5, 2, State::Active)).await,
+            Err(sched::Error::Control(control::Error::Refused))
+        ));
+        assert_eq!(control.table().tenant(1).map(|t| t.generation), Some(1));
+        assert!(control.table().tenant(5).is_none());
         configure(&nodes, vec![tenant(3, 1, State::Active)]).await;
         wait_for(&nodes, 3, 1, State::Active).await;
-        assert_eq!(
-            lists.check(3, 1, &["a@example.org"]).await,
-            Err(Refusal::Keys)
-        );
+        assert_eq!(lists.check(3, 1, &["a@example.org"]).await, Ok(vec![false]));
         let mut draft = nodes[0].draft(1, None).expect("draft");
         nodes[0]
             .recipient(&mut draft, "to@example.org")
@@ -668,6 +686,21 @@ fn suppressions_and_queues_use_keys_from_the_keys_process() {
             .expect("recipient");
         assert_eq!(again, queue);
     });
+    restarted.stop();
+}
+
+#[test]
+fn a_different_naming_key_refuses_to_start() {
+    let driver = Rc::new(SimDriver::with_disk(33, Config::default(), created(33)));
+    let cluster = started(&driver, 2);
+    let nodes = cluster.nodes.clone();
+    cluster.run(async move { ready(&nodes).await });
+    cluster.stop();
+    let disk = driver.crash();
+    let other = Rc::new(SimDriver::with_disk(34, Config::default(), disk.clone()));
+    assert!(try_started(&other, 2, 0, None, false, *b"another key 16 b").is_none());
+    let same = Rc::new(SimDriver::with_disk(35, Config::default(), disk));
+    let restarted = started(&same, 2);
     restarted.stop();
 }
 
@@ -1344,7 +1377,7 @@ fn index_session(
     tuning: (u64, usize),
     second: bool,
 ) -> bool {
-    let Some(cluster) = try_started(driver, cores, 0, Some(tuning), false) else {
+    let Some(cluster) = try_started(driver, cores, 0, Some(tuning), false, NAMING) else {
         return false;
     };
     let nodes = cluster.nodes.clone();

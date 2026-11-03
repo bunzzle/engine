@@ -33,6 +33,7 @@ impl fmt::Display for Error {
                     KeyError::Unavailable => "unavailable",
                     KeyError::Unknown => "unknown",
                     KeyError::Failed => "failed",
+                    KeyError::Conflict => "held by another generation",
                 };
                 write!(f, "keys {what} for tenant {tenant} generation {generation}")
             }
