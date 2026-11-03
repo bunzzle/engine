@@ -68,7 +68,8 @@ impl<const N: usize> Secret<N> {
         Ok(secret)
     }
 
-    pub(crate) fn copy(&self) -> Self {
+    #[must_use]
+    pub fn copy(&self) -> Self {
         let mut out = Self([0; N]);
         out.0.copy_from_slice(&self.0);
         out

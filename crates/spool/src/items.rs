@@ -4,6 +4,7 @@ pub const BODY_ITEM: u32 = 1;
 pub const SLICE_BASE: u32 = 2;
 pub const STATE_BASE: u32 = 1 << 16;
 pub const HEAD_CLEAR: usize = 48;
+pub const WRAP: usize = 91;
 
 pub fn slice_item(slice: u32) -> u32 {
     SLICE_BASE + slice
@@ -13,6 +14,7 @@ pub fn slice_item(slice: u32) -> u32 {
 pub struct HeadClear {
     pub batch_key: u64,
     pub recipients: u32,
+    pub day: u32,
     pub body_size: u64,
     pub accepted: u64,
     pub not_before: u64,
@@ -25,6 +27,7 @@ impl HeadClear {
         let mut fields = FieldsMut::new(&mut out);
         fields.put_u64(0, self.batch_key);
         fields.put_u32(8, self.recipients);
+        fields.put_u32(12, self.day);
         fields.put_u64(16, self.body_size);
         fields.put_u64(24, self.accepted);
         fields.put_u64(32, self.not_before);
@@ -37,16 +40,22 @@ impl HeadClear {
             return None;
         }
         let fields = Fields::new(clear);
-        let reserved = fields.u32(12) != 0 || fields.bytes(41, 7).iter().any(|&b| b != 0);
+        let reserved = fields.bytes(41, 7).iter().any(|&b| b != 0);
         (!reserved).then(|| Self {
             batch_key: fields.u64(0),
             recipients: fields.u32(8),
+            day: fields.u32(12),
             body_size: fields.u64(16),
             accepted: fields.u64(24),
             not_before: fields.u64(32),
             priority: fields.u8(40),
         })
     }
+}
+
+pub fn head_parts(region: &[u8]) -> Option<(&[u8; WRAP], &[u8])> {
+    let (wrap, sealed) = region.split_first_chunk::<WRAP>()?;
+    Some((wrap, sealed))
 }
 
 pub(crate) fn encode_slice(queues: &[u32], sealed: &[u8]) -> Vec<u8> {

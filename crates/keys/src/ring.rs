@@ -4,7 +4,7 @@ use std::pin::Pin;
 use std::rc::Rc;
 use std::time::Duration;
 
-use crypto::{Secret, TenantKeys};
+use crypto::{Secret, TenantKeys, Wrap};
 use rt::{Instant, Sender};
 
 use crate::cache::{Cache, CacheStats};
@@ -14,6 +14,7 @@ use crate::{Client, Error};
 pub type Connecting = Pin<Box<dyn Future<Output = Result<Client, Error>>>>;
 pub type Connect = Rc<dyn Fn() -> Connecting>;
 type Waiters = Vec<Sender<Result<Working, Fault>>>;
+type Unwrapping = (Wrap, Vec<Sender<Result<Secret<32>, Fault>>>);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RingSettings {
@@ -53,6 +54,8 @@ pub enum Fault {
     Unknown,
     Failed,
     Conflict,
+    Gone,
+    Bad,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -65,6 +68,9 @@ pub struct RingStats {
     pub unknown: u64,
     pub unavailable: u64,
     pub failed: u64,
+    pub unwraps: u64,
+    pub gone: u64,
+    pub bad: u64,
     pub tenants: CacheStats,
 }
 
@@ -88,6 +94,7 @@ struct Inner {
     failed: Cell<bool>,
     tenants: RefCell<Cache<(u32, u32), Working>>,
     opening: RefCell<HashMap<(u32, u32), Waiters>>,
+    unwrapping: RefCell<HashMap<(u32, u32, u16, u64), Unwrapping>>,
     stats: Cell<RingStats>,
 }
 
@@ -123,6 +130,7 @@ impl Ring {
                 failed: Cell::new(false),
                 tenants: RefCell::new(Cache::new(settings.tenants)),
                 opening: RefCell::new(HashMap::new()),
+                unwrapping: RefCell::new(HashMap::new()),
                 stats: Cell::new(RingStats::default()),
             }),
         }
@@ -220,6 +228,65 @@ impl Ring {
         }
     }
 
+    pub async fn unwrap(
+        &self,
+        tenant: u32,
+        generation: u32,
+        shard: u16,
+        id: u64,
+        wrap: &Wrap,
+    ) -> Result<Secret<32>, Fault> {
+        if (wrap.generation, wrap.shard) != (generation, shard) {
+            self.count(|s| s.bad += 1);
+            return Err(Fault::Bad);
+        }
+        if self.failed() {
+            self.count(|s| s.refused += 1);
+            return Err(Fault::Failed);
+        }
+        let key = (tenant, generation, shard, id);
+        let (reply, mut answer) = rt::channel();
+        let first = {
+            let mut unwrapping = self.inner.unwrapping.borrow_mut();
+            let (asked, waiting) = unwrapping
+                .entry(key)
+                .or_insert_with(|| (wrap.clone(), Vec::new()));
+            if asked != wrap {
+                drop(unwrapping);
+                self.count(|s| s.bad += 1);
+                return Err(Fault::Bad);
+            }
+            waiting.push(reply);
+            waiting.len() == 1
+        };
+        if first {
+            let ring = self.clone();
+            let request = Request::Unwrap {
+                tenant,
+                batch: id,
+                wrap: wrap.clone(),
+            };
+            rt::spawn(async move {
+                ring.count(|s| s.unwraps += 1);
+                let result = match ring.call(&request).await {
+                    Ok(Answer::Key(secret)) => Ok(secret),
+                    Ok(Answer::Refused(refused)) => Err(ring.fault(None, Some(refused))),
+                    Ok(_) => Err(ring.fault(None, None)),
+                    Err(error) => Err(ring.fault(Some(error), None)),
+                };
+                let waiting = ring.inner.unwrapping.borrow_mut().remove(&key);
+                for waiter in waiting.map(|(_, waiting)| waiting).unwrap_or_default() {
+                    let copy = match &result {
+                        Ok(secret) => Ok(secret.copy()),
+                        Err(fault) => Err(*fault),
+                    };
+                    let _ = waiter.send(copy);
+                }
+            });
+        }
+        answer.recv().await.unwrap_or(Err(Fault::Unavailable))
+    }
+
     pub async fn create(&self, tenant: u32, generation: u32, retention: u16) -> Result<(), Fault> {
         let request = Request::Create {
             tenant,
@@ -288,6 +355,8 @@ impl Ring {
         let fault = match (error, refused) {
             (_, Some(Error::Unknown)) => Fault::Unknown,
             (_, Some(Error::Generation)) => Fault::Conflict,
+            (_, Some(Error::Gone)) => Fault::Gone,
+            (_, Some(Error::Open)) => Fault::Bad,
             (_, Some(Error::Failed | Error::Unreadable))
             | (Some(Error::Failed | Error::Changed), _) => Fault::Failed,
             _ => Fault::Unavailable,
@@ -296,6 +365,8 @@ impl Ring {
             Fault::Unknown | Fault::Conflict => s.unknown += 1,
             Fault::Failed => s.failed += 1,
             Fault::Unavailable => s.unavailable += 1,
+            Fault::Gone => s.gone += 1,
+            Fault::Bad => s.bad += 1,
         });
         fault
     }

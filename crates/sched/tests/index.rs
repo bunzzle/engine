@@ -9,17 +9,18 @@ use std::task::Poll;
 use std::time::Duration;
 
 use control::{Created, KeyError, KeySource, Naming, Object, Pool, Ready, State, Table, Tenant};
-use crypto::{Secret, Tenant as Root, TenantKeys};
+use crypto::{BatchKey, Secret, Tenant as Root, TenantKeys, Wrap, day_public, open_batch};
 use index::{Entry, Op};
 use keys::{
-    Audit, Client as KeyClient, Connect, Ring, RingSettings, Server, Settings as KeySettings, Vault,
+    Audit, BatchSettings, Batches, Client as KeyClient, Connect, Ring, RingSettings, Server,
+    Settings as KeySettings, Vault, Working,
 };
 use rt::sim::{Config, Disk, Faults, Machine, SimDriver, Stalls, check};
 use rt::{JoinHandle, Runtime, TcpListener, TcpStream, sleep, spawn, timeout};
 use sched::{
-    Answered, Attempt, Begun, Clock, DAY, Draft, Hash, KIND_REQUEST, KIND_SUPPRESS, Keyring,
-    Meshes, Node, Parts, Reason, Refusal, Running, SHAPE, Settings, Suppression, Ticket, Transport,
-    normalize, punycode, retain, retain_request,
+    Answered, Attempt, Batched, Begun, Clock, DAY, Draft, Hash, KIND_REQUEST, KIND_SUPPRESS,
+    Keyring, Keys, Meshes, Node, Parts, Reason, Refusal, Running, SHAPE, Settings, Suppression,
+    Ticket, Transport, Unsealable, Unwrapped, normalize, punycode, retain, retain_request,
 };
 use spool::{Body, Head, HeadClear, Message, MessageId, SLICE, Slice};
 use store::{Client, Committer, DataFile, Options, SLOT_SIZE, Setup, Tiering, boot};
@@ -34,7 +35,17 @@ const OPTIONS: Options = Options {
     shards: SHARDS as u32,
 };
 
-struct Toy;
+struct Toy {
+    batches: RefCell<Batches>,
+}
+
+impl Default for Toy {
+    fn default() -> Self {
+        Self {
+            batches: RefCell::new(Batches::new(BatchSettings::default())),
+        }
+    }
+}
 
 const KEYLESS: u32 = 199;
 const NO_CREATE: u32 = 198;
@@ -68,6 +79,56 @@ impl KeySource for Toy {
         Box::pin(std::future::ready(
             self.get(tenant, generation).ok_or(missing),
         ))
+    }
+}
+
+const TOY_DAY: u32 = 20_000;
+
+fn toy_day_secret(tenant: u32, day: u32) -> Secret<32> {
+    let mut bytes = [9; 32];
+    bytes[..4].copy_from_slice(&tenant.to_le_bytes());
+    bytes[4..8].copy_from_slice(&day.to_le_bytes());
+    Secret::new(bytes)
+}
+
+impl Keys for Toy {
+    fn batch(&self, tenant: u32, generation: u32, shard: u16, first: u64) -> Batched<'_> {
+        let batch = match self.get(tenant, generation) {
+            Some(keys) => {
+                let public = |day| day_public(&toy_day_secret(tenant, day)).expect("public");
+                let working = Working {
+                    keys,
+                    day: TOY_DAY,
+                    oldest: TOY_DAY,
+                    today: public(TOY_DAY),
+                    tomorrow: public(TOY_DAY + 1),
+                };
+                self.batches
+                    .borrow_mut()
+                    .seal(&working, shard, first, rt::now())
+                    .map_err(|_| KeyError::Unavailable)
+            }
+            None => Err(KeyError::Unavailable),
+        };
+        Box::pin(std::future::ready(batch))
+    }
+
+    fn batch_key(
+        &self,
+        tenant: u32,
+        generation: u32,
+        shard: u16,
+        id: u64,
+        wrap: Wrap,
+    ) -> Unwrapped<'_> {
+        let key = if (wrap.generation, wrap.shard) == (generation, shard) {
+            open_batch(&toy_day_secret(tenant, wrap.day), tenant, id, &wrap)
+                .map(|secret| Rc::new(BatchKey::new(&secret)))
+                .map_err(|_| Unsealable::Bad)
+        } else {
+            Err(Unsealable::Bad)
+        };
+        Box::pin(std::future::ready(key))
     }
 }
 
@@ -204,10 +265,14 @@ fn keys_up(machine: &Machine) {
     }));
 }
 
-fn keyring() -> Rc<dyn KeySource> {
+fn keyring() -> Rc<dyn Keys> {
     let connect: Connect =
         Rc::new(|| Box::pin(async { Ok(KeyClient::new(TcpStream::connect(KEYS_AT).await?)) }));
-    Rc::new(Keyring::new(Ring::new(connect, RingSettings::new(1)), 30))
+    Rc::new(Keyring::new(
+        Ring::new(connect, RingSettings::new(1)),
+        30,
+        BatchSettings::default(),
+    ))
 }
 
 async fn keys_listening() {
@@ -264,7 +329,11 @@ fn try_started(
                     ..Tiering::default()
                 });
             }
-            let keys: Rc<dyn KeySource> = if real_keys { keyring() } else { Rc::new(Toy) };
+            let keys: Rc<dyn Keys> = if real_keys {
+                keyring()
+            } else {
+                Rc::new(Toy::default())
+            };
             let parts = Parts {
                 keys,
                 transport: Idle,
@@ -704,6 +773,257 @@ fn a_different_naming_key_refuses_to_start() {
     restarted.stop();
 }
 
+struct Sealed {
+    id: MessageId,
+    clear: HeadClear,
+    wrap: [u8; spool::WRAP],
+    head: Vec<u8>,
+    body: Vec<u8>,
+    slice: Vec<u8>,
+}
+
+async fn owned_shard(node: &Node<Idle>) -> u16 {
+    for shard in 0..SHARDS {
+        if node.spool().id(shard).await.is_ok() {
+            return shard;
+        }
+    }
+    panic!("no shard on this core");
+}
+
+async fn seal_one(node: &Node<Idle>, shard: u16, n: u8) -> Sealed {
+    let mut draft = node.draft(1, None).expect("draft");
+    let address = format!("s{n}@example.org");
+    node.recipient(&mut draft, &address)
+        .await
+        .expect("recipient");
+    let mut sealing = node.sealing(&draft, shard).await.expect("sealing");
+    let clear = HeadClear {
+        recipients: 1,
+        accepted: 5,
+        ..HeadClear::default()
+    };
+    let head = sealing
+        .head(clear, u64::MAX / 2, &[n; 10], b"Subject: hi\r\n")
+        .expect("head");
+    let body = sealing.inline_body(&[n; 300]).expect("body");
+    let slice = sealing
+        .slice(0, draft.queues().to_vec(), address.as_bytes())
+        .expect("slice");
+    let sealed = Sealed {
+        id: sealing.id(),
+        clear: head.clear,
+        wrap: head.wrap,
+        head: head.sealed.clone(),
+        body: match &body {
+            Body::Inline(bytes) => bytes.clone(),
+            Body::Chain(_) => panic!("inline"),
+        },
+        slice: slice.sealed.clone(),
+    };
+    let message = Message {
+        id: sealing.id(),
+        tenant: 1,
+        head,
+        body,
+        slices: vec![slice],
+    };
+    node.accept(draft, message).await.expect("accept");
+    sealed
+}
+
+async fn opens(node: &Node<Idle>, sealed: &Sealed, n: u8) {
+    let opener = node
+        .opener(1, 1, sealed.id, &sealed.clear, &sealed.wrap)
+        .await
+        .expect("opener");
+    let (envelope, headers) = opener.head(&sealed.head).expect("head");
+    assert_eq!(
+        (envelope, headers),
+        (vec![n; 10], b"Subject: hi\r\n".to_vec())
+    );
+    assert_eq!(
+        opener.inline_body(&sealed.body).expect("body"),
+        vec![n; 300]
+    );
+    let address = format!("s{n}@example.org");
+    assert_eq!(
+        opener.slice(0, &sealed.slice).expect("slice"),
+        address.as_bytes()
+    );
+}
+
+#[test]
+fn sealed_items_open_only_under_their_own_message_and_item() {
+    let driver = Rc::new(SimDriver::with_disk(36, Config::default(), created(36)));
+    let cluster = started(&driver, 2);
+    let nodes = cluster.nodes.clone();
+    cluster.run(async move {
+        ready(&nodes).await;
+        let node = &nodes[0];
+        let shard = owned_shard(node).await;
+        let draft = node.draft(1, None).expect("draft");
+        let first = node.sealing(&draft, shard).await.expect("sealing");
+        let second = node.sealing(&draft, shard).await.expect("sealing");
+        assert_ne!(first.id(), second.id());
+        let mut once = second;
+        let clear = HeadClear::default();
+        assert!(once.head(clear, 1, b"e", b"h").is_ok());
+        assert_eq!(
+            once.head(clear, 1, b"e", b"h").err(),
+            Some(Refusal::Message)
+        );
+        assert!(once.inline_body(b"b").is_ok());
+        assert!(once.body_chunks().is_err());
+        assert!(once.slice(0, vec![1], b"r").is_ok());
+        assert_eq!(once.slice(0, vec![1], b"r").err(), Some(Refusal::Message));
+        assert!(once.slice(1, vec![1], b"r").is_ok());
+        let mut large = node.sealing(&draft, shard).await.expect("sealing");
+        let big = vec![0; store::MAX_PAYLOAD];
+        assert_eq!(
+            large.head(clear, 1, b"e", &big).err(),
+            Some(Refusal::Message)
+        );
+        drop(first);
+
+        let sealed = seal_one(node, shard, 7).await;
+        opens(node, &sealed, 7).await;
+        opens(&nodes[1], &sealed, 7).await;
+        let opener = |tenant, generation, clear: HeadClear| {
+            let (node, wrap, id) = (node.clone(), sealed.wrap, sealed.id);
+            async move {
+                node.opener(tenant, generation, id, &clear, &wrap)
+                    .await
+                    .err()
+            }
+        };
+        let bad = Some(Unsealable::Bad);
+        assert_eq!(opener(1, 2, sealed.clear).await, bad);
+        assert_eq!(opener(2, 1, sealed.clear).await, bad);
+        let mut day = sealed.clear;
+        day.day += 1;
+        assert_eq!(opener(1, 1, day).await, bad);
+        let mut batch = sealed.clear;
+        batch.batch_key += 1;
+        assert_eq!(opener(1, 1, batch).await, bad);
+        let mut wrap = sealed.wrap;
+        wrap[50] ^= 1;
+        assert_eq!(
+            node.opener(1, 1, sealed.id, &sealed.clear, &wrap)
+                .await
+                .err(),
+            bad
+        );
+        let other = MessageId {
+            key: sealed.id.key + 1,
+            ..sealed.id
+        };
+        let moved = node
+            .opener(1, 1, other, &sealed.clear, &sealed.wrap)
+            .await
+            .expect("opener");
+        assert_eq!(moved.head(&sealed.head).err(), bad);
+        let right = node
+            .opener(1, 1, sealed.id, &sealed.clear, &sealed.wrap)
+            .await
+            .expect("opener");
+        assert_eq!(right.inline_body(&sealed.head).err(), bad);
+        assert_eq!(right.slice(1, &sealed.slice).err(), bad);
+        assert_eq!(right.head(&sealed.body).err(), bad);
+    });
+    cluster.stop();
+}
+
+#[test]
+fn body_chunks_open_in_order_and_a_cut_stream_is_refused() {
+    let driver = Rc::new(SimDriver::with_disk(39, Config::default(), created(39)));
+    let cluster = started(&driver, 2);
+    let nodes = cluster.nodes.clone();
+    cluster.run(async move {
+        ready(&nodes).await;
+        let node = &nodes[0];
+        let shard = owned_shard(node).await;
+        let draft = node.draft(1, None).expect("draft");
+        let clear = HeadClear::default();
+        let mut chunked = node.sealing(&draft, shard).await.expect("sealing");
+        let head = chunked.head(clear, 1, b"e", b"h").expect("head");
+        let mut chunks = chunked.body_chunks().expect("chunks");
+        let mut parts = [vec![1; 64], vec![2; 64], vec![3; 10]];
+        for part in &mut parts[..2] {
+            chunks.seal(part).expect("seal");
+        }
+        chunks.seal_last(&mut parts[2]);
+        let opener = node
+            .opener(1, 1, chunked.id(), &head.clear, &head.wrap)
+            .await
+            .expect("opener");
+        let mut cut = parts[..2].to_vec();
+        let mut short = opener.body_chunks();
+        for part in &mut cut {
+            short.open(false, part).expect("chunk");
+        }
+        assert!(short.finish().is_err());
+        let mut stream = opener.body_chunks();
+        let mut whole = Vec::new();
+        for (n, part) in parts.iter_mut().enumerate() {
+            whole.extend_from_slice(stream.open(n == 2, part).expect("chunk"));
+        }
+        stream.finish().expect("finish");
+        assert_eq!(whole, [vec![1; 64], vec![2; 64], vec![3; 10]].concat());
+    });
+    cluster.stop();
+}
+
+fn unwraps(driver: &SimDriver) -> u64 {
+    let disk = driver.disk();
+    let Some(audit) = disk.contents(&Path::new(KEYS_DIR).join("audit")) else {
+        return 0;
+    };
+    String::from_utf8(audit.to_vec())
+        .expect("text")
+        .lines()
+        .filter(|line| line.contains(" unwrap 1 1 "))
+        .filter_map(|line| line.rsplit(' ').next()?.parse::<u64>().ok())
+        .sum()
+}
+
+#[test]
+fn sealed_messages_open_after_a_restart_with_one_unwrap_per_batch() {
+    let driver = Rc::new(SimDriver::with_disk(37, Config::default(), created(37)));
+    let cluster = started_with_keys(&driver, 2);
+    let nodes = cluster.nodes.clone();
+    let sealed = cluster.run(async move {
+        keys_listening().await;
+        ready(&nodes).await;
+        let node = &nodes[0];
+        let shard = owned_shard(node).await;
+        let mut sealed = Vec::new();
+        for n in 0..5 {
+            sealed.push(seal_one(node, shard, n).await);
+        }
+        assert!(sealed.iter().all(|s| s.clear.batch_key == sealed[0].id.key));
+        for (n, one) in (0..).zip(&sealed) {
+            opens(node, one, n).await;
+        }
+        sleep(Duration::from_millis(300)).await;
+        sealed
+    });
+    assert_eq!(unwraps(&driver), 0);
+    drop(cluster);
+    let driver = Rc::new(SimDriver::with_disk(38, Config::default(), driver.crash()));
+    let restarted = started_with_keys(&driver, 2);
+    let nodes = restarted.nodes.clone();
+    restarted.run(async move {
+        wait_for(&nodes, 1, 1, State::Active).await;
+        for (n, one) in (0..).zip(&sealed) {
+            opens(&nodes[0], one, n).await;
+        }
+        sleep(Duration::from_millis(300)).await;
+    });
+    assert_eq!(unwraps(&driver), 1);
+    restarted.stop();
+}
+
 #[test]
 fn listing_pages_through_every_core_in_hash_order() {
     listing(3, 4);
@@ -839,6 +1159,7 @@ fn message(id: MessageId, draft: &Draft) -> Message {
                 ..HeadClear::default()
             },
             expiry: u64::MAX / 2,
+            wrap: [3; spool::WRAP],
             sealed: vec![1; 64],
         },
         body: Body::Inline(vec![2; 300]),

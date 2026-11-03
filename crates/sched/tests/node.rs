@@ -196,6 +196,7 @@ fn message(id: MessageId, now: u64, driver: &SimDriver, expiring: bool) -> Messa
                 ..HeadClear::default()
             },
             expiry,
+            wrap: [3; spool::WRAP],
             sealed: vec![1; 64],
         },
         body: Body::Inline(vec![2; 300]),

@@ -8,7 +8,7 @@ use store::{
 
 use crate::bodies::{Writer, Written};
 use crate::error::Error;
-use crate::items::{BODY_ITEM, HeadClear, encode_slice, slice_item};
+use crate::items::{BODY_ITEM, HeadClear, WRAP, encode_slice, slice_item};
 use crate::limits::{Bounds, Limits, SLICE};
 use crate::pending::{self, Pending};
 use crate::recipients::Table;
@@ -45,6 +45,7 @@ impl MessageId {
 pub struct Head {
     pub clear: HeadClear,
     pub expiry: u64,
+    pub wrap: [u8; WRAP],
     pub sealed: Vec<u8>,
 }
 
@@ -304,7 +305,7 @@ impl Spool {
                 head_change,
                 head.clear.encode(),
                 Vec::new(),
-                head.sealed,
+                [&head.wrap[..], &head.sealed].concat(),
             )
             .map_err(|_| Error::Limit("header"))?,
         );
