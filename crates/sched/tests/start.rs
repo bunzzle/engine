@@ -7,12 +7,15 @@ use std::rc::Rc;
 use std::task::Poll;
 use std::time::Duration;
 
-use control::{Label, Limits as TenantLimits, Name, Naming, Object, Pool, Sealer, State, Tenant};
+use control::{
+    KeyError, KeySource, Limits as TenantLimits, Name, Naming, Object, Pool, Ready, State, Tenant,
+};
+use crypto::{Secret, Tenant as Root, TenantKeys};
 use rt::sim::{Config, Disk, Faults, Machine, SimDriver, Stalls, check};
 use rt::{JoinHandle, Runtime, sleep, spawn, timeout};
 use sched::{
-    Answer, Answered, Attempt, Clock, Draft, Hash, Hasher, Kind, Limits, Meshes, Node, Parts,
-    Reason, Refusal, Running, Settings, Transport,
+    Answer, Answered, Attempt, Clock, Draft, Kind, Limits, Meshes, Node, Parts, Reason, Refusal,
+    Running, Settings, Transport,
 };
 use spool::{Body, Head, HeadClear, Message, MessageId, SLICE, Slice};
 use store::{Client, DataFile, Options, SLOT_SIZE, Setup, boot};
@@ -122,33 +125,18 @@ fn pool(id: u32) -> Object {
 
 struct Toy;
 
-fn label_bytes(label: &Label) -> Vec<u8> {
-    let mut out = Vec::new();
-    out.extend_from_slice(&label.tenant.to_le_bytes());
-    out.extend_from_slice(&label.generation.to_le_bytes());
-    out.push(label.kind);
-    out.extend_from_slice(&label.id.to_le_bytes());
-    out
-}
-
-impl Sealer for Toy {
-    fn seal(&self, label: &Label, clear: &[u8]) -> Vec<u8> {
-        let mut out = label_bytes(label);
-        out.extend(clear.iter().map(|b| b ^ 0x5a));
-        out
+impl KeySource for Toy {
+    fn get(&self, tenant: u32, generation: u32) -> Option<TenantKeys> {
+        let root = Root::new(&Secret::new(
+            [u8::try_from(tenant % 200).expect("small"); 32],
+        ));
+        Some(TenantKeys::derive(tenant, generation, &root, 1))
     }
 
-    fn open(&self, label: &Label, sealed: &[u8]) -> Option<Vec<u8>> {
-        let rest = sealed.strip_prefix(label_bytes(label).as_slice())?;
-        Some(rest.iter().map(|b| b ^ 0x5a).collect())
-    }
-}
-
-struct Keyed;
-
-impl Hasher for Keyed {
-    fn hash(&self, tenant: u32, data: &[u8]) -> Hash {
-        index::siphash128(&[7; 16], &[&tenant.to_le_bytes()[..], data].concat())
+    fn ready(&self, tenant: u32, generation: u32) -> Ready<'_> {
+        Box::pin(std::future::ready(
+            self.get(tenant, generation).ok_or(KeyError::Unknown),
+        ))
     }
 }
 
@@ -602,8 +590,7 @@ fn start(
                 .ok()?;
             let shards = core.shards.clone();
             let parts = Parts {
-                sealer: Rc::new(Toy),
-                hasher: Rc::new(Keyed),
+                keys: Rc::new(Toy),
                 transport,
                 clock: Clock::start(),
             };

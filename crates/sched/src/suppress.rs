@@ -2,7 +2,8 @@ use std::cell::{Cell, OnceCell, RefCell};
 use std::collections::BTreeMap;
 use std::rc::Rc;
 
-use control::{Label, Naming, Sealer, State, Table, siphash};
+use control::{KeySource, Label, Naming, State, Table, siphash, tenant_keys};
+use crypto::TenantKeys;
 use index::{Entry, Key, Op, Shape};
 use rt::{Ends, JoinHandle, Peers, Sender, channel, spawn};
 use store::{Changes, Claim, IndexRecord};
@@ -19,8 +20,18 @@ const PARTITION: (u8, u32) = (KIND_SUPPRESS, 0);
 
 pub type Hash = [u8; 16];
 
-pub trait Hasher {
-    fn hash(&self, tenant: u32, data: &[u8]) -> Hash;
+pub fn keyed_hash(keys: &TenantKeys, data: &[u8]) -> Hash {
+    index::siphash128(keys.hash_key().expose(), data)
+}
+
+pub(crate) async fn keys_of(
+    source: &dyn KeySource,
+    tenant: u32,
+    generation: u32,
+) -> Result<TenantKeys, Refusal> {
+    tenant_keys(source, tenant, generation)
+        .await
+        .map_err(|_| Refusal::Keys)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -128,10 +139,12 @@ pub fn retain(table: &Table, now: u64, entry: &Entry, oldest: bool) -> bool {
 enum Request {
     Check {
         tenant: u32,
+        generation: u32,
         keys: Vec<(u16, Hash)>,
     },
     Add {
         tenant: u32,
+        generation: u32,
         shard: u16,
         hash: Hash,
         address: Box<str>,
@@ -140,16 +153,19 @@ enum Request {
     },
     Remove {
         tenant: u32,
+        generation: u32,
         shard: u16,
         hash: Hash,
     },
     Get {
         tenant: u32,
+        generation: u32,
         shard: u16,
         hash: Hash,
     },
     List {
         tenant: u32,
+        generation: u32,
         after: Option<Hash>,
         limit: usize,
     },
@@ -171,8 +187,7 @@ enum Message {
 }
 
 pub struct Inputs {
-    pub hasher: Rc<dyn Hasher>,
-    pub sealer: Rc<dyn Sealer>,
+    pub keys: Rc<dyn KeySource>,
     pub changes: Changes,
     pub table: Rc<RefCell<Table>>,
     pub clock: Clock,
@@ -183,6 +198,7 @@ pub struct Inputs {
 struct Inner {
     parts: Inputs,
     cores: u16,
+    unopened: Cell<u64>,
     peers: OnceCell<Peers<Ask>>,
     waiting: RefCell<BTreeMap<u64, Sender<Answer>>>,
     tickets: Cell<u64>,
@@ -198,6 +214,7 @@ impl Suppressions {
         let inner = Rc::new(Inner {
             parts,
             cores: ends.cores(),
+            unopened: Cell::new(0),
             peers: OnceCell::new(),
             waiting: RefCell::new(BTreeMap::new()),
             tickets: Cell::new(0),
@@ -220,25 +237,42 @@ impl Suppressions {
         owner_shard(&self.inner.parts.naming, tenant, hash)
     }
 
-    pub fn hash(&self, tenant: u32, address: &str) -> Option<Hash> {
-        let normal = normalize(address)?;
-        Some(self.inner.parts.hasher.hash(tenant, normal.as_bytes()))
+    pub fn unopened(&self) -> u64 {
+        self.inner.unopened.get()
     }
 
-    pub async fn check(&self, tenant: u32, addresses: &[&str]) -> Result<Vec<bool>, Refusal> {
+    pub async fn hash(&self, tenant: u32, generation: u32, address: &str) -> Result<Hash, Refusal> {
+        let normal = normalize(address).ok_or(Refusal::Address)?;
+        let keys = keys_of(self.inner.parts.keys.as_ref(), tenant, generation).await?;
+        Ok(keyed_hash(&keys, normal.as_bytes()))
+    }
+
+    pub async fn check(
+        &self,
+        tenant: u32,
+        generation: u32,
+        addresses: &[&str],
+    ) -> Result<Vec<bool>, Refusal> {
+        let normals = addresses
+            .iter()
+            .map(|address| normalize(address).ok_or(Refusal::Address))
+            .collect::<Result<Vec<_>, _>>()?;
+        let keys = keys_of(self.inner.parts.keys.as_ref(), tenant, generation).await?;
         let mut by_core: BTreeMap<u16, Vec<(usize, u16, Hash)>> = BTreeMap::new();
-        for (at, address) in addresses.iter().enumerate() {
-            let hash = self.hash(tenant, address).ok_or(Refusal::Address)?;
+        for (at, normal) in normals.iter().enumerate() {
+            let hash = keyed_hash(&keys, normal.as_bytes());
             let shard = self.owner(tenant, &hash);
             by_core
                 .entry(shard % self.inner.cores)
                 .or_default()
                 .push((at, shard, hash));
         }
+        drop(keys);
         let mut asked = Vec::new();
         for (core, keys) in by_core {
             let request = Request::Check {
                 tenant,
+                generation,
                 keys: keys.iter().map(|&(_, s, h)| (s, h)).collect(),
             };
             asked.push((keys, self.send(core, request)));
@@ -266,11 +300,13 @@ impl Suppressions {
         reason: Reason,
         until: Option<u64>,
     ) -> Result<(), Refusal> {
+        let generation = self.generation(tenant)?;
         let address = normalize(address).ok_or(Refusal::Address)?;
-        let hash = self.inner.parts.hasher.hash(tenant, address.as_bytes());
+        let hash = self.hash(tenant, generation, &address).await?;
         let shard = self.owner(tenant, &hash);
         let request = Request::Add {
             tenant,
+            generation,
             shard,
             hash,
             address: address.into(),
@@ -284,13 +320,15 @@ impl Suppressions {
     }
 
     pub async fn remove(&self, tenant: u32, address: &str) -> Result<bool, Refusal> {
-        let hash = self.hash(tenant, address).ok_or(Refusal::Address)?;
+        let generation = self.generation(tenant)?;
+        let hash = self.hash(tenant, generation, address).await?;
         let shard = self.owner(tenant, &hash);
         match self
             .ask(
                 shard,
                 Request::Remove {
                     tenant,
+                    generation,
                     shard,
                     hash,
                 },
@@ -303,13 +341,15 @@ impl Suppressions {
     }
 
     pub async fn get(&self, tenant: u32, address: &str) -> Result<Option<Suppression>, Refusal> {
-        let hash = self.hash(tenant, address).ok_or(Refusal::Address)?;
+        let generation = self.generation(tenant)?;
+        let hash = self.hash(tenant, generation, address).await?;
         let shard = self.owner(tenant, &hash);
         match self
             .ask(
                 shard,
                 Request::Get {
                     tenant,
+                    generation,
                     shard,
                     hash,
                 },
@@ -330,10 +370,12 @@ impl Suppressions {
         if limit == 0 {
             return Ok(Page::default());
         }
+        let generation = self.generation(tenant)?;
         let mut asked = Vec::new();
         for core in 0..self.inner.cores {
             let request = Request::List {
                 tenant,
+                generation,
                 after,
                 limit,
             };
@@ -396,33 +438,41 @@ impl Suppressions {
 
     async fn serve(&self, request: Request) -> Answer {
         match request {
-            Request::Check { tenant, keys } => Answer::Checked(self.checked(tenant, keys).await),
+            Request::Check {
+                tenant,
+                generation,
+                keys,
+            } => Answer::Checked(self.checked(tenant, generation, keys).await),
             Request::Add {
                 tenant,
+                generation,
                 shard,
                 hash,
                 address,
                 reason,
                 until,
             } => Answer::Added(
-                self.added(tenant, shard, hash, &address, reason, until)
+                self.added(tenant, generation, shard, hash, &address, reason, until)
                     .await,
             ),
             Request::Remove {
                 tenant,
+                generation,
                 shard,
                 hash,
-            } => Answer::Removed(self.removed(tenant, shard, hash).await),
+            } => Answer::Removed(self.removed(tenant, generation, shard, hash).await),
             Request::Get {
                 tenant,
+                generation,
                 shard,
                 hash,
-            } => Answer::Got(self.found(tenant, shard, hash).await),
+            } => Answer::Got(self.found(tenant, generation, shard, hash).await),
             Request::List {
                 tenant,
+                generation,
                 after,
                 limit,
-            } => Answer::Listed(self.listed(tenant, after, limit).await),
+            } => Answer::Listed(self.listed(tenant, generation, after, limit).await),
         }
     }
 
@@ -437,12 +487,21 @@ impl Suppressions {
             .ok_or(Refusal::Tenant)
     }
 
+    fn current(&self, tenant: u32, generation: u32) -> Result<(), Refusal> {
+        if self.generation(tenant)? == generation {
+            Ok(())
+        } else {
+            Err(Refusal::Tenant)
+        }
+    }
+
     async fn values(
         &self,
         tenant: u32,
+        generation: u32,
         keys: &[(u16, Hash)],
     ) -> Result<Vec<Option<Value>>, Refusal> {
-        let generation = self.generation(tenant)?;
+        self.current(tenant, generation)?;
         let asked = keys
             .iter()
             .map(|&(shard, hash)| (shard, index::key(tenant, hash)))
@@ -466,32 +525,41 @@ impl Suppressions {
             .collect())
     }
 
-    async fn checked(&self, tenant: u32, keys: Vec<(u16, Hash)>) -> Result<Vec<bool>, Refusal> {
-        let values = self.values(tenant, &keys).await?;
+    async fn checked(
+        &self,
+        tenant: u32,
+        generation: u32,
+        keys: Vec<(u16, Hash)>,
+    ) -> Result<Vec<bool>, Refusal> {
+        let values = self.values(tenant, generation, &keys).await?;
         Ok(values.iter().map(Option::is_some).collect())
     }
 
     async fn found(
         &self,
         tenant: u32,
+        generation: u32,
         shard: u16,
         hash: Hash,
     ) -> Result<Option<Suppression>, Refusal> {
-        let values = self.values(tenant, &[(shard, hash)]).await?;
+        let values = self.values(tenant, generation, &[(shard, hash)]).await?;
         Ok(values[0].map(|v| v.suppression))
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn added(
         &self,
         tenant: u32,
+        generation: u32,
         shard: u16,
         hash: Hash,
         address: &str,
         reason: Reason,
         until: Option<u64>,
     ) -> Result<(), Refusal> {
-        let generation = self.generation(tenant)?;
+        self.current(tenant, generation)?;
         let parts = &self.inner.parts;
+        let keys = keys_of(parts.keys.as_ref(), tenant, generation).await?;
         let value = Value {
             generation,
             suppression: Suppression {
@@ -500,9 +568,10 @@ impl Suppressions {
                 until: until.filter(|&u| u != 0),
             },
         };
-        let sealed = parts
-            .sealer
-            .seal(&label(tenant, generation), address.as_bytes());
+        let sealed = keys
+            .seal(&label(tenant, generation, hash).bytes(), address.as_bytes())
+            .map_err(|_| Refusal::Failed)?;
+        drop(keys);
         if sealed.len() > index::MAX_PAYLOAD {
             return Err(Refusal::Address);
         }
@@ -518,8 +587,14 @@ impl Suppressions {
             .map_err(|e| refusal(&e))
     }
 
-    async fn removed(&self, tenant: u32, shard: u16, hash: Hash) -> Result<bool, Refusal> {
-        let found = self.found(tenant, shard, hash).await?.is_some();
+    async fn removed(
+        &self,
+        tenant: u32,
+        generation: u32,
+        shard: u16,
+        hash: Hash,
+    ) -> Result<bool, Refusal> {
+        let found = self.found(tenant, generation, shard, hash).await?.is_some();
         let record = IndexRecord {
             kind: KIND_SUPPRESS,
             partition: PARTITION.1,
@@ -537,12 +612,13 @@ impl Suppressions {
     async fn listed(
         &self,
         tenant: u32,
+        generation: u32,
         after: Option<Hash>,
         limit: usize,
     ) -> Result<Vec<(Hash, Listed)>, Refusal> {
-        let generation = self.generation(tenant)?;
+        self.current(tenant, generation)?;
         let parts = &self.inner.parts;
-        let label = label(tenant, generation);
+        let keys = keys_of(parts.keys.as_ref(), tenant, generation).await?;
         let from = match after {
             Some(hash) => next(index::key(tenant, hash)),
             None => Some(index::key(tenant, [0; 16])),
@@ -569,12 +645,15 @@ impl Suppressions {
                         .then(|| Value::decode(&entry.value))
                         .flatten()
                         .filter(|v| v.live(generation, now));
-                    let opened = live.and_then(|v| {
-                        let address = parts.sealer.open(&label, &entry.payload)?;
-                        Some((v, String::from_utf8(address).ok()?))
-                    });
-                    if let Some((value, address)) = opened {
-                        let hash = entry.key[4..].try_into().expect("16 bytes");
+                    let Some(value) = live else {
+                        continue;
+                    };
+                    let hash: Hash = entry.key[4..].try_into().expect("16 bytes");
+                    let opened = keys
+                        .open(&label(tenant, generation, hash).bytes(), &entry.payload)
+                        .ok()
+                        .and_then(|address| String::from_utf8(address).ok());
+                    if let Some(address) = opened {
                         out.push((
                             hash,
                             Listed {
@@ -583,6 +662,8 @@ impl Suppressions {
                             },
                         ));
                         found += 1;
+                    } else {
+                        self.inner.unopened.set(self.inner.unopened.get() + 1);
                     }
                 }
                 let Some(last) = page.last().filter(|_| page.len() >= limit) else {
@@ -608,12 +689,13 @@ pub(crate) fn owner_shard(naming: &Naming, tenant: u32, hash: &Hash) -> u16 {
         .expect("shard fits in u16")
 }
 
-fn label(tenant: u32, generation: u32) -> Label {
+fn label(tenant: u32, generation: u32, hash: Hash) -> Label {
     Label {
         tenant,
         generation,
         kind: SEAL_SUPPRESS,
         id: 0,
+        hash: Some(hash),
     }
 }
 
@@ -631,5 +713,21 @@ pub(crate) fn refusal(error: &store::Error) -> Refusal {
     match error {
         store::Error::Busy => Refusal::Busy,
         _ => Refusal::Failed,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{SEAL_SUPPRESS, label};
+
+    #[test]
+    fn a_payload_label_binds_the_address_hash() {
+        let bound = label(4, 2, [7; 16]);
+        assert_eq!(
+            (bound.tenant, bound.generation, bound.kind, bound.id),
+            (4, 2, SEAL_SUPPRESS, 0)
+        );
+        assert_eq!(bound.hash, Some([7; 16]));
+        assert_ne!(label(4, 2, [8; 16]).bytes(), bound.bytes());
     }
 }

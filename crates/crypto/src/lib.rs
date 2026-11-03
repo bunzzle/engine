@@ -1,5 +1,6 @@
 mod error;
 mod kdf;
+mod keys;
 mod record;
 mod seal;
 mod secret;
@@ -9,6 +10,7 @@ mod wrap;
 
 pub use error::Error;
 pub use kdf::Prk;
+pub use keys::TenantKeys;
 pub use record::{AAD, BatchKey, aad};
 pub use seal::{DataKey, OVERHEAD};
 pub use secret::{Plain, Secret};

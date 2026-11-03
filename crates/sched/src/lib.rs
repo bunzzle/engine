@@ -26,7 +26,7 @@ pub use requests::{
 };
 pub use start::{CONTROL_SHARD, Links, Meshes, Node, Parts, Running, Settings};
 pub use suppress::{
-    Ask, Hash, Hasher, Inputs, KIND_SUPPRESS, Listed, Page, Reason, SEAL_SUPPRESS, SHAPE,
-    Suppression, Suppressions, retain,
+    Ask, Hash, Inputs, KIND_SUPPRESS, Listed, Page, Reason, SEAL_SUPPRESS, SHAPE, Suppression,
+    Suppressions, keyed_hash, retain,
 };
 pub use transport::{Answered, Attempt, Claimed, Transport};

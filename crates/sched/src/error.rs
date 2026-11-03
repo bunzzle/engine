@@ -41,12 +41,13 @@ pub enum Refusal {
     Recipients,
     Message,
     Busy,
+    Keys,
     Failed,
 }
 
 impl Refusal {
     pub fn temporary(self) -> bool {
-        matches!(self, Self::Busy | Self::Failed)
+        matches!(self, Self::Busy | Self::Keys | Self::Failed)
     }
 }
 
@@ -61,6 +62,7 @@ impl fmt::Display for Refusal {
             Self::Recipients => "too many recipients",
             Self::Message => "message does not match its recipients",
             Self::Busy => "over the limit, try again later",
+            Self::Keys => "tenant keys unavailable, try again later",
             Self::Failed => "temporary failure",
         };
         f.write_str(what)

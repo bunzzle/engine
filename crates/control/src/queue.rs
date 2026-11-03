@@ -1,3 +1,7 @@
+use std::pin::Pin;
+
+use crypto::TenantKeys;
+
 use crate::error::Error;
 use crate::record::{KIND_QUEUE, SYSTEM};
 use crate::siphash::siphash;
@@ -110,17 +114,54 @@ impl Head {
     }
 }
 
+pub const LABEL_SIZE: usize = 30;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Label {
     pub tenant: u32,
     pub generation: u32,
     pub kind: u8,
     pub id: u32,
+    pub hash: Option<[u8; 16]>,
 }
 
-pub trait Sealer {
-    fn seal(&self, label: &Label, clear: &[u8]) -> Vec<u8>;
-    fn open(&self, label: &Label, sealed: &[u8]) -> Option<Vec<u8>>;
+impl Label {
+    pub fn bytes(&self) -> [u8; LABEL_SIZE] {
+        let mut out = [0; LABEL_SIZE];
+        out[..4].copy_from_slice(&self.tenant.to_le_bytes());
+        out[4..8].copy_from_slice(&self.generation.to_le_bytes());
+        out[8] = self.kind;
+        out[9..13].copy_from_slice(&self.id.to_le_bytes());
+        if let Some(hash) = self.hash {
+            out[13] = 1;
+            out[14..].copy_from_slice(&hash);
+        }
+        out
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KeyError {
+    Unavailable,
+    Unknown,
+}
+
+pub type Ready<'a> = Pin<Box<dyn Future<Output = Result<TenantKeys, KeyError>> + 'a>>;
+
+pub trait KeySource {
+    fn get(&self, tenant: u32, generation: u32) -> Option<TenantKeys>;
+    fn ready(&self, tenant: u32, generation: u32) -> Ready<'_>;
+}
+
+pub async fn tenant_keys(
+    source: &dyn KeySource,
+    tenant: u32,
+    generation: u32,
+) -> Result<TenantKeys, KeyError> {
+    match source.get(tenant, generation) {
+        Some(keys) => Ok(keys),
+        None => source.ready(tenant, generation).await,
+    }
 }
 
 pub trait Tenancy {

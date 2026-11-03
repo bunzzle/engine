@@ -1,6 +1,9 @@
 use std::cell::{Cell, OnceCell, RefCell};
 use std::collections::{BTreeMap, VecDeque};
 use std::rc::Rc;
+use std::time::Duration;
+
+use crypto::TenantKeys;
 
 use rt::{Ends, JoinHandle, Notify, Peers, Sender, channel, spawn};
 use store::{
@@ -10,7 +13,9 @@ use store::{
 
 use crate::cache::{Cache, CacheStats};
 use crate::error::Error;
-use crate::queue::{Head, Label, Name, Queue, Sealer, Tenancy, naming_shard, queue_shard};
+use crate::queue::{
+    Head, KeyError, KeySource, Label, Name, Queue, Tenancy, naming_shard, queue_shard, tenant_keys,
+};
 use crate::record::KIND_QUEUE;
 
 pub enum Call {
@@ -91,6 +96,42 @@ impl Owned {
 
 struct Fixed;
 
+struct Stored {
+    head: Head,
+    tenant: u32,
+    clear: Vec<u8>,
+    hidden: Vec<u8>,
+}
+
+const KEY_WAIT: Duration = Duration::from_millis(100);
+const KEY_WAIT_MAX: Duration = Duration::from_secs(5);
+
+async fn wait_keys(
+    keys: &dyn KeySource,
+    tenant: u32,
+    generation: u32,
+) -> Result<(TenantKeys, u64), Error> {
+    let mut pause = KEY_WAIT;
+    let mut waits = 0;
+    loop {
+        match tenant_keys(keys, tenant, generation).await {
+            Ok(found) => return Ok((found, waits)),
+            Err(KeyError::Unavailable) => {
+                waits += 1;
+                rt::sleep(pause).await;
+                pause = (pause * 2).min(KEY_WAIT_MAX);
+            }
+            Err(error) => {
+                return Err(Error::Keys {
+                    tenant,
+                    generation,
+                    error,
+                });
+            }
+        }
+    }
+}
+
 impl Owner for Fixed {
     fn locate(&self, _: Location) -> impl Future<Output = Option<Location>> {
         std::future::ready(None)
@@ -101,11 +142,16 @@ pub struct Loaded {
     naming: Naming,
     owned: Owned,
     skipped: u64,
+    waited: u64,
 }
 
 impl Loaded {
     pub fn skipped(&self) -> u64 {
         self.skipped
+    }
+
+    pub fn waited(&self) -> u64 {
+        self.waited
     }
 
     pub fn queues(&self) -> usize {
@@ -116,12 +162,12 @@ impl Loaded {
         self,
         ends: Ends<Call>,
         changes: Changes,
-        sealer: Rc<dyn Sealer>,
+        keys: Rc<dyn KeySource>,
     ) -> (Queues, JoinHandle<()>) {
         let inner = Rc::new(Inner {
             naming: self.naming,
             cores: ends.cores(),
-            sealer,
+            keys,
             changes,
             owned: RefCell::new(self.owned),
             cache: RefCell::new(Cache::new(self.naming.cache)),
@@ -154,7 +200,7 @@ impl Loaded {
 struct Inner {
     naming: Naming,
     cores: u16,
-    sealer: Rc<dyn Sealer>,
+    keys: Rc<dyn KeySource>,
     changes: Changes,
     owned: RefCell<Owned>,
     cache: RefCell<Cache>,
@@ -187,14 +233,16 @@ impl Drop for Held<'_> {
 }
 
 impl Queues {
-    pub async fn load(core: &Core, naming: Naming, sealer: &dyn Sealer) -> Result<Loaded, Error> {
+    pub async fn load(core: &Core, naming: Naming, keys: &dyn KeySource) -> Result<Loaded, Error> {
         let reader = core.file.reader();
         let mut owned = Owned::default();
         let mut skipped = 0;
+        let mut waited = 0;
         for &shard in &core.shards {
             let state = core.keeper.state(shard).ok_or(Error::Invalid("shard"))?;
             owned.next.insert(shard, 1);
             owned.ids.insert(shard, 0);
+            let mut found: BTreeMap<(u32, u32), Vec<Stored>> = BTreeMap::new();
             for (key, item) in state.entries() {
                 if !is_control(key.message) || key.item != HEAD_ITEM {
                     continue;
@@ -208,16 +256,31 @@ impl Queues {
                 }
                 *owned.ids.entry(shard).or_default() += 1;
                 let buf = reader.read(item.location, item.tenant, &Fixed).await?;
-                let queue = Record::decode(&buf)
-                    .ok()
-                    .and_then(|record| {
-                        let parts = Index::parts(record.payload())?;
-                        open(parts.clear, parts.sealed, sealer)
+                let stored = Record::decode(&buf).ok().and_then(|record| {
+                    let parts = Index::parts(record.payload())?;
+                    let head = Head::decode(parts.clear)?;
+                    Some(Stored {
+                        head,
+                        tenant: item.tenant,
+                        clear: parts.clear.to_vec(),
+                        hidden: parts.sealed.to_vec(),
                     })
-                    .filter(|q| {
-                        q.id == id
-                            && q.name.tenant == item.tenant
-                            && queue_shard(id, naming.shards) == shard
+                });
+                match stored {
+                    Some(stored) if stored.head.id == id => found
+                        .entry((stored.head.tenant, stored.head.generation))
+                        .or_default()
+                        .push(stored),
+                    _ => skipped += 1,
+                }
+            }
+            for ((tenant, generation), group) in found {
+                let (sealing, waits) = wait_keys(keys, tenant, generation).await?;
+                waited += waits;
+                for stored in group {
+                    let queue = open(&stored.clear, &stored.hidden, &sealing).filter(|q| {
+                        q.name.tenant == stored.tenant
+                            && queue_shard(q.id, naming.shards) == shard
                             && naming_shard(
                                 &naming.key,
                                 q.name.tenant,
@@ -225,9 +288,10 @@ impl Queues {
                                 naming.shards,
                             ) == shard
                     });
-                match queue {
-                    Some(queue) => owned.insert(queue),
-                    None => skipped += 1,
+                    match queue {
+                        Some(queue) => owned.insert(queue),
+                        None => skipped += 1,
+                    }
                 }
             }
         }
@@ -235,6 +299,7 @@ impl Queues {
             naming,
             owned,
             skipped,
+            waited,
         })
     }
 
@@ -544,13 +609,24 @@ impl Queues {
     }
 
     async fn write(&self, shard: u16, queue: &Queue) -> Result<(), Error> {
+        let (tenant, generation) = (queue.name.tenant, queue.name.generation);
         let label = Label {
-            tenant: queue.name.tenant,
-            generation: queue.name.generation,
+            tenant,
+            generation,
             kind: KIND_QUEUE,
             id: queue.id,
+            hash: None,
         };
-        let sealed = self.inner.sealer.seal(&label, queue.name.domain.as_bytes());
+        let sealing = tenant_keys(self.inner.keys.as_ref(), tenant, generation)
+            .await
+            .map_err(|error| Error::Keys {
+                tenant,
+                generation,
+                error,
+            })?;
+        let sealed = sealing
+            .seal(&label.bytes(), queue.name.domain.as_bytes())
+            .map_err(|_| Error::Invalid("seal"))?;
         let batch = Batch {
             shard,
             message: control_key(KIND_QUEUE, queue.id),
@@ -580,14 +656,15 @@ impl Tenancy for Queues {
     }
 }
 
-fn open(clear: &[u8], hidden: &[u8], sealer: &dyn Sealer) -> Option<Queue> {
+fn open(clear: &[u8], hidden: &[u8], keys: &TenantKeys) -> Option<Queue> {
     let head = Head::decode(clear)?;
     let label = Label {
         tenant: head.tenant,
         generation: head.generation,
         kind: KIND_QUEUE,
         id: head.id,
+        hash: None,
     };
-    let domain = String::from_utf8(sealer.open(&label, hidden)?).ok()?;
+    let domain = String::from_utf8(keys.open(&label.bytes(), hidden).ok()?).ok()?;
     Queue::decode(clear, domain.into())
 }

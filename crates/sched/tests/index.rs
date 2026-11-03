@@ -6,14 +6,15 @@ use std::rc::Rc;
 use std::task::Poll;
 use std::time::Duration;
 
-use control::{Label, Naming, Object, Pool, Sealer, State, Table, Tenant};
+use control::{KeyError, KeySource, Naming, Object, Pool, Ready, State, Table, Tenant};
+use crypto::{Secret, Tenant as Root, TenantKeys};
 use index::{Entry, Op};
 use rt::sim::{Config, Disk, Faults, Machine, SimDriver, Stalls, check};
 use rt::{JoinHandle, Runtime, sleep, spawn, timeout};
 use sched::{
-    Answered, Attempt, Begun, Clock, DAY, Draft, Hash, Hasher, KIND_REQUEST, KIND_SUPPRESS, Meshes,
-    Node, Parts, Reason, Refusal, Running, SHAPE, Settings, Suppression, Ticket, Transport,
-    normalize, punycode, retain, retain_request,
+    Answered, Attempt, Begun, Clock, DAY, Draft, Hash, KIND_REQUEST, KIND_SUPPRESS, Meshes, Node,
+    Parts, Reason, Refusal, Running, SHAPE, Settings, Suppression, Ticket, Transport, normalize,
+    punycode, retain, retain_request,
 };
 use spool::{Body, Head, HeadClear, Message, MessageId, SLICE, Slice};
 use store::{Client, Committer, DataFile, Options, SLOT_SIZE, Setup, Tiering, boot};
@@ -30,33 +31,28 @@ const OPTIONS: Options = Options {
 
 struct Toy;
 
-fn label_bytes(label: &Label) -> Vec<u8> {
-    let mut out = Vec::new();
-    out.extend_from_slice(&label.tenant.to_le_bytes());
-    out.extend_from_slice(&label.generation.to_le_bytes());
-    out.push(label.kind);
-    out.extend_from_slice(&label.id.to_le_bytes());
-    out
-}
+const KEYLESS: u32 = 199;
 
-impl Sealer for Toy {
-    fn seal(&self, label: &Label, clear: &[u8]) -> Vec<u8> {
-        let mut out = label_bytes(label);
-        out.extend(clear.iter().map(|b| b ^ 0x5a));
-        out
+impl KeySource for Toy {
+    fn get(&self, tenant: u32, generation: u32) -> Option<TenantKeys> {
+        if tenant == KEYLESS {
+            return None;
+        }
+        let root = Root::new(&Secret::new(
+            [u8::try_from(tenant % 200).expect("small"); 32],
+        ));
+        Some(TenantKeys::derive(tenant, generation, &root, 1))
     }
 
-    fn open(&self, label: &Label, sealed: &[u8]) -> Option<Vec<u8>> {
-        let rest = sealed.strip_prefix(label_bytes(label).as_slice())?;
-        Some(rest.iter().map(|b| b ^ 0x5a).collect())
-    }
-}
-
-struct Keyed;
-
-impl Hasher for Keyed {
-    fn hash(&self, tenant: u32, data: &[u8]) -> Hash {
-        index::siphash128(&[3; 16], &[&tenant.to_le_bytes()[..], data].concat())
+    fn ready(&self, tenant: u32, generation: u32) -> Ready<'_> {
+        let missing = if tenant == KEYLESS {
+            KeyError::Unavailable
+        } else {
+            KeyError::Unknown
+        };
+        Box::pin(std::future::ready(
+            self.get(tenant, generation).ok_or(missing),
+        ))
     }
 }
 
@@ -208,8 +204,7 @@ fn try_started(
                 });
             }
             let parts = Parts {
-                sealer: Rc::new(Toy),
-                hasher: Rc::new(Keyed),
+                keys: Rc::new(Toy),
                 transport: Idle,
                 clock: Clock::at(rt::wall_ms().saturating_sub(behind), rt::now()),
             };
@@ -467,6 +462,7 @@ fn suppressions_expire_and_end_with_a_new_generation() {
         let checked = lists
             .check(
                 1,
+                1,
                 &["brief@example.org", "kept@example.org", "free@example.org"],
             )
             .await;
@@ -475,7 +471,7 @@ fn suppressions_expire_and_end_with_a_new_generation() {
         assert_eq!(found.and_then(|s| s.until), Some(now + 1_000));
         sleep(Duration::from_millis(1_500)).await;
         let checked = lists
-            .check(1, &["brief@example.org", "kept@example.org"])
+            .check(1, 1, &["brief@example.org", "kept@example.org"])
             .await;
         assert_eq!(checked, Ok(vec![false, true]));
         let page = lists.list(1, None, 10).await.expect("list");
@@ -484,7 +480,11 @@ fn suppressions_expire_and_end_with_a_new_generation() {
 
         configure(&nodes, vec![tenant(1, 2, State::Active)]).await;
         wait_for(&nodes, 1, 2, State::Active).await;
-        let checked = lists.check(1, &["kept@example.org"]).await;
+        assert_eq!(
+            lists.check(1, 1, &["kept@example.org"]).await,
+            Err(Refusal::Tenant)
+        );
+        let checked = lists.check(1, 2, &["kept@example.org"]).await;
         assert_eq!(checked, Ok(vec![false]));
         let page = lists.list(1, None, 10).await.expect("list");
         assert_eq!(page.listed, Vec::new());
@@ -492,15 +492,54 @@ fn suppressions_expire_and_end_with_a_new_generation() {
             .add(1, "kept@example.org", Reason::Manual, None)
             .await
             .expect("add again");
-        let checked = lists.check(1, &["kept@example.org"]).await;
+        let checked = lists.check(1, 2, &["kept@example.org"]).await;
         assert_eq!(checked, Ok(vec![true]));
 
         configure(&nodes, vec![tenant(2, 1, State::Suspended)]).await;
         wait_for(&nodes, 2, 1, State::Suspended).await;
         assert_eq!(
-            lists.check(2, &["kept@example.org"]).await,
+            lists.check(2, 1, &["kept@example.org"]).await,
             Err(Refusal::Tenant)
         );
+    });
+    cluster.stop();
+}
+
+#[test]
+fn missing_keys_refuse_for_now_and_never_answer_not_suppressed() {
+    let driver = Rc::new(SimDriver::with_disk(21, Config::default(), created(21)));
+    let cluster = started(&driver, 2);
+    let nodes = cluster.nodes.clone();
+    cluster.run(async move {
+        ready(&nodes).await;
+        configure(&nodes, vec![tenant(KEYLESS, 1, State::Active)]).await;
+        wait_for(&nodes, KEYLESS, 1, State::Active).await;
+        let lists = nodes[0].suppressions();
+        let address = "a@example.org";
+        assert_eq!(
+            lists.check(KEYLESS, 1, &[address]).await,
+            Err(Refusal::Keys)
+        );
+        assert_eq!(
+            lists.add(KEYLESS, address, Reason::Manual, None).await,
+            Err(Refusal::Keys)
+        );
+        assert_eq!(lists.get(KEYLESS, address).await, Err(Refusal::Keys));
+        assert_eq!(lists.remove(KEYLESS, address).await, Err(Refusal::Keys));
+        assert_eq!(
+            nodes[0].request_shard(KEYLESS, b"key").await,
+            Err(Refusal::Keys)
+        );
+        assert_eq!(
+            nodes[0].begin(KEYLESS, b"key", [1; 16]).await.err(),
+            Some(Refusal::Keys)
+        );
+        let mut draft = nodes[0].draft(KEYLESS, None).expect("draft");
+        assert_eq!(
+            nodes[0].recipient(&mut draft, address).await,
+            Err(Refusal::Keys)
+        );
+        assert!(Refusal::Keys.temporary());
     });
     cluster.stop();
 }
@@ -548,7 +587,7 @@ fn listing(case: u64, cores: u16) {
                 let page = lists.list(1, after, size).await.expect("list");
                 assert!(page.listed.len() <= size);
                 for listed in &page.listed {
-                    let hash = lists.hash(1, &listed.address).expect("hash");
+                    let hash = lists.hash(1, 1, &listed.address).await.expect("hash");
                     hashes.push(hash);
                     assert_eq!(listed.suppression.reason, Reason::Manual);
                 }
@@ -647,8 +686,8 @@ fn message(id: MessageId, draft: &Draft) -> Message {
     }
 }
 
-fn owner<'a>(nodes: &'a [Node<Idle>], tenant: u32, key: &[u8]) -> (&'a Node<Idle>, u16) {
-    let shard = nodes[0].request_shard(tenant, key);
+async fn owner<'a>(nodes: &'a [Node<Idle>], tenant: u32, key: &[u8]) -> (&'a Node<Idle>, u16) {
+    let shard = nodes[0].request_shard(tenant, key).await.expect("shard");
     let core = usize::from(shard) % nodes.len();
     (&nodes[core], shard)
 }
@@ -690,7 +729,7 @@ fn a_retry_gets_the_first_answer_and_another_request_is_refused() {
     cluster.run(async move {
         ready(&nodes).await;
         let key = b"order-1".as_slice();
-        let (node, shard) = owner(&nodes, 1, key);
+        let (node, shard) = owner(&nodes, 1, key).await;
         let ticket = fresh(node, 1, key, [1; 16]).await;
         let id = accept(node, ticket, shard, "a@example.org").await;
         assert_eq!(replayed(node, 1, key, [1; 16]).await, vec![id]);
@@ -698,9 +737,9 @@ fn a_retry_gets_the_first_answer_and_another_request_is_refused() {
             node.begin(1, key, [2; 16]).await.err(),
             Some(Refusal::Conflict)
         );
-        let (other, _) = owner(&nodes, 2, key);
+        let (other, _) = owner(&nodes, 2, key).await;
         drop(fresh(other, 2, key, [1; 16]).await);
-        let (elsewhere, _) = owner(&nodes, 1, b"order-2");
+        let (elsewhere, _) = owner(&nodes, 1, b"order-2").await;
         let wrong = nodes
             .iter()
             .find(|n| !std::ptr::eq(*n, elsewhere))
@@ -709,7 +748,7 @@ fn a_retry_gets_the_first_answer_and_another_request_is_refused() {
             wrong.begin(1, b"order-2", [1; 16]).await.err(),
             Some(Refusal::Message)
         );
-        let (node, shard) = owner(&nodes, 1, b"order-3");
+        let (node, shard) = owner(&nodes, 1, b"order-3").await;
         let ticket = fresh(node, 1, b"order-3", [3; 16]).await;
         let mut draft = node.draft(1, None).expect("draft");
         node.recipient(&mut draft, "b@example.org")
@@ -737,7 +776,7 @@ fn concurrent_requests_with_one_key_are_accepted_once() {
     cluster.run(async move {
         ready(&nodes).await;
         let key = b"same".as_slice();
-        let (node, shard) = owner(&nodes, 1, key);
+        let (node, shard) = owner(&nodes, 1, key).await;
         let first = fresh(node, 1, key, [5; 16]).await;
         let waiters: Vec<_> = (0..3)
             .map(|_| {
@@ -760,9 +799,10 @@ fn concurrent_requests_with_one_key_are_accepted_once() {
             }
         }
 
+        let racer = owner(&nodes, 1, b"race").await.0.clone();
         let racers: Vec<_> = (0..3)
             .map(|n| {
-                let node = owner(&nodes, 1, b"race").0.clone();
+                let node = racer.clone();
                 spawn(async move {
                     match node.begin(1, b"race", [2; 16]).await {
                         Ok(Begun::Fresh(ticket)) => {
@@ -784,7 +824,7 @@ fn concurrent_requests_with_one_key_are_accepted_once() {
         assert!(answers.iter().all(|(_, ids)| *ids == answers[0].1));
 
         let key = b"failing".as_slice();
-        let (node, shard) = owner(&nodes, 1, key);
+        let (node, shard) = owner(&nodes, 1, key).await;
         let first = fresh(node, 1, key, [7; 16]).await;
         let waiter = {
             let node = node.clone();
@@ -822,7 +862,7 @@ fn records_last_a_day_and_old_days_are_dropped() {
         let early = b"early".as_slice();
         let late = b"late".as_slice();
         at_day_offset(1_000).await;
-        let (node, shard) = owner(&nodes, 1, early);
+        let (node, shard) = owner(&nodes, 1, early).await;
         let first = accept(
             node,
             fresh(node, 1, early, [8; 16]).await,
@@ -841,7 +881,7 @@ fn records_last_a_day_and_old_days_are_dropped() {
         sleep(Duration::from_millis(DAY / 2)).await;
         assert_eq!(replayed(node, 1, early, [8; 16]).await, vec![first]);
         at_day_offset(DAY - 1_800_000).await;
-        let (late_node, late_shard) = owner(&nodes, 1, late);
+        let (late_node, late_shard) = owner(&nodes, 1, late).await;
         let ticket = fresh(late_node, 1, late, [3; 16]).await;
         let second = accept(late_node, ticket, late_shard, "g@example.org").await;
         at_day_offset(60_000).await;
@@ -876,11 +916,23 @@ fn a_new_generation_forgets_old_requests() {
     cluster.run(async move {
         ready(&nodes).await;
         let key = b"gen".as_slice();
-        let (node, shard) = owner(&nodes, 1, key);
+        let (node, shard) = owner(&nodes, 1, key).await;
         let ticket = fresh(node, 1, key, [4; 16]).await;
         accept(node, ticket, shard, "f@example.org").await;
+        let stale = fresh(node, 1, b"stale", [5; 16]).await;
         configure(&nodes, vec![tenant(1, 2, State::Active)]).await;
         wait_for(&nodes, 1, 2, State::Active).await;
+        let mut draft = node.draft(1, None).expect("draft");
+        node.recipient(&mut draft, "s@example.org")
+            .await
+            .expect("recipient");
+        let id = node.spool().id(stale.shard()).await.expect("id");
+        let built = message(id, &draft);
+        assert_eq!(
+            node.accept_once(stale, draft, built).await,
+            Err(Refusal::Message)
+        );
+        let (node, _) = owner(&nodes, 1, key).await;
         drop(fresh(node, 1, key, [4; 16]).await);
         configure(&nodes, vec![tenant(1, 2, State::Suspended)]).await;
         wait_for(&nodes, 1, 2, State::Suspended).await;
@@ -903,7 +955,7 @@ fn accepted_requests_survive_a_crash_with_the_same_answer() {
         let mut answers = Vec::new();
         for n in 0..12u8 {
             let key = vec![b'k', n];
-            let (node, shard) = owner(&nodes, 1, &key);
+            let (node, shard) = owner(&nodes, 1, &key).await;
             let ticket = fresh(node, 1, &key, [n; 16]).await;
             let id = accept(node, ticket, shard, &format!("r{n}@example.org")).await;
             answers.push((key, id));
@@ -920,7 +972,7 @@ fn accepted_requests_survive_a_crash_with_the_same_answer() {
     restarted.run(async move {
         wait_for(&nodes, 1, 1, State::Active).await;
         for (n, (key, id)) in (0u8..).zip(&answers) {
-            let (node, _) = owner(&nodes, 1, key);
+            let (node, _) = owner(&nodes, 1, key).await;
             assert_eq!(replayed(node, 1, key, [n; 16]).await, vec![*id]);
             assert_eq!(
                 node.begin(1, key, [n + 100; 16]).await.err(),
@@ -996,7 +1048,7 @@ async fn change_list(node: &Node<Idle>, model: &Shared, driver: &SimDriver, work
     let slot = (tenant, address.clone());
     let lists = node.suppressions();
     if driver.random().is_multiple_of(5) {
-        let checked = lists.check(tenant, &[address.as_str()]).await;
+        let checked = lists.check(tenant, 1, &[address.as_str()]).await;
         let want = model.borrow().lists.get(&slot).copied();
         match (want, checked) {
             (Some(Want::Present(_)), Ok(found)) => assert_eq!(found, vec![true], "{address}"),
@@ -1027,7 +1079,7 @@ async fn request(nodes: &[Node<Idle>], model: &Shared, driver: &SimDriver) {
     let right = digest(&key);
     let honest = !driver.random().is_multiple_of(8);
     let digest = if honest { right } else { [0xee; 16] };
-    let (node, shard) = owner(nodes, 1, &key);
+    let (node, shard) = owner(nodes, 1, &key).await;
     let begun = node.begin(1, &key, digest).await;
     let known = model.borrow().accepted.get(&key).cloned();
     let ticket = match begun {
@@ -1136,7 +1188,7 @@ async fn verify_model(nodes: &[Node<Idle>], model: &Shared) {
         }
     }
     for (key, ids) in accepted {
-        let (node, _) = owner(nodes, 1, &key);
+        let (node, _) = owner(nodes, 1, &key).await;
         assert_eq!(replayed(node, 1, &key, digest(&key)).await, ids);
     }
 }

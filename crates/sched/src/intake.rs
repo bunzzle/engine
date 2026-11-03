@@ -92,7 +92,12 @@ impl<T: Transport + 'static> Node<T> {
         let valid: Vec<&str> = domains.iter().map(|(_, address, _)| *address).collect();
         let checked = match self.current(draft) {
             Ok(()) if valid.is_empty() => Ok(Vec::new()),
-            Ok(()) => self.inner.suppressions.check(draft.tenant, &valid).await,
+            Ok(()) => {
+                self.inner
+                    .suppressions
+                    .check(draft.tenant, draft.generation, &valid)
+                    .await
+            }
             Err(refusal) => Err(refusal),
         };
         let suppressed = match checked {
@@ -144,8 +149,8 @@ impl<T: Transport + 'static> Node<T> {
         self.accepted(draft, message, None).await
     }
 
-    pub fn request_shard(&self, tenant: u32, key: &[u8]) -> u16 {
-        self.inner.requests.shard(tenant, key)
+    pub async fn request_shard(&self, tenant: u32, key: &[u8]) -> Result<u16, Refusal> {
+        self.inner.requests.shard(tenant, key).await
     }
 
     pub async fn begin(&self, tenant: u32, key: &[u8], digest: Hash) -> Result<Begun, Refusal> {
@@ -158,7 +163,10 @@ impl<T: Transport + 'static> Node<T> {
         draft: Draft,
         message: Message,
     ) -> Result<(), Refusal> {
-        if ticket.tenant() != draft.tenant || message.id.shard != ticket.shard() {
+        if ticket.tenant() != draft.tenant
+            || ticket.generation() != draft.generation
+            || message.id.shard != ticket.shard()
+        {
             return Err(Refusal::Message);
         }
         let record = self
