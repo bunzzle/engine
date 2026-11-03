@@ -7,6 +7,7 @@ mod node;
 mod normal;
 mod policy;
 mod requests;
+mod sealing;
 mod start;
 mod suppress;
 mod transport;
@@ -25,6 +26,9 @@ pub use policy::{
 pub use requests::{
     Begun, DAY, INLINE_IDS, KIND_REQUEST, REQUEST_SHAPE, RequestInputs, Requests, Ticket,
     retain_request,
+};
+pub use sealing::{
+    Batched, Keys, LABEL_BODY, LABEL_HEAD, LABEL_SLICE, Opener, Sealing, Unsealable, Unwrapped,
 };
 pub use start::{CONTROL_SHARD, Links, Meshes, Node, Parts, Running, Settings};
 pub use suppress::{

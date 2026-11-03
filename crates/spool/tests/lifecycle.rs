@@ -117,6 +117,7 @@ async fn accept(
                 ..HeadClear::default()
             },
             expiry: 1000 + step,
+            wrap: [3; spool::WRAP],
             sealed: vec![1; 64],
         },
         body: Body::Inline(vec![2; 300]),

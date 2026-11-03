@@ -59,6 +59,11 @@ impl<K: Copy + Eq + Hash, V: Clone> Cache<K, V> {
         }
     }
 
+    pub fn peek(&self, key: &K) -> Option<&V> {
+        let at = *self.index.get(key)?;
+        self.slots[at].as_ref().map(|slot| &slot.value)
+    }
+
     pub fn put(&mut self, key: K, value: V) {
         if let Some(&at) = self.index.get(&key) {
             if let Some(slot) = self.slots[at].as_mut() {

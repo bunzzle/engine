@@ -1,4 +1,5 @@
 mod audit;
+mod batch;
 mod cache;
 mod client;
 mod clock;
@@ -12,6 +13,7 @@ mod state;
 mod vault;
 
 pub use audit::{Audit, Op};
+pub use batch::{Batch, BatchSettings, BatchStats, Batches};
 pub use cache::{Cache, CacheStats};
 pub use client::Client;
 pub use clock::{Clock, MIN_GAP, Step};

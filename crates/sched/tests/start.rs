@@ -11,12 +11,13 @@ use control::{
     Created, KeyError, KeySource, Limits as TenantLimits, Name, Naming, Object, Pool, Ready, State,
     Tenant,
 };
-use crypto::{Secret, Tenant as Root, TenantKeys};
+use crypto::{BatchKey, Secret, Tenant as Root, TenantKeys, Wrap, day_public, open_batch};
+use keys::{BatchSettings, Batches, Working};
 use rt::sim::{Config, Disk, Faults, Machine, SimDriver, Stalls, check};
 use rt::{JoinHandle, Runtime, sleep, spawn, timeout};
 use sched::{
-    Answer, Answered, Attempt, Clock, Draft, Kind, Limits, Meshes, Node, Parts, Reason, Refusal,
-    Running, Settings, Transport,
+    Answer, Answered, Attempt, Batched, Clock, Draft, Keys, Kind, Limits, Meshes, Node, Parts,
+    Reason, Refusal, Running, Settings, Transport, Unsealable, Unwrapped,
 };
 use spool::{Body, Head, HeadClear, Message, MessageId, SLICE, Slice};
 use store::{Client, DataFile, Options, SLOT_SIZE, Setup, boot};
@@ -124,7 +125,17 @@ fn pool(id: u32) -> Object {
     })
 }
 
-struct Toy;
+struct Toy {
+    batches: RefCell<Batches>,
+}
+
+impl Default for Toy {
+    fn default() -> Self {
+        Self {
+            batches: RefCell::new(Batches::new(BatchSettings::default())),
+        }
+    }
+}
 
 impl KeySource for Toy {
     fn get(&self, tenant: u32, generation: u32) -> Option<TenantKeys> {
@@ -142,6 +153,56 @@ impl KeySource for Toy {
         Box::pin(std::future::ready(
             self.get(tenant, generation).ok_or(KeyError::Unknown),
         ))
+    }
+}
+
+const TOY_DAY: u32 = 20_000;
+
+fn toy_day_secret(tenant: u32, day: u32) -> Secret<32> {
+    let mut bytes = [9; 32];
+    bytes[..4].copy_from_slice(&tenant.to_le_bytes());
+    bytes[4..8].copy_from_slice(&day.to_le_bytes());
+    Secret::new(bytes)
+}
+
+impl Keys for Toy {
+    fn batch(&self, tenant: u32, generation: u32, shard: u16, first: u64) -> Batched<'_> {
+        let batch = match self.get(tenant, generation) {
+            Some(keys) => {
+                let public = |day| day_public(&toy_day_secret(tenant, day)).expect("public");
+                let working = Working {
+                    keys,
+                    day: TOY_DAY,
+                    oldest: TOY_DAY,
+                    today: public(TOY_DAY),
+                    tomorrow: public(TOY_DAY + 1),
+                };
+                self.batches
+                    .borrow_mut()
+                    .seal(&working, shard, first, rt::now())
+                    .map_err(|_| KeyError::Unavailable)
+            }
+            None => Err(KeyError::Unavailable),
+        };
+        Box::pin(std::future::ready(batch))
+    }
+
+    fn batch_key(
+        &self,
+        tenant: u32,
+        generation: u32,
+        shard: u16,
+        id: u64,
+        wrap: Wrap,
+    ) -> Unwrapped<'_> {
+        let key = if (wrap.generation, wrap.shard) == (generation, shard) {
+            open_batch(&toy_day_secret(tenant, wrap.day), tenant, id, &wrap)
+                .map(|secret| Rc::new(BatchKey::new(&secret)))
+                .map_err(|_| Unsealable::Bad)
+        } else {
+            Err(Unsealable::Bad)
+        };
+        Box::pin(std::future::ready(key))
     }
 }
 
@@ -347,6 +408,7 @@ fn message(id: MessageId, draft: &Draft, now: u64) -> Message {
                 ..HeadClear::default()
             },
             expiry: u64::MAX / 2,
+            wrap: [3; spool::WRAP],
             sealed: vec![1; 64],
         },
         body: Body::Inline(vec![2; 300]),
@@ -595,7 +657,7 @@ fn start(
                 .ok()?;
             let shards = core.shards.clone();
             let parts = Parts {
-                keys: Rc::new(Toy),
+                keys: Rc::new(Toy::default()),
                 transport,
                 clock: Clock::start(),
             };

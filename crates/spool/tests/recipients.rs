@@ -82,6 +82,7 @@ impl Node {
                     ..HeadClear::default()
                 },
                 expiry,
+                wrap: [3; spool::WRAP],
                 sealed: vec![1; 50],
             },
             body: Body::Inline(vec![3; 10]),

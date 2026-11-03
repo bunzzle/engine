@@ -34,6 +34,7 @@ fn head(recipients: usize) -> Head {
             ..HeadClear::default()
         },
         expiry: 9,
+        wrap: [3; spool::WRAP],
         sealed: vec![1; 100],
     }
 }
@@ -136,6 +137,12 @@ fn intake_refuses_messages_over_the_limits() {
         let mut header = message(id, &[3]);
         header.head.sealed = vec![1; MAX_PAYLOAD];
         refused(intake.accept(vec![header]).await, "header");
+        let mut edge = message(id, &[3]);
+        edge.head.sealed = vec![1; MAX_PAYLOAD - INDEX_SIZE - spool::HEAD_CLEAR];
+        refused(intake.accept(vec![edge]).await, "header");
+        let mut edge = message(id, &[3]);
+        edge.head.sealed = vec![1; MAX_PAYLOAD - INDEX_SIZE - spool::HEAD_CLEAR - spool::WRAP + 1];
+        refused(intake.accept(vec![edge]).await, "header");
         let mut inline = message(id, &[3]);
         inline.body = Body::Inline(vec![3; 1025]);
         refused(intake.accept(vec![inline]).await, "inline body");

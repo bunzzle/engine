@@ -1,15 +1,29 @@
+use std::cell::RefCell;
+use std::rc::Rc;
+
 use control::{Created, KeyError, KeySource, Ready};
-use crypto::TenantKeys;
-use keys::{Fault, Ring};
+use crypto::{BatchKey, TenantKeys, Wrap};
+use keys::{BatchSettings, BatchStats, Batches, Fault, Ring};
+
+use crate::sealing::{Batched, Keys, Unsealable, Unwrapped};
 
 pub struct Keyring {
     ring: Ring,
     retention: u16,
+    batches: RefCell<Batches>,
 }
 
 impl Keyring {
-    pub fn new(ring: Ring, retention: u16) -> Self {
-        Self { ring, retention }
+    pub fn new(ring: Ring, retention: u16, batches: BatchSettings) -> Self {
+        Self {
+            ring,
+            retention,
+            batches: RefCell::new(Batches::new(batches)),
+        }
+    }
+
+    pub fn batch_stats(&self) -> BatchStats {
+        self.batches.borrow().stats()
     }
 
     pub fn ring(&self) -> &Ring {
@@ -19,10 +33,20 @@ impl Keyring {
 
 fn key_error(fault: Fault) -> KeyError {
     match fault {
-        Fault::Unknown => KeyError::Unknown,
+        Fault::Unknown | Fault::Gone => KeyError::Unknown,
         Fault::Unavailable => KeyError::Unavailable,
-        Fault::Failed => KeyError::Failed,
+        Fault::Failed | Fault::Bad => KeyError::Failed,
         Fault::Conflict => KeyError::Conflict,
+    }
+}
+
+fn unsealable(fault: Fault) -> Unsealable {
+    match fault {
+        Fault::Unavailable => Unsealable::Unavailable,
+        Fault::Gone => Unsealable::Gone,
+        Fault::Unknown | Fault::Conflict => Unsealable::Unknown,
+        Fault::Bad => Unsealable::Bad,
+        Fault::Failed => Unsealable::Failed,
     }
 }
 
@@ -49,6 +73,53 @@ impl KeySource for Keyring {
                 .create(tenant, generation, self.retention)
                 .await
                 .map_err(key_error)
+        })
+    }
+}
+
+impl Keys for Keyring {
+    fn batch(&self, tenant: u32, generation: u32, shard: u16, first: u64) -> Batched<'_> {
+        Box::pin(async move {
+            let working = self
+                .ring
+                .open(tenant, generation)
+                .await
+                .map_err(key_error)?;
+            self.batches
+                .borrow_mut()
+                .seal(&working, shard, first, rt::now())
+                .map_err(|_| KeyError::Unavailable)
+        })
+    }
+
+    fn batch_key(
+        &self,
+        tenant: u32,
+        generation: u32,
+        shard: u16,
+        id: u64,
+        wrap: Wrap,
+    ) -> Unwrapped<'_> {
+        Box::pin(async move {
+            if let Some(key) = self
+                .batches
+                .borrow_mut()
+                .cached(tenant, generation, shard, id)
+            {
+                return Ok(key);
+            }
+            let secret = self
+                .ring
+                .unwrap(tenant, generation, shard, id, &wrap)
+                .await
+                .map_err(unsealable)?;
+            let mut batches = self.batches.borrow_mut();
+            if let Some(key) = batches.cached(tenant, generation, shard, id) {
+                return Ok(key);
+            }
+            let key = Rc::new(BatchKey::new(&secret));
+            batches.remember(tenant, generation, shard, id, Rc::clone(&key));
+            Ok(key)
         })
     }
 }

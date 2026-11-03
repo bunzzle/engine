@@ -4,9 +4,12 @@ use std::path::Path;
 use std::rc::Rc;
 use std::time::Duration;
 
-use crypto::{Plain, Secret};
+use crypto::{BatchKey, Plain, Secret, Wrap, seal_batch};
 use keys::proto::{Answer, Frames, Request};
-use keys::{Audit, Client, Connect, Error, Fault, Ring, RingSettings, Server, Settings, Vault};
+use keys::{
+    Audit, BatchSettings, Batches, Client, Connect, Error, Fault, Ring, RingSettings, Server,
+    Settings, Vault,
+};
 use rt::sim::{Config, SimDriver};
 use rt::{Buf, Runtime, TcpListener, TcpStream, sleep, spawn};
 
@@ -209,6 +212,82 @@ fn create_sets_retention_adopts_a_retry_and_refuses_another_generation() {
             let text = String::from_utf8(audit.to_vec()).expect("text");
             assert_eq!(text.matches(" retention 4 1 ").count(), 2, "{text}");
         }
+    });
+}
+
+#[test]
+fn unwrap_answers_once_per_batch_and_maps_refusals() {
+    let driver = Rc::new(SimDriver::new(9, quiet()));
+    run(&driver, async {
+        let _server = serve("/a", 1).await;
+        let ring = Ring::new(hosts(&[1]).0, settings());
+        ring.create(4, 1, 30).await.expect("create");
+        let working = ring.open(4, 1).await.expect("open");
+        let mut batches = Batches::new(BatchSettings::default());
+        let batch = batches.seal(&working, 2, 77, rt::now()).expect("seal");
+        let wrap = Wrap::decode(&batch.wrap).expect("wrap");
+        let mut tasks = Vec::new();
+        for _ in 0..10 {
+            let ring = ring.clone();
+            let wrap = wrap.clone();
+            tasks.push(spawn(async move { ring.unwrap(4, 1, 2, 77, &wrap).await }));
+        }
+        let message = [7; 16];
+        let aad = crypto::aad(4, 1, &message, 0, 1);
+        let sealed = batch.key.record(&message, 0, 1).seal_one(&aad, b"mail");
+        for task in tasks {
+            let key = BatchKey::new(&task.await.expect("unwrap"));
+            let opened = key.record(&message, 0, 1).open_one(&aad, &sealed);
+            assert_eq!(opened.expect("open"), b"mail");
+        }
+        assert_eq!(ring.stats().unwraps, 1);
+        let ninety = batches.seal(&working, 3, 90, rt::now()).expect("seal");
+        let ninety = Wrap::decode(&ninety.wrap).expect("wrap");
+        let mut tampered = ninety.clone();
+        tampered.enc[0] ^= 1;
+        let joined = {
+            let ring = ring.clone();
+            let wrap = ninety.clone();
+            spawn(async move { ring.unwrap(4, 1, 3, 90, &wrap).await })
+        };
+        while ring.stats().unwraps < 2 {
+            rt::yield_now().await;
+        }
+        let other = {
+            let ring = ring.clone();
+            let wrap = ninety.clone();
+            spawn(async move { ring.unwrap(5, 1, 3, 90, &wrap).await })
+        };
+        assert_eq!(
+            ring.unwrap(4, 1, 3, 90, &tampered).await.err(),
+            Some(Fault::Bad)
+        );
+        assert!(joined.await.is_ok());
+        assert_eq!(other.await.err(), Some(Fault::Unknown));
+        assert_eq!(
+            ring.unwrap(4, 2, 2, 77, &wrap).await.err(),
+            Some(Fault::Bad)
+        );
+        assert_eq!(
+            ring.unwrap(4, 1, 3, 77, &wrap).await.err(),
+            Some(Fault::Bad)
+        );
+        assert_eq!(ring.stats().unwraps, 3);
+        assert_eq!(
+            ring.unwrap(4, 1, 2, 78, &wrap).await.err(),
+            Some(Fault::Bad)
+        );
+        assert_eq!(
+            ring.unwrap(9, 1, 2, 77, &wrap).await.err(),
+            Some(Fault::Unknown)
+        );
+        let old =
+            seal_batch(&working.today, 4, 1, DAY - 5, 2, 80, &Secret::new([3; 32])).expect("wrap");
+        assert_eq!(
+            ring.unwrap(4, 1, 2, 80, &old).await.err(),
+            Some(Fault::Gone)
+        );
+        assert_eq!(ring.stats().gone, 1);
     });
 }
 

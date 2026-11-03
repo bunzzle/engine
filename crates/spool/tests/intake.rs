@@ -125,12 +125,14 @@ async fn draft(intake: &Spool, shard: u16, step: u64) -> Result<(Message, Accept
             batch_key: seed % 5,
             recipients: u32::try_from(slices.iter().map(|s| s.queues.len()).sum::<usize>())
                 .expect("fits"),
+            day: u32::try_from(seed % 30_000).expect("fits"),
             body_size: seed % 100_000,
             accepted: step,
             not_before: step + 1,
             priority: u8::try_from(step % 3).expect("fits"),
         },
         expiry: 1000 + step,
+        wrap: bytes(seed ^ 1, spool::WRAP).try_into().expect("wrap size"),
         sealed: bytes(seed, 200 + usize::try_from(seed % 300).expect("fits")),
     };
     let (body, expected) = if step.is_multiple_of(3) {
@@ -368,7 +370,12 @@ async fn verify(file: &CoreFile, keeper: &Keeper, model: &Model) {
         assert_eq!(head.tenant, message.tenant);
         assert_eq!(HeadClear::decode(&head.clear), Some(message.head.clear));
         assert_eq!(head.delivery.due, message.head.expiry);
-        assert_eq!(read(file, head.location, 7).await, message.head.sealed);
+        let region = read(file, head.location, 7).await;
+        let (wrap, sealed) = spool::head_parts(&region).expect("wrap");
+        assert_eq!(
+            (wrap, sealed),
+            (&message.head.wrap, message.head.sealed.as_slice())
+        );
         let body = state.get(store::Key::new(key, BODY_ITEM)).expect("body");
         let found = if body.bodies.is_empty() {
             Expected::Inline(read(file, body.location, 7).await)

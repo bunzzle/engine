@@ -13,6 +13,7 @@ use crate::clock::Clock;
 use crate::error::Error;
 use crate::node::{Config, Note, Sched};
 use crate::requests::{KIND_REQUEST, RequestInputs, Requests, retain_request};
+use crate::sealing::Keys;
 use crate::suppress::{self, Inputs, KIND_SUPPRESS, Suppressions};
 use crate::transport::Transport;
 
@@ -70,14 +71,14 @@ pub struct Settings {
 }
 
 pub struct Parts<T> {
-    pub keys: Rc<dyn KeySource>,
+    pub keys: Rc<dyn Keys>,
     pub transport: T,
     pub clock: Clock,
 }
 
 pub(crate) struct Inner<T> {
     pub(crate) settings: Settings,
-    keys: Rc<dyn KeySource>,
+    keys: Rc<dyn Keys>,
     cores: u16,
     pub(crate) spool: spool::Spool,
     pub(crate) sched: Sched<T>,
@@ -134,7 +135,7 @@ impl<T: Transport + 'static> Node<T> {
             None
         };
         let check = naming(control.as_ref().map(|(loaded, _)| loaded), &settings)?;
-        let loaded = Queues::load(&core, settings.naming, parts.keys.as_ref()).await?;
+        let loaded = Queues::load(&core, settings.naming, &*parts.keys).await?;
         let table = Rc::new(RefCell::new(Table::default()));
         let clock = parts.clock;
         retain_current(&mut core, &table, clock);
@@ -162,7 +163,7 @@ impl<T: Transport + 'static> Node<T> {
         };
 
         let inputs = Inputs {
-            keys: Rc::clone(&parts.keys),
+            keys: Rc::clone(&parts.keys) as Rc<dyn KeySource>,
             changes: changes.clone(),
             table: Rc::clone(&table),
             clock,
@@ -171,8 +172,11 @@ impl<T: Transport + 'static> Node<T> {
         };
         let (suppressions, requests, mut index_done) =
             index_services(links.suppress, inputs).await?;
-        let (queues, names_done) =
-            loaded.start(links.names, changes.clone(), Rc::clone(&parts.keys));
+        let (queues, names_done) = loaded.start(
+            links.names,
+            changes.clone(),
+            Rc::clone(&parts.keys) as Rc<dyn KeySource>,
+        );
 
         let (leases, leases_done) =
             start_leases(links.leases, &table, &spool, settings.naming.shards);
@@ -233,6 +237,10 @@ impl<T: Transport + 'static> Node<T> {
 impl<T: Transport + 'static> Node<T> {
     pub fn spool(&self) -> &spool::Spool {
         &self.inner.spool
+    }
+
+    pub(crate) fn keys(&self) -> &dyn Keys {
+        &*self.inner.keys
     }
 
     pub fn sched(&self) -> &Sched<T> {
