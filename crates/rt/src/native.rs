@@ -86,13 +86,16 @@ fn blocked(e: &io::Error) -> bool {
 }
 
 fn open(path: &Path, options: &OpenOptions) -> io::Result<fs::File> {
-    fs::OpenOptions::new()
-        .read(options.read)
+    let mut open = fs::OpenOptions::new();
+    open.read(options.read)
         .write(options.write)
         .create(options.create)
         .create_new(options.create_new)
-        .truncate(options.truncate)
-        .open(path)
+        .truncate(options.truncate);
+    if let Some(mode) = options.mode {
+        std::os::unix::fs::OpenOptionsExt::mode(&mut open, mode);
+    }
+    open.open(path)
 }
 
 impl Native {
@@ -198,6 +201,7 @@ impl State {
             | Op::WriteAt { .. }
             | Op::SyncData { .. }
             | Op::SyncDir { .. }
+            | Op::Rename { .. }
             | Op::Allocate { .. }
             | Op::Stat { .. } => Ok(self.run_file(poller, op)),
             op => self.run_net(poller, op),
@@ -237,6 +241,7 @@ impl State {
             Op::SyncDir { path } => {
                 Completion::Unit(fs::File::open(path).and_then(|d| sys::fs::full_sync(&d)))
             }
+            Op::Rename { from, to } => Completion::Unit(fs::rename(from, to)),
             Op::Allocate { handle, len } => {
                 Completion::Unit(self.file(handle).and_then(|f| sys::fs::allocate(f, len)))
             }

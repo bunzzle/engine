@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use rt::sim::{Config, Disk, Faults, SimDriver, check};
 use rt::{
-    Buf, File, OpenOptions, Runtime, TcpListener, TcpStream, UdpSocket, now, sleep, spawn,
+    Buf, File, OpenOptions, Runtime, TcpListener, TcpStream, UdpSocket, now, rename, sleep, spawn,
     sync_dir, timeout, wall_ms,
 };
 
@@ -157,6 +157,46 @@ fn new_files_need_a_directory_sync_to_survive() {
     assert!(!driver.crash().exists(Path::new("/dir/new")));
     run(&driver, async { sync_dir("/dir").await.expect("sync dir") });
     assert!(driver.crash().exists(Path::new("/dir/new")));
+}
+
+async fn replace(sync: bool) {
+    write_file("/dir/old", b"old", true).await;
+    sync_dir("/dir").await.expect("sync dir");
+    let file = File::open("/dir/temp", &create()).await.expect("open");
+    let (written, _) = file.write_all_at(Buf::from_slice(b"new"), 0).await;
+    written.expect("write");
+    file.sync_data().await.expect("sync");
+    rename("/dir/temp", "/dir/old").await.expect("rename");
+    if sync {
+        sync_dir("/dir").await.expect("sync dir");
+    }
+}
+
+#[test]
+fn a_rename_is_old_or_new_after_a_crash() {
+    let mut seen = Vec::new();
+    for seed in 0..40 {
+        let driver = Rc::new(SimDriver::new(seed, faults(|f| f.crash_keep = 0)));
+        run(&driver, replace(false));
+        let disk = driver.crash();
+        let contents = disk.contents(Path::new("/dir/old")).map(<[u8]>::to_vec);
+        assert!(!disk.exists(Path::new("/dir/temp")));
+        assert!(contents == Some(b"old".to_vec()) || contents == Some(b"new".to_vec()));
+        seen.push(contents);
+    }
+    assert!(seen.contains(&Some(b"old".to_vec())));
+    assert!(seen.contains(&Some(b"new".to_vec())));
+}
+
+#[test]
+fn a_rename_survives_once_the_directory_is_synced() {
+    check(0..20, |seed| {
+        let driver = Rc::new(SimDriver::new(seed, faults(|f| f.crash_keep = 0)));
+        run(&driver, replace(true));
+        let disk = driver.crash();
+        assert_eq!(disk.contents(Path::new("/dir/old")), Some(&b"new"[..]));
+        assert!(!disk.exists(Path::new("/dir/temp")));
+    });
 }
 
 #[test]

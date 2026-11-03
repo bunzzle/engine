@@ -15,11 +15,21 @@ struct FileData {
     durable: Vec<u8>,
     dirty: BTreeSet<u64>,
     durable_exists: bool,
+    mode: Option<u32>,
+}
+
+#[derive(Clone, Debug)]
+struct Rename {
+    from: PathBuf,
+    to: PathBuf,
+    replaced: Option<FileData>,
+    moved_existed: bool,
 }
 
 #[derive(Clone, Debug)]
 pub struct Disk {
     files: BTreeMap<PathBuf, FileData>,
+    renames: Vec<Rename>,
     sector_size: u64,
 }
 
@@ -44,6 +54,7 @@ impl Disk {
     pub fn new(sector_size: u32) -> Self {
         Self {
             files: BTreeMap::new(),
+            renames: Vec::new(),
             sector_size: u64::from(sector_size),
         }
     }
@@ -60,8 +71,20 @@ impl Disk {
         self.files.contains_key(path)
     }
 
+    pub fn mode(&self, path: &Path) -> Option<u32> {
+        self.files.get(path).and_then(|file| file.mode)
+    }
+
     pub fn contents(&self, path: &Path) -> Option<&[u8]> {
         self.files.get(path).map(|file| file.current.as_slice())
+    }
+
+    pub fn put(&mut self, path: &Path, data: &[u8]) {
+        let file = self.files.entry(path.to_path_buf()).or_default();
+        file.current = data.to_vec();
+        file.durable = data.to_vec();
+        file.dirty.clear();
+        file.durable_exists = true;
     }
 
     pub(super) fn open(&mut self, path: &Path, options: &OpenOptions) -> io::Result<()> {
@@ -70,11 +93,17 @@ impl Disk {
             Some(file) => {
                 if options.truncate {
                     file.current.clear();
+                    file.durable.clear();
+                    file.dirty.clear();
                 }
                 Ok(())
             }
             None if options.create || options.create_new => {
-                self.files.insert(path.to_path_buf(), FileData::default());
+                let file = FileData {
+                    mode: options.mode,
+                    ..FileData::default()
+                };
+                self.files.insert(path.to_path_buf(), file);
                 Ok(())
             }
             None => Err(io::ErrorKind::NotFound.into()),
@@ -167,16 +196,44 @@ impl Disk {
         Ok(())
     }
 
+    pub(super) fn rename(&mut self, from: &Path, to: &Path) -> io::Result<()> {
+        let file = self.files.remove(from).ok_or(io::ErrorKind::NotFound)?;
+        let moved_existed = file.durable_exists;
+        let replaced = self.files.insert(to.to_path_buf(), file);
+        self.renames.push(Rename {
+            from: from.to_path_buf(),
+            to: to.to_path_buf(),
+            replaced,
+            moved_existed,
+        });
+        Ok(())
+    }
+
     pub(super) fn sync_dir(&mut self, dir: &Path) {
         for (path, file) in &mut self.files {
             if path.parent() == Some(dir) {
                 file.durable_exists = true;
             }
         }
+        self.renames
+            .retain(|rename| rename.to.parent() != Some(dir) && rename.from.parent() != Some(dir));
     }
 
     pub(super) fn crash(&mut self, rng: &mut Rng, faults: &Faults) {
         let sector_size = self.sector_size;
+        for rename in std::mem::take(&mut self.renames).into_iter().rev() {
+            if rng.chance(MILLION / 2) {
+                if let Some(mut moved) = self.files.remove(&rename.to) {
+                    moved.durable_exists = rename.moved_existed;
+                    self.files.insert(rename.from, moved);
+                }
+                if let Some(replaced) = rename.replaced {
+                    self.files.insert(rename.to, replaced);
+                }
+            } else if let Some(moved) = self.files.get_mut(&rename.to) {
+                moved.durable_exists = true;
+            }
+        }
         self.files.retain(|_, file| file.durable_exists);
         for file in self.files.values_mut() {
             for sector in std::mem::take(&mut file.dirty) {

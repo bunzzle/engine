@@ -21,6 +21,7 @@ pub struct OpenOptions {
     pub create: bool,
     pub create_new: bool,
     pub truncate: bool,
+    pub mode: Option<u32>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -50,6 +51,10 @@ pub enum Op {
     },
     SyncDir {
         path: PathBuf,
+    },
+    Rename {
+        from: PathBuf,
+        to: PathBuf,
     },
     Allocate {
         handle: Handle,
