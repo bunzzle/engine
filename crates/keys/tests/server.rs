@@ -83,7 +83,9 @@ fn calls_answer_keys_unwraps_and_refusals() {
             generation: 1,
             retention: 30,
         };
-        let (day, data, today) = keys(client.call(&create).await.expect("create"));
+        let created = client.call(&create).await.expect("create");
+        assert!(matches!(created, Answer::Keys { oldest: DAY, .. }));
+        let (day, data, today) = keys(created);
         assert_eq!(day, DAY);
         let open = Request::Open {
             tenant: 1,
@@ -343,6 +345,95 @@ fn shreds_wait_for_settled_days_or_the_deadline() {
             Error::Gone
         );
         assert_eq!(server.stats().forced, 1);
+    });
+}
+
+#[test]
+fn a_waiting_create_does_not_hold_back_answers_behind_it() {
+    let driver = Rc::new(SimDriver::new(9, quiet()));
+    run(&driver, async {
+        let _server = start(Settings::default()).await;
+        let client = Rc::new(client().await);
+        let first = Request::Create {
+            tenant: 1,
+            generation: 1,
+            retention: 30,
+        };
+        keys(client.call(&first).await.expect("create"));
+        let creating = spawn({
+            let client = Rc::clone(&client);
+            async move {
+                let second = Request::Create {
+                    tenant: 2,
+                    generation: 1,
+                    retention: 30,
+                };
+                keys(client.call(&second).await.expect("create"));
+                rt::now()
+            }
+        });
+        sleep(Duration::from_millis(10)).await;
+        let open = Request::Open {
+            tenant: 1,
+            generation: 1,
+        };
+        keys(client.call(&open).await.expect("open"));
+        let opened = rt::now();
+        let created = creating.await;
+        assert!(
+            created.saturating_duration_since(opened) >= Duration::from_millis(500),
+            "{opened:?} {created:?}"
+        );
+    });
+}
+
+#[test]
+fn more_requests_than_in_flight_slots_are_all_answered_in_order() {
+    let driver = Rc::new(SimDriver::new(10, quiet()));
+    run(&driver, async {
+        let _server = start(Settings::default()).await;
+        let stream = TcpStream::connect(addr()).await.expect("connect");
+        let mut out = Plain::with_capacity(64 * 1024);
+        for id in 0..3_000 {
+            Request::Hello { node: 1 }.encode(id, &mut out);
+        }
+        let (written, _) = stream.write_all(Buf::from_slice(&out)).await;
+        written.expect("write");
+        let mut frames = Frames::default();
+        let mut ids = Vec::new();
+        while ids.len() < 3_000 {
+            let (read, buf) = stream.read(Buf::new(4096)).await;
+            let n = read.expect("read");
+            assert!(n > 0, "closed after {} answers", ids.len());
+            frames.push(&buf[..n]);
+            while let Some((op, id, body)) = frames.pop().expect("frame") {
+                assert!(matches!(
+                    Answer::decode(op, &body).expect("answer"),
+                    Answer::Hello { day: DAY, .. }
+                ));
+                ids.push(id);
+            }
+        }
+        assert!(ids.iter().copied().eq(0..3_000));
+    });
+}
+
+#[test]
+fn a_call_past_its_deadline_times_out_and_the_client_stays_open() {
+    let driver = Rc::new(SimDriver::new(11, quiet()));
+    run(&driver, async {
+        let silent = SocketAddr::from((Ipv4Addr::new(10, 0, 0, 2), 7000));
+        let listener = TcpListener::bind(silent, 4).await.expect("bind");
+        let held = spawn(async move { listener.accept().await.expect("accept") });
+        let client = Client::new(TcpStream::connect(silent).await.expect("connect"));
+        let _stream = held.await;
+        let begin = rt::now();
+        let answer = client
+            .call_within(&Request::Hello { node: 1 }, Duration::from_secs(2))
+            .await;
+        assert_eq!(answer.err(), Some(Error::Timeout));
+        assert!(rt::now().saturating_duration_since(begin) >= Duration::from_secs(2));
+        assert!(!client.is_closed());
     });
 }
 

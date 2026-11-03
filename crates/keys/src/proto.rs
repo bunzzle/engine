@@ -46,6 +46,7 @@ pub enum Answer {
     },
     Keys {
         day: u32,
+        oldest: u32,
         version: u8,
         data: Secret<32>,
         hash: Secret<16>,
@@ -248,6 +249,7 @@ impl Answer {
             }
             Self::Keys {
                 day,
+                oldest,
                 version,
                 data,
                 hash,
@@ -259,6 +261,7 @@ impl Answer {
                 id,
                 &[
                     &day.to_le_bytes(),
+                    &oldest.to_le_bytes(),
                     &[*version],
                     data.expose(),
                     hash.expose(),
@@ -281,6 +284,7 @@ impl Answer {
             },
             0x82 => Self::Keys {
                 day: r.u32()?,
+                oldest: r.u32()?,
                 version: r.u8()?,
                 data: r.secret()?,
                 hash: r.secret()?,
@@ -299,7 +303,7 @@ impl Answer {
         HEAD + match self {
             Self::Done => 0,
             Self::Hello { .. } => 20,
-            Self::Keys { .. } => 117,
+            Self::Keys { .. } => 121,
             Self::Key(_) => 32,
             Self::Refused(_) => 1,
         }
@@ -427,6 +431,7 @@ mod tests {
             },
             Answer::Keys {
                 day: 1,
+                oldest: 8,
                 version: 1,
                 data: Secret::new([3; 32]),
                 hash: Secret::new([4; 16]),

@@ -21,6 +21,7 @@ const RESTORE: u8 = 2;
 
 pub struct Keys {
     pub day: u32,
+    pub oldest: u32,
     pub data: Secret<32>,
     pub version: u8,
     pub hash: Secret<16>,
@@ -297,6 +298,7 @@ impl Vault {
         let tomorrow = self.with_day(tenant, entry, day + 1, day_public)?;
         Ok(Keys {
             day,
+            oldest: entry.oldest,
             data: root.data_secret(generation, VERSION),
             version: VERSION,
             hash: root.hash_key(generation),

@@ -1,10 +1,10 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::io;
 use std::rc::Rc;
 use std::time::Duration;
 
 use crypto::{Plain, Secret};
-use rt::{Buf, Instant, Receiver, Sender};
+use rt::{Buf, Instant, Notify, Receiver, Sender};
 
 use crate::audit::{Audit, Op};
 use crate::limit::{Limits, Rate};
@@ -13,6 +13,7 @@ use crate::{Clock, Error, Keys, Step, Vault};
 
 const DAY_MS: u64 = 86_400_000;
 const ACCEPT_PAUSE: Duration = Duration::from_millis(100);
+const IN_FLIGHT: usize = 1_024;
 
 pub trait Stream {
     fn read(&self, buf: Buf) -> impl Future<Output = (io::Result<usize>, Buf)>;
@@ -148,6 +149,7 @@ struct Core {
 fn keys_answer(keys: Keys) -> Answer {
     Answer::Keys {
         day: keys.day,
+        oldest: keys.oldest,
         version: keys.version,
         data: keys.data,
         hash: keys.hash,
@@ -345,57 +347,99 @@ async fn accept(listener: rt::UnixListener, peer: u32, commands: Sender<Command>
     }
 }
 
-enum Call {
-    Waiting(Receiver<Answer>),
-    Ready(Answer),
+struct Room {
+    free: Cell<usize>,
+    freed: Notify,
+    closed: Cell<bool>,
 }
 
-async fn connection<S: Stream>(stream: S, commands: Sender<Command>) {
+async fn connection<S: Stream + 'static>(stream: S, commands: Sender<Command>) {
+    let stream = Rc::new(stream);
+    let room = Rc::new(Room {
+        free: Cell::new(IN_FLIGHT),
+        freed: Notify::default(),
+        closed: Cell::new(false),
+    });
+    let (answers, outgoing) = rt::channel();
+    rt::spawn(write_answers(
+        Rc::clone(&stream),
+        outgoing,
+        Rc::clone(&room),
+    ));
     let mut frames = Frames::default();
     loop {
         let (read, buf) = stream.read(Buf::new(MAX_FRAME)).await;
         let n = match read {
-            Ok(0) | Err(_) => return,
+            Ok(0) | Err(_) => break,
             Ok(n) => n,
         };
         frames.push(&buf[..n]);
-        let mut calls = Vec::new();
         loop {
-            match frames.pop() {
-                Ok(Some((op, id, body))) => match Request::decode(op, &body) {
-                    Ok(request) => {
-                        let (reply, answer) = rt::channel();
-                        if commands.send(Command::Call(request, reply)).is_err() {
-                            return;
-                        }
-                        calls.push((id, Call::Waiting(answer)));
-                    }
-                    Err(error) => calls.push((id, Call::Ready(Answer::Refused(error)))),
-                },
+            let (op, id, body) = match frames.pop() {
+                Ok(Some(frame)) => frame,
                 Ok(None) => break,
-                Err(_) => return,
+                Err(_) => {
+                    room.closed.set(true);
+                    return;
+                }
+            };
+            while room.free.get() == 0 && !room.closed.get() {
+                room.freed.wait().await;
+            }
+            if room.closed.get() {
+                return;
+            }
+            room.free.set(room.free.get() - 1);
+            match Request::decode(op, &body) {
+                Ok(request) => {
+                    let (reply, mut answer) = rt::channel();
+                    if commands.send(Command::Call(request, reply)).is_err() {
+                        room.closed.set(true);
+                        return;
+                    }
+                    let answers = answers.clone();
+                    rt::spawn(async move {
+                        let answer = answer
+                            .recv()
+                            .await
+                            .unwrap_or(Answer::Refused(Error::Failed));
+                        let _ = answers.send((id, answer));
+                    });
+                }
+                Err(error) => {
+                    let _ = answers.send((id, Answer::Refused(error)));
+                }
             }
         }
-        let mut answers = Vec::with_capacity(calls.len());
-        for (id, call) in calls {
-            let answer = match call {
-                Call::Waiting(mut answer) => answer
-                    .recv()
-                    .await
-                    .unwrap_or(Answer::Refused(Error::Failed)),
-                Call::Ready(answer) => answer,
-            };
-            answers.push((id, answer));
+    }
+    room.closed.set(true);
+    room.freed.notify();
+}
+
+async fn write_answers<S: Stream>(
+    stream: Rc<S>,
+    mut outgoing: Receiver<(u32, Answer)>,
+    room: Rc<Room>,
+) {
+    while let Some(first) = outgoing.recv().await {
+        let mut batch = vec![first];
+        while let Some(more) = outgoing.try_recv() {
+            batch.push(more);
         }
-        let mut out = Plain::with_capacity(answers.iter().map(|(_, a)| a.size()).sum());
-        for (id, answer) in &answers {
+        let mut out = Plain::with_capacity(batch.iter().map(|(_, a)| a.size()).sum());
+        for (id, answer) in &batch {
             answer.encode(*id, &mut out);
         }
-        drop(answers);
+        let count = batch.len();
+        drop(batch);
         let (written, mut buf) = stream.write_all(Buf::from_slice(&out)).await;
         sys::mem::wipe(&mut buf);
         if written.is_err() {
+            room.closed.set(true);
+            room.freed.notify();
             return;
         }
+        room.free.set(room.free.get() + count);
+        room.freed.notify();
     }
 }
