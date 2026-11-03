@@ -18,6 +18,7 @@ const IN_FLIGHT: usize = 1_024;
 pub trait Stream {
     fn read(&self, buf: Buf) -> impl Future<Output = (io::Result<usize>, Buf)>;
     fn write_all(&self, buf: Buf) -> impl Future<Output = (io::Result<()>, Buf)>;
+    fn shutdown(&self) -> impl Future<Output = io::Result<()>>;
 }
 
 impl Stream for rt::TcpStream {
@@ -28,6 +29,10 @@ impl Stream for rt::TcpStream {
     fn write_all(&self, buf: Buf) -> impl Future<Output = (io::Result<()>, Buf)> {
         rt::TcpStream::write_all(self, buf)
     }
+
+    fn shutdown(&self) -> impl Future<Output = io::Result<()>> {
+        rt::TcpStream::shutdown(self)
+    }
 }
 
 impl Stream for rt::UnixStream {
@@ -37,6 +42,10 @@ impl Stream for rt::UnixStream {
 
     fn write_all(&self, buf: Buf) -> impl Future<Output = (io::Result<()>, Buf)> {
         rt::UnixStream::write_all(self, buf)
+    }
+
+    fn shutdown(&self) -> impl Future<Output = io::Result<()>> {
+        rt::UnixStream::shutdown(self)
     }
 }
 

@@ -1,6 +1,8 @@
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::poll_fn;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::path::Path;
 use std::pin::pin;
 use std::rc::Rc;
 use std::task::Poll;
@@ -9,12 +11,16 @@ use std::time::Duration;
 use control::{KeyError, KeySource, Naming, Object, Pool, Ready, State, Table, Tenant};
 use crypto::{Secret, Tenant as Root, TenantKeys};
 use index::{Entry, Op};
+use keys::proto::{Answer as KeyAnswer, Request};
+use keys::{
+    Audit, Client as KeyClient, Connect, Ring, RingSettings, Server, Settings as KeySettings, Vault,
+};
 use rt::sim::{Config, Disk, Faults, Machine, SimDriver, Stalls, check};
-use rt::{JoinHandle, Runtime, sleep, spawn, timeout};
+use rt::{JoinHandle, Runtime, TcpListener, TcpStream, sleep, spawn, timeout};
 use sched::{
-    Answered, Attempt, Begun, Clock, DAY, Draft, Hash, KIND_REQUEST, KIND_SUPPRESS, Meshes, Node,
-    Parts, Reason, Refusal, Running, SHAPE, Settings, Suppression, Ticket, Transport, normalize,
-    punycode, retain, retain_request,
+    Answered, Attempt, Begun, Clock, DAY, Draft, Hash, KIND_REQUEST, KIND_SUPPRESS, Keyring,
+    Meshes, Node, Parts, Reason, Refusal, Running, SHAPE, Settings, Suppression, Ticket, Transport,
+    normalize, punycode, retain, retain_request,
 };
 use spool::{Body, Head, HeadClear, Message, MessageId, SLICE, Slice};
 use store::{Client, Committer, DataFile, Options, SLOT_SIZE, Setup, Tiering, boot};
@@ -161,7 +167,61 @@ fn started_tuned(
     behind: u64,
     tuning: Option<(u64, usize)>,
 ) -> Cluster {
-    try_started(driver, cores, behind, tuning).expect("start")
+    try_started(driver, cores, behind, tuning, false).expect("start")
+}
+
+fn started_with_keys(driver: &Rc<SimDriver>, cores: u16) -> Cluster {
+    try_started(driver, cores, 0, None, true).expect("start")
+}
+
+const KEYS_DIR: &str = "/keys";
+const KEYS_AT: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 9)), 7000);
+
+fn keys_up(machine: &Machine) {
+    drop(machine.spawn_on(0, async {
+        let dir = Path::new(KEYS_DIR);
+        let vault = match Vault::open(dir).await {
+            Ok(vault) => vault,
+            Err(_) => Vault::init(dir, 20_000).await.expect("init"),
+        };
+        let audit = Audit::open(dir).await.expect("audit");
+        let server = Rc::new(Server::start(vault, audit, KeySettings::default()));
+        let listener = TcpListener::bind(KEYS_AT, 16).await.expect("bind");
+        while let Ok((stream, _)) = listener.accept().await {
+            server.serve(stream);
+        }
+    }));
+}
+
+fn keyring() -> Rc<dyn KeySource> {
+    let connect: Connect =
+        Rc::new(|| Box::pin(async { Ok(KeyClient::new(TcpStream::connect(KEYS_AT).await?)) }));
+    Rc::new(Keyring::new(Ring::new(connect, RingSettings::new(1))))
+}
+
+async fn create_keys(tenant: u32, generation: u32) {
+    let mut tries = 0;
+    let stream = loop {
+        match TcpStream::connect(KEYS_AT).await {
+            Ok(stream) => break stream,
+            Err(_) if tries < 100 => {
+                tries += 1;
+                sleep(Duration::from_millis(10)).await;
+            }
+            Err(error) => panic!("connect: {error}"),
+        }
+    };
+    let client = KeyClient::new(stream);
+    let create = Request::Create {
+        tenant,
+        generation,
+        retention: 30,
+    };
+    assert!(matches!(
+        client.call(&create).await.expect("create"),
+        KeyAnswer::Keys { .. }
+    ));
+    client.close();
 }
 
 fn try_started(
@@ -169,6 +229,7 @@ fn try_started(
     cores: u16,
     behind: u64,
     tuning: Option<(u64, usize)>,
+    real_keys: bool,
 ) -> Option<Cluster> {
     let machine = Machine::new(Rc::clone(driver), usize::from(cores) + 1, Stalls::default());
     let setup = Setup {
@@ -184,6 +245,9 @@ fn try_started(
         .ok()?
         .ok()?;
     let committer = machine.spawn_on(0, booted.committer.run());
+    if real_keys {
+        keys_up(&machine);
+    }
     let meshes = std::sync::Arc::new(Meshes::new(cores));
     let mut tasks = Vec::new();
     for start in booted.starts {
@@ -203,8 +267,9 @@ fn try_started(
                     ..Tiering::default()
                 });
             }
+            let keys: Rc<dyn KeySource> = if real_keys { keyring() } else { Rc::new(Toy) };
             let parts = Parts {
-                keys: Rc::new(Toy),
+                keys,
                 transport: Idle,
                 clock: Clock::at(rt::wall_ms().saturating_sub(behind), rt::now()),
             };
@@ -255,7 +320,7 @@ async fn wait_for(nodes: &[Node<Idle>], tenant: u32, generation: u32, state: Sta
 async fn ready(nodes: &[Node<Idle>]) {
     let pool = Object::Pool(Pool {
         id: 1,
-        addresses: vec![(std::net::IpAddr::from([192, 0, 2, 1]), 1)],
+        addresses: vec![(IpAddr::from([192, 0, 2, 1]), 1)],
     });
     let missing: Vec<Object> = {
         let control = nodes.iter().find(|n| n.controls()).expect("control core");
@@ -542,6 +607,68 @@ fn missing_keys_refuse_for_now_and_never_answer_not_suppressed() {
         assert!(Refusal::Keys.temporary());
     });
     cluster.stop();
+}
+
+#[test]
+fn suppressions_and_queues_use_keys_from_the_keys_process() {
+    let driver = Rc::new(SimDriver::with_disk(31, Config::default(), created(31)));
+    let cluster = started_with_keys(&driver, 2);
+    let nodes = cluster.nodes.clone();
+    let queue = cluster.run(async move {
+        create_keys(1, 1).await;
+        create_keys(2, 1).await;
+        ready(&nodes).await;
+        let lists = nodes[0].suppressions();
+        lists
+            .add(1, "kept@example.org", Reason::Manual, None)
+            .await
+            .expect("add");
+        assert_eq!(
+            lists
+                .check(1, 1, &["kept@example.org", "free@example.org"])
+                .await,
+            Ok(vec![true, false])
+        );
+        assert_eq!(
+            lists.check(2, 1, &["kept@example.org"]).await,
+            Ok(vec![false])
+        );
+        let page = lists.list(1, None, 10).await.expect("list");
+        assert_eq!(page.listed[0].address, "kept@example.org");
+        configure(&nodes, vec![tenant(3, 1, State::Active)]).await;
+        wait_for(&nodes, 3, 1, State::Active).await;
+        assert_eq!(
+            lists.check(3, 1, &["a@example.org"]).await,
+            Err(Refusal::Keys)
+        );
+        let mut draft = nodes[0].draft(1, None).expect("draft");
+        nodes[0]
+            .recipient(&mut draft, "to@example.org")
+            .await
+            .expect("recipient")
+    });
+    drop(cluster);
+    let driver = Rc::new(SimDriver::with_disk(32, Config::default(), driver.crash()));
+    let restarted = started_with_keys(&driver, 2);
+    let nodes = restarted.nodes.clone();
+    restarted.run(async move {
+        wait_for(&nodes, 1, 1, State::Active).await;
+        let lists = nodes[1].suppressions();
+        assert_eq!(
+            lists.check(1, 1, &["kept@example.org"]).await,
+            Ok(vec![true])
+        );
+        let page = lists.list(1, None, 10).await.expect("list");
+        assert_eq!(page.listed.len(), 1);
+        assert_eq!(page.listed[0].address, "kept@example.org");
+        let mut draft = nodes[1].draft(1, None).expect("draft");
+        let again = nodes[1]
+            .recipient(&mut draft, "other@example.org")
+            .await
+            .expect("recipient");
+        assert_eq!(again, queue);
+    });
+    restarted.stop();
 }
 
 #[test]
@@ -1217,7 +1344,7 @@ fn index_session(
     tuning: (u64, usize),
     second: bool,
 ) -> bool {
-    let Some(cluster) = try_started(driver, cores, 0, Some(tuning)) else {
+    let Some(cluster) = try_started(driver, cores, 0, Some(tuning), false) else {
         return false;
     };
     let nodes = cluster.nodes.clone();

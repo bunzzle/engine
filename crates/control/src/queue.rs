@@ -144,6 +144,7 @@ impl Label {
 pub enum KeyError {
     Unavailable,
     Unknown,
+    Failed,
 }
 
 pub type Ready<'a> = Pin<Box<dyn Future<Output = Result<TenantKeys, KeyError>> + 'a>>;

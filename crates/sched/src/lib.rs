@@ -1,6 +1,7 @@
 mod clock;
 mod error;
 mod intake;
+mod keyring;
 mod lanes;
 mod node;
 mod normal;
@@ -13,6 +14,7 @@ mod transport;
 pub use clock::Clock;
 pub use error::{Error, Refusal};
 pub use intake::{Draft, domain_of};
+pub use keyring::Keyring;
 pub use lanes::{Entry, Lanes, Limits, QueueId, Take, ranges};
 pub use node::{Arrival, Claim, Config, Note, Route, Sched, queue_core};
 pub use normal::{MAX_ADDRESS, normalize, punycode};

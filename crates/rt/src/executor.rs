@@ -205,6 +205,10 @@ pub(crate) fn try_current() -> Option<Rc<Inner>> {
     CURRENT.with(|current| current.borrow().clone())
 }
 
+pub fn in_runtime() -> bool {
+    try_current().is_some()
+}
+
 pub(crate) fn driver() -> Rc<dyn Driver> {
     Rc::clone(&current().driver)
 }

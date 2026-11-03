@@ -136,9 +136,15 @@ impl<T: Transport + 'static> Node<T> {
             generation: draft.generation,
             pool: draft.pool,
         };
-        let Ok(queue) = inner.queues.name(&name).await else {
-            inner.leases.give_back(&draft.tenant, taken);
-            return Err(Refusal::Failed);
+        let queue = match inner.queues.name(&name).await {
+            Ok(queue) => queue,
+            Err(error) => {
+                inner.leases.give_back(&draft.tenant, taken);
+                return Err(match error {
+                    control::Error::Keys { .. } => Refusal::Keys,
+                    _ => Refusal::Failed,
+                });
+            }
         };
         draft.queues.push(queue);
         draft.taken.push(taken);

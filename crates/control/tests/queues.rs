@@ -54,6 +54,7 @@ const DOMAINS: [&str; 12] = [
 struct Toy {
     wrong: BTreeSet<u32>,
     unknown: BTreeSet<u32>,
+    failed: BTreeSet<u32>,
     unavailable: Cell<u32>,
     asked: Cell<u32>,
 }
@@ -67,6 +68,9 @@ impl Toy {
         }
         if self.unknown.contains(&tenant) {
             return Err(KeyError::Unknown);
+        }
+        if self.failed.contains(&tenant) {
+            return Err(KeyError::Failed);
         }
         let seed = if self.wrong.contains(&tenant) { 9 } else { 1 };
         let root = Tenant::new(&Secret::new([seed; 32]));
@@ -502,7 +506,7 @@ fn records_that_do_not_open_or_decode_are_skipped_at_start() {
         let shard = naming_shard(&KEY, 1, "b.example", SHARDS);
         let ids: Vec<u32> = (900..)
             .filter(|&id| queue_shard(id, SHARDS) == shard)
-            .take(4)
+            .take(5)
             .collect();
         let real = |id| Queue {
             id,
@@ -515,6 +519,17 @@ fn records_that_do_not_open_or_decode_are_skipped_at_start() {
             (ids[1], 1, real(ids[1]).encode(), b"not sealed".to_vec()),
             (ids[2], 3, real(ids[2]).encode(), seal_for(ids[2])),
             (ids[3], 1, real(ids[2]).encode(), seal_for(ids[2])),
+            (
+                ids[4],
+                1,
+                Queue {
+                    id: ids[4],
+                    name: name(9, 1, 1, "b.example"),
+                    draining: false,
+                }
+                .encode(),
+                seal_for(ids[4]),
+            ),
         ] {
             let batch = Batch {
                 shard,
@@ -539,12 +554,13 @@ fn records_that_do_not_open_or_decode_are_skipped_at_start() {
     machine.block_on(0, node.stop());
     let refusing = Rc::new(Toy {
         wrong: BTreeSet::from([2]),
+        unknown: BTreeSet::from([9]),
         ..Toy::default()
     });
     let driver = Rc::new(SimDriver::with_disk(2, Config::default(), driver.crash()));
     let machine = self::machine(&driver, cores);
     let node = Node::start(&machine, cores, &refusing).expect("restart");
-    assert_eq!(node.skipped, 5);
+    assert_eq!(node.skipped, 6);
     assert_eq!(node.loaded, 1);
     assert!(node.queues[0].entry(kept).is_some());
     assert!(node.queues[0].entry(gone).is_none());
@@ -645,6 +661,23 @@ fn start_waits_for_keys_asks_once_per_tenant_and_fails_on_unknown_ones() {
         ),
         "{failed:?}"
     );
+    let broken = Rc::new(Toy {
+        failed: BTreeSet::from([1]),
+        ..Toy::default()
+    });
+    let driver = Rc::new(SimDriver::with_disk(6, Config::default(), disk.clone()));
+    let failed = Node::try_start(&self::machine(&driver, cores), cores, &broken).err();
+    assert!(
+        matches!(
+            failed,
+            Some(Some(Error::Keys {
+                tenant: 1,
+                generation: 1,
+                error: KeyError::Failed,
+            }))
+        ),
+        "{failed:?}"
+    );
     let slow = Rc::new(Toy {
         unavailable: Cell::new(3),
         ..Toy::default()
@@ -657,6 +690,28 @@ fn start_waits_for_keys_asks_once_per_tenant_and_fails_on_unknown_ones() {
     assert_eq!(node.skipped, 0);
     let groups = 2 * SHARDS;
     assert!(slow.asked.get() <= groups + 3, "{} asks", slow.asked.get());
+    slow.unavailable.set(1_000);
+    let queues = node.queues[0].clone();
+    let refused = machine.block_on(1, async move {
+        let named = queues.name(&name(1, 1, 1, "new.example")).await;
+        (named, queues.stats().keys)
+    });
+    assert!(
+        matches!(
+            refused,
+            (
+                Err(Error::Keys {
+                    tenant: 1,
+                    generation: 1,
+                    error: KeyError::Unavailable,
+                }),
+                _
+            )
+        ),
+        "{refused:?}"
+    );
+    let keys: u64 = node.queues.iter().map(|q| q.stats().keys).sum();
+    assert_eq!(keys, 1);
     machine.block_on(0, node.stop());
 }
 
