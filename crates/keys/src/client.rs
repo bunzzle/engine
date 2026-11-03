@@ -55,13 +55,32 @@ impl Client {
         Ok(Self::new(stream))
     }
 
+    pub fn is_closed(&self) -> bool {
+        self.closed.get()
+    }
+
     pub async fn call(&self, request: &Request) -> Result<Answer, Error> {
+        let (_, mut answer) = self.send(request)?;
+        answer.recv().await.ok_or(Error::Closed)
+    }
+
+    pub async fn call_within(&self, request: &Request, limit: Duration) -> Result<Answer, Error> {
+        let (id, mut answer) = self.send(request)?;
+        if let Ok(answer) = rt::timeout(limit, answer.recv()).await {
+            answer.ok_or(Error::Closed)
+        } else {
+            self.waiting.borrow_mut().remove(&id);
+            Err(Error::Timeout)
+        }
+    }
+
+    fn send(&self, request: &Request) -> Result<(u32, Receiver<Answer>), Error> {
         if self.closed.get() {
             return Err(Error::Closed);
         }
         let id = self.next.get();
         self.next.set(id.wrapping_add(1));
-        let (reply, mut answer) = rt::channel();
+        let (reply, answer) = rt::channel();
         self.waiting.borrow_mut().insert(id, reply);
         let mut out = Plain::with_capacity(REQUEST);
         request.encode(id, &mut out);
@@ -69,7 +88,7 @@ impl Client {
             self.waiting.borrow_mut().remove(&id);
             return Err(Error::Closed);
         }
-        answer.recv().await.ok_or(Error::Closed)
+        Ok((id, answer))
     }
 }
 
