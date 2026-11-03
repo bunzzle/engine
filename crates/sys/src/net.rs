@@ -222,6 +222,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn both_ends_see_the_peer_uid() {
         let dir = std::env::temp_dir().join(format!("sys-net-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("dir");
@@ -247,6 +248,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn missing_socket_is_an_error() {
         assert!(unix_connect(Path::new("/nonexistent/bunzzle.sock")).is_err());
     }

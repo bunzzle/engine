@@ -48,6 +48,7 @@ pub fn lock_memory() -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn core_dumps_turn_off() {
         super::no_core_dumps().expect("core dumps off");
     }
