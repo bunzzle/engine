@@ -7,6 +7,7 @@ pub enum Error {
     Order,
     Random,
     Key,
+    Label,
 }
 
 impl fmt::Display for Error {
@@ -17,6 +18,7 @@ impl fmt::Display for Error {
             Self::Order => write!(f, "stream chunk out of order"),
             Self::Random => write!(f, "random source failed"),
             Self::Key => write!(f, "key rejected"),
+            Self::Label => write!(f, "label belongs to another tenant"),
         }
     }
 }

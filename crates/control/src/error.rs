@@ -1,5 +1,7 @@
 use std::fmt;
 
+use crate::queue::KeyError;
+
 #[derive(Debug)]
 pub enum Error {
     Store(store::Error),
@@ -7,6 +9,11 @@ pub enum Error {
     Full,
     Refused,
     Busy,
+    Keys {
+        tenant: u32,
+        generation: u32,
+        error: KeyError,
+    },
 }
 
 impl fmt::Display for Error {
@@ -17,6 +24,22 @@ impl fmt::Display for Error {
             Self::Full => write!(f, "control records over their budget"),
             Self::Refused => write!(f, "refused"),
             Self::Busy => write!(f, "over the limit, try again later"),
+            Self::Keys {
+                tenant,
+                generation,
+                error: KeyError::Unavailable,
+            } => write!(
+                f,
+                "keys unavailable for tenant {tenant} generation {generation}"
+            ),
+            Self::Keys {
+                tenant,
+                generation,
+                error: KeyError::Unknown,
+            } => write!(
+                f,
+                "keys do not know tenant {tenant} generation {generation}"
+            ),
         }
     }
 }

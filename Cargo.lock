@@ -66,6 +66,7 @@ dependencies = [
 name = "control"
 version = "0.0.0"
 dependencies = [
+ "crypto",
  "rt",
  "store",
 ]
@@ -163,6 +164,7 @@ name = "sched"
 version = "0.0.0"
 dependencies = [
  "control",
+ "crypto",
  "index",
  "rt",
  "spool",

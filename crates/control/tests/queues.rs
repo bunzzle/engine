@@ -1,4 +1,4 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::panic::{self, AssertUnwindSafe};
@@ -7,9 +7,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use control::{
-    Cache, Call, Error, KIND_QUEUE, Label, LoadedQueues, Name, Naming, Queue, Queues, Sealer,
-    Tenancy, domain_ok, naming_shard, queue_shard, siphash,
+    Cache, Call, Error, KIND_QUEUE, KeyError, KeySource, LABEL_SIZE, Label, LoadedQueues, Name,
+    Naming, Queue, Queues, Ready, Tenancy, domain_ok, naming_shard, queue_shard, siphash,
 };
+use crypto::{Secret, Tenant, TenantKeys};
 use rt::sim::{Config, Disk, Machine, SimDriver, Stalls, check};
 use rt::{JoinHandle, Mesh, Runtime, timeout};
 use store::{
@@ -51,33 +52,51 @@ const DOMAINS: [&str; 12] = [
 
 #[derive(Default)]
 struct Toy {
-    gone: BTreeSet<u32>,
+    wrong: BTreeSet<u32>,
+    unknown: BTreeSet<u32>,
+    unavailable: Cell<u32>,
+    asked: Cell<u32>,
 }
 
-fn label_bytes(label: &Label) -> Vec<u8> {
-    let mut out = Vec::new();
-    out.extend_from_slice(&label.tenant.to_le_bytes());
-    out.extend_from_slice(&label.generation.to_le_bytes());
-    out.push(label.kind);
-    out.extend_from_slice(&label.id.to_le_bytes());
-    out
-}
-
-impl Sealer for Toy {
-    fn seal(&self, label: &Label, clear: &[u8]) -> Vec<u8> {
-        let mut out = label_bytes(label);
-        out.extend(clear.iter().map(|b| b ^ 0x5a));
-        out
-    }
-
-    fn open(&self, label: &Label, sealed: &[u8]) -> Option<Vec<u8>> {
-        if self.gone.contains(&label.tenant) {
-            return None;
+impl Toy {
+    fn answer(&self, tenant: u32, generation: u32) -> Result<TenantKeys, KeyError> {
+        self.asked.set(self.asked.get() + 1);
+        if self.unavailable.get() > 0 {
+            self.unavailable.set(self.unavailable.get() - 1);
+            return Err(KeyError::Unavailable);
         }
-        let head = label_bytes(label);
-        let rest = sealed.strip_prefix(head.as_slice())?;
-        Some(rest.iter().map(|b| b ^ 0x5a).collect())
+        if self.unknown.contains(&tenant) {
+            return Err(KeyError::Unknown);
+        }
+        let seed = if self.wrong.contains(&tenant) { 9 } else { 1 };
+        let root = Tenant::new(&Secret::new([seed; 32]));
+        Ok(TenantKeys::derive(tenant, generation, &root, 1))
     }
+}
+
+impl KeySource for Toy {
+    fn get(&self, _: u32, _: u32) -> Option<TenantKeys> {
+        None
+    }
+
+    fn ready(&self, tenant: u32, generation: u32) -> Ready<'_> {
+        Box::pin(std::future::ready(self.answer(tenant, generation)))
+    }
+}
+
+fn seal_queue(tenant: u32, id: u32, domain: &[u8]) -> Vec<u8> {
+    let label = Label {
+        tenant,
+        generation: 1,
+        kind: KIND_QUEUE,
+        id,
+        hash: None,
+    };
+    Toy::default()
+        .answer(tenant, 1)
+        .expect("keys")
+        .seal(&label.bytes(), domain)
+        .expect("seal")
 }
 
 fn name(tenant: u32, generation: u32, pool: u32, domain: &str) -> Name {
@@ -198,11 +217,16 @@ struct Node {
     committer: JoinHandle<()>,
     client: Client,
     skipped: u64,
+    waited: u64,
     loaded: usize,
 }
 
 impl Node {
     fn start(machine: &Machine, cores: u16, sealer: &Rc<Toy>) -> Option<Self> {
+        Self::try_start(machine, cores, sealer).ok()
+    }
+
+    fn try_start(machine: &Machine, cores: u16, sealer: &Rc<Toy>) -> Result<Self, Option<Error>> {
         let setup = Setup {
             cores,
             credits: 4,
@@ -213,8 +237,8 @@ impl Node {
             .block_on(0, async move {
                 timeout(Duration::from_secs(60), boot(PATH, setup)).await
             })
-            .ok()?
-            .ok()?;
+            .map_err(|_| None)?
+            .map_err(|_| None)?;
         let committer = machine.spawn_on(0, async move { drop(booted.committer.run().await) });
         let mesh = Arc::new(Mesh::<Call>::new(cores));
         let mut node = Self {
@@ -225,6 +249,7 @@ impl Node {
             committer,
             client: booted.client,
             skipped: 0,
+            waited: 0,
             loaded: 0,
         };
         for start in booted.starts {
@@ -234,24 +259,27 @@ impl Node {
             let (loaded, core): (LoadedQueues, _) = machine.block_on(at, async move {
                 let core = timeout(Duration::from_secs(60), start.open())
                     .await
-                    .ok()?
-                    .ok()?;
-                let loaded = Queues::load(&core, NAMING, opener.as_ref()).await.ok()?;
-                Some((loaded, core))
+                    .map_err(|_| None)?
+                    .map_err(|_| None)?;
+                let loaded = Queues::load(&core, NAMING, opener.as_ref())
+                    .await
+                    .map_err(Some)?;
+                Ok::<_, Option<Error>>((loaded, core))
             })?;
             node.skipped += loaded.skipped();
+            node.waited += loaded.waited();
             node.loaded += loaded.queues();
             let (owner, changes) = Shards::new(core);
             node.owners.push(machine.spawn_on(at, owner.run()));
             node.changes.push(changes.clone());
             let ends = mesh.take(index).expect("ends");
-            let sealer: Rc<dyn Sealer> = Rc::clone(sealer) as Rc<dyn Sealer>;
+            let sealer: Rc<dyn KeySource> = Rc::clone(sealer) as Rc<dyn KeySource>;
             let (queues, done) =
                 machine.block_on(at, async move { loaded.start(ends, changes, sealer) });
             node.queues.push(queues);
             node.meshes.push(done);
         }
-        Some(node)
+        Ok(node)
     }
 
     async fn stop(self) {
@@ -481,17 +509,7 @@ fn records_that_do_not_open_or_decode_are_skipped_at_start() {
             name: name(1, 1, 1, "b.example"),
             draining: false,
         };
-        let seal_for = |id| {
-            Toy::default().seal(
-                &Label {
-                    tenant: 1,
-                    generation: 1,
-                    kind: KIND_QUEUE,
-                    id,
-                },
-                b"b.example",
-            )
-        };
+        let seal_for = |id| seal_queue(1, id, b"b.example");
         for (id, tenant, clear, sealed) in [
             (ids[0], 1, vec![9; 24], seal_for(ids[0])),
             (ids[1], 1, real(ids[1]).encode(), b"not sealed".to_vec()),
@@ -520,7 +538,8 @@ fn records_that_do_not_open_or_decode_are_skipped_at_start() {
     });
     machine.block_on(0, node.stop());
     let refusing = Rc::new(Toy {
-        gone: BTreeSet::from([2]),
+        wrong: BTreeSet::from([2]),
+        ..Toy::default()
     });
     let driver = Rc::new(SimDriver::with_disk(2, Config::default(), driver.crash()));
     let machine = self::machine(&driver, cores);
@@ -538,6 +557,106 @@ fn records_that_do_not_open_or_decode_are_skipped_at_start() {
     });
     assert_eq!(queue_shard(again, SHARDS), queue_shard(gone, SHARDS));
     assert!(again > gone, "id {again} reused");
+    machine.block_on(0, node.stop());
+}
+
+#[test]
+fn label_bytes_are_fixed_width() {
+    let mut label = Label {
+        tenant: 0x0102_0304,
+        generation: 5,
+        kind: 0x81,
+        id: 7,
+        hash: None,
+    };
+    let mut plain = vec![4, 3, 2, 1, 5, 0, 0, 0, 0x81, 7, 0, 0, 0, 0];
+    plain.extend_from_slice(&[0; 16]);
+    assert_eq!(label.bytes().to_vec(), plain);
+    label.hash = Some([0xaa; 16]);
+    let mut hashed = vec![4, 3, 2, 1, 5, 0, 0, 0, 0x81, 7, 0, 0, 0, 1];
+    hashed.extend_from_slice(&[0xaa; 16]);
+    assert_eq!(label.bytes().to_vec(), hashed);
+    assert_eq!(hashed.len(), LABEL_SIZE);
+}
+
+#[test]
+fn a_sealed_payload_opens_only_under_its_own_label() {
+    let keys = Toy::default().answer(4, 2).expect("keys");
+    let label = |hash: Option<[u8; 16]>| Label {
+        tenant: 4,
+        generation: 2,
+        kind: 0x81,
+        id: 0,
+        hash,
+    };
+    let sealed = keys
+        .seal(&label(Some([1; 16])).bytes(), b"a@example.org")
+        .expect("seal");
+    assert_eq!(
+        keys.open(&label(Some([1; 16])).bytes(), &sealed)
+            .expect("open"),
+        b"a@example.org"
+    );
+    assert!(keys.open(&label(Some([2; 16])).bytes(), &sealed).is_err());
+    assert!(keys.open(&label(None).bytes(), &sealed).is_err());
+    let other = Label {
+        tenant: 5,
+        ..label(Some([1; 16]))
+    };
+    assert!(keys.open(&other.bytes(), &sealed).is_err());
+    assert!(keys.seal(&other.bytes(), b"a@example.org").is_err());
+}
+
+#[test]
+fn start_waits_for_keys_asks_once_per_tenant_and_fails_on_unknown_ones() {
+    let cores: u16 = 1;
+    let sealer = Rc::new(Toy::default());
+    let driver = Rc::new(SimDriver::with_disk(3, Config::default(), created(3)));
+    let machine = machine(&driver, cores);
+    let node = Node::start(&machine, cores, &sealer).expect("start");
+    let queues = node.queues[0].clone();
+    machine.block_on(1, async move {
+        for n in 0..24 {
+            let domain = format!("d{n}.example");
+            for tenant in [1, 2] {
+                queues
+                    .name(&name(tenant, 1, 1, &domain))
+                    .await
+                    .expect("named");
+            }
+        }
+    });
+    machine.block_on(0, node.stop());
+    let disk = driver.crash();
+    let unknown = Rc::new(Toy {
+        unknown: BTreeSet::from([2]),
+        ..Toy::default()
+    });
+    let driver = Rc::new(SimDriver::with_disk(4, Config::default(), disk.clone()));
+    let failed = Node::try_start(&self::machine(&driver, cores), cores, &unknown).err();
+    assert!(
+        matches!(
+            failed,
+            Some(Some(Error::Keys {
+                tenant: 2,
+                generation: 1,
+                error: KeyError::Unknown,
+            }))
+        ),
+        "{failed:?}"
+    );
+    let slow = Rc::new(Toy {
+        unavailable: Cell::new(3),
+        ..Toy::default()
+    });
+    let driver = Rc::new(SimDriver::with_disk(5, Config::default(), disk));
+    let machine = self::machine(&driver, cores);
+    let node = Node::start(&machine, cores, &slow).expect("restart");
+    assert_eq!(node.waited, 3);
+    assert_eq!(node.loaded, 48);
+    assert_eq!(node.skipped, 0);
+    let groups = 2 * SHARDS;
+    assert!(slow.asked.get() <= groups + 3, "{} asks", slow.asked.get());
     machine.block_on(0, node.stop());
 }
 

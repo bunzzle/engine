@@ -2,7 +2,7 @@ use std::cell::{Cell, Ref, RefCell};
 use std::rc::Rc;
 
 use control::{
-    Ask, Call, Leases, Name, Naming, Object, Queues, Sealer, Table, Update, Writer, broadcast,
+    Ask, Call, KeySource, Leases, Name, Naming, Object, Queues, Table, Update, Writer, broadcast,
     limit_core,
 };
 use rt::{Ends, JoinHandle, Mesh, Notify, Peers, spawn};
@@ -13,7 +13,7 @@ use crate::clock::Clock;
 use crate::error::Error;
 use crate::node::{Config, Note, Sched};
 use crate::requests::{KIND_REQUEST, RequestInputs, Requests, retain_request};
-use crate::suppress::{self, Hasher, Inputs, KIND_SUPPRESS, Suppressions};
+use crate::suppress::{self, Inputs, KIND_SUPPRESS, Suppressions};
 use crate::transport::Transport;
 
 pub const CONTROL_SHARD: u16 = 0;
@@ -70,8 +70,7 @@ pub struct Settings {
 }
 
 pub struct Parts<T> {
-    pub sealer: Rc<dyn Sealer>,
-    pub hasher: Rc<dyn Hasher>,
+    pub keys: Rc<dyn KeySource>,
     pub transport: T,
     pub clock: Clock,
 }
@@ -133,7 +132,7 @@ impl<T: Transport + 'static> Node<T> {
         } else {
             None
         };
-        let loaded = Queues::load(&core, settings.naming, parts.sealer.as_ref()).await?;
+        let loaded = Queues::load(&core, settings.naming, parts.keys.as_ref()).await?;
         let table = Rc::new(RefCell::new(Table::default()));
         let clock = parts.clock;
         retain_current(&mut core, &table, clock);
@@ -158,8 +157,7 @@ impl<T: Transport + 'static> Node<T> {
         });
 
         let inputs = Inputs {
-            hasher: Rc::clone(&parts.hasher),
-            sealer: Rc::clone(&parts.sealer),
+            keys: Rc::clone(&parts.keys),
             changes: changes.clone(),
             table: Rc::clone(&table),
             clock,
@@ -168,7 +166,7 @@ impl<T: Transport + 'static> Node<T> {
         };
         let (suppressions, requests, mut index_done) =
             index_services(links.suppress, inputs).await?;
-        let (queues, names_done) = loaded.start(links.names, changes.clone(), parts.sealer);
+        let (queues, names_done) = loaded.start(links.names, changes.clone(), parts.keys);
 
         let shards = settings.naming.shards;
         let rules = Rc::clone(&table);
@@ -316,7 +314,7 @@ async fn index_services(
     inputs: Inputs,
 ) -> Result<(Suppressions, Requests, Vec<JoinHandle<()>>), Error> {
     let request_inputs = RequestInputs {
-        hasher: Rc::clone(&inputs.hasher),
+        keys: Rc::clone(&inputs.keys),
         changes: inputs.changes.clone(),
         table: Rc::clone(&inputs.table),
         clock: inputs.clock,

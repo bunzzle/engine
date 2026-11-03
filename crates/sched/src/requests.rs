@@ -5,7 +5,7 @@ use std::pin::pin;
 use std::rc::Rc;
 use std::task::Poll;
 
-use control::{Naming, State, Table};
+use control::{KeySource, Naming, State, Table};
 use index::{Entry, Op, Shape};
 use rt::{JoinHandle, Notify, Sender, channel, sleep_until, spawn};
 use spool::MessageId;
@@ -13,7 +13,7 @@ use store::{Changes, IndexRecord};
 
 use crate::clock::Clock;
 use crate::error::Refusal;
-use crate::suppress::{Hash, Hasher, owner_shard, refusal};
+use crate::suppress::{Hash, keyed_hash, keys_of, owner_shard, refusal};
 
 pub const KIND_REQUEST: u8 = 2;
 pub const DAY: u64 = 86_400_000;
@@ -96,6 +96,7 @@ pub enum Begun {
 pub struct Ticket {
     requests: Requests,
     tenant: u32,
+    generation: u32,
     hash: Hash,
     digest: Hash,
     shard: u16,
@@ -104,6 +105,10 @@ pub struct Ticket {
 impl Ticket {
     pub fn tenant(&self) -> u32 {
         self.tenant
+    }
+
+    pub fn generation(&self) -> u32 {
+        self.generation
     }
 
     pub fn shard(&self) -> u16 {
@@ -118,7 +123,7 @@ impl Drop for Ticket {
 }
 
 pub struct RequestInputs {
-    pub hasher: Rc<dyn Hasher>,
+    pub keys: Rc<dyn KeySource>,
     pub changes: Changes,
     pub table: Rc<RefCell<Table>>,
     pub clock: Clock,
@@ -179,9 +184,15 @@ impl Requests {
         day
     }
 
-    pub fn shard(&self, tenant: u32, key: &[u8]) -> u16 {
-        let hash = self.inner.parts.hasher.hash(tenant, key);
-        owner_shard(&self.inner.parts.naming, tenant, &hash)
+    pub async fn shard(&self, tenant: u32, key: &[u8]) -> Result<u16, Refusal> {
+        let generation = self.generation(tenant)?;
+        let hash = self.hash(tenant, generation, key).await?;
+        Ok(owner_shard(&self.inner.parts.naming, tenant, &hash))
+    }
+
+    async fn hash(&self, tenant: u32, generation: u32, key: &[u8]) -> Result<Hash, Refusal> {
+        let keys = keys_of(self.inner.parts.keys.as_ref(), tenant, generation).await?;
+        Ok(keyed_hash(&keys, key))
     }
 
     pub fn in_flight(&self) -> usize {
@@ -189,8 +200,9 @@ impl Requests {
     }
 
     pub async fn begin(&self, tenant: u32, key: &[u8], digest: Hash) -> Result<Begun, Refusal> {
+        let generation = self.generation(tenant)?;
+        let hash = self.hash(tenant, generation, key).await?;
         let parts = &self.inner.parts;
-        let hash = parts.hasher.hash(tenant, key);
         let shard = owner_shard(&parts.naming, tenant, &hash);
         if !parts.shards.contains(&shard) {
             return Err(Refusal::Message);
@@ -203,7 +215,7 @@ impl Requests {
                 woken.recv().await;
                 continue;
             }
-            match self.find(tenant, shard, hash).await? {
+            match self.find(tenant, generation, shard, hash).await? {
                 Some(found) if found.digest == digest => return Ok(Begun::Replay(found.ids)),
                 Some(_) => return Err(Refusal::Conflict),
                 None => {}
@@ -222,6 +234,7 @@ impl Requests {
             return Ok(Begun::Fresh(Ticket {
                 requests: self.clone(),
                 tenant,
+                generation,
                 hash,
                 digest,
                 shard,
@@ -291,8 +304,16 @@ impl Requests {
             .ok_or(Refusal::Tenant)
     }
 
-    async fn find(&self, tenant: u32, shard: u16, hash: Hash) -> Result<Option<Value>, Refusal> {
-        let generation = self.generation(tenant)?;
+    async fn find(
+        &self,
+        tenant: u32,
+        generation: u32,
+        shard: u16,
+        hash: Hash,
+    ) -> Result<Option<Value>, Refusal> {
+        if self.generation(tenant)? != generation {
+            return Err(Refusal::Tenant);
+        }
         let parts = &self.inner.parts;
         let today = self.today();
         let key = index::key(tenant, hash);
