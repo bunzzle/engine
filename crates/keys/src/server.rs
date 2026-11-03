@@ -12,6 +12,7 @@ use crate::proto::{Answer, Frames, MAX_FRAME, Request};
 use crate::{Clock, Error, Keys, Step, Vault};
 
 const DAY_MS: u64 = 86_400_000;
+const ACCEPT_PAUSE: Duration = Duration::from_millis(100);
 
 pub trait Stream {
     fn read(&self, buf: Buf) -> impl Future<Output = (io::Result<usize>, Buf)>;
@@ -25,6 +26,16 @@ impl Stream for rt::TcpStream {
 
     fn write_all(&self, buf: Buf) -> impl Future<Output = (io::Result<()>, Buf)> {
         rt::TcpStream::write_all(self, buf)
+    }
+}
+
+impl Stream for rt::UnixStream {
+    fn read(&self, buf: Buf) -> impl Future<Output = (io::Result<usize>, Buf)> {
+        rt::UnixStream::read(self, buf)
+    }
+
+    fn write_all(&self, buf: Buf) -> impl Future<Output = (io::Result<()>, Buf)> {
+        rt::UnixStream::write_all(self, buf)
     }
 }
 
@@ -63,6 +74,7 @@ pub struct Stats {
     pub busy: u64,
     pub forced: u64,
     pub failed: u64,
+    pub refused: u64,
 }
 
 enum Command {
@@ -107,6 +119,15 @@ impl Server {
 
     pub fn serve<S: Stream + 'static>(&self, stream: S) {
         rt::spawn(connection(stream, self.commands.clone()));
+    }
+
+    pub fn listen(&self, listener: rt::UnixListener, peer: u32) {
+        rt::spawn(accept(
+            listener,
+            peer,
+            self.commands.clone(),
+            Rc::clone(&self.stats),
+        ));
     }
 
     pub fn stats(&self) -> Stats {
@@ -305,6 +326,23 @@ impl Core {
                 }
             },
         );
+    }
+}
+
+async fn accept(
+    listener: rt::UnixListener,
+    peer: u32,
+    commands: Sender<Command>,
+    stats: Rc<RefCell<Stats>>,
+) {
+    loop {
+        match listener.accept().await {
+            Ok((stream, uid)) if uid == peer => {
+                rt::spawn(connection(stream, commands.clone()));
+            }
+            Ok(_) => stats.borrow_mut().refused += 1,
+            Err(_) => rt::sleep(ACCEPT_PAUSE).await,
+        }
     }
 }
 

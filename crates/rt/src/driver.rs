@@ -99,6 +99,15 @@ pub enum Op {
     LocalAddr {
         handle: Handle,
     },
+    ListenUnix {
+        path: PathBuf,
+    },
+    AcceptUnix {
+        handle: Handle,
+    },
+    ConnectUnix {
+        path: PathBuf,
+    },
 }
 
 #[derive(Debug)]
@@ -110,6 +119,7 @@ pub enum Completion {
     Accepted(io::Result<(Handle, SocketAddr)>),
     From(io::Result<(usize, SocketAddr)>, Buf),
     Addr(io::Result<SocketAddr>),
+    Peer(io::Result<(Handle, u32)>),
 }
 
 pub trait Unpark: Send + Sync {

@@ -1,13 +1,19 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::net::{IpAddr, SocketAddr};
+use std::path::{Path, PathBuf};
 
 pub(super) enum Socket {
     Listener {
         addr: SocketAddr,
         backlog: VecDeque<(u64, SocketAddr)>,
     },
+    UnixListener {
+        path: PathBuf,
+        uid: u32,
+        backlog: VecDeque<(u64, u32)>,
+    },
     Stream {
-        local: SocketAddr,
+        local: Option<SocketAddr>,
         peer: u64,
         inbound: VecDeque<u8>,
         eof: bool,
@@ -62,7 +68,14 @@ impl Net {
             Socket::Listener { addr: bound, .. } | Socket::Udp { addr: bound, .. } => {
                 *bound == addr
             }
-            Socket::Stream { .. } => false,
+            Socket::Stream { .. } | Socket::UnixListener { .. } => false,
+        })
+    }
+
+    pub(super) fn unix_at(&self, path: &Path) -> Option<u64> {
+        self.sockets.iter().find_map(|(id, socket)| match socket {
+            Socket::UnixListener { path: bound, .. } if bound == path => Some(*id),
+            _ => None,
         })
     }
 
@@ -92,8 +105,11 @@ impl Net {
         }
     }
 
-    pub(super) fn connect(&mut self, listener: u64, addr: SocketAddr) -> u64 {
-        let client_addr = self.bind_addr(SocketAddr::new(addr.ip(), 0));
+    fn pair(
+        &mut self,
+        client_addr: Option<SocketAddr>,
+        server_addr: Option<SocketAddr>,
+    ) -> (u64, u64) {
         let client = self.next_id + 1;
         let server = self.next_id + 2;
         self.add(Socket::Stream {
@@ -104,16 +120,37 @@ impl Net {
             reset: false,
         });
         self.add(Socket::Stream {
-            local: addr,
+            local: server_addr,
             peer: client,
             inbound: VecDeque::new(),
             eof: false,
             reset: false,
         });
+        (client, server)
+    }
+
+    pub(super) fn connect(&mut self, listener: u64, addr: SocketAddr) -> u64 {
+        let client_addr = self.bind_addr(SocketAddr::new(addr.ip(), 0));
+        let (client, server) = self.pair(Some(client_addr), Some(addr));
         if let Some(Socket::Listener { backlog, .. }) = self.sockets.get_mut(&listener) {
             backlog.push_back((server, client_addr));
         }
         client
+    }
+
+    pub(super) fn connect_unix(&mut self, listener: u64, uid: u32) -> Option<(u64, u32)> {
+        let Some(Socket::UnixListener {
+            uid: server_uid, ..
+        }) = self.sockets.get(&listener)
+        else {
+            return None;
+        };
+        let server_uid = *server_uid;
+        let (client, server) = self.pair(None, None);
+        if let Some(Socket::UnixListener { backlog, .. }) = self.sockets.get_mut(&listener) {
+            backlog.push_back((server, uid));
+        }
+        Some((client, server_uid))
     }
 
     pub(super) fn reset(&mut self, id: u64) {

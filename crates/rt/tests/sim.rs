@@ -6,8 +6,8 @@ use std::time::Duration;
 
 use rt::sim::{Config, Disk, Faults, SimDriver, check};
 use rt::{
-    Buf, File, OpenOptions, Runtime, TcpListener, TcpStream, UdpSocket, now, rename, sleep, spawn,
-    sync_dir, timeout, wall_ms,
+    Buf, File, OpenOptions, Runtime, TcpListener, TcpStream, UdpSocket, UnixListener, UnixStream,
+    now, rename, sleep, spawn, sync_dir, timeout, wall_ms,
 };
 
 const MILLION: u32 = 1_000_000;
@@ -363,6 +363,58 @@ fn closed_streams_read_end_of_file() {
         read.expect("read")
     });
     assert_eq!(n, 0);
+}
+
+#[test]
+fn unix_streams_report_both_peer_uids() {
+    check(0..20, |seed| {
+        let driver = Rc::new(SimDriver::new(seed, Config::default()));
+        let control = Rc::clone(&driver);
+        let (reply, client_uid, server_uid) = run(&driver, async move {
+            control.set_uid(70);
+            let listener = UnixListener::bind(Path::new("/run/keys.sock"))
+                .await
+                .expect("bind");
+            let server = spawn(async move {
+                let (stream, uid) = listener.accept().await.expect("accept");
+                let (read, buf) = stream.read(Buf::new(64)).await;
+                read.expect("read");
+                let (written, _) = stream.write_all(buf).await;
+                written.expect("write");
+                uid
+            });
+            control.set_uid(80);
+            let (client, server_uid) = UnixStream::connect(Path::new("/run/keys.sock"))
+                .await
+                .expect("connect");
+            let (written, _) = client.write_all(Buf::from_slice(b"ping")).await;
+            written.expect("write");
+            let (read, buf) = client.read(Buf::new(64)).await;
+            read.expect("read");
+            (buf.to_vec(), server.await, server_uid)
+        });
+        assert_eq!(reply, b"ping");
+        assert_eq!(client_uid, 80);
+        assert_eq!(server_uid, 70);
+    });
+}
+
+#[test]
+fn unix_paths_are_exclusive_and_must_exist() {
+    let driver = Rc::new(SimDriver::new(14, Config::default()));
+    let (again, missing) = run(&driver, async {
+        let _listener = UnixListener::bind(Path::new("/run/a.sock"))
+            .await
+            .expect("bind");
+        let again = UnixListener::bind(Path::new("/run/a.sock")).await;
+        let missing = UnixStream::connect(Path::new("/run/b.sock")).await;
+        (
+            again.err().map(|e| e.kind()),
+            missing.err().map(|e| e.kind()),
+        )
+    });
+    assert_eq!(again, Some(std::io::ErrorKind::AddrInUse));
+    assert_eq!(missing, Some(std::io::ErrorKind::NotFound));
 }
 
 #[test]

@@ -6,5 +6,10 @@ rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
 
+[dependencies]
+keys = { path = "../keys" }
+rt = { path = "../rt" }
+sys = { path = "../sys" }
+
 [lints]
 workspace = true

@@ -114,6 +114,7 @@ struct State {
     done: BTreeMap<OpId, Completion>,
     disk_ops: u64,
     halted: bool,
+    uid: u32,
 }
 
 fn bad_handle() -> io::Error {
@@ -153,7 +154,9 @@ impl State {
     fn delay_for(&mut self, op: &Op) -> Duration {
         let (low, high) = match op {
             Op::SyncData { .. } | Op::SyncDir { .. } => self.config.sync_latency,
-            Op::Connect { .. } | Op::Send { .. } | Op::SendTo { .. } => self.config.net_latency,
+            Op::Connect { .. } | Op::ConnectUnix { .. } | Op::Send { .. } | Op::SendTo { .. } => {
+                self.config.net_latency
+            }
             _ => self.config.io_latency,
         };
         self.rng.between(low, high)
@@ -377,12 +380,58 @@ impl State {
             Op::LocalAddr { handle } => {
                 let addr = match self.socket(handle).and_then(|id| self.net.sockets.get(&id)) {
                     Some(Socket::Listener { addr, .. } | Socket::Udp { addr, .. }) => Ok(*addr),
-                    Some(Socket::Stream { local, .. }) => Ok(*local),
-                    None => Err(bad_handle()),
+                    Some(Socket::Stream { local, .. }) => local.ok_or_else(bad_handle),
+                    _ => Err(bad_handle()),
                 };
                 Ok(Completion::Addr(addr))
             }
+            unix @ (Op::ListenUnix { .. } | Op::AcceptUnix { .. } | Op::ConnectUnix { .. }) => {
+                self.unix(unix)
+            }
             file => Ok(self.file_op(file)),
+        }
+    }
+
+    fn unix(&mut self, op: Op) -> Result<Completion, Op> {
+        match op {
+            Op::ListenUnix { path } => {
+                if self.net.unix_at(&path).is_some() {
+                    return Ok(Completion::Handle(Err(io::ErrorKind::AddrInUse.into())));
+                }
+                let id = self.net.add(Socket::UnixListener {
+                    path,
+                    uid: self.uid,
+                    backlog: std::collections::VecDeque::new(),
+                });
+                Ok(Completion::Handle(Ok(self.add(Resource::Socket(id)))))
+            }
+            Op::AcceptUnix { handle } => {
+                let Some(id) = self.socket(handle) else {
+                    return Ok(Completion::Peer(Err(bad_handle())));
+                };
+                let next = match self.net.sockets.get_mut(&id) {
+                    Some(Socket::UnixListener { backlog, .. }) => backlog.pop_front(),
+                    _ => return Ok(Completion::Peer(Err(bad_handle()))),
+                };
+                match next {
+                    Some((stream, uid)) => Ok(Completion::Peer(Ok((
+                        self.add(Resource::Socket(stream)),
+                        uid,
+                    )))),
+                    None => Err(Op::AcceptUnix { handle }),
+                }
+            }
+            Op::ConnectUnix { path } => {
+                let connected = self
+                    .net
+                    .unix_at(&path)
+                    .and_then(|listener| self.net.connect_unix(listener, self.uid));
+                Ok(Completion::Peer(match connected {
+                    Some((client, uid)) => Ok((self.add(Resource::Socket(client)), uid)),
+                    None => Err(io::ErrorKind::NotFound.into()),
+                }))
+            }
+            other => Ok(self.file_op(other)),
         }
     }
 
@@ -551,6 +600,7 @@ impl SimDriver {
                 done: BTreeMap::new(),
                 disk_ops: 0,
                 halted: false,
+                uid: 0,
             }),
         }
     }
@@ -583,6 +633,10 @@ impl SimDriver {
         disk
     }
 
+    pub fn set_uid(&self, uid: u32) {
+        self.state.borrow_mut().uid = uid;
+    }
+
     pub fn jump_wall_clock(&self, delta_ms: i64) {
         self.state.borrow_mut().wall_offset_ms += delta_ms;
     }
@@ -600,7 +654,9 @@ impl SimDriver {
             .sockets
             .iter()
             .find_map(|(id, socket)| match socket {
-                Socket::Stream { local: addr, .. } if *addr == local => Some(*id),
+                Socket::Stream {
+                    local: Some(addr), ..
+                } if *addr == local => Some(*id),
                 _ => None,
             });
         if let Some(id) = id {

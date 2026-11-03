@@ -4,9 +4,10 @@ use std::collections::BTreeMap;
 use std::collections::VecDeque;
 use std::fs;
 use std::io::{self, Read, Write};
-use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream, UdpSocket};
-use std::os::fd::AsFd;
+use std::net::{Shutdown, TcpListener, TcpStream, UdpSocket};
+use std::os::fd::{AsFd, BorrowedFd};
 use std::os::unix::fs::FileExt;
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -30,11 +31,66 @@ enum Resource {
     Listener(TcpListener),
     Stream(TcpStream),
     Udp(UdpSocket),
+    UnixListener(UnixListener),
+    UnixStream(UnixStream),
+}
+
+impl Resource {
+    fn fd(&self) -> Option<BorrowedFd<'_>> {
+        match self {
+            Self::File(_) => None,
+            Self::Listener(s) => Some(s.as_fd()),
+            Self::Stream(s) => Some(s.as_fd()),
+            Self::Udp(s) => Some(s.as_fd()),
+            Self::UnixListener(s) => Some(s.as_fd()),
+            Self::UnixStream(s) => Some(s.as_fd()),
+        }
+    }
+
+    fn connected(&self) -> io::Result<bool> {
+        let (error, peer) = match self {
+            Self::Stream(s) => (s.take_error(), s.peer_addr().map(drop)),
+            Self::UnixStream(s) => (s.take_error(), s.peer_addr().map(drop)),
+            _ => return Err(bad_handle()),
+        };
+        if let Some(e) = error? {
+            return Err(e);
+        }
+        match peer {
+            Ok(()) => Ok(true),
+            Err(e) if e.kind() == io::ErrorKind::NotConnected => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
+
+    fn read(&self, buf: &mut [u8]) -> io::Result<usize> {
+        match self {
+            Self::Stream(s) => Read::read(&mut &*s, buf),
+            Self::UnixStream(s) => Read::read(&mut &*s, buf),
+            _ => Err(bad_handle()),
+        }
+    }
+
+    fn write(&self, buf: &[u8]) -> io::Result<usize> {
+        match self {
+            Self::Stream(s) => Write::write(&mut &*s, buf),
+            Self::UnixStream(s) => Write::write(&mut &*s, buf),
+            _ => Err(bad_handle()),
+        }
+    }
+
+    fn shutdown(&self) -> io::Result<()> {
+        match self {
+            Self::Stream(s) => s.shutdown(Shutdown::Write),
+            Self::UnixStream(s) => s.shutdown(Shutdown::Write),
+            _ => Err(bad_handle()),
+        }
+    }
 }
 
 enum Step {
     Run(Op),
-    Connect(Handle, TcpStream),
+    Connect(Handle, Resource),
 }
 
 struct Pending {
@@ -71,6 +127,14 @@ struct Wake(Arc<Poller>);
 impl Unpark for Wake {
     fn unpark(&self) {
         let _ = self.0.wake();
+    }
+}
+
+fn failed(unix: bool, e: io::Error) -> Completion {
+    if unix {
+        Completion::Peer(Err(e))
+    } else {
+        Completion::Handle(Err(e))
     }
 }
 
@@ -130,11 +194,8 @@ impl State {
         self.next_handle += 1;
         let handle = Handle(self.next_handle);
         let token = usize::try_from(handle.0).expect("handle fits in usize");
-        match &resource {
-            Resource::File(_) => {}
-            Resource::Listener(s) => poller.watch(s.as_fd(), token)?,
-            Resource::Stream(s) => poller.watch(s.as_fd(), token)?,
-            Resource::Udp(s) => poller.watch(s.as_fd(), token)?,
+        if let Some(fd) = resource.fd() {
+            poller.watch(fd, token)?;
         }
         self.resources.insert(handle, resource);
         Ok(handle)
@@ -147,11 +208,8 @@ impl State {
         }
     }
 
-    fn stream(&self, handle: Handle) -> io::Result<&TcpStream> {
-        match self.resources.get(&handle) {
-            Some(Resource::Stream(s)) => Ok(s),
-            _ => Err(bad_handle()),
-        }
+    fn stream(&self, handle: Handle) -> io::Result<&Resource> {
+        self.resources.get(&handle).ok_or_else(bad_handle)
     }
 
     fn udp(&self, handle: Handle) -> io::Result<&UdpSocket> {
@@ -164,34 +222,47 @@ impl State {
     fn step(&mut self, poller: &Poller, step: Step) -> Result<Completion, Step> {
         match step {
             Step::Run(op) => self.run(poller, op),
-            Step::Connect(handle, stream) => match stream.take_error() {
-                Ok(None) => match stream.peer_addr() {
-                    Ok(_) => {
-                        self.resources.insert(handle, Resource::Stream(stream));
-                        Ok(Completion::Handle(Ok(handle)))
-                    }
-                    Err(e) if e.kind() == io::ErrorKind::NotConnected => {
-                        Err(Step::Connect(handle, stream))
-                    }
-                    Err(e) => Ok(Completion::Handle(Err(e))),
-                },
-                Ok(Some(e)) | Err(e) => Ok(Completion::Handle(Err(e))),
+            Step::Connect(handle, resource) => match resource.connected() {
+                Ok(true) => {
+                    let peer = match &resource {
+                        Resource::UnixStream(s) => Some(sys::net::peer_uid(s.as_fd())),
+                        _ => None,
+                    };
+                    self.resources.insert(handle, resource);
+                    Ok(match peer {
+                        None => Completion::Handle(Ok(handle)),
+                        Some(Ok(uid)) => Completion::Peer(Ok((handle, uid))),
+                        Some(Err(e)) => {
+                            self.resources.remove(&handle);
+                            Completion::Peer(Err(e))
+                        }
+                    })
+                }
+                Ok(false) => Err(Step::Connect(handle, resource)),
+                Err(e) => Ok(failed(matches!(resource, Resource::UnixStream(_)), e)),
             },
         }
     }
 
-    fn connect(&mut self, poller: &Poller, addr: SocketAddr) -> Result<Completion, Step> {
-        let stream = match sys::net::connect(addr) {
-            Ok(stream) => stream,
-            Err(e) => return Ok(Completion::Handle(Err(e))),
+    fn connect(
+        &mut self,
+        poller: &Poller,
+        made: io::Result<Resource>,
+        unix: bool,
+    ) -> Result<Completion, Step> {
+        let resource = match made {
+            Ok(resource) => resource,
+            Err(e) => return Ok(failed(unix, e)),
         };
         self.next_handle += 1;
         let handle = Handle(self.next_handle);
         let token = usize::try_from(handle.0).expect("handle fits in usize");
-        if let Err(e) = poller.watch(stream.as_fd(), token) {
-            return Ok(Completion::Handle(Err(e)));
+        if let Some(fd) = resource.fd()
+            && let Err(e) = poller.watch(fd, token)
+        {
+            return Ok(failed(unix, e));
         }
-        self.step(poller, Step::Connect(handle, stream))
+        self.step(poller, Step::Connect(handle, resource))
     }
 
     fn run(&mut self, poller: &Poller, op: Op) -> Result<Completion, Step> {
@@ -280,12 +351,12 @@ impl State {
                     )),
                 }
             }
-            Op::Connect { addr } => self.connect(poller, addr),
+            Op::Connect { addr } => {
+                self.connect(poller, sys::net::connect(addr).map(Resource::Stream), false)
+            }
             Op::Recv { handle, mut buf } => {
                 buf.clear();
-                let result = self
-                    .stream(handle)
-                    .and_then(|mut s| s.read(buf.spare_mut()));
+                let result = self.stream(handle).and_then(|s| s.read(buf.spare_mut()));
                 match result {
                     Err(e) if blocked(&e) => Err(Step::Run(Op::Recv { handle, buf })),
                     result => {
@@ -296,13 +367,12 @@ impl State {
                     }
                 }
             }
-            Op::Send { handle, buf } => match self.stream(handle).and_then(|mut s| s.write(&buf)) {
+            Op::Send { handle, buf } => match self.stream(handle).and_then(|s| s.write(&buf)) {
                 Err(e) if blocked(&e) => Err(Step::Run(Op::Send { handle, buf })),
                 result => Ok(Completion::Bytes(result, buf)),
             },
             Op::Shutdown { handle } => Ok(Completion::Unit(
-                self.stream(handle)
-                    .and_then(|s| s.shutdown(Shutdown::Write)),
+                self.stream(handle).and_then(Resource::shutdown),
             )),
             Op::BindUdp { addr } => Ok(Completion::Handle(
                 UdpSocket::bind(addr)
@@ -333,6 +403,46 @@ impl State {
                 Some(Resource::Udp(s)) => s.local_addr(),
                 _ => Err(bad_handle()),
             })),
+            unix @ (Op::ListenUnix { .. } | Op::AcceptUnix { .. } | Op::ConnectUnix { .. }) => {
+                self.run_unix(poller, unix)
+            }
+            other => Ok(Completion::Unit(Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!("not a socket operation: {other:?}"),
+            )))),
+        }
+    }
+
+    fn run_unix(&mut self, poller: &Poller, op: Op) -> Result<Completion, Step> {
+        match op {
+            Op::ListenUnix { path } => Ok(Completion::Handle(
+                UnixListener::bind(path)
+                    .and_then(|l| l.set_nonblocking(true).map(|()| l))
+                    .and_then(|l| self.add(poller, Resource::UnixListener(l))),
+            )),
+            Op::AcceptUnix { handle } => {
+                let accepted = match self.resources.get(&handle) {
+                    Some(Resource::UnixListener(l)) => l.accept(),
+                    _ => Err(bad_handle()),
+                };
+                match accepted {
+                    Err(e) if blocked(&e) => Err(Step::Run(Op::AcceptUnix { handle })),
+                    Err(e) => Ok(Completion::Peer(Err(e))),
+                    Ok((stream, _)) => Ok(Completion::Peer(
+                        sys::net::peer_uid(stream.as_fd())
+                            .and_then(|uid| stream.set_nonblocking(true).map(|()| uid))
+                            .and_then(|uid| {
+                                self.add(poller, Resource::UnixStream(stream))
+                                    .map(|h| (h, uid))
+                            }),
+                    )),
+                }
+            }
+            Op::ConnectUnix { path } => self.connect(
+                poller,
+                sys::net::unix_connect(&path).map(Resource::UnixStream),
+                true,
+            ),
             other => Ok(Completion::Unit(Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 format!("not a socket operation: {other:?}"),
@@ -507,8 +617,11 @@ impl Driver for Native {
         if state.waiting.remove(&id).is_some() {
             state.backlog.retain(|(queued, _)| *queued != id.0);
         }
-        if let Some(Completion::Handle(Ok(handle)) | Completion::Accepted(Ok((handle, _)))) =
-            state.done.remove(&id)
+        if let Some(
+            Completion::Handle(Ok(handle))
+            | Completion::Accepted(Ok((handle, _)))
+            | Completion::Peer(Ok((handle, _))),
+        ) = state.done.remove(&id)
         {
             state.resources.remove(&handle);
         }

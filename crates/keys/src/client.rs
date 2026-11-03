@@ -1,5 +1,6 @@
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
+use std::path::Path;
 use std::rc::Rc;
 
 use crypto::Plain;
@@ -32,6 +33,14 @@ impl Client {
             frames,
             closed,
         }
+    }
+
+    pub async fn connect(path: &Path, server: u32) -> Result<Self, Error> {
+        let (stream, uid) = rt::UnixStream::connect(path).await?;
+        if uid != server {
+            return Err(Error::Peer);
+        }
+        Ok(Self::new(stream))
     }
 
     pub async fn call(&self, request: &Request) -> Result<Answer, Error> {

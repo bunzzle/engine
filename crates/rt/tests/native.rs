@@ -7,8 +7,8 @@ use std::time::Duration;
 use std::{fs, io, process, thread};
 
 use rt::{
-    Buf, File, Native, OpenOptions, Runtime, TcpListener, TcpStream, UdpSocket, channel, now,
-    rename, sleep, spawn, sync_dir, timeout,
+    Buf, File, Native, OpenOptions, Runtime, TcpListener, TcpStream, UdpSocket, UnixListener,
+    UnixStream, channel, now, rename, sleep, spawn, sync_dir, timeout,
 };
 
 fn run<T: 'static>(future: impl Future<Output = T> + 'static) -> T {
@@ -224,6 +224,62 @@ fn a_refused_connect_reports_an_error() {
         let kind = refused.err().map(|e| e.kind());
         assert_eq!(kind, Some(io::ErrorKind::ConnectionRefused));
     });
+}
+
+#[test]
+fn unix_echo_reports_the_peer_uid() {
+    for (name, driver) in drivers() {
+        let dir = scratch(&format!("unix-{name}"));
+        let path = dir.join("s");
+        let uid = sys::process::euid();
+        Runtime::new(Rc::new(driver)).block_on(async move {
+            let listener = UnixListener::bind(&path).await.expect("bind");
+            let server = spawn(async move {
+                let (stream, peer) = listener.accept().await.expect("accept");
+                let mut total = Vec::new();
+                loop {
+                    let (read, buf) = stream.read(Buf::new(7)).await;
+                    if read.expect("read") == 0 {
+                        break;
+                    }
+                    total.extend_from_slice(&buf);
+                }
+                let (written, _) = stream.write_all(Buf::from_slice(&total)).await;
+                written.expect("echo");
+                stream.shutdown().await.expect("shutdown");
+                peer
+            });
+            let (client, server_uid) = UnixStream::connect(&path).await.expect("connect");
+            let message = vec![7u8; 300_000];
+            let (written, _) = client.write_all(Buf::from_slice(&message)).await;
+            written.expect("write");
+            client.shutdown().await.expect("shutdown");
+            let mut echoed = Vec::new();
+            loop {
+                let (read, buf) = client.read(Buf::new(65536)).await;
+                if read.expect("read") == 0 {
+                    break;
+                }
+                echoed.extend_from_slice(&buf);
+            }
+            assert_eq!(server.await, uid);
+            assert_eq!(server_uid, uid);
+            assert_eq!(echoed, message);
+        });
+        fs::remove_dir_all(&dir).expect("clean");
+    }
+}
+
+#[test]
+fn a_unix_connect_without_a_socket_fails() {
+    let dir = scratch("unix-missing");
+    let path = dir.join("none");
+    let result = run(async move { UnixStream::connect(&path).await.map(drop) });
+    assert_eq!(
+        result.err().map(|e| e.kind()),
+        Some(io::ErrorKind::NotFound)
+    );
+    fs::remove_dir_all(&dir).expect("clean");
 }
 
 #[test]
