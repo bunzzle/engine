@@ -4,6 +4,7 @@ use std::fmt;
 pub enum Error {
     Spool(spool::Error),
     Control(control::Error),
+    Naming,
     Closed,
 }
 
@@ -12,6 +13,7 @@ impl fmt::Display for Error {
         match self {
             Self::Spool(e) => write!(f, "{e}"),
             Self::Control(e) => write!(f, "{e}"),
+            Self::Naming => write!(f, "naming key does not match this spool"),
             Self::Closed => write!(f, "closed"),
         }
     }

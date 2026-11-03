@@ -2,8 +2,8 @@ use std::cell::{Cell, Ref, RefCell};
 use std::rc::Rc;
 
 use control::{
-    Ask, Call, KeySource, Leases, Name, Naming, Object, Queues, Table, Update, Writer, broadcast,
-    limit_core,
+    Ask, Call, KeyError, KeySource, Leases, Name, Naming, Object, Queues, Table, Update, Writer,
+    broadcast, limit_core,
 };
 use rt::{Ends, JoinHandle, Mesh, Notify, Peers, spawn};
 use store::Tiering;
@@ -77,6 +77,7 @@ pub struct Parts<T> {
 
 pub(crate) struct Inner<T> {
     pub(crate) settings: Settings,
+    keys: Rc<dyn KeySource>,
     cores: u16,
     pub(crate) spool: spool::Spool,
     pub(crate) sched: Sched<T>,
@@ -132,6 +133,7 @@ impl<T: Transport + 'static> Node<T> {
         } else {
             None
         };
+        let check = naming(control.as_ref().map(|(loaded, _)| loaded), &settings)?;
         let loaded = Queues::load(&core, settings.naming, parts.keys.as_ref()).await?;
         let table = Rc::new(RefCell::new(Table::default()));
         let clock = parts.clock;
@@ -151,10 +153,13 @@ impl<T: Transport + 'static> Node<T> {
                 applied.notify();
             })
         };
-        let writer = control.map(|(loaded, snapshot)| {
-            broadcast(&config, cores, &control::Note::Snapshot(snapshot));
-            loaded.writer(changes.clone())
-        });
+        let writer = match control {
+            Some((loaded, snapshot)) => {
+                broadcast(&config, cores, &control::Note::Snapshot(snapshot));
+                Some(control_writer(loaded, changes.clone(), check).await?)
+            }
+            None => None,
+        };
 
         let inputs = Inputs {
             keys: Rc::clone(&parts.keys),
@@ -166,18 +171,11 @@ impl<T: Transport + 'static> Node<T> {
         };
         let (suppressions, requests, mut index_done) =
             index_services(links.suppress, inputs).await?;
-        let (queues, names_done) = loaded.start(links.names, changes.clone(), parts.keys);
+        let (queues, names_done) =
+            loaded.start(links.names, changes.clone(), Rc::clone(&parts.keys));
 
-        let shards = settings.naming.shards;
-        let rules = Rc::clone(&table);
-        let (leases, leases_done) = Leases::start(
-            links.leases,
-            move |tenant| limit_core(*tenant, shards, cores),
-            move |tenant| rules.borrow().tenant(*tenant).map(|t| t.limits),
-        );
-        leases.restore(spool.open_counts());
-        let freed = leases.clone();
-        spool.on_close(move |tenant, count| freed.free(&tenant, count));
+        let (leases, leases_done) =
+            start_leases(links.leases, &table, &spool, settings.naming.shards);
 
         while !table.borrow().loaded() {
             applied.wait().await;
@@ -201,6 +199,7 @@ impl<T: Transport + 'static> Node<T> {
 
         let inner = Inner {
             settings,
+            keys: Rc::clone(&parts.keys),
             cores,
             spool,
             sched,
@@ -282,6 +281,11 @@ impl<T: Transport + 'static> Node<T> {
             inner.writing.set(false);
             return Err(control::Error::Invalid("core").into());
         };
+        if let Err(error) = self.create_keys(&object).await {
+            *inner.writer.borrow_mut() = Some(writer);
+            inner.writing.set(false);
+            return Err(error.into());
+        }
         let written = writer.write(object).await;
         *inner.writer.borrow_mut() = Some(writer);
         inner.writing.set(false);
@@ -292,6 +296,31 @@ impl<T: Transport + 'static> Node<T> {
             &control::Note::Update(update.clone()),
         );
         Ok(update)
+    }
+
+    async fn create_keys(&self, object: &Object) -> Result<(), control::Error> {
+        let Object::Tenant(tenant) = object else {
+            return Ok(());
+        };
+        let (id, generation) = (tenant.id, tenant.generation);
+        let known = self.inner.table.borrow().tenant(id).map(|t| t.generation);
+        match known {
+            Some(current) if current == generation => return Ok(()),
+            None if generation != 1 => return Err(control::Error::Refused),
+            _ => {}
+        }
+        self.inner
+            .keys
+            .create(id, generation)
+            .await
+            .map_err(|error| match error {
+                KeyError::Conflict => control::Error::Refused,
+                error => control::Error::Keys {
+                    tenant: id,
+                    generation,
+                    error,
+                },
+            })
     }
 
     pub async fn rebind(&self, name: &Name, pool: u32) -> Result<u32, Error> {
@@ -326,6 +355,48 @@ async fn index_services(
         .await
         .map_err(spool::Error::from)?;
     Ok((suppressions, requests, vec![lists_done, requests_done]))
+}
+
+fn start_leases(
+    ends: Ends<Ask<u32>>,
+    table: &Rc<RefCell<Table>>,
+    spool: &spool::Spool,
+    shards: u32,
+) -> (Leases<u32>, JoinHandle<()>) {
+    let cores = ends.cores();
+    let rules = Rc::clone(table);
+    let (leases, done) = Leases::start(
+        ends,
+        move |tenant| limit_core(*tenant, shards, cores),
+        move |tenant| rules.borrow().tenant(*tenant).map(|t| t.limits),
+    );
+    leases.restore(spool.open_counts());
+    let freed = leases.clone();
+    spool.on_close(move |tenant, count| freed.free(&tenant, count));
+    (leases, done)
+}
+
+async fn control_writer(
+    loaded: control::Loaded,
+    changes: Changes,
+    check: u64,
+) -> Result<Writer, Error> {
+    let mut writer = loaded.writer(changes);
+    if writer.naming_check().is_none() {
+        writer.set_naming_check(check).await?;
+    }
+    Ok(writer)
+}
+
+fn naming(control: Option<&control::Loaded>, settings: &Settings) -> Result<u64, Error> {
+    let check = control::naming_check(&settings.naming.key);
+    if control
+        .and_then(control::Loaded::naming_check)
+        .is_some_and(|found| found != check)
+    {
+        return Err(Error::Naming);
+    }
+    Ok(check)
 }
 
 fn retain_current(core: &mut Core, table: &Rc<RefCell<Table>>, clock: Clock) {

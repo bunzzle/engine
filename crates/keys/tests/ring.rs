@@ -185,6 +185,34 @@ fn tenant_keys_open_once_on_first_use_and_stay_cached() {
 }
 
 #[test]
+fn create_sets_retention_adopts_a_retry_and_refuses_another_generation() {
+    let driver = Rc::new(SimDriver::new(8, quiet()));
+    run(&driver, {
+        let driver = Rc::clone(&driver);
+        async move {
+            let _server = serve("/a", 1).await;
+            let ring = Ring::new(hosts(&[1]).0, settings());
+            assert_eq!(ring.create(4, 1, 30).await, Ok(()));
+            let first = ring.get(4, 1).expect("cached");
+            assert_eq!(ring.stats().opens, 0);
+            assert_eq!(ring.create(4, 1, 60).await, Ok(()));
+            let again = ring.open(4, 1).await.expect("open");
+            let label = [&4u32.to_le_bytes()[..], &1u32.to_le_bytes()].concat();
+            let sealed = first.keys.seal(&label, b"mail").expect("seal");
+            assert_eq!(again.keys.open(&label, &sealed).expect("open"), b"mail");
+            assert_eq!(ring.create(4, 2, 30).await, Err(Fault::Conflict));
+            sleep(Duration::from_secs(1)).await;
+            let disk = driver.disk();
+            let audit = disk
+                .contents(&Path::new("/a").join("audit"))
+                .expect("audit");
+            let text = String::from_utf8(audit.to_vec()).expect("text");
+            assert_eq!(text.matches(" retention 4 1 ").count(), 2, "{text}");
+        }
+    });
+}
+
+#[test]
 fn keys_down_is_unavailable_and_retries_back_off() {
     let driver = Rc::new(SimDriver::new(2, quiet()));
     run(&driver, async {
