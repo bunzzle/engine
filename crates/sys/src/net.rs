@@ -113,6 +113,21 @@ pub fn connect(addr: SocketAddr) -> io::Result<TcpStream> {
     }
 }
 
+pub fn transient(error: &io::Error) -> bool {
+    matches!(
+        error.raw_os_error(),
+        Some(
+            libc::EMFILE
+                | libc::ENFILE
+                | libc::ENOBUFS
+                | libc::ENOMEM
+                | libc::ECONNABORTED
+                | libc::EINTR
+                | libc::EAGAIN
+        )
+    )
+}
+
 #[cfg(target_vendor = "apple")]
 const UNIX_PATH: usize = 104;
 #[cfg(not(target_vendor = "apple"))]
@@ -219,6 +234,16 @@ mod tests {
         assert_eq!(peer_uid(client.as_fd()).expect("client side"), euid());
         drop(listener);
         std::fs::remove_dir_all(&dir).expect("clean");
+    }
+
+    #[test]
+    fn only_resource_errors_are_transient() {
+        let error = |code| std::io::Error::from_raw_os_error(code);
+        assert!(super::transient(&error(libc::EMFILE)));
+        assert!(super::transient(&error(libc::ECONNABORTED)));
+        assert!(!super::transient(&error(libc::EBADF)));
+        assert!(!super::transient(&error(libc::EINVAL)));
+        assert!(!super::transient(&std::io::Error::other("x")));
     }
 
     #[test]

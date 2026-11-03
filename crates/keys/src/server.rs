@@ -79,6 +79,7 @@ pub struct Stats {
 
 enum Command {
     Call(Request, Sender<Answer>),
+    Refused(u32),
     Tick,
 }
 
@@ -121,13 +122,8 @@ impl Server {
         rt::spawn(connection(stream, self.commands.clone()));
     }
 
-    pub fn listen(&self, listener: rt::UnixListener, peer: u32) {
-        rt::spawn(accept(
-            listener,
-            peer,
-            self.commands.clone(),
-            Rc::clone(&self.stats),
-        ));
+    pub fn listen(&self, listener: rt::UnixListener, peer: u32) -> rt::JoinHandle<io::Error> {
+        rt::spawn(accept(listener, peer, self.commands.clone()))
     }
 
     pub fn stats(&self) -> Stats {
@@ -168,6 +164,10 @@ impl Core {
                     if let Some(answer) = self.call(request, &reply).await {
                         let _ = reply.send(answer);
                     }
+                }
+                Command::Refused(uid) => {
+                    self.stats.borrow_mut().refused += 1;
+                    self.audit.note(Op::Refused, uid, 0, self.vault.day());
                 }
                 Command::Tick => self.tick().await,
             }
@@ -329,19 +329,18 @@ impl Core {
     }
 }
 
-async fn accept(
-    listener: rt::UnixListener,
-    peer: u32,
-    commands: Sender<Command>,
-    stats: Rc<RefCell<Stats>>,
-) {
+async fn accept(listener: rt::UnixListener, peer: u32, commands: Sender<Command>) -> io::Error {
     loop {
         match listener.accept().await {
             Ok((stream, uid)) if uid == peer => {
                 rt::spawn(connection(stream, commands.clone()));
             }
-            Ok(_) => stats.borrow_mut().refused += 1,
-            Err(_) => rt::sleep(ACCEPT_PAUSE).await,
+            Ok((stream, uid)) => {
+                drop(stream);
+                let _ = commands.send(Command::Refused(uid));
+            }
+            Err(error) if sys::net::transient(&error) => rt::sleep(ACCEPT_PAUSE).await,
+            Err(error) => return error,
         }
     }
 }

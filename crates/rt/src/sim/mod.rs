@@ -695,7 +695,14 @@ impl Driver for SimDriver {
         let mut state = self.state.borrow_mut();
         state.pending.remove(&id);
         state.waiting.remove(&id);
-        state.done.remove(&id);
+        if let Some(
+            Completion::Handle(Ok(handle))
+            | Completion::Accepted(Ok((handle, _)))
+            | Completion::Peer(Ok((handle, _))),
+        ) = state.done.remove(&id)
+        {
+            state.release(handle);
+        }
     }
 
     fn release(&self, handle: Handle) {

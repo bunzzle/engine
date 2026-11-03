@@ -1,6 +1,6 @@
 use std::fs;
 use std::io;
-use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
@@ -9,6 +9,7 @@ use rt::{Native, Runtime, UnixListener};
 
 const DAY_MS: u64 = 86_400_000;
 const SOCKET_MODE: u32 = 0o666;
+const STICKY: u32 = 0o1000;
 
 pub enum Command {
     Init {
@@ -52,22 +53,28 @@ pub fn private_dir(dir: &Path, uid: u32) -> Result<(), String> {
     Ok(())
 }
 
-pub fn socket_dir(socket: &Path, uid: u32) -> Result<(), String> {
-    let parent = match socket.parent() {
-        Some(p) if !p.as_os_str().is_empty() => p,
-        _ => Path::new("."),
+pub fn socket_path(socket: &Path, uid: u32) -> Result<PathBuf, String> {
+    let (Some(parent), Some(name)) = (socket.parent(), socket.file_name()) else {
+        return Err(format!("{} is not a socket path", socket.display()));
     };
-    let meta = fs::metadata(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
-    if meta.uid() != uid && meta.uid() != 0 {
-        return Err(format!("{} belongs to another user", parent.display()));
+    if !socket.is_absolute() {
+        return Err(format!("{} must be an absolute path", socket.display()));
     }
-    if meta.mode() & 0o022 != 0 {
-        return Err(format!(
-            "{} must not be writable by group or others",
-            parent.display()
-        ));
+    let real = fs::canonicalize(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
+    for (depth, dir) in real.ancestors().enumerate() {
+        let meta = fs::symlink_metadata(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+        if meta.uid() != uid && meta.uid() != 0 {
+            return Err(format!("{} belongs to another user", dir.display()));
+        }
+        let shared = meta.mode() & 0o022 != 0;
+        if shared && (depth == 0 || meta.mode() & STICKY == 0) {
+            return Err(format!(
+                "{} must not be writable by group or others",
+                dir.display()
+            ));
+        }
     }
-    Ok(())
+    Ok(real.join(name))
 }
 
 pub fn clear_socket(socket: &Path) -> Result<(), String> {
@@ -79,10 +86,44 @@ pub fn clear_socket(socket: &Path) -> Result<(), String> {
     if !meta.file_type().is_socket() {
         return Err(format!("{} exists and is not a socket", socket.display()));
     }
-    if std::os::unix::net::UnixStream::connect(socket).is_ok() {
-        return Err(format!("keys already listens on {}", socket.display()));
+    match sys::net::unix_connect(socket) {
+        Ok(_) => Err(format!("keys already listens on {}", socket.display())),
+        Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+            Err(format!("keys already listens on {}", socket.display()))
+        }
+        Err(e) if e.kind() == io::ErrorKind::ConnectionRefused => {
+            fs::remove_file(socket).map_err(|e| format!("{}: {e}", socket.display()))
+        }
+        Err(e) => Err(format!("{}: {e}", socket.display())),
     }
-    fs::remove_file(socket).map_err(|e| format!("{}: {e}", socket.display()))
+}
+
+pub fn lock(dir: &Path) -> Result<fs::File, String> {
+    let path = dir.join("lock");
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(keys::MODE)
+        .open(&path)
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    match file.try_lock() {
+        Ok(()) => Ok(file),
+        Err(fs::TryLockError::WouldBlock) => {
+            Err(format!("another keys process uses {}", dir.display()))
+        }
+        Err(fs::TryLockError::Error(e)) => Err(format!("{}: {e}", path.display())),
+    }
+}
+
+pub async fn bind(socket: &Path) -> Result<UnixListener, String> {
+    let listener = UnixListener::bind(socket)
+        .await
+        .map_err(|e| format!("{}: {e}", socket.display()))?;
+    fs::set_permissions(socket, fs::Permissions::from_mode(SOCKET_MODE))
+        .map_err(|e| format!("{}: {e}", socket.display()))?;
+    Ok(listener)
 }
 
 fn harden() -> Result<(), String> {
@@ -111,6 +152,7 @@ pub fn run(command: Command) -> Result<(), String> {
                 _ => {}
             }
             private_dir(&dir, uid)?;
+            let _lock = lock(&dir)?;
             let day = u32::try_from(wall_ms() / DAY_MS).unwrap_or(u32::MAX);
             runtime()?.block_on(async move {
                 Vault::init(&dir, day)
@@ -128,7 +170,8 @@ pub fn run(command: Command) -> Result<(), String> {
                 return Err("keys must run as another user than the engine".into());
             }
             private_dir(&dir, uid)?;
-            socket_dir(&socket, uid)?;
+            let _lock = lock(&dir)?;
+            let socket = socket_path(&socket, uid)?;
             clear_socket(&socket)?;
             runtime()?.block_on(serve(dir, socket, engine))
         }
@@ -145,15 +188,10 @@ fn wall_ms() -> u64 {
 async fn serve(dir: PathBuf, socket: PathBuf, engine: u32) -> Result<(), String> {
     let vault = Vault::open(&dir).await.map_err(|e| e.to_string())?;
     let audit = Audit::open(&dir).await.map_err(|e| e.to_string())?;
-    let listener = UnixListener::bind(&socket)
-        .await
-        .map_err(|e| format!("{}: {e}", socket.display()))?;
-    fs::set_permissions(&socket, fs::Permissions::from_mode(SOCKET_MODE))
-        .map_err(|e| format!("{}: {e}", socket.display()))?;
+    let listener = bind(&socket).await?;
     let server = Server::start(vault, audit, Settings::default());
-    server.listen(listener, engine);
-    std::future::pending::<()>().await;
-    Ok(())
+    let error = server.listen(listener, engine).await;
+    Err(format!("{}: {error}", socket.display()))
 }
 
 #[cfg(test)]
@@ -163,7 +201,7 @@ mod tests {
     use std::os::unix::net::UnixListener;
     use std::path::PathBuf;
 
-    use super::{Command, clear_socket, private_dir, socket_dir};
+    use super::{Command, bind, clear_socket, lock, private_dir, socket_path};
 
     fn scratch(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("bunzzle-keys-{}-{name}", std::process::id()));
@@ -213,17 +251,63 @@ mod tests {
 
     #[test]
     fn the_socket_directory_must_not_be_shared() {
-        let dir = scratch("socket-dir");
+        let dir = fs::canonicalize(scratch("socket-dir")).expect("real");
         let uid = sys::process::euid();
         let socket = dir.join("keys.sock");
         mode(&dir, 0o755);
-        assert!(socket_dir(&socket, uid).is_ok());
+        assert_eq!(socket_path(&socket, uid), Ok(socket.clone()));
         mode(&dir, 0o775);
-        assert!(socket_dir(&socket, uid).is_err());
-        mode(&dir, 0o757);
-        assert!(socket_dir(&socket, uid).is_err());
+        assert!(socket_path(&socket, uid).is_err());
+        mode(&dir, 0o1757);
+        assert!(socket_path(&socket, uid).is_err());
         mode(&dir, 0o755);
-        assert!(socket_dir(&socket, uid.wrapping_add(1)).is_err());
+        assert!(socket_path(&socket, uid.wrapping_add(1)).is_err());
+        assert!(socket_path(std::path::Path::new("keys.sock"), uid).is_err());
+        fs::remove_dir_all(&dir).expect("clean");
+    }
+
+    #[test]
+    fn every_directory_above_the_socket_is_checked() {
+        let dir = fs::canonicalize(scratch("ancestors")).expect("real");
+        let uid = sys::process::euid();
+        let inner = dir.join("inner");
+        fs::create_dir(&inner).expect("inner");
+        mode(&inner, 0o755);
+        mode(&dir, 0o777);
+        assert!(socket_path(&inner.join("keys.sock"), uid).is_err());
+        mode(&dir, 0o1777);
+        assert!(socket_path(&inner.join("keys.sock"), uid).is_ok());
+        mode(&dir, 0o755);
+        let link = dir.join("link");
+        std::os::unix::fs::symlink(&inner, &link).expect("symlink");
+        assert_eq!(
+            socket_path(&link.join("keys.sock"), uid),
+            Ok(inner.join("keys.sock"))
+        );
+        fs::remove_dir_all(&dir).expect("clean");
+    }
+
+    #[test]
+    fn one_process_holds_the_key_directory() {
+        let dir = scratch("lock");
+        let held = lock(&dir).expect("lock");
+        assert!(lock(&dir).is_err());
+        drop(held);
+        assert!(lock(&dir).is_ok());
+        fs::remove_dir_all(&dir).expect("clean");
+    }
+
+    #[test]
+    fn the_socket_is_open_to_every_user() {
+        let dir = scratch("bind");
+        let socket = dir.join("keys.sock");
+        let path = socket.clone();
+        let driver = rt::Native::new().expect("driver");
+        rt::Runtime::new(std::rc::Rc::new(driver)).block_on(async move {
+            let _listener = bind(&path).await.expect("bind");
+            let mode = fs::metadata(&path).expect("socket").permissions().mode();
+            assert_eq!(mode & 0o777, 0o666);
+        });
         fs::remove_dir_all(&dir).expect("clean");
     }
 

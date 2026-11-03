@@ -30,6 +30,17 @@ pub fn no_core_dumps() -> io::Result<()> {
 
 #[allow(unsafe_code)]
 pub fn lock_memory() -> io::Result<()> {
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: `limit` is a writable `rlimit` that lives for the call.
+    check(unsafe { libc::getrlimit(libc::RLIMIT_MEMLOCK, &raw mut limit) })?;
+    if limit.rlim_cur != libc::RLIM_INFINITY && euid() != 0 {
+        return Err(io::Error::other(
+            "locked memory is limited; set the limit to unlimited",
+        ));
+    }
     // SAFETY: plain system call with constant flags.
     check(unsafe { libc::mlockall(libc::MCL_CURRENT | libc::MCL_FUTURE) }).map(drop)
 }

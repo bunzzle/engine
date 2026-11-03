@@ -403,5 +403,15 @@ fn the_unix_socket_serves_only_the_engine_user() {
         assert_eq!(refused.err(), Some(Error::Closed));
         assert_eq!(server.stats().refused, 1);
         assert_eq!(day(&engine).await, DAY);
+        sleep(Duration::from_secs(1)).await;
     });
+    let text = String::from_utf8(
+        driver
+            .disk()
+            .contents(&Path::new(DIR).join("audit"))
+            .expect("audit")
+            .to_vec(),
+    )
+    .expect("text");
+    assert!(text.contains(&format!(" refused 90 0 {DAY} 1\n")), "{text}");
 }

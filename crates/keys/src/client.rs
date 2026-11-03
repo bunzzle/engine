@@ -2,6 +2,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::path::Path;
 use std::rc::Rc;
+use std::time::Duration;
 
 use crypto::Plain;
 use rt::{Buf, Receiver, Sender};
@@ -11,6 +12,8 @@ use crate::proto::{Answer, Frames, MAX_FRAME, Request};
 use crate::server::Stream;
 
 const REQUEST: usize = 128;
+const CONNECT_TRIES: u32 = 8;
+const CONNECT_PAUSE: Duration = Duration::from_millis(10);
 
 pub struct Client {
     next: Cell<u32>,
@@ -36,7 +39,16 @@ impl Client {
     }
 
     pub async fn connect(path: &Path, server: u32) -> Result<Self, Error> {
-        let (stream, uid) = rt::UnixStream::connect(path).await?;
+        let mut tries = 1;
+        let (stream, uid) = loop {
+            match rt::UnixStream::connect(path).await {
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock && tries < CONNECT_TRIES => {
+                    rt::sleep(CONNECT_PAUSE * tries).await;
+                    tries += 1;
+                }
+                result => break result?,
+            }
+        };
         if uid != server {
             return Err(Error::Peer);
         }
