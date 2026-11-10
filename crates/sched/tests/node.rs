@@ -159,31 +159,40 @@ impl Transport for Simulated {
             }
         }
         sleep(Duration::from_millis(1 + self.below(2_000))).await;
-        let fault = match self.below(40) {
-            0 => Some(Unsealable::Unavailable),
-            1 => Some(Unsealable::Unknown),
-            2 => Some(Unsealable::Gone),
-            _ => None,
+        let (fault, mixed) = match self.below(40) {
+            0 => (Some(Unsealable::Unavailable), false),
+            1 => (Some(Unsealable::Unknown), false),
+            2 => (Some(Unsealable::Gone), false),
+            3 => (Some(Unsealable::Gone), true),
+            _ => (None, false),
         };
         let mut world = self.world.borrow_mut();
         if let Some(fault) = fault {
-            if fault == Unsealable::Gone {
+            if fault == Unsealable::Gone && !mixed {
                 world
                     .cancelling
                     .insert((attempt.message.shard, attempt.message.key));
             }
-            return attempt
-                .recipients
-                .iter()
-                .map(|c| {
-                    world.in_attempt.remove(&key(attempt.message, c.recipient));
-                    Answered {
-                        recipient: c.recipient,
-                        answer: Answer::Unopened {
+            return (0..)
+                .zip(&attempt.recipients)
+                .map(|(n, c)| {
+                    let k = key(attempt.message, c.recipient);
+                    world.in_attempt.remove(&k);
+                    let answer = if mixed && n == 0 {
+                        self.answer()
+                    } else {
+                        Answer::Unopened {
                             fault,
                             generation: 1,
                             day: 0,
-                        },
+                        }
+                    };
+                    if matches!(answer, Answer::Delivered | Answer::Failed) {
+                        *world.finals.entry(k).or_default() += 1;
+                    }
+                    Answered {
+                        recipient: c.recipient,
+                        answer,
                         reply: Vec::new(),
                     }
                 })

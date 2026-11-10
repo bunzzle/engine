@@ -494,7 +494,7 @@ impl<T: Transport + 'static> Sched<T> {
         drop(spawn(async move { sched.attempt(route, claimed).await }));
     }
 
-    async fn attempt(&self, route: Route, claimed: Vec<Claimed>) {
+    async fn attempt(&self, route: Route, mut claimed: Vec<Claimed>) {
         let id = self.inner.next_attempt.get();
         self.inner.next_attempt.set(id + 1);
         let started = self.inner.clock.now();
@@ -519,8 +519,18 @@ impl<T: Transport + 'static> Sched<T> {
             _ => None,
         });
         if let Some((fault, generation, day)) = unopened {
-            self.unopened(route, &claimed, fault, generation, day).await;
-            return;
+            let (shut, open): (Vec<Claimed>, Vec<Claimed>) = claimed.into_iter().partition(|c| {
+                by_recipient
+                    .get(&c.recipient)
+                    .is_some_and(|a| matches!(a.answer, Answer::Unopened { .. }))
+            });
+            let mixed = !open.is_empty();
+            self.unopened(route, &shut, fault, generation, day, mixed)
+                .await;
+            if !mixed {
+                return;
+            }
+            claimed = open;
         }
         let reports = claimed
             .iter()
@@ -621,11 +631,16 @@ impl<T: Transport + 'static> Sched<T> {
         fault: Unsealable,
         generation: u32,
         day: u32,
+        mixed: bool,
     ) {
-        let oldest = match (fault, self.inner.keys.get()) {
-            (Unsealable::Gone, Some(keys)) => keys.oldest(route.tenant, generation).await.ok(),
-            _ => None,
-        };
+        let now = self.inner.clock.now();
+        let mut oldest = None;
+        if fault == Unsealable::Gone && !mixed {
+            let room = self.inner.breaker.borrow_mut().room(now);
+            if let (true, Some(keys)) = (room, self.inner.keys.get()) {
+                oldest = keys.oldest(route.tenant, generation).await.ok();
+            }
+        }
         let now = self.inner.clock.now();
         let chosen =
             self.inner
