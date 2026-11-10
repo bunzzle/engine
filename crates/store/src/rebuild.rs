@@ -36,8 +36,18 @@ impl Keeper {
                 None => Roots::default(),
             };
             let mut state = ShardState::default();
+            let mut last = None;
             for root in &roots.state {
-                state.load_run(read_run(data, root, shard).await?);
+                let run = read_run(data, root, shard).await?;
+                let first = run.changes.keys().next().copied();
+                if root.segment > 0 && first.is_none_or(|first| last.is_some_and(|l| first <= l)) {
+                    return Err(Error::Damaged {
+                        region: root.region,
+                        offset: root.offset,
+                    });
+                }
+                last = run.changes.keys().next_back().copied().or(last);
+                state.load_run(run, root.segment == 0);
             }
             let covered = state.covered();
             let indexes = indexes::load(data, &roots.index).await?;

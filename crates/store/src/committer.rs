@@ -17,7 +17,9 @@ use crate::reader::{Pins, Reader};
 use crate::record::{self, Header, MAX_PAYLOAD, record_size};
 use crate::recovery::State;
 use crate::regions::{Claim, Regions};
+use crate::run;
 use crate::session::{Answer, Event, Owned, Results, Session};
+use crate::shard::KIND_STATE;
 use crate::usage::Usage;
 use compaction::Compaction;
 pub use compaction::{CompactionStats, Space};
@@ -225,6 +227,7 @@ impl Committer {
             sessions: Vec::new(),
             queues: Queues::default(),
             runs: Runs {
+                published: state.runs.clone(),
                 regions: state.runs,
                 ..Runs::default()
             },
@@ -680,12 +683,18 @@ impl Committer {
         self.check_bodies(submission)?;
         let superblock = self.data.superblock();
         let region_size = superblock.region_size();
+        let sector = superblock.sector_size() as usize;
         let mut total = 0u64;
         for write in &submission.records {
             if u32::from(write.shard) >= superblock.shards() {
                 return Err(Error::Invalid("shard"));
             }
             if write.payload.len() > MAX_PAYLOAD {
+                return Err(Error::CommitTooLarge);
+            }
+            if write.kind == KIND_STATE
+                && !run::entry_fits(write.payload.len(), sector, region_size)
+            {
                 return Err(Error::CommitTooLarge);
             }
             total += record_size(write.payload.len()) as u64;
