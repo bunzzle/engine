@@ -754,3 +754,46 @@ fn a_sign_queued_before_a_delete_returns_no_signature() {
         assert!(done(&deleted.await.expect("delete")));
     });
 }
+
+#[test]
+fn a_delete_of_another_generation_leaves_signs_alone() {
+    let driver = Rc::new(SimDriver::new(26, quiet()));
+    run(&driver, async {
+        let _server = start(Settings::default()).await;
+        let client = Rc::new(client().await);
+        created(&client, 1).await;
+        let ed = DkimAlg::Ed25519Sha256;
+        made(client.call(&dkim_new(1, 1, ed)).await.expect("new"));
+        let signing = Rc::clone(&client);
+        let signed = spawn(async move { signing.call(&sign(1, 1, ed, [1; 32])).await });
+        let deleting = Rc::clone(&client);
+        let deleted = spawn(async move {
+            let delete = Request::Delete {
+                tenant: 1,
+                generation: 2,
+            };
+            deleting.call(&delete).await
+        });
+        assert!(matches!(signed.await.expect("sign"), Answer::Signature(_)));
+        assert!(done(&deleted.await.expect("delete")));
+    });
+}
+
+#[test]
+fn a_load_over_the_frame_limit_is_refused_by_the_client() {
+    let driver = Rc::new(SimDriver::new(27, quiet()));
+    run(&driver, async {
+        let _server = start(Settings::default()).await;
+        let client = client().await;
+        created(&client, 1).await;
+        let load = Request::Load {
+            tenant: 1,
+            generation: 1,
+            key: 1,
+            alg: DkimAlg::Ed25519Sha256,
+            blob: vec![0; 70_000],
+        };
+        assert_eq!(client.call(&load).await.err(), Some(Error::Bad));
+        assert_eq!(day(&client).await, DAY);
+    });
+}

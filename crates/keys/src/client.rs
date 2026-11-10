@@ -98,6 +98,9 @@ impl Client {
         if self.closed.get() {
             return Err(Error::Closed);
         }
+        if request.size() > MAX_FRAME {
+            return Err(Error::Bad);
+        }
         let id = self.next.get();
         self.next.set(id.wrapping_add(1));
         let (reply, answer) = rt::channel();

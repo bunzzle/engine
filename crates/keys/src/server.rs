@@ -315,7 +315,9 @@ impl Core {
             }
             Request::Delete { tenant, generation } => {
                 self.dkim.retain(|id, _| id.0 != tenant);
-                self.deletes += 1;
+                if self.vault.holds(tenant, generation) {
+                    self.deletes += 1;
+                }
                 match self.vault.delete(tenant, generation).await {
                     Ok(()) => {
                         self.audit
@@ -486,7 +488,7 @@ impl Core {
                 Answer::Signature(signature)
             }
             Done::Loaded(None) => Answer::Refused(Error::Open),
-            Done::New(None) | Done::Signed(None) => Answer::Refused(Error::Bad),
+            Done::New(None) | Done::Signed(None) => self.refused(Error::Failed),
         }
     }
 

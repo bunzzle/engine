@@ -363,14 +363,16 @@ impl Vault {
         use_key(&chains[&tenant][index]).map_err(Into::into)
     }
 
-    pub async fn delete(&mut self, tenant: u32, generation: u32) -> Result<(), Error> {
-        self.check()?;
-        if self
-            .state
+    pub fn holds(&self, tenant: u32, generation: u32) -> bool {
+        self.state
             .tenants
             .get(&tenant)
-            .is_none_or(|entry| entry.generation != generation)
-        {
+            .is_some_and(|entry| entry.generation == generation)
+    }
+
+    pub async fn delete(&mut self, tenant: u32, generation: u32) -> Result<(), Error> {
+        self.check()?;
+        if !self.holds(tenant, generation) {
             return Ok(());
         }
         self.state.tenants.remove(&tenant);

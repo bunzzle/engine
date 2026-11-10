@@ -1,3 +1,4 @@
+use std::panic::{self, AssertUnwindSafe};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 
@@ -61,6 +62,19 @@ fn work(job: Job) -> Done {
     }
 }
 
+fn failed(job: &Job) -> Done {
+    match job {
+        Job::New { .. } => Done::New(None),
+        Job::Load { .. } => Done::Loaded(None),
+        Job::Sign { .. } => Done::Signed(None),
+    }
+}
+
+fn guarded(job: Job) -> Done {
+    let failure = failed(&job);
+    panic::catch_unwind(AssertUnwindSafe(|| work(job))).unwrap_or(failure)
+}
+
 type Task = (Job, Box<dyn FnOnce(Done) + Send>);
 
 pub struct Signers {
@@ -92,7 +106,7 @@ impl Signers {
                         let Ok((job, done)) = task else {
                             return;
                         };
-                        done(work(job));
+                        done(guarded(job));
                     }
                 })
             })
@@ -112,10 +126,10 @@ impl Signers {
         match &self.queue {
             Some(queue) => {
                 if let Err(mpsc::SendError((job, done))) = queue.send((job, Box::new(done))) {
-                    done(work(job));
+                    done(guarded(job));
                 }
             }
-            None => done(work(job)),
+            None => done(guarded(job)),
         }
     }
 }
