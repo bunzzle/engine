@@ -1,4 +1,4 @@
-use crypto::{Plain, Secret, WRAP, Wrap};
+use crypto::{DkimAlg, Plain, Secret, WRAP, Wrap};
 
 use crate::Error;
 
@@ -36,6 +36,26 @@ pub enum Request {
         tenant: u32,
         generation: u32,
     },
+    DkimNew {
+        tenant: u32,
+        generation: u32,
+        key: u32,
+        alg: DkimAlg,
+    },
+    Load {
+        tenant: u32,
+        generation: u32,
+        key: u32,
+        alg: DkimAlg,
+        blob: Vec<u8>,
+    },
+    Sign {
+        tenant: u32,
+        generation: u32,
+        key: u32,
+        alg: DkimAlg,
+        digest: [u8; 32],
+    },
 }
 
 pub enum Answer {
@@ -54,10 +74,15 @@ pub enum Answer {
         tomorrow: [u8; 32],
     },
     Key(Secret<32>),
+    Dkim {
+        public: Vec<u8>,
+        blob: Vec<u8>,
+    },
+    Signature(Vec<u8>),
     Refused(Error),
 }
 
-const REFUSALS: [Error; 10] = [
+const REFUSALS: [Error; 11] = [
     Error::Unknown,
     Error::Generation,
     Error::Pending,
@@ -68,6 +93,7 @@ const REFUSALS: [Error; 10] = [
     Error::Busy,
     Error::Bad,
     Error::Unreadable,
+    Error::Conflict,
 ];
 
 fn refusal_code(error: Error) -> u8 {
@@ -128,6 +154,15 @@ impl Reader<'_> {
         Ok(Secret::from_slice(self.take(N)?)?)
     }
 
+    fn alg(&mut self) -> Result<DkimAlg, Error> {
+        DkimAlg::from_code(self.u8()?).ok_or(Error::Bad)
+    }
+
+    fn bytes(&mut self) -> Result<Vec<u8>, Error> {
+        let len = usize::from(self.u16()?);
+        Ok(self.take(len)?.to_vec())
+    }
+
     fn end(&self) -> Result<(), Error> {
         if self.bytes.is_empty() {
             Ok(())
@@ -135,6 +170,12 @@ impl Reader<'_> {
             Err(Error::Bad)
         }
     }
+}
+
+fn length(bytes: &[u8]) -> [u8; 2] {
+    u16::try_from(bytes.len())
+        .expect("small field")
+        .to_le_bytes()
 }
 
 fn frame(out: &mut Plain, op: u8, id: u32, body: &[&[u8]]) {
@@ -148,6 +189,13 @@ fn frame(out: &mut Plain, op: u8, id: u32, body: &[&[u8]]) {
 }
 
 impl Request {
+    pub fn size(&self) -> usize {
+        match self {
+            Self::Load { blob, .. } => HEAD + 15 + blob.len(),
+            _ => 128,
+        }
+    }
+
     pub fn encode(&self, id: u32, out: &mut Plain) {
         match self {
             Self::Hello { node } => frame(out, 1, id, &[&node.to_le_bytes()]),
@@ -202,6 +250,68 @@ impl Request {
                 id,
                 &[&tenant.to_le_bytes(), &generation.to_le_bytes()],
             ),
+            Self::DkimNew { .. } | Self::Load { .. } | Self::Sign { .. } => {
+                self.encode_dkim(id, out);
+            }
+        }
+    }
+
+    fn encode_dkim(&self, id: u32, out: &mut Plain) {
+        match self {
+            Self::DkimNew {
+                tenant,
+                generation,
+                key,
+                alg,
+            } => frame(
+                out,
+                8,
+                id,
+                &[
+                    &tenant.to_le_bytes(),
+                    &generation.to_le_bytes(),
+                    &key.to_le_bytes(),
+                    &[alg.code()],
+                ],
+            ),
+            Self::Load {
+                tenant,
+                generation,
+                key,
+                alg,
+                blob,
+            } => frame(
+                out,
+                9,
+                id,
+                &[
+                    &tenant.to_le_bytes(),
+                    &generation.to_le_bytes(),
+                    &key.to_le_bytes(),
+                    &[alg.code()],
+                    &length(blob),
+                    blob,
+                ],
+            ),
+            Self::Sign {
+                tenant,
+                generation,
+                key,
+                alg,
+                digest,
+            } => frame(
+                out,
+                10,
+                id,
+                &[
+                    &tenant.to_le_bytes(),
+                    &generation.to_le_bytes(),
+                    &key.to_le_bytes(),
+                    &[alg.code()],
+                    digest,
+                ],
+            ),
+            _ => {}
         }
     }
 
@@ -232,6 +342,26 @@ impl Request {
             7 => Self::Delete {
                 tenant: r.u32()?,
                 generation: r.u32()?,
+            },
+            8 => Self::DkimNew {
+                tenant: r.u32()?,
+                generation: r.u32()?,
+                key: r.u32()?,
+                alg: r.alg()?,
+            },
+            9 => Self::Load {
+                tenant: r.u32()?,
+                generation: r.u32()?,
+                key: r.u32()?,
+                alg: r.alg()?,
+                blob: r.bytes()?,
+            },
+            10 => Self::Sign {
+                tenant: r.u32()?,
+                generation: r.u32()?,
+                key: r.u32()?,
+                alg: r.alg()?,
+                digest: r.array()?,
             },
             _ => return Err(Error::Bad),
         };
@@ -270,6 +400,17 @@ impl Answer {
                 ],
             ),
             Self::Key(key) => frame(out, 0x83, id, &[key.expose()]),
+            Self::Dkim { public, blob } => {
+                frame(
+                    out,
+                    0x84,
+                    id,
+                    &[&length(public), public, &length(blob), blob],
+                );
+            }
+            Self::Signature(signature) => {
+                frame(out, 0x85, id, &[&length(signature), signature]);
+            }
             Self::Refused(error) => frame(out, 0xff, id, &[&[refusal_code(*error)]]),
         }
     }
@@ -292,6 +433,11 @@ impl Answer {
                 tomorrow: r.array()?,
             },
             0x83 => Self::Key(r.secret()?),
+            0x84 => Self::Dkim {
+                public: r.bytes()?,
+                blob: r.bytes()?,
+            },
+            0x85 => Self::Signature(r.bytes()?),
             0xff => Self::Refused(refusal(r.u8()?)),
             _ => return Err(Error::Bad),
         };
@@ -305,6 +451,8 @@ impl Answer {
             Self::Hello { .. } => 20,
             Self::Keys { .. } => 121,
             Self::Key(_) => 32,
+            Self::Dkim { public, blob } => 4 + public.len() + blob.len(),
+            Self::Signature(signature) => 2 + signature.len(),
             Self::Refused(_) => 1,
         }
     }
@@ -358,7 +506,7 @@ impl Drop for Frames {
 
 #[cfg(test)]
 mod tests {
-    use crypto::{Plain, Secret, Wrap};
+    use crypto::{DkimAlg, Plain, Secret, Wrap};
 
     use super::{Answer, Frames, Request};
     use crate::Error;
@@ -396,12 +544,33 @@ mod tests {
                 tenant: 2,
                 generation: 3,
             },
+            Request::DkimNew {
+                tenant: 2,
+                generation: 3,
+                key: 4,
+                alg: DkimAlg::RsaSha256,
+            },
+            Request::Load {
+                tenant: 2,
+                generation: 3,
+                key: 4,
+                alg: DkimAlg::Ed25519Sha256,
+                blob: vec![9; 1_300],
+            },
+            Request::Sign {
+                tenant: 2,
+                generation: 3,
+                key: 4,
+                alg: DkimAlg::Ed25519Sha256,
+                digest: [8; 32],
+            },
         ]
     }
 
     #[test]
     fn requests_round_trip_in_one_stream() {
-        let mut out = Plain::with_capacity(4096);
+        let size = requests().iter().map(Request::size).sum();
+        let mut out = Plain::with_capacity(size);
         for (id, request) in requests().iter().enumerate() {
             request.encode(u32::try_from(id).expect("small"), &mut out);
         }
@@ -439,7 +608,13 @@ mod tests {
                 tomorrow: [6; 32],
             },
             Answer::Key(Secret::new([7; 32])),
+            Answer::Dkim {
+                public: vec![1; 294],
+                blob: vec![2; 1_250],
+            },
+            Answer::Signature(vec![3; 256]),
             Answer::Refused(Error::Busy),
+            Answer::Refused(Error::Conflict),
         ];
         for answer in answers {
             let mut out = Plain::with_capacity(answer.size());

@@ -2,7 +2,9 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-use crypto::{Secret, Tenant, Wrap, day_public, day_secret, next_day, open_batch, ratchet};
+use crypto::{
+    DataKey, Secret, Tenant, Wrap, day_public, day_secret, next_day, open_batch, ratchet,
+};
 use rt::{Buf, File, OpenOptions};
 
 use crate::file::{self, MASTER, Master};
@@ -307,6 +309,15 @@ impl Vault {
         })
     }
 
+    pub fn dkim(&self, tenant: u32, generation: u32) -> Result<DataKey, Error> {
+        let entry = self.durable(tenant, generation)?;
+        Ok(Tenant::new(&entry.key).dkim_key(generation, VERSION))
+    }
+
+    pub fn active(&self, tenant: u32, generation: u32) -> Result<(), Error> {
+        self.durable(tenant, generation).map(drop)
+    }
+
     pub fn unwrap(&self, tenant: u32, batch: u64, wrap: &Wrap) -> Result<Secret<32>, Error> {
         let entry = self.durable(tenant, wrap.generation)?;
         self.with_day(tenant, entry, wrap.day, |secret| {
@@ -352,14 +363,16 @@ impl Vault {
         use_key(&chains[&tenant][index]).map_err(Into::into)
     }
 
-    pub async fn delete(&mut self, tenant: u32, generation: u32) -> Result<(), Error> {
-        self.check()?;
-        if self
-            .state
+    pub fn holds(&self, tenant: u32, generation: u32) -> bool {
+        self.state
             .tenants
             .get(&tenant)
-            .is_none_or(|entry| entry.generation != generation)
-        {
+            .is_some_and(|entry| entry.generation == generation)
+    }
+
+    pub async fn delete(&mut self, tenant: u32, generation: u32) -> Result<(), Error> {
+        self.check()?;
+        if !self.holds(tenant, generation) {
             return Ok(());
         }
         self.state.tenants.remove(&tenant);

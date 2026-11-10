@@ -11,5 +11,8 @@ crypto = { path = "../crypto" }
 rt = { path = "../rt" }
 sys = { path = "../sys" }
 
+[dev-dependencies]
+aws-lc-rs = "=1.18.2"
+
 [lints]
 workspace = true

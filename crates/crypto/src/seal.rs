@@ -1,4 +1,4 @@
-use crate::{ChunkKey, Error, Prk, Secret, TAG};
+use crate::{ChunkKey, Error, Plain, Prk, Secret, TAG};
 
 const FORMAT: u8 = 1;
 const SALT: usize = 16;
@@ -56,6 +56,10 @@ impl DataKey {
             .len();
         body.truncate(len);
         Ok(body)
+    }
+
+    pub fn open_plain(&self, label: &[u8], sealed: &[u8]) -> Result<Plain, Error> {
+        self.open(label, sealed).map(Plain::new)
     }
 
     fn key(&self, salt: &[u8], label: &[u8]) -> ChunkKey {

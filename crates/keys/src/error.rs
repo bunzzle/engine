@@ -20,6 +20,7 @@ pub enum Error {
     Timeout,
     Peer,
     Changed,
+    Conflict,
     Crypto(crypto::Error),
 }
 
@@ -56,6 +57,7 @@ impl fmt::Display for Error {
             Self::Timeout => write!(f, "keys call timed out"),
             Self::Peer => write!(f, "keys socket belongs to another user"),
             Self::Changed => write!(f, "keys serve another vault than before"),
+            Self::Conflict => write!(f, "dkim key id holds another key"),
             Self::Crypto(error) => write!(f, "{error}"),
         }
     }
