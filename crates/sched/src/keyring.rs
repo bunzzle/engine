@@ -5,7 +5,7 @@ use control::{Created, KeyError, KeySource, Ready};
 use crypto::{BatchKey, TenantKeys, Wrap};
 use keys::{BatchSettings, BatchStats, Batches, Fault, Ring};
 
-use crate::sealing::{Batched, Keys, Unsealable, Unwrapped};
+use crate::sealing::{Batched, Keys, Oldest, Unsealable, Unwrapped};
 
 pub struct Keyring {
     ring: Ring,
@@ -84,6 +84,16 @@ impl Keys for Keyring {
 
     fn settled(&self, day: u32) {
         self.ring.settled(day);
+    }
+
+    fn oldest(&self, tenant: u32, generation: u32) -> Oldest<'_> {
+        Box::pin(async move {
+            self.ring
+                .fresh(tenant, generation)
+                .await
+                .map(|working| working.oldest)
+                .map_err(key_error)
+        })
     }
 
     fn batch(&self, tenant: u32, generation: u32, shard: u16, first: u64) -> Batched<'_> {

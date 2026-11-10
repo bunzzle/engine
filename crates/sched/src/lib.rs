@@ -11,6 +11,7 @@ mod sealing;
 mod start;
 mod suppress;
 mod transport;
+mod unopened;
 
 pub use clock::Clock;
 pub use error::{Error, Refusal};
@@ -28,8 +29,8 @@ pub use requests::{
     retain_request,
 };
 pub use sealing::{
-    Batched, Keys, LABEL_BODY, LABEL_HEAD, LABEL_REPLY, LABEL_SLICE, Opener, Sealing, Unsealable,
-    Unwrapped,
+    Batched, Keys, LABEL_BODY, LABEL_HEAD, LABEL_REPLY, LABEL_SLICE, Oldest, Opener, Sealing,
+    Unsealable, Unwrapped,
 };
 pub use start::{CONTROL_SHARD, Links, Meshes, Node, Parts, Running, Settings};
 pub use suppress::{
@@ -37,3 +38,4 @@ pub use suppress::{
     Suppressions, keyed_hash, retain,
 };
 pub use transport::{Answered, Attempt, Claimed, Transport};
+pub use unopened::{Action, DROPS_PER_MINUTE, UnopenedStats, action};

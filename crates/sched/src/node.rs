@@ -13,7 +13,12 @@ use spool::{Done, Error, Message, MessageId, Outcome, Pending, Reply, Report, Sp
 use crate::clock::Clock;
 use crate::lanes::{Entry, Lanes, Limits, QueueId, Take, ranges};
 use crate::policy::{Answer, BACKOFF, Kind, clamp, delay};
+use crate::sealing::{Keys, Unsealable};
 use crate::transport::{Answered, Attempt, Claimed, Transport};
+use crate::unopened::{Action, Breaker, UnopenedStats, action};
+
+const HOLD: u64 = 3_600_000;
+const QUARANTINE: u64 = u64::MAX / 2;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Config {
@@ -86,6 +91,14 @@ pub enum Note {
         core: u16,
         day: u32,
     },
+    Released {
+        route: Route,
+        recipients: Vec<(u32, u64)>,
+    },
+    Dropped {
+        route: Route,
+        recipients: Vec<u32>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -123,6 +136,8 @@ struct Inner<T> {
     index: u16,
     cores: u16,
     lows: RefCell<BTreeMap<u16, u32>>,
+    keys: OnceCell<Rc<dyn Keys>>,
+    breaker: RefCell<Breaker>,
     clock: Clock,
     spool: Spool,
     transport: T,
@@ -166,6 +181,8 @@ impl<T: Transport + 'static> Sched<T> {
             index: ends.index(),
             cores: ends.cores(),
             lows: RefCell::new(BTreeMap::new()),
+            keys: OnceCell::new(),
+            breaker: RefCell::new(Breaker::default()),
             clock,
             spool,
             transport,
@@ -315,6 +332,14 @@ impl<T: Transport + 'static> Sched<T> {
         }
     }
 
+    pub fn use_keys(&self, keys: Rc<dyn Keys>) {
+        let _ = self.inner.keys.set(keys);
+    }
+
+    pub fn unopened_stats(&self) -> UnopenedStats {
+        self.inner.breaker.borrow().stats.clone()
+    }
+
     pub fn report_low(&self, day: u32) {
         match self.inner.index {
             0 => {
@@ -385,6 +410,8 @@ impl<T: Transport + 'static> Sched<T> {
                 }
                 self.inner.lows.borrow_mut().insert(core, day);
             }
+            Note::Released { route, recipients } => self.released(route, recipients),
+            Note::Dropped { route, recipients } => self.dropped(route, recipients),
         }
     }
 
@@ -467,7 +494,7 @@ impl<T: Transport + 'static> Sched<T> {
         drop(spawn(async move { sched.attempt(route, claimed).await }));
     }
 
-    async fn attempt(&self, route: Route, claimed: Vec<Claimed>) {
+    async fn attempt(&self, route: Route, mut claimed: Vec<Claimed>) {
         let id = self.inner.next_attempt.get();
         self.inner.next_attempt.set(id + 1);
         let started = self.inner.clock.now();
@@ -483,6 +510,28 @@ impl<T: Transport + 'static> Sched<T> {
         let now = self.inner.clock.now();
         let mut by_recipient: BTreeMap<u32, Answered> =
             answers.into_iter().map(|a| (a.recipient, a)).collect();
+        let unopened = by_recipient.values().find_map(|a| match a.answer {
+            Answer::Unopened {
+                fault,
+                generation,
+                day,
+            } => Some((fault, generation, day)),
+            _ => None,
+        });
+        if let Some((fault, generation, day)) = unopened {
+            let (shut, open): (Vec<Claimed>, Vec<Claimed>) = claimed.into_iter().partition(|c| {
+                by_recipient
+                    .get(&c.recipient)
+                    .is_some_and(|a| matches!(a.answer, Answer::Unopened { .. }))
+            });
+            let mixed = !open.is_empty();
+            self.unopened(route, &shut, fault, generation, day, mixed)
+                .await;
+            if !mixed {
+                return;
+            }
+            claimed = open;
+        }
         let reports = claimed
             .iter()
             .map(|c| {
@@ -493,6 +542,14 @@ impl<T: Transport + 'static> Sched<T> {
                 let outcome = match answer {
                     Answer::Delivered => Outcome::Delivered,
                     Answer::Failed => Outcome::Failed,
+                    Answer::Unopened { .. } => {
+                        let (wait, class) = delay(Kind::Temporary, c.attempts.saturating_add(1));
+                        Outcome::Deferred {
+                            due: now + wait,
+                            class,
+                            notified: c.notified,
+                        }
+                    }
                     Answer::Deferred(kind) => {
                         let (wait, class) = delay(kind, c.attempts.saturating_add(1));
                         Outcome::Deferred {
@@ -558,13 +615,115 @@ impl<T: Transport + 'static> Sched<T> {
             Some(Done::Dropped) => Vec::new(),
             None => reports
                 .iter()
-                .map(|(r, _)| (*r, now + BACKOFF[0]))
+                .map(|(r, due)| (*r, due.unwrap_or(0).max(now + BACKOFF[0])))
                 .collect(),
         };
         self.relane(route, relane, now);
         let count = u32::try_from(reports.len()).expect("batch fits");
         self.inner.lanes.borrow_mut().done(route.queue, count, now);
         self.inner.notify.notify();
+    }
+
+    async fn unopened(
+        &self,
+        route: Route,
+        claimed: &[Claimed],
+        fault: Unsealable,
+        generation: u32,
+        day: u32,
+        mixed: bool,
+    ) {
+        let now = self.inner.clock.now();
+        let mut oldest = None;
+        if fault == Unsealable::Gone && !mixed {
+            let room = self.inner.breaker.borrow_mut().room(now);
+            if let (true, Some(keys)) = (room, self.inner.keys.get()) {
+                oldest = keys.oldest(route.tenant, generation).await.ok();
+            }
+        }
+        let now = self.inner.clock.now();
+        let chosen =
+            self.inner
+                .breaker
+                .borrow_mut()
+                .decide(route.tenant, action(fault, day, oldest), now);
+        let note = match chosen {
+            Action::Drop => Note::Dropped {
+                route,
+                recipients: claimed.iter().map(|c| c.recipient).collect(),
+            },
+            Action::Quarantine => Note::Report {
+                route,
+                reports: claimed
+                    .iter()
+                    .map(|c| Report {
+                        recipient: c.recipient,
+                        outcome: Outcome::Deferred {
+                            due: QUARANTINE,
+                            class: c.class,
+                            notified: c.notified,
+                        },
+                        reply: None,
+                    })
+                    .collect(),
+            },
+            Action::Hold | Action::Defer => {
+                let wait = if chosen == Action::Hold {
+                    HOLD
+                } else {
+                    BACKOFF[0]
+                };
+                Note::Released {
+                    route,
+                    recipients: claimed.iter().map(|c| (c.recipient, now + wait)).collect(),
+                }
+            }
+        };
+        self.send(self.owner(route.message), note);
+    }
+
+    fn released(&self, route: Route, recipients: Vec<(u32, u64)>) {
+        let ids: Vec<u32> = recipients.iter().map(|(r, _)| *r).collect();
+        self.inner.spool.release(route.message, &ids);
+        let core = queue_core(route.queue, self.inner.config.shards, self.inner.cores);
+        self.send(
+            core,
+            Note::Reported {
+                route,
+                reports: recipients
+                    .into_iter()
+                    .map(|(r, due)| (r, Some(due)))
+                    .collect(),
+                done: None,
+            },
+        );
+    }
+
+    fn dropped(&self, route: Route, recipients: Vec<u32>) {
+        let sched = self.clone();
+        drop(spawn(async move {
+            let spool = &sched.inner.spool;
+            spool.release(route.message, &recipients);
+            let done = spool
+                .cancel(route.message)
+                .await
+                .ok()
+                .map(|()| Done::Dropped);
+            let now = sched.inner.clock.now();
+            let reports = recipients
+                .into_iter()
+                .map(|r| (r, done.is_none().then_some(now + HOLD)))
+                .collect();
+            let core = queue_core(route.queue, sched.inner.config.shards, sched.inner.cores);
+            sched.send(
+                core,
+                Note::Reported {
+                    route,
+                    reports,
+                    done,
+                },
+            );
+        }));
     }
 
     fn relane(&self, route: Route, recipients: Vec<(u32, u64)>, now: u64) {

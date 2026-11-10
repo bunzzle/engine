@@ -261,11 +261,7 @@ impl Ring {
         let wall = wall_day();
         self.count(|s| s.behind = wall.saturating_sub(working.seen));
         if wall > working.seen.saturating_add(1) {
-            self.inner
-                .tenants
-                .borrow_mut()
-                .remove(&(tenant, generation));
-            working = self.open(tenant, generation).await?;
+            working = self.fresh(tenant, generation).await?;
         } else if wall > working.seen {
             self.refresh(tenant, generation);
         }
@@ -273,6 +269,14 @@ impl Ring {
             return Ok(working.next_day());
         }
         Ok(working)
+    }
+
+    pub async fn fresh(&self, tenant: u32, generation: u32) -> Result<Working, Fault> {
+        self.inner
+            .tenants
+            .borrow_mut()
+            .remove(&(tenant, generation));
+        self.open(tenant, generation).await
     }
 
     pub fn settled(&self, day: u32) {

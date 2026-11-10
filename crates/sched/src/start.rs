@@ -196,6 +196,7 @@ impl<T: Transport + 'static> Node<T> {
             parts.clock,
             settings.sched,
         );
+        sched.use_keys(Rc::clone(&parts.keys));
         let restored = pending.len() as u64;
         sched.restore(pending, |tenant| {
             table.borrow().tenant(tenant).map(|t| t.generation)

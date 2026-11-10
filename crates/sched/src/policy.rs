@@ -1,3 +1,5 @@
+use crate::sealing::Unsealable;
+
 const MINUTE: u64 = 60_000;
 const HOUR: u64 = 60 * MINUTE;
 
@@ -35,6 +37,11 @@ pub enum Answer {
     Delivered,
     Failed,
     Deferred(Kind),
+    Unopened {
+        fault: Unsealable,
+        generation: u32,
+        day: u32,
+    },
 }
 
 pub fn delay(kind: Kind, attempts: u16) -> (u64, u8) {

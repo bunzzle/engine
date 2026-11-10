@@ -36,12 +36,17 @@ pub enum Unsealable {
 }
 
 pub type Batched<'a> = Pin<Box<dyn Future<Output = Result<Rc<Batch>, KeyError>> + 'a>>;
+pub type Oldest<'a> = Pin<Box<dyn Future<Output = Result<u32, KeyError>> + 'a>>;
 pub type Unwrapped<'a> = Pin<Box<dyn Future<Output = Result<Rc<BatchKey>, Unsealable>> + 'a>>;
 
 pub trait Keys: KeySource {
     fn tick(&self) {}
 
     fn settled(&self, _day: u32) {}
+
+    fn oldest(&self, _tenant: u32, _generation: u32) -> Oldest<'_> {
+        Box::pin(async { Err(KeyError::Unavailable) })
+    }
 
     fn batch(&self, tenant: u32, generation: u32, shard: u16, first: u64) -> Batched<'_>;
     fn batch_key(
