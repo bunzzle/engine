@@ -336,6 +336,7 @@ fn fail_first(session: Session, mut results: Results, failing: u32) -> JoinHandl
                         })
                         .to_vec();
                     session.parts(sequence, parts).expect("parts");
+                    return;
                 }
                 cuts += 1;
             }
@@ -367,6 +368,54 @@ fn failed_cuts_give_back_the_regions_they_wrote() {
         }
         core.checkpoint(&client).await.expect("checkpoint");
         core.check().await;
+    });
+}
+
+#[test]
+fn failed_cuts_after_a_restart_keep_the_published_runs() {
+    run(30, async {
+        let (client, mut sessions, source, committer) = start(1).await;
+        let mut core = Core::new(sessions.remove(0), &source).await;
+        for chunk in 0..5u64 {
+            core.changes(
+                2,
+                (chunk * 200..(chunk + 1) * 200)
+                    .map(|k| put(k, 1))
+                    .collect(),
+            )
+            .await;
+        }
+        core.checkpoint(&client).await.expect("checkpoint");
+        drop(client);
+        drop(core);
+        drop(committer.await);
+        let rebuilt = rebuild(&[0, 2]).await;
+        let (client, mut sessions, source, committer) = start(2).await;
+        let other = sessions.pop().expect("second");
+        let _failing = fail_first(other.0, other.1, 10);
+        let mut core = Core::owning(sessions.remove(0), &source, &[]).await;
+        core.keeper = rebuilt;
+        for round in 0..10u64 {
+            core.change(2, put(5_000 + round, 2)).await;
+            assert!(matches!(
+                core.checkpoint(&client).await,
+                Err(Error::Invalid("part"))
+            ));
+        }
+        core.checkpoint(&client).await.expect("checkpoint");
+        core.check().await;
+        let roots = core.keeper.roots(2).expect("kept").to_vec();
+        assert!(roots.iter().any(|r| r.base) && roots.iter().any(|r| !r.base));
+        let state = core.keeper.state(2).expect("kept").clone();
+        drop(client);
+        drop(core);
+        let committer = committer.await;
+        for root in &roots {
+            assert!(committer.regions().is_used(root.region), "{root:?}");
+        }
+        drop(committer);
+        let again = rebuild(&[0, 2]).await;
+        assert_eq!(again.state(2).expect("kept").entries(), state.entries());
     });
 }
 
@@ -426,9 +475,25 @@ fn a_shard_state_larger_than_a_region_is_written_in_segments() {
             core.change(2, delete(round * 11)).await;
             core.checkpoint(&client).await.expect("checkpoint");
         }
+        for chunk in 0..5u64 {
+            core.changes(
+                2,
+                (chunk * 500..(chunk + 1) * 500)
+                    .map(|k| put(k * 2 + 1, 3))
+                    .collect(),
+            )
+            .await;
+        }
+        core.changes(2, (0..900).map(|k| delete(k * 4)).collect())
+            .await;
+        core.checkpoint(&client).await.expect("checkpoint");
         core.check().await;
         let roots = core.keeper.roots(2).expect("kept").to_vec();
-        assert_eq!(roots.iter().filter(|r| !r.base).count(), 3);
+        assert_eq!(
+            roots.iter().filter(|r| !r.base && r.segment == 0).count(),
+            4
+        );
+        assert!(roots.iter().any(|r| !r.base && r.segment > 0));
         let state = core.keeper.state(2).expect("kept").clone();
         drop(client);
         drop(core);

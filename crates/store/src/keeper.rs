@@ -34,7 +34,6 @@ pub struct Keeper {
     flush: Placer,
     tiering: Tiering,
     unhold: Vec<u32>,
-    cut_failures: u64,
 }
 
 impl Default for Keeper {
@@ -45,7 +44,6 @@ impl Default for Keeper {
             flush: Placer::new(Claim::Flush),
             tiering: Tiering::default(),
             unhold: Vec::new(),
-            cut_failures: 0,
         }
     }
 }
@@ -314,7 +312,6 @@ impl Keeper {
             let roots = match roots {
                 Ok(roots) => roots,
                 Err(e) => {
-                    self.cut_failures += 1;
                     self.abandoned(sequence);
                     session.fail(sequence)?;
                     return Err(e);
@@ -329,12 +326,7 @@ impl Keeper {
             let kept = self.shards.get_mut(&shard).expect("shard is kept here");
             kept.pending.as_mut().expect("pending cut").roots = roots;
         }
-        self.cut_failures = 0;
         session.parts(sequence, parts)
-    }
-
-    pub fn cut_failures(&self) -> u64 {
-        self.cut_failures
     }
 
     async fn next_roots(
