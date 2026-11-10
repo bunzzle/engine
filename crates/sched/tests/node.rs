@@ -7,10 +7,14 @@ use std::sync::Arc;
 use std::task::Poll;
 use std::time::Duration;
 
-use control::Tenancy;
+use control::{Created, KeyError, KeySource, Ready, Tenancy};
+use crypto::{TenantKeys, Wrap};
 use rt::sim::{Config, Disk, Faults, Machine, SimDriver, Stalls, check};
 use rt::{JoinHandle, Mesh, Runtime, sleep, spawn, timeout};
-use sched::{Answer, Answered, Arrival, Attempt, Clock, Kind, Limits, Note, Sched, Transport};
+use sched::{
+    Answer, Answered, Arrival, Attempt, Batched, Clock, Keys, Kind, Limits, Note, Oldest, Sched,
+    Transport, Unsealable, Unwrapped,
+};
 use spool::{Body, Head, HeadClear, Message, MessageId, SLICE, Slice, Spool};
 use store::{Client, DataFile, Keeper, Options, SLOT_SIZE, Setup, boot};
 
@@ -73,6 +77,36 @@ impl Tenancy for Tens {
     }
 }
 
+struct Shredded;
+
+impl KeySource for Shredded {
+    fn get(&self, _: u32, _: u32) -> Option<TenantKeys> {
+        None
+    }
+
+    fn ready(&self, _: u32, _: u32) -> Ready<'_> {
+        Box::pin(async { Err(KeyError::Unavailable) })
+    }
+
+    fn create(&self, _: u32, _: u32) -> Created<'_> {
+        Box::pin(async { Err(KeyError::Unavailable) })
+    }
+}
+
+impl Keys for Shredded {
+    fn batch(&self, _: u32, _: u32, _: u16, _: u64) -> Batched<'_> {
+        Box::pin(async { Err(KeyError::Unavailable) })
+    }
+
+    fn batch_key(&self, _: u32, _: u32, _: u16, _: u64, _: Wrap) -> Unwrapped<'_> {
+        Box::pin(async { Err(Unsealable::Unavailable) })
+    }
+
+    fn oldest(&self, _: u32, _: u32) -> Oldest<'_> {
+        Box::pin(async { Ok(1) })
+    }
+}
+
 struct Simulated {
     world: Shared,
     driver: Rc<SimDriver>,
@@ -125,7 +159,36 @@ impl Transport for Simulated {
             }
         }
         sleep(Duration::from_millis(1 + self.below(2_000))).await;
+        let fault = match self.below(40) {
+            0 => Some(Unsealable::Unavailable),
+            1 => Some(Unsealable::Unknown),
+            2 => Some(Unsealable::Gone),
+            _ => None,
+        };
         let mut world = self.world.borrow_mut();
+        if let Some(fault) = fault {
+            if fault == Unsealable::Gone {
+                world
+                    .cancelling
+                    .insert((attempt.message.shard, attempt.message.key));
+            }
+            return attempt
+                .recipients
+                .iter()
+                .map(|c| {
+                    world.in_attempt.remove(&key(attempt.message, c.recipient));
+                    Answered {
+                        recipient: c.recipient,
+                        answer: Answer::Unopened {
+                            fault,
+                            generation: 1,
+                            day: 0,
+                        },
+                        reply: Vec::new(),
+                    }
+                })
+                .collect();
+        }
         attempt
             .recipients
             .iter()
@@ -327,6 +390,9 @@ struct Session {
     errors: u64,
     expired: u64,
     refused: u64,
+    dropped: u64,
+    held: u64,
+    deferred: u64,
 }
 
 type Feed = (usize, Spool, Vec<u16>);
@@ -378,6 +444,7 @@ fn start_cores(
             };
             let (sched, done) =
                 Sched::start(ends, opened, transport, Rc::new(Tens), clock, config());
+            sched.use_keys(Rc::new(Shredded));
             sched.restore(pending, |_| Some(1));
             (sched, done)
         });
@@ -455,6 +522,9 @@ fn session(driver: &Rc<SimDriver>, world: &Shared, intake_on: bool, limit: Durat
             errors: scheds.iter().map(Sched::report_errors).sum(),
             refused: scheds.iter().map(Sched::refused).sum(),
             expired: scheds.iter().map(Sched::expired).sum(),
+            dropped: scheds.iter().map(|s| s.unopened_stats().dropped).sum(),
+            held: scheds.iter().map(|s| s.unopened_stats().held).sum(),
+            deferred: scheds.iter().map(|s| s.unopened_stats().deferred).sum(),
         };
         if power.is_halted() {
             return session;
@@ -515,6 +585,10 @@ fn one_session(seed: u64) {
     assert_eq!(run.errors, 0, "seed {seed}: report refused");
     assert_eq!(run.refused, 0, "seed {seed}: enqueue refused");
     assert!(run.expired > 0, "seed {seed}: no expiry ran");
+    assert!(
+        run.dropped > 0 && run.held > 0 && run.deferred > 0,
+        "seed {seed}: unopened answers not seen"
+    );
     let world = world.borrow();
     verify(seed, &world);
     assert!(
