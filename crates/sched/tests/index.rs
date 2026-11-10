@@ -22,7 +22,7 @@ use sched::{
     Keyring, Keys, Meshes, Node, Parts, Reason, Refusal, Running, SHAPE, Settings, Suppression,
     Ticket, Transport, Unsealable, Unwrapped, normalize, punycode, retain, retain_request,
 };
-use spool::{Body, Head, HeadClear, Message, MessageId, SLICE, Slice};
+use spool::{Body, Head, HeadClear, Message, MessageId, SLICE, Slice, Stamp};
 use store::{Client, Committer, DataFile, Options, SLOT_SIZE, Setup, Tiering, boot};
 
 const PATH: &str = "/data/store";
@@ -102,6 +102,7 @@ impl Keys for Toy {
                     oldest: TOY_DAY,
                     today: public(TOY_DAY),
                     tomorrow: public(TOY_DAY + 1),
+                    seen: TOY_DAY,
                 };
                 self.batches
                     .borrow_mut()
@@ -797,7 +798,7 @@ async fn seal_one(node: &Node<Idle>, shard: u16, n: u8) -> Sealed {
     node.recipient(&mut draft, &address)
         .await
         .expect("recipient");
-    let mut sealing = node.sealing(&draft, shard).await.expect("sealing");
+    let mut sealing = node.sealing(&mut draft, shard).await.expect("sealing");
     let clear = HeadClear {
         recipients: 1,
         accepted: 5,
@@ -862,9 +863,9 @@ fn sealed_items_open_only_under_their_own_message_and_item() {
         ready(&nodes).await;
         let node = &nodes[0];
         let shard = owned_shard(node).await;
-        let draft = node.draft(1, None).expect("draft");
-        let first = node.sealing(&draft, shard).await.expect("sealing");
-        let second = node.sealing(&draft, shard).await.expect("sealing");
+        let mut draft = node.draft(1, None).expect("draft");
+        let first = node.sealing(&mut draft, shard).await.expect("sealing");
+        let second = node.sealing(&mut draft, shard).await.expect("sealing");
         assert_ne!(first.id(), second.id());
         let mut once = second;
         let clear = HeadClear::default();
@@ -878,7 +879,7 @@ fn sealed_items_open_only_under_their_own_message_and_item() {
         assert!(once.slice(0, vec![1], b"r").is_ok());
         assert_eq!(once.slice(0, vec![1], b"r").err(), Some(Refusal::Message));
         assert!(once.slice(1, vec![1], b"r").is_ok());
-        let mut large = node.sealing(&draft, shard).await.expect("sealing");
+        let mut large = node.sealing(&mut draft, shard).await.expect("sealing");
         let big = vec![0; store::MAX_PAYLOAD];
         assert_eq!(
             large.head(clear, 1, b"e", &big).err(),
@@ -935,6 +936,50 @@ fn sealed_items_open_only_under_their_own_message_and_item() {
 }
 
 #[test]
+fn replies_seal_once_per_stamp_and_open_only_under_it() {
+    let driver = Rc::new(SimDriver::with_disk(42, Config::default(), created(42)));
+    let cluster = started(&driver, 2);
+    let nodes = cluster.nodes.clone();
+    cluster.run(async move {
+        ready(&nodes).await;
+        let node = &nodes[0];
+        let shard = owned_shard(node).await;
+        let sealed = seal_one(node, shard, 0).await;
+        let opener = node
+            .opener(1, 1, sealed.id, &sealed.clear, &sealed.wrap)
+            .await
+            .expect("opener");
+        let stamp = node.spool().stamp(shard).expect("stamp");
+        let reply = opener.seal_reply(0, stamp, b"250 ok").expect("seal");
+        assert_eq!(
+            opener.seal_reply(0, stamp, b"250 ok").err(),
+            Some(Unsealable::Bad)
+        );
+        let again = node
+            .opener(1, 1, sealed.id, &sealed.clear, &sealed.wrap)
+            .await
+            .expect("opener");
+        assert_eq!(again.open_reply(0, stamp, &reply).expect("open"), b"250 ok");
+        let later = Stamp {
+            write: stamp.write + 1,
+            ..stamp
+        };
+        let rebooted = Stamp {
+            boot: stamp.boot + 1,
+            ..stamp
+        };
+        let bad = Some(Unsealable::Bad);
+        assert_eq!(again.open_reply(0, later, &reply).err(), bad);
+        assert_eq!(again.open_reply(0, rebooted, &reply).err(), bad);
+        assert_eq!(again.open_reply(1, stamp, &reply).err(), bad);
+        assert_eq!(again.slice(0, &reply).err(), bad);
+        let other = opener.seal_reply(0, later, b"250 ok").expect("seal");
+        assert_ne!(other, reply);
+    });
+    cluster.stop();
+}
+
+#[test]
 fn body_chunks_open_in_order_and_a_cut_stream_is_refused() {
     let driver = Rc::new(SimDriver::with_disk(39, Config::default(), created(39)));
     let cluster = started(&driver, 2);
@@ -943,9 +988,9 @@ fn body_chunks_open_in_order_and_a_cut_stream_is_refused() {
         ready(&nodes).await;
         let node = &nodes[0];
         let shard = owned_shard(node).await;
-        let draft = node.draft(1, None).expect("draft");
+        let mut draft = node.draft(1, None).expect("draft");
         let clear = HeadClear::default();
-        let mut chunked = node.sealing(&draft, shard).await.expect("sealing");
+        let mut chunked = node.sealing(&mut draft, shard).await.expect("sealing");
         let head = chunked.head(clear, 1, b"e", b"h").expect("head");
         let mut chunks = chunked.body_chunks().expect("chunks");
         let mut parts = [vec![1; 64], vec![2; 64], vec![3; 10]];
@@ -1022,6 +1067,86 @@ fn sealed_messages_open_after_a_restart_with_one_unwrap_per_batch() {
     });
     assert_eq!(unwraps(&driver), 1);
     restarted.stop();
+}
+
+const DAY_MS: i64 = 86_400_000;
+
+#[test]
+fn a_day_change_starts_a_new_batch_and_both_days_open_after_a_restart() {
+    let driver = Rc::new(SimDriver::with_disk(39, Config::default(), created(39)));
+    let cluster = started_with_keys(&driver, 2);
+    let nodes = cluster.nodes.clone();
+    let jumps = Rc::clone(&driver);
+    let sealed = cluster.run(async move {
+        keys_listening().await;
+        ready(&nodes).await;
+        let node = &nodes[0];
+        let shard = owned_shard(node).await;
+        let first = seal_one(node, shard, 0).await;
+        jumps.jump_wall_clock(DAY_MS);
+        let second = seal_one(node, shard, 1).await;
+        assert_eq!(second.clear.day, first.clear.day + 1);
+        assert_ne!(second.clear.batch_key, first.clear.batch_key);
+        opens(node, &first, 0).await;
+        opens(node, &second, 1).await;
+        sleep(Duration::from_millis(300)).await;
+        vec![first, second]
+    });
+    assert_eq!(unwraps(&driver), 0);
+    drop(cluster);
+    let driver = Rc::new(SimDriver::with_disk(40, Config::default(), driver.crash()));
+    let restarted = started_with_keys(&driver, 2);
+    let nodes = restarted.nodes.clone();
+    restarted.run(async move {
+        wait_for(&nodes, 1, 1, State::Active).await;
+        for (n, one) in (0..).zip(&sealed) {
+            opens(&nodes[0], one, n).await;
+        }
+        sleep(Duration::from_millis(300)).await;
+    });
+    assert_eq!(unwraps(&driver), 2);
+    restarted.stop();
+}
+
+#[test]
+fn settled_waits_for_live_and_sealing_mail_on_every_core() {
+    let driver = Rc::new(SimDriver::with_disk(41, Config::default(), created(41)));
+    let cluster = started_with_keys(&driver, 2);
+    let nodes = cluster.nodes.clone();
+    cluster.run(async move {
+        keys_listening().await;
+        ready(&nodes).await;
+        sleep(Duration::from_secs(2)).await;
+        let today = keys::wall_day();
+        assert_eq!(nodes[0].sched().settled_low(), Some(today));
+        assert_eq!(nodes[1].sched().settled_low(), None);
+
+        let shard = owned_shard(&nodes[0]).await;
+        let live = seal_one(&nodes[0], shard, 0).await;
+        let day = live.clear.day;
+        assert!(day < today);
+        assert_eq!(nodes[0].spool().oldest_day(), Some(day));
+        sleep(Duration::from_secs(61)).await;
+        assert_eq!(nodes[0].sched().settled_low(), Some(day));
+        nodes[0].spool().cancel(live.id).await.expect("cancel");
+        assert_eq!(nodes[0].spool().oldest_day(), None);
+        sleep(Duration::from_secs(61)).await;
+        assert_eq!(nodes[0].sched().settled_low(), Some(today));
+
+        let other = owned_shard(&nodes[1]).await;
+        let mut draft = nodes[1].draft(1, None).expect("draft");
+        nodes[1]
+            .recipient(&mut draft, "held@example.org")
+            .await
+            .expect("recipient");
+        drop(nodes[1].sealing(&mut draft, other).await.expect("sealing"));
+        sleep(Duration::from_secs(61)).await;
+        assert_eq!(nodes[0].sched().settled_low(), Some(day));
+        drop(draft);
+        sleep(Duration::from_secs(61)).await;
+        assert_eq!(nodes[0].sched().settled_low(), Some(today));
+    });
+    cluster.stop();
 }
 
 #[test]

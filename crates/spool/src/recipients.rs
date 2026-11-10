@@ -92,6 +92,7 @@ struct Call {
 
 struct Entry {
     tenant: u32,
+    day: u32,
     recipients: u32,
     ready: u64,
     expiry: u64,
@@ -109,6 +110,7 @@ impl Entry {
     fn new(tenant: u32, head: &HeadClear, expiry: u64) -> Self {
         Self {
             tenant,
+            day: head.day,
             recipients: head.recipients,
             ready: head.accepted.max(head.not_before),
             expiry,
@@ -171,6 +173,7 @@ pub(crate) struct Table {
     expiries: BTreeSet<(u64, u16, u64)>,
     writes: BTreeMap<u16, u64>,
     open: BTreeMap<u32, u64>,
+    days: BTreeMap<u32, u64>,
 }
 
 impl Table {
@@ -225,6 +228,7 @@ impl Table {
         for entry in table.messages.values() {
             *table.open.entry(entry.tenant).or_default() +=
                 u64::from(entry.recipients - entry.finals);
+            *table.days.entry(entry.day).or_default() += 1;
         }
         Ok(table)
     }
@@ -239,6 +243,7 @@ impl Table {
     ) {
         self.expiries.insert((expiry, shard, message));
         *self.open.entry(tenant).or_default() += u64::from(head.recipients);
+        *self.days.entry(head.day).or_default() += 1;
         self.messages
             .insert((shard, message), Entry::new(tenant, head, expiry));
     }
@@ -246,6 +251,12 @@ impl Table {
     fn remove(&mut self, key: (u16, u64)) -> Option<(u32, u64)> {
         let entry = self.messages.remove(&key)?;
         self.expiries.remove(&(entry.expiry, key.0, key.1));
+        if let Some(count) = self.days.get_mut(&entry.day) {
+            *count -= 1;
+            if *count == 0 {
+                self.days.remove(&entry.day);
+            }
+        }
         let closed = u64::from(entry.recipients - entry.finals);
         Some((entry.tenant, self.close(entry.tenant, closed)))
     }
@@ -301,6 +312,10 @@ impl Spool {
             .messages
             .get(&(id.shard, id.key))?
             .recipient(recipient)
+    }
+
+    pub fn oldest_day(&self) -> Option<u32> {
+        self.inner.table.borrow().days.keys().next().copied()
     }
 
     pub fn messages(&self) -> Vec<MessageId> {

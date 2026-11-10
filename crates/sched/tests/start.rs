@@ -176,6 +176,7 @@ impl Keys for Toy {
                     oldest: TOY_DAY,
                     today: public(TOY_DAY),
                     tomorrow: public(TOY_DAY + 1),
+                    seen: TOY_DAY,
                 };
                 self.batches
                     .borrow_mut()

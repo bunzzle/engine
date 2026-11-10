@@ -82,6 +82,10 @@ pub enum Note {
         reports: Vec<(u32, Option<u64>)>,
         done: Option<Done>,
     },
+    Low {
+        core: u16,
+        day: u32,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -116,7 +120,9 @@ pub fn queue_core(queue: QueueId, shards: u32, cores: u16) -> u16 {
 
 struct Inner<T> {
     config: Config,
+    index: u16,
     cores: u16,
+    lows: RefCell<BTreeMap<u16, u32>>,
     clock: Clock,
     spool: Spool,
     transport: T,
@@ -157,7 +163,9 @@ impl<T: Transport + 'static> Sched<T> {
     ) -> (Self, JoinHandle<()>) {
         let inner = Rc::new(Inner {
             config,
+            index: ends.index(),
             cores: ends.cores(),
+            lows: RefCell::new(BTreeMap::new()),
             clock,
             spool,
             transport,
@@ -307,6 +315,23 @@ impl<T: Transport + 'static> Sched<T> {
         }
     }
 
+    pub fn report_low(&self, day: u32) {
+        match self.inner.index {
+            0 => {
+                self.inner.lows.borrow_mut().insert(0, day);
+            }
+            core => self.send(0, Note::Low { core, day }),
+        }
+    }
+
+    pub fn settled_low(&self) -> Option<u32> {
+        let lows = self.inner.lows.borrow();
+        if lows.len() < usize::from(self.inner.cores) {
+            return None;
+        }
+        lows.values().copied().min()
+    }
+
     fn send(&self, core: u16, note: Note) {
         if let Some(peers) = self.inner.peers.get() {
             peers.send(core, note);
@@ -353,6 +378,13 @@ impl<T: Transport + 'static> Sched<T> {
                 reports,
                 done,
             } => self.reported(route, &reports, done),
+            Note::Low { core, day } => {
+                if self.inner.index != 0 || core >= self.inner.cores {
+                    self.refuse();
+                    return;
+                }
+                self.inner.lows.borrow_mut().insert(core, day);
+            }
         }
     }
 
