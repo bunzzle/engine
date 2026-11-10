@@ -337,6 +337,10 @@ impl<T: Transport + 'static> Node<T> {
         Ok(self.inner.queues.rebind(name, pool).await?)
     }
 
+    pub fn holds_kept(&self) -> u64 {
+        self.inner.holds.kept()
+    }
+
     pub fn ticks_late(&self) -> u64 {
         self.inner.ticker.late.get()
     }

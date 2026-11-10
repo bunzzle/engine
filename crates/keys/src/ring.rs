@@ -119,6 +119,7 @@ struct Inner {
     unwrapping: RefCell<HashMap<(u32, u32, u16, u64), Unwrapping>>,
     refreshed: RefCell<HashMap<(u32, u32), Instant>>,
     settled: Cell<u32>,
+    settling: Cell<bool>,
     stats: Cell<RingStats>,
 }
 
@@ -157,6 +158,7 @@ impl Ring {
                 unwrapping: RefCell::new(HashMap::new()),
                 refreshed: RefCell::new(HashMap::new()),
                 settled: Cell::new(0),
+                settling: Cell::new(false),
                 stats: Cell::new(RingStats::default()),
             }),
         }
@@ -274,12 +276,15 @@ impl Ring {
     }
 
     pub fn settled(&self, day: u32) {
-        if self.failed() || day <= self.inner.settled.get() {
+        if self.failed() || self.inner.settling.get() || day <= self.inner.settled.get() {
             return;
         }
+        self.inner.settling.set(true);
         let ring = self.clone();
         rt::spawn(async move {
-            if let Ok(Answer::Done) = ring.call(&Request::Settled { day }).await {
+            let answer = ring.call(&Request::Settled { day }).await;
+            ring.inner.settling.set(false);
+            if let Ok(Answer::Done) = answer {
                 ring.inner.settled.set(ring.inner.settled.get().max(day));
                 ring.count(|s| s.settled = s.settled.max(day));
             }

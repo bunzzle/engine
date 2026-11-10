@@ -379,9 +379,11 @@ impl<T: Transport + 'static> Sched<T> {
                 done,
             } => self.reported(route, &reports, done),
             Note::Low { core, day } => {
-                if self.inner.index == 0 && core < self.inner.cores {
-                    self.inner.lows.borrow_mut().insert(core, day);
+                if self.inner.index != 0 || core >= self.inner.cores {
+                    self.refuse();
+                    return;
                 }
+                self.inner.lows.borrow_mut().insert(core, day);
             }
         }
     }

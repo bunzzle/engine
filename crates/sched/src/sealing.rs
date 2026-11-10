@@ -1,4 +1,4 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
 use std::pin::Pin;
 use std::rc::Rc;
@@ -55,7 +55,7 @@ pub trait Keys: KeySource {
 }
 
 #[derive(Clone, Default)]
-pub(crate) struct Holds(Rc<RefCell<BTreeMap<u32, u64>>>);
+pub(crate) struct Holds(Rc<RefCell<BTreeMap<u32, u64>>>, Rc<Cell<u64>>);
 
 impl Holds {
     pub(crate) fn hold(&self, day: u32) -> DayHold {
@@ -70,6 +70,10 @@ impl Holds {
     pub(crate) fn oldest(&self) -> Option<u32> {
         self.0.borrow().keys().next().copied()
     }
+
+    pub(crate) fn kept(&self) -> u64 {
+        self.1.get()
+    }
 }
 
 pub(crate) struct DayHold {
@@ -81,6 +85,7 @@ pub(crate) struct DayHold {
 impl DayHold {
     pub(crate) fn keep(mut self) {
         self.kept = true;
+        self.holds.1.set(self.holds.1.get() + 1);
     }
 }
 

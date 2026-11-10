@@ -209,14 +209,15 @@ impl<T: Transport + 'static> Node<T> {
         self.current(&draft)?;
         let arrival = Arrival::of(&message, draft.generation);
         let accepted = self.inner.spool.accept_indexed(vec![message], index).await;
-        if let Err(error) = accepted {
-            for hold in draft.holds.drain(..) {
-                hold.keep();
+        match accepted {
+            Ok(()) => {}
+            Err(spool::Error::Store(store::Error::Busy)) => return Err(Refusal::Busy),
+            Err(_) => {
+                for hold in draft.holds.drain(..) {
+                    hold.keep();
+                }
+                return Err(Refusal::Failed);
             }
-            return Err(match error {
-                spool::Error::Store(store::Error::Busy) => Refusal::Busy,
-                _ => Refusal::Failed,
-            });
         }
         draft.taken.clear();
         self.inner.sched.enqueue(arrival);
