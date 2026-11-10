@@ -20,6 +20,8 @@ pub enum Op {
     Shred,
     Forced,
     Refused,
+    DkimNew,
+    Load,
 }
 
 impl Op {
@@ -35,6 +37,8 @@ impl Op {
             Self::Shred => "shred",
             Self::Forced => "forced",
             Self::Refused => "refused",
+            Self::DkimNew => "dkim-new",
+            Self::Load => "load",
         }
     }
 }

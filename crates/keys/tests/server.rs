@@ -3,7 +3,8 @@ use std::path::Path;
 use std::rc::Rc;
 use std::time::Duration;
 
-use crypto::{Plain, Secret, seal_batch};
+use aws_lc_rs::signature::{ED25519, RSA_PKCS1_2048_8192_SHA256, UnparsedPublicKey};
+use crypto::{DkimAlg, Plain, Secret, seal_batch};
 use keys::proto::{Answer, Frames, Request};
 use keys::{Audit, Client, Error, Rate, Server, Settings, Vault};
 use rt::sim::{Config, SimDriver};
@@ -505,4 +506,251 @@ fn the_unix_socket_serves_only_the_engine_user() {
     )
     .expect("text");
     assert!(text.contains(&format!(" refused 90 0 {DAY} 1\n")), "{text}");
+}
+
+async fn created(client: &Client, tenant: u32) {
+    let create = Request::Create {
+        tenant,
+        generation: 1,
+        retention: 30,
+    };
+    keys(client.call(&create).await.expect("create"));
+}
+
+fn dkim_new(tenant: u32, key: u32, alg: DkimAlg) -> Request {
+    Request::DkimNew {
+        tenant,
+        generation: 1,
+        key,
+        alg,
+    }
+}
+
+fn sign(tenant: u32, key: u32, alg: DkimAlg, digest: [u8; 32]) -> Request {
+    Request::Sign {
+        tenant,
+        generation: 1,
+        key,
+        alg,
+        digest,
+    }
+}
+
+fn load(tenant: u32, key: u32, alg: DkimAlg, blob: &[u8]) -> Request {
+    Request::Load {
+        tenant,
+        generation: 1,
+        key,
+        alg,
+        blob: blob.to_vec(),
+    }
+}
+
+fn signature(answer: Answer) -> Vec<u8> {
+    match answer {
+        Answer::Signature(signature) => signature,
+        _ => panic!("expected a signature"),
+    }
+}
+
+fn made(answer: Answer) -> (Vec<u8>, Vec<u8>) {
+    match answer {
+        Answer::Dkim { public, blob } => (public, blob),
+        _ => panic!("expected a dkim key"),
+    }
+}
+
+fn done(answer: &Answer) -> bool {
+    matches!(answer, Answer::Done)
+}
+
+async fn restarted() -> Rc<Server> {
+    let vault = Vault::open(Path::new(DIR)).await.expect("open");
+    let audit = Audit::open(Path::new(DIR)).await.expect("audit");
+    let server = Rc::new(Server::start(vault, audit, Settings::default()));
+    let listener = TcpListener::bind(addr(), 16).await.expect("bind");
+    let accepting = Rc::clone(&server);
+    spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            accepting.serve(stream);
+        }
+    });
+    server
+}
+
+#[test]
+fn dkim_keys_sign_only_for_their_tenant_key_and_alg() {
+    let driver = Rc::new(SimDriver::new(21, quiet()));
+    let (public, blob, first) = run(&driver, async {
+        let server = start(Settings::default()).await;
+        let client = client().await;
+        created(&client, 3).await;
+        created(&client, 5).await;
+        let ed = DkimAlg::Ed25519Sha256;
+        let (public, blob) = made(client.call(&dkim_new(3, 1, ed)).await.expect("new"));
+        assert_eq!(public.len(), 32);
+        let digest = [7; 32];
+        let first = signature(client.call(&sign(3, 1, ed, digest)).await.expect("sign"));
+        UnparsedPublicKey::new(&ED25519, &public)
+            .verify(&digest, &first)
+            .expect("verify");
+        let again = client.call(&dkim_new(3, 1, ed)).await.expect("new");
+        assert_eq!(refused(&again), Error::Conflict);
+        let wrong_alg = client
+            .call(&sign(3, 1, DkimAlg::RsaSha256, digest))
+            .await
+            .expect("sign");
+        assert_eq!(refused(&wrong_alg), Error::Open);
+        let missing = client.call(&sign(3, 2, ed, digest)).await.expect("sign");
+        assert_eq!(refused(&missing), Error::Unknown);
+        let stranger = client.call(&sign(4, 1, ed, digest)).await.expect("sign");
+        assert_eq!(refused(&stranger), Error::Unknown);
+        let foreign = client.call(&dkim_new(4, 1, ed)).await.expect("new");
+        assert_eq!(refused(&foreign), Error::Unknown);
+        assert!(done(
+            &client.call(&load(3, 1, ed, &blob)).await.expect("load")
+        ));
+        let mut other = blob.clone();
+        other[20] ^= 1;
+        let replaced = client.call(&load(3, 1, ed, &other)).await.expect("load");
+        assert_eq!(refused(&replaced), Error::Conflict);
+
+        let rsa = DkimAlg::RsaSha256;
+        let (rsa_public, _) = made(client.call(&dkim_new(3, 2, rsa)).await.expect("new"));
+        let message = b"from:a@example.org\r\n";
+        let hash: [u8; 32] = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, message)
+            .as_ref()
+            .try_into()
+            .expect("32 bytes");
+        let signed = signature(client.call(&sign(3, 2, rsa, hash)).await.expect("sign"));
+        UnparsedPublicKey::new(&RSA_PKCS1_2048_8192_SHA256, &rsa_public)
+            .verify(message, &signed)
+            .expect("verify");
+        let stats = server.stats();
+        assert_eq!((stats.dkim_new, stats.signs, stats.conflicts), (2, 2, 2));
+        sleep(Duration::from_secs(2)).await;
+        (public, blob, first)
+    });
+
+    let driver = Rc::new(SimDriver::with_disk(22, quiet(), driver.crash()));
+    run(&driver, async move {
+        let server = restarted().await;
+        let client = client().await;
+        let ed = DkimAlg::Ed25519Sha256;
+        let digest = [7; 32];
+        let unloaded = client.call(&sign(3, 1, ed, digest)).await.expect("sign");
+        assert_eq!(refused(&unloaded), Error::Unknown);
+        let moved = client.call(&load(5, 1, ed, &blob)).await.expect("load");
+        assert_eq!(refused(&moved), Error::Open);
+        let other_id = client.call(&load(3, 9, ed, &blob)).await.expect("load");
+        assert_eq!(refused(&other_id), Error::Open);
+        let other_alg = client
+            .call(&load(3, 1, DkimAlg::RsaSha256, &blob))
+            .await
+            .expect("load");
+        assert_eq!(refused(&other_alg), Error::Open);
+        assert!(done(
+            &client.call(&load(3, 1, ed, &blob)).await.expect("load")
+        ));
+        assert!(done(
+            &client.call(&load(3, 1, ed, &blob)).await.expect("load")
+        ));
+        let signed = signature(client.call(&sign(3, 1, ed, digest)).await.expect("sign"));
+        assert_eq!(signed, first);
+        UnparsedPublicKey::new(&ED25519, &public)
+            .verify(&digest, &signed)
+            .expect("verify");
+        assert_eq!(server.stats().loads, 1);
+        let delete = Request::Delete {
+            tenant: 3,
+            generation: 1,
+        };
+        assert!(done(&client.call(&delete).await.expect("delete")));
+        let gone = client.call(&sign(3, 1, ed, digest)).await.expect("sign");
+        assert_eq!(refused(&gone), Error::Unknown);
+        let reload = client.call(&load(3, 1, ed, &blob)).await.expect("load");
+        assert_eq!(refused(&reload), Error::Unknown);
+        sleep(Duration::from_secs(2)).await;
+    });
+    let disk = driver.disk();
+    let audit = disk.contents(&Path::new(DIR).join("audit")).expect("audit");
+    let audit = String::from_utf8(audit.to_vec()).expect("text");
+    assert_eq!(
+        audit.lines().filter(|l| l.contains(" dkim-new ")).count(),
+        2
+    );
+    assert_eq!(audit.lines().filter(|l| l.contains(" load ")).count(), 1);
+}
+
+#[test]
+fn dkim_requests_on_a_pending_tenant_are_refused_not_parked() {
+    let driver = Rc::new(SimDriver::new(23, quiet()));
+    run(&driver, async {
+        let _server = start(Settings::default()).await;
+        let client = Rc::new(client().await);
+        created(&client, 1).await;
+        let creating = Rc::clone(&client);
+        let create = spawn(async move { created(&creating, 2).await });
+        sleep(Duration::from_millis(5)).await;
+        let ed = DkimAlg::Ed25519Sha256;
+        let pending = client.call(&dkim_new(2, 1, ed)).await.expect("new");
+        assert_eq!(refused(&pending), Error::Pending);
+        let sign_pending = client.call(&sign(2, 1, ed, [1; 32])).await.expect("sign");
+        assert_eq!(refused(&sign_pending), Error::Pending);
+        create.await;
+        made(client.call(&dkim_new(2, 1, ed)).await.expect("new"));
+    });
+}
+
+#[test]
+fn signs_over_the_queue_bound_are_busy() {
+    let driver = Rc::new(SimDriver::new(24, quiet()));
+    run(&driver, async {
+        let server = start(Settings::default()).await;
+        let client = Rc::new(client().await);
+        created(&client, 1).await;
+        let ed = DkimAlg::Ed25519Sha256;
+        made(client.call(&dkim_new(1, 1, ed)).await.expect("new"));
+        let mut tasks = Vec::new();
+        for n in 0..40u8 {
+            let client = Rc::clone(&client);
+            tasks.push(spawn(async move {
+                client.call(&sign(1, 1, ed, [n; 32])).await.expect("sign")
+            }));
+        }
+        let mut signed = 0;
+        for task in tasks {
+            match task.await {
+                Answer::Signature(_) => signed += 1,
+                answer => assert_eq!(refused(&answer), Error::Busy),
+            }
+        }
+        let busy = server.stats().dkim_busy;
+        assert_eq!(signed + busy, 40);
+        assert!(signed >= 4 && busy > 0, "{signed} signed, {busy} busy");
+    });
+}
+
+#[test]
+fn a_sign_queued_before_a_delete_returns_no_signature() {
+    let driver = Rc::new(SimDriver::new(25, quiet()));
+    run(&driver, async {
+        let _server = start(Settings::default()).await;
+        let client = Rc::new(client().await);
+        created(&client, 1).await;
+        let ed = DkimAlg::Ed25519Sha256;
+        made(client.call(&dkim_new(1, 1, ed)).await.expect("new"));
+        let signing = Rc::clone(&client);
+        let signed = spawn(async move { signing.call(&sign(1, 1, ed, [1; 32])).await });
+        let deleting = Rc::clone(&client);
+        let deleted = spawn(async move {
+            let delete = Request::Delete {
+                tenant: 1,
+                generation: 1,
+            };
+            deleting.call(&delete).await
+        });
+        assert_eq!(refused(&signed.await.expect("sign")), Error::Busy);
+        assert!(done(&deleted.await.expect("delete")));
+    });
 }

@@ -9,6 +9,7 @@ mod limit;
 pub mod proto;
 mod ring;
 mod server;
+mod signers;
 mod state;
 mod vault;
 
@@ -21,5 +22,6 @@ pub use error::Error;
 pub use limit::{Limits, Rate};
 pub use ring::{Connect, Connecting, Fault, Ring, RingSettings, RingStats, Working, wall_day};
 pub use server::{Server, Settings, Stats, Stream};
+pub use signers::Signers;
 pub use state::{Entry, State};
 pub use vault::{Keys, MAX_RETENTION, MODE, VERSION, Vault};

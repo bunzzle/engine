@@ -1,3 +1,4 @@
+mod dkim;
 mod error;
 mod kdf;
 mod keys;
@@ -8,6 +9,7 @@ mod stream;
 mod tenant;
 mod wrap;
 
+pub use dkim::{DKIM_LABEL, DkimAlg, DkimKey, dkim_label};
 pub use error::Error;
 pub use kdf::Prk;
 pub use keys::TenantKeys;

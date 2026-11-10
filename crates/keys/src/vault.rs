@@ -2,7 +2,9 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-use crypto::{Secret, Tenant, Wrap, day_public, day_secret, next_day, open_batch, ratchet};
+use crypto::{
+    DataKey, Secret, Tenant, Wrap, day_public, day_secret, next_day, open_batch, ratchet,
+};
 use rt::{Buf, File, OpenOptions};
 
 use crate::file::{self, MASTER, Master};
@@ -305,6 +307,15 @@ impl Vault {
             today,
             tomorrow,
         })
+    }
+
+    pub fn dkim(&self, tenant: u32, generation: u32) -> Result<DataKey, Error> {
+        let entry = self.durable(tenant, generation)?;
+        Ok(Tenant::new(&entry.key).dkim_key(generation, VERSION))
+    }
+
+    pub fn active(&self, tenant: u32, generation: u32) -> Result<(), Error> {
+        self.durable(tenant, generation).map(drop)
     }
 
     pub fn unwrap(&self, tenant: u32, batch: u64, wrap: &Wrap) -> Result<Secret<32>, Error> {

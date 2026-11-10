@@ -11,7 +11,6 @@ use crate::Error;
 use crate::proto::{Answer, Frames, MAX_FRAME, Request};
 use crate::server::Stream;
 
-const REQUEST: usize = 128;
 const CONNECT_TRIES: u32 = 8;
 const CONNECT_PAUSE: Duration = Duration::from_millis(10);
 
@@ -103,7 +102,7 @@ impl Client {
         self.next.set(id.wrapping_add(1));
         let (reply, answer) = rt::channel();
         self.waiting.borrow_mut().insert(id, reply);
-        let mut out = Plain::with_capacity(REQUEST);
+        let mut out = Plain::with_capacity(request.size());
         request.encode(id, &mut out);
         if self.frames.send(out).is_err() {
             self.waiting.borrow_mut().remove(&id);

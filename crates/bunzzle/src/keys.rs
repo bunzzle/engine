@@ -189,7 +189,12 @@ async fn serve(dir: PathBuf, socket: PathBuf, engine: u32) -> Result<(), String>
     let vault = Vault::open(&dir).await.map_err(|e| e.to_string())?;
     let audit = Audit::open(&dir).await.map_err(|e| e.to_string())?;
     let listener = bind(&socket).await?;
-    let server = Server::start(vault, audit, Settings::default());
+    let signers = std::thread::available_parallelism().map_or(1, usize::from);
+    let settings = Settings {
+        signers,
+        ..Settings::default()
+    };
+    let server = Server::start(vault, audit, settings);
     let error = server.listen(listener, engine).await;
     Err(format!("{}: {error}", socket.display()))
 }

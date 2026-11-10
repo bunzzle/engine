@@ -1,19 +1,23 @@
 use std::cell::{Cell, RefCell};
 use std::io;
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::Duration;
 
-use crypto::{Plain, Secret};
+use crypto::{DkimKey, Plain, Secret};
 use rt::{Buf, Instant, Notify, Receiver, Sender};
 
 use crate::audit::{Audit, Op};
+use crate::cache::Cache;
 use crate::limit::{Limits, Rate};
 use crate::proto::{Answer, Frames, MAX_FRAME, Request};
+use crate::signers::{Done, Job, Signers};
 use crate::{Clock, Error, Keys, Step, Vault};
 
 const DAY_MS: u64 = 86_400_000;
 const ACCEPT_PAUSE: Duration = Duration::from_millis(100);
 const IN_FLIGHT: usize = 1_024;
+const DKIM_KEYS: usize = 4_096;
 
 pub trait Stream {
     fn read(&self, buf: Buf) -> impl Future<Output = (io::Result<usize>, Buf)>;
@@ -56,6 +60,7 @@ pub struct Settings {
     pub pace: Duration,
     pub force_after: Duration,
     pub tick: Duration,
+    pub signers: usize,
 }
 
 impl Default for Settings {
@@ -72,6 +77,7 @@ impl Default for Settings {
             pace: Duration::from_secs(1),
             force_after: Duration::from_hours(6),
             tick: Duration::from_millis(100),
+            signers: 0,
         }
     }
 }
@@ -85,12 +91,32 @@ pub struct Stats {
     pub forced: u64,
     pub failed: u64,
     pub refused: u64,
+    pub dkim_new: u64,
+    pub loads: u64,
+    pub signs: u64,
+    pub dkim_busy: u64,
+    pub conflicts: u64,
 }
 
 enum Command {
     Call(Request, Sender<Answer>),
     Refused(u32),
     Tick,
+    Dkim(Finished),
+}
+
+struct Finished {
+    reply: Sender<Answer>,
+    id: (u32, u32, u32),
+    blob: Option<Arc<[u8]>>,
+    deletes: u64,
+    done: Done,
+}
+
+#[derive(Clone)]
+struct DkimEntry {
+    key: Arc<DkimKey>,
+    blob: Arc<[u8]>,
 }
 
 pub struct Server {
@@ -114,6 +140,11 @@ impl Server {
             last_step: Step::Wait,
             settled: None,
             force_at: None,
+            commands: commands.clone(),
+            signers: Signers::new(settings.signers),
+            dkim: Cache::new(DKIM_KEYS),
+            jobs: 0,
+            deletes: 0,
         };
         rt::spawn(core.run(receiver));
         let ticker = commands.clone();
@@ -153,6 +184,11 @@ struct Core {
     last_step: Step,
     settled: Option<u32>,
     force_at: Option<Instant>,
+    commands: Sender<Command>,
+    signers: Signers,
+    dkim: Cache<(u32, u32, u32), DkimEntry>,
+    jobs: usize,
+    deletes: u64,
 }
 
 fn keys_answer(keys: Keys) -> Answer {
@@ -181,6 +217,10 @@ impl Core {
                     self.audit.note(Op::Refused, uid, 0, self.vault.day());
                 }
                 Command::Tick => self.tick().await,
+                Command::Dkim(finished) => {
+                    let reply = finished.reply.clone();
+                    let _ = reply.send(self.finished(finished));
+                }
             }
             self.answer_waiting();
         }
@@ -270,7 +310,12 @@ impl Core {
                 }
                 Answer::Done
             }
+            Request::DkimNew { .. } | Request::Load { .. } | Request::Sign { .. } => {
+                return self.dkim_call(request, reply);
+            }
             Request::Delete { tenant, generation } => {
+                self.dkim.retain(|id, _| id.0 != tenant);
+                self.deletes += 1;
                 match self.vault.delete(tenant, generation).await {
                     Ok(()) => {
                         self.audit
@@ -282,6 +327,167 @@ impl Core {
             }
         };
         Some(answer)
+    }
+
+    fn dkim_call(&mut self, request: Request, reply: &Sender<Answer>) -> Option<Answer> {
+        match request {
+            Request::DkimNew {
+                tenant,
+                generation,
+                key,
+                alg,
+            } => {
+                let seal = match self.vault.dkim(tenant, generation) {
+                    Ok(seal) => seal,
+                    Err(error) => return Some(self.refused(error)),
+                };
+                if self.dkim.peek(&(tenant, generation, key)).is_some() {
+                    self.stats.borrow_mut().conflicts += 1;
+                    return Some(Answer::Refused(Error::Conflict));
+                }
+                let job = Job::New {
+                    tenant,
+                    generation,
+                    key,
+                    alg,
+                    seal,
+                };
+                self.submit(job, reply, (tenant, generation, key), None)
+            }
+            Request::Load {
+                tenant,
+                generation,
+                key,
+                alg,
+                blob,
+            } => {
+                let seal = match self.vault.dkim(tenant, generation) {
+                    Ok(seal) => seal,
+                    Err(error) => return Some(self.refused(error)),
+                };
+                if let Some(cached) = self.dkim.peek(&(tenant, generation, key)) {
+                    if cached.key.alg() == alg && *cached.blob == blob[..] {
+                        return Some(Answer::Done);
+                    }
+                    self.stats.borrow_mut().conflicts += 1;
+                    return Some(Answer::Refused(Error::Conflict));
+                }
+                let blob: Arc<[u8]> = blob.into();
+                let job = Job::Load {
+                    tenant,
+                    generation,
+                    key,
+                    alg,
+                    blob: Arc::clone(&blob),
+                    seal,
+                };
+                self.submit(job, reply, (tenant, generation, key), Some(blob))
+            }
+            Request::Sign {
+                tenant,
+                generation,
+                key,
+                alg,
+                digest,
+            } => {
+                if let Err(error) = self.vault.active(tenant, generation) {
+                    return Some(self.refused(error));
+                }
+                let Some(cached) = self.dkim.get(&(tenant, generation, key)) else {
+                    return Some(Answer::Refused(Error::Unknown));
+                };
+                if cached.key.alg() != alg {
+                    return Some(Answer::Refused(Error::Open));
+                }
+                let job = Job::Sign {
+                    key: cached.key,
+                    digest,
+                };
+                self.submit(job, reply, (tenant, generation, key), None)
+            }
+            _ => Some(Answer::Refused(Error::Bad)),
+        }
+    }
+
+    fn submit(
+        &mut self,
+        job: Job,
+        reply: &Sender<Answer>,
+        id: (u32, u32, u32),
+        blob: Option<Arc<[u8]>>,
+    ) -> Option<Answer> {
+        if self.jobs >= self.signers.limit() {
+            self.stats.borrow_mut().dkim_busy += 1;
+            return Some(Answer::Refused(Error::Busy));
+        }
+        self.jobs += 1;
+        let commands = self.commands.clone();
+        let reply = reply.clone();
+        let deletes = self.deletes;
+        self.signers.submit(job, move |done| {
+            let _ = commands.send(Command::Dkim(Finished {
+                reply,
+                id,
+                blob,
+                deletes,
+                done,
+            }));
+        });
+        None
+    }
+
+    fn finished(&mut self, finished: Finished) -> Answer {
+        self.jobs -= 1;
+        let Finished {
+            id,
+            blob,
+            deletes,
+            done,
+            ..
+        } = finished;
+        if deletes != self.deletes {
+            return Answer::Refused(Error::Busy);
+        }
+        let (tenant, generation, key) = id;
+        match done {
+            Done::New(Some((made, public, sealed))) => {
+                if self.dkim.peek(&id).is_some() {
+                    self.stats.borrow_mut().conflicts += 1;
+                    return Answer::Refused(Error::Conflict);
+                }
+                let entry = DkimEntry {
+                    key: made,
+                    blob: sealed.clone().into(),
+                };
+                self.dkim.put(id, entry);
+                self.stats.borrow_mut().dkim_new += 1;
+                self.audit.note(Op::DkimNew, tenant, generation, key);
+                Answer::Dkim {
+                    public,
+                    blob: sealed,
+                }
+            }
+            Done::Loaded(Some(opened)) => {
+                let blob = blob.unwrap_or_else(|| Arc::from(Vec::new()));
+                if let Some(cached) = self.dkim.peek(&id) {
+                    if cached.key.alg() == opened.alg() && cached.blob == blob {
+                        return Answer::Done;
+                    }
+                    self.stats.borrow_mut().conflicts += 1;
+                    return Answer::Refused(Error::Conflict);
+                }
+                self.dkim.put(id, DkimEntry { key: opened, blob });
+                self.stats.borrow_mut().loads += 1;
+                self.audit.note(Op::Load, tenant, generation, key);
+                Answer::Done
+            }
+            Done::Signed(Some(signature)) => {
+                self.stats.borrow_mut().signs += 1;
+                Answer::Signature(signature)
+            }
+            Done::Loaded(None) => Answer::Refused(Error::Open),
+            Done::New(None) | Done::Signed(None) => Answer::Refused(Error::Bad),
+        }
     }
 
     async fn tick(&mut self) {
