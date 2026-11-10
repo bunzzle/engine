@@ -60,7 +60,7 @@ impl Placer {
         }
     }
 
-    fn room(&self, region_size: u64) -> u64 {
+    pub(crate) fn room(&self, region_size: u64) -> u64 {
         self.current
             .as_ref()
             .map_or(region_size, |a| region_size - a.offset)

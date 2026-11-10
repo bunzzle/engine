@@ -27,10 +27,23 @@ const OPTIONS: Options = Options {
     shards: SHARDS as u32,
 };
 
+const LARGE: Options = Options {
+    region_count: 64,
+    ..OPTIONS
+};
+
 fn run<T: 'static>(seed: u64, future: impl Future<Output = T> + 'static) -> T {
+    run_with(seed, &OPTIONS, future)
+}
+
+fn run_with<T: 'static>(
+    seed: u64,
+    options: &'static Options,
+    future: impl Future<Output = T> + 'static,
+) -> T {
     let setup = Rc::new(SimDriver::new(seed, Config::default()));
     Runtime::new(setup.clone()).block_on(async {
-        DataFile::create(PATH, &OPTIONS).await.expect("create");
+        DataFile::create(PATH, options).await.expect("create");
     });
     let driver = Rc::new(SimDriver::with_disk(seed, Config::default(), setup.crash()));
     Runtime::new(driver).block_on(future)
@@ -166,7 +179,8 @@ impl Core {
             let Some(roots) = self.keeper.roots(shard) else {
                 continue;
             };
-            assert!(roots.len() <= MAX_DELTAS + 1);
+            let deltas = roots.iter().filter(|r| !r.base && r.segment == 0).count();
+            assert!(deltas <= MAX_DELTAS);
             assert!(roots.first().is_none_or(|r| r.base));
             let state = self.keeper.state(shard).expect("kept");
             assert_eq!(&fold(&self.data, shard, roots).await, state.entries());
@@ -178,7 +192,7 @@ async fn fold(data: &CoreFile, shard: u16, roots: &[Root]) -> BTreeMap<Key, Item
     let mut map = BTreeMap::new();
     for root in roots {
         let run = read_run(data, root, shard).await.expect("run");
-        if run.base {
+        if run.base && root.segment == 0 {
             map.clear();
         }
         for (key, item) in run.changes {
@@ -306,6 +320,138 @@ fn fail_cut(session: Session, mut results: Results, failing: u32) -> JoinHandle<
     })
 }
 
+fn fail_first(session: Session, mut results: Results, failing: u32) -> JoinHandle<()> {
+    spawn(async move {
+        let mut cuts = 0;
+        while let Some(event) = results.recv().await {
+            if let Event::Cut { sequence } = event {
+                if cuts < failing {
+                    session.fail(sequence).expect("fail");
+                } else {
+                    let parts = [1, 3]
+                        .map(|tag| Part {
+                            tag,
+                            replay_sequence: sequence,
+                            bytes: encode_part(&[], &[]),
+                        })
+                        .to_vec();
+                    session.parts(sequence, parts).expect("parts");
+                }
+                cuts += 1;
+            }
+        }
+    })
+}
+
+#[test]
+fn failed_cuts_give_back_the_regions_they_wrote() {
+    run(28, async {
+        let (client, mut sessions, source, _committer) = start(2).await;
+        let other = sessions.pop().expect("second");
+        let _failing = fail_first(other.0, other.1, 30);
+        let mut core = Core::owning(sessions.remove(0), &source, &[0, 2]).await;
+        for chunk in 0..5u64 {
+            core.changes(
+                2,
+                (chunk * 200..(chunk + 1) * 200)
+                    .map(|k| put(k, 1))
+                    .collect(),
+            )
+            .await;
+        }
+        for _ in 0..30 {
+            assert!(matches!(
+                core.checkpoint(&client).await,
+                Err(Error::Invalid("part"))
+            ));
+        }
+        core.checkpoint(&client).await.expect("checkpoint");
+        core.check().await;
+    });
+}
+
+#[test]
+fn a_state_record_that_cannot_fit_one_segment_is_refused() {
+    run(29, async {
+        let (_client, mut sessions, _source, _committer) = start(1).await;
+        let (session, mut results) = sessions.remove(0);
+        let region = usize::try_from(OPTIONS.region_size).expect("fits");
+        for (tag, size) in [(1, region - 4096), (2, region - 72)] {
+            let submission = Submission {
+                claim: Claim::Intake,
+                records: vec![Write {
+                    kind: KIND_STATE,
+                    counted: true,
+                    shard: 2,
+                    tenant: 7,
+                    payload: put(tag, 1).payload(&vec![0xAB; size - 72]),
+                }],
+                bodies: Vec::new(),
+                dead: Vec::new(),
+            };
+            session.submit(tag, submission).expect("credit");
+            match results.recv().await.expect("event") {
+                Event::Durable { tag: 1, .. } => assert_eq!(tag, 1),
+                Event::Rejected {
+                    tag: 2,
+                    error: Error::CommitTooLarge,
+                } => assert_eq!(tag, 2),
+                _ => panic!("unexpected event for {tag}"),
+            }
+        }
+    });
+}
+
+#[test]
+fn a_shard_state_larger_than_a_region_is_written_in_segments() {
+    run_with(27, &LARGE, async {
+        let (client, mut sessions, source, committer) = start(1).await;
+        let mut core = Core::new(sessions.remove(0), &source).await;
+        for chunk in 0..30u64 {
+            core.changes(
+                2,
+                (chunk * 200..(chunk + 1) * 200)
+                    .map(|k| put(k, 1))
+                    .collect(),
+            )
+            .await;
+        }
+        core.checkpoint(&client).await.expect("checkpoint");
+        let base = core.keeper.roots(2).expect("kept").to_vec();
+        assert!(base.len() >= 3, "{} segments", base.len());
+        assert!(base.iter().all(|r| r.base && r.run == 0));
+        for round in 0..3u64 {
+            core.changes(2, (0..300).map(|k| put(k * 7 + round, 2)).collect())
+                .await;
+            core.change(2, delete(round * 11)).await;
+            core.checkpoint(&client).await.expect("checkpoint");
+        }
+        core.check().await;
+        let roots = core.keeper.roots(2).expect("kept").to_vec();
+        assert_eq!(roots.iter().filter(|r| !r.base).count(), 3);
+        let state = core.keeper.state(2).expect("kept").clone();
+        drop(client);
+        drop(core);
+        drop(committer.await);
+        let rebuilt = rebuild(&ALL).await;
+        assert_eq!(rebuilt.roots(2).expect("kept"), roots.as_slice());
+        assert_eq!(rebuilt.state(2).expect("kept").entries(), state.entries());
+        let mut swapped = roots.clone();
+        swapped.swap(0, 1);
+        (swapped[0].segment, swapped[1].segment) = (0, 1);
+        let part = Part {
+            tag: 2,
+            replay_sequence: 0,
+            bytes: encode_part(&swapped, &[]),
+        };
+        let file = core_file().await;
+        assert!(matches!(
+            Keeper::rebuild(&file, &[part], &[], &[2]).await,
+            Err(Error::Damaged { .. })
+        ));
+    });
+}
+
 #[test]
 fn an_abandoned_cut_keeps_its_changes_for_the_next_one() {
     run(22, async {
@@ -348,6 +494,8 @@ fn a_root_outside_the_state_regions_abandons_the_checkpoint() {
                     let root = Root {
                         region: 5,
                         base: true,
+                        run: 0,
+                        segment: 0,
                         epoch: 0,
                         offset: 0,
                         length: 4096,
@@ -446,7 +594,8 @@ fn a_new_base_follows_the_last_allowed_delta() {
         for round in 0..=MAX_DELTAS as u64 {
             core.change(2, put(round, 2)).await;
             core.checkpoint(&client).await.expect("checkpoint");
-            lengths.push(core.keeper.roots(2).expect("kept").len());
+            let roots = core.keeper.roots(2).expect("kept");
+            lengths.push(roots.iter().filter(|r| r.segment == 0).count());
         }
         let mut expected: Vec<usize> = (2..=MAX_DELTAS + 1).collect();
         expected.push(1);

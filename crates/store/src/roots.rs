@@ -5,7 +5,7 @@ use crate::run::{ROOT_SIZE, Root, decode_roots, encode_roots};
 
 pub const INDEX_ROOT_SIZE: usize = 56;
 
-const PART_FORMAT: u32 = 1;
+const PART_FORMAT: u32 = 2;
 const HEAD: usize = 16;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -159,6 +159,8 @@ mod tests {
         vec![Root {
             region: 2,
             base: true,
+            run: 0,
+            segment: 0,
             epoch: 9,
             offset: 0,
             length: 4096,
@@ -213,7 +215,7 @@ mod tests {
         let bytes = encode_part(&state(), &valid());
         let first = bytes.len() - 5 * INDEX_ROOT_SIZE;
         let mut format = bytes.clone();
-        format[0] = 2;
+        format[0] = 1;
         assert_eq!(decode_part(&format), None);
         let mut reserved = bytes.clone();
         reserved[12] = 1;

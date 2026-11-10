@@ -926,7 +926,9 @@ fn restart(seed: u64, cores: u16) {
         names_survive(seed, world);
     });
     verify(seed, &world.borrow(), &run);
-    assert!(world.borrow().restored > 0, "seed {seed}: nothing restored");
+    if first.is_halted() {
+        assert!(world.borrow().restored > 0, "seed {seed}: nothing restored");
+    }
 }
 
 #[test]

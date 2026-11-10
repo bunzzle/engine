@@ -10,6 +10,7 @@ use crate::run::Root;
 #[derive(Default)]
 pub(super) struct Runs {
     pub(super) regions: Vec<u32>,
+    pub(super) published: Vec<u32>,
     pub(super) held: Vec<Vec<u32>>,
     pub(super) merging: Vec<u32>,
 }
@@ -128,8 +129,14 @@ impl Committer {
             .iter()
             .partition(|r| referenced.contains(r) || held.iter().any(|h| h.contains(r)));
         self.runs.regions = kept;
+        self.runs.published = referenced.to_vec();
         for region in released {
             self.regions.release(region);
         }
+    }
+
+    pub(super) fn release_unpublished(&mut self) {
+        let published = self.runs.published.clone();
+        self.release_state(&published);
     }
 }

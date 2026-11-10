@@ -280,8 +280,8 @@ impl ShardState {
             .range(Key::new(message, 0)..=Key::new(message, u32::MAX))
     }
 
-    pub fn load_run(&mut self, run: Run) {
-        if run.base {
+    pub fn load_run(&mut self, run: Run, first: bool) {
+        if run.base && first {
             self.entries.clear();
         }
         for (key, item) in run.changes {

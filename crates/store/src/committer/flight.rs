@@ -326,6 +326,9 @@ impl Committer {
         if result.is_ok() {
             self.broadcast(|| Event::Published { sequence });
         } else {
+            if !self.failed {
+                self.release_unpublished();
+            }
             self.broadcast(|| Event::Abandoned { sequence });
         }
         let boot = result
@@ -432,6 +435,9 @@ impl Committer {
         if let Some(flight) = self.queues.flight.take() {
             for &region in &flight.regions {
                 self.regions.release(region);
+            }
+            if !self.failed {
+                self.release_unpublished();
             }
             let sequence = flight.snapshot.position.sequence;
             self.broadcast(|| Event::Abandoned { sequence });

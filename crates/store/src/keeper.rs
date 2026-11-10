@@ -13,7 +13,7 @@ use crate::regions::Claim;
 use crate::roots::{IndexRoot, encode_part};
 use crate::run::{self, MAX_DELTAS, Root};
 use crate::session::Session;
-use crate::shard::{Delta, Index, ShardState};
+use crate::shard::{self, Delta, Index, Item, ShardState};
 
 struct Pending {
     sequence: u64,
@@ -34,6 +34,7 @@ pub struct Keeper {
     flush: Placer,
     tiering: Tiering,
     unhold: Vec<u32>,
+    cut_failures: u64,
 }
 
 impl Default for Keeper {
@@ -44,6 +45,7 @@ impl Default for Keeper {
             flush: Placer::new(Claim::Flush),
             tiering: Tiering::default(),
             unhold: Vec::new(),
+            cut_failures: 0,
         }
     }
 }
@@ -282,6 +284,8 @@ impl Keeper {
         sequence: u64,
     ) -> Result<(), Error> {
         let covered = sequence - 1;
+        self.append.claimed.clear();
+        self.flush.claimed.clear();
         for region in std::mem::take(&mut self.unhold) {
             session.unhold(region)?;
         }
@@ -310,6 +314,7 @@ impl Keeper {
             let roots = match roots {
                 Ok(roots) => roots,
                 Err(e) => {
+                    self.cut_failures += 1;
                     self.abandoned(sequence);
                     session.fail(sequence)?;
                     return Err(e);
@@ -324,7 +329,12 @@ impl Keeper {
             let kept = self.shards.get_mut(&shard).expect("shard is kept here");
             kept.pending.as_mut().expect("pending cut").roots = roots;
         }
+        self.cut_failures = 0;
         session.parts(sequence, parts)
+    }
+
+    pub fn cut_failures(&self) -> u64 {
+        self.cut_failures
     }
 
     async fn next_roots(
@@ -340,51 +350,48 @@ impl Keeper {
         if changes.is_empty() {
             return Ok(kept.roots.clone());
         }
-        let deltas = kept.roots.iter().filter(|r| !r.base);
-        let count = deltas.clone().count();
-        let delta_bytes: u64 = deltas.map(|r| u64::from(r.length)).sum::<u64>()
+        let length = |base: bool| {
+            kept.roots
+                .iter()
+                .filter(|r| r.base == base)
+                .map(|r| u64::from(r.length))
+                .sum::<u64>()
+        };
+        let delta_bytes = length(false)
             + changes
                 .values()
                 .map(|item| run::entry_size(item.as_ref()) as u64)
                 .sum::<u64>();
         let rebase = match kept.roots.first() {
-            Some(base) if base.base => count >= MAX_DELTAS || delta_bytes > u64::from(base.length),
+            Some(base) if base.base => {
+                run::delta_runs(&kept.roots) >= MAX_DELTAS || delta_bytes > length(true)
+            }
             _ => true,
         };
-        let blob = if rebase {
-            let entries = kept.state.entries();
-            run::encode(
-                shard,
-                true,
-                covered,
-                entries.iter().map(|(&k, v)| (k, Some(v))),
-            )
+        let entries: Vec<(shard::Key, Option<&Item>)> = if rebase {
+            kept.state
+                .entries()
+                .iter()
+                .map(|(&k, v)| (k, Some(v)))
+                .collect()
         } else {
-            run::encode(
-                shard,
-                false,
-                covered,
-                changes.iter().map(|(&k, v)| (k, v.as_ref())),
-            )
+            changes.iter().map(|(&k, v)| (k, v.as_ref())).collect()
         };
         let mut roots = if rebase {
             Vec::new()
         } else {
             kept.roots.clone()
         };
-        roots.push(self.write(data, session, &blob).await?);
+        write_segments(
+            &mut self.append,
+            data,
+            session,
+            (shard, covered),
+            &mut roots,
+            &entries,
+        )
+        .await?;
         Ok(roots)
-    }
-
-    async fn write(
-        &mut self,
-        data: &CoreFile,
-        session: &Session,
-        blob: &[u8],
-    ) -> Result<Root, Error> {
-        let size = run::disk_size(blob, data.sector_size() as usize) as u64;
-        let (region, epoch, offset) = self.append.place(session, data, size).await?;
-        run::write(data, region, epoch, offset, blob).await
     }
 
     async fn flush(
@@ -456,6 +463,58 @@ impl Keeper {
                     partition.abandoned();
                 }
             }
+        }
+    }
+}
+
+async fn write_segments(
+    placer: &mut Placer,
+    data: &CoreFile,
+    session: &Session,
+    (shard, covered): (u16, u64),
+    roots: &mut Vec<Root>,
+    entries: &[(shard::Key, Option<&Item>)],
+) -> Result<(), Error> {
+    let sector = data.sector_size() as usize;
+    let region_size = data.superblock().region_size();
+    let base = roots.is_empty();
+    let run = run::next_run(roots);
+    let mut segment = 0;
+    let mut rest = entries;
+    loop {
+        let room = placer.room(region_size);
+        let first = rest.first().map_or(0, |(_, item)| run::entry_size(*item));
+        let limit = if run::disk_length(run::blob_size(first), sector) as u64 <= room {
+            room
+        } else {
+            region_size
+        };
+        let mut bytes = 0;
+        let mut count = 0;
+        for (_, item) in rest {
+            let next = bytes + run::entry_size(*item);
+            if count > 0 && run::disk_length(run::blob_size(next), sector) as u64 > limit {
+                break;
+            }
+            bytes = next;
+            count += 1;
+        }
+        let (chunk, tail) = rest.split_at(count);
+        rest = tail;
+        let blob = run::encode(shard, base, covered, chunk.iter().copied());
+        let size = run::disk_size(&blob, sector) as u64;
+        let (region, epoch, offset) = placer.place(session, data, size).await?;
+        let place = run::Place {
+            region,
+            epoch,
+            offset,
+            run,
+            segment,
+        };
+        roots.push(run::write(data, place, &blob).await?);
+        segment += 1;
+        if rest.is_empty() {
+            return Ok(());
         }
     }
 }

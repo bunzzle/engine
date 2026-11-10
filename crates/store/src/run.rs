@@ -6,13 +6,13 @@ use crate::committer::Location;
 use crate::core_file::CoreFile;
 use crate::error::Error;
 use crate::layout::{Fields, FieldsMut};
-use crate::record::{self, FLAG_MORE, Header, Record, record_size};
+use crate::record::{self, FLAG_MORE, Header, MAX_PAYLOAD, Record, record_size};
 use crate::shard::{BODY_SIZE, Delivery, Item, Key, decode_bodies, encode_body};
 use sys::crc32c::checksum;
 
 pub const KIND_RUN: u8 = 3;
 pub const MAX_DELTAS: usize = 8;
-pub const ROOT_SIZE: usize = 40;
+pub const ROOT_SIZE: usize = 48;
 
 const RUN_FORMAT: u32 = 3;
 const HEAD: usize = 24;
@@ -25,6 +25,8 @@ const OP_TOMBSTONE: u8 = 2;
 pub struct Root {
     pub region: u32,
     pub base: bool,
+    pub run: u32,
+    pub segment: u32,
     pub epoch: u64,
     pub offset: u64,
     pub length: u32,
@@ -51,12 +53,14 @@ pub fn encode_roots(roots: &[Root]) -> Vec<u8> {
         fields.put_u32(24, root.length);
         fields.put_u32(28, root.checksum);
         fields.put_u64(32, root.covered);
+        fields.put_u32(40, root.run);
+        fields.put_u32(44, root.segment);
     }
     out
 }
 
 pub fn decode_roots(bytes: &[u8]) -> Option<Vec<Root>> {
-    if !bytes.len().is_multiple_of(ROOT_SIZE) || bytes.len() > (MAX_DELTAS + 1) * ROOT_SIZE {
+    if !bytes.len().is_multiple_of(ROOT_SIZE) {
         return None;
     }
     let mut roots = Vec::with_capacity(bytes.len() / ROOT_SIZE);
@@ -66,20 +70,47 @@ pub fn decode_roots(bytes: &[u8]) -> Option<Vec<Root>> {
         if flags & !FLAG_BASE != 0 || fields.bytes(5, 3) != [0; 3] || fields.u32(24) == 0 {
             return None;
         }
-        roots.push(Root {
+        let root = Root {
             region: fields.u32(0),
             base: flags == FLAG_BASE,
+            run: fields.u32(40),
+            segment: fields.u32(44),
             epoch: fields.u64(8),
             offset: fields.u64(16),
             length: fields.u32(24),
             checksum: fields.u32(28),
             covered: fields.u64(32),
-        });
+        };
+        if !follows(roots.last(), &root) {
+            return None;
+        }
+        roots.push(root);
     }
-    let ordered = roots.iter().skip(1).all(|r| !r.base)
-        && roots.windows(2).all(|w| w[0].covered < w[1].covered)
-        && roots.iter().filter(|r| !r.base).count() <= MAX_DELTAS;
-    ordered.then_some(roots)
+    (delta_runs(&roots) <= MAX_DELTAS).then_some(roots)
+}
+
+fn follows(previous: Option<&Root>, root: &Root) -> bool {
+    let Some(previous) = previous else {
+        return root.run == 0 && root.segment == 0;
+    };
+    if root.run == previous.run {
+        root.segment == previous.segment + 1
+            && root.base == previous.base
+            && root.covered == previous.covered
+    } else {
+        root.run == previous.run + 1
+            && root.segment == 0
+            && !root.base
+            && root.covered > previous.covered
+    }
+}
+
+pub(crate) fn delta_runs(roots: &[Root]) -> usize {
+    roots.iter().filter(|r| !r.base && r.segment == 0).count()
+}
+
+pub(crate) fn next_run(roots: &[Root]) -> u32 {
+    roots.last().map_or(0, |r| r.run + 1)
 }
 
 pub(crate) fn entry_size(item: Option<&Item>) -> usize {
@@ -217,19 +248,45 @@ pub(crate) fn decode(blob: &[u8]) -> Option<Run> {
 }
 
 pub(crate) fn disk_size(blob: &[u8], sector: usize) -> usize {
-    record::chunks(blob)
-        .map(|(_, chunk)| record_size(chunk.len()))
-        .sum::<usize>()
-        .next_multiple_of(sector)
+    disk_length(blob.len(), sector)
 }
 
-pub(crate) async fn write(
-    data: &CoreFile,
-    region: u32,
-    epoch: u64,
-    offset: u64,
-    blob: &[u8],
-) -> Result<Root, Error> {
+pub(crate) fn disk_length(bytes: usize, sector: usize) -> usize {
+    let full = bytes / MAX_PAYLOAD;
+    let rest = bytes % MAX_PAYLOAD;
+    let last = if rest > 0 || bytes == 0 {
+        record_size(rest)
+    } else {
+        0
+    };
+    (full * record_size(MAX_PAYLOAD) + last).next_multiple_of(sector)
+}
+
+pub(crate) const fn blob_size(entries: usize) -> usize {
+    HEAD + entries
+}
+
+pub(crate) fn entry_fits(payload: usize, sector: usize, region_size: u64) -> bool {
+    let entry = ENTRY + payload.next_multiple_of(8);
+    disk_length(blob_size(entry), sector) as u64 <= region_size
+}
+
+pub(crate) struct Place {
+    pub region: u32,
+    pub epoch: u64,
+    pub offset: u64,
+    pub run: u32,
+    pub segment: u32,
+}
+
+pub(crate) async fn write(data: &CoreFile, place: Place, blob: &[u8]) -> Result<Root, Error> {
+    let Place {
+        region,
+        epoch,
+        offset,
+        run,
+        segment,
+    } = place;
     let head = Fields::new(&blob[..HEAD]);
     let shard = head.u16(4);
     let base = head.u8(6) == FLAG_BASE;
@@ -259,6 +316,8 @@ pub(crate) async fn write(
     Ok(Root {
         region,
         base,
+        run,
+        segment,
         epoch,
         offset,
         length: u32::try_from(length).expect("run fits in a region"),
@@ -320,7 +379,9 @@ pub async fn read_run(data: &CoreFile, root: &Root, shard: u16) -> Result<Run, E
 mod tests {
     use std::collections::BTreeMap;
 
-    use super::{ENTRY, HEAD, MAX_DELTAS, Root, decode, decode_roots, encode, encode_roots};
+    use super::{
+        ENTRY, HEAD, MAX_DELTAS, ROOT_SIZE, Root, decode, decode_roots, encode, encode_roots,
+    };
     use crate::committer::Location;
     use crate::journal::Range;
     use crate::shard::{BODY_SIZE, Delivery, Item, Key};
@@ -353,10 +414,12 @@ mod tests {
         }
     }
 
-    fn root(base: bool, covered: u64) -> Root {
+    fn root(base: bool, run: u32, segment: u32, covered: u64) -> Root {
         Root {
             region: 2,
             base,
+            run,
+            segment,
             epoch: 9,
             offset: 4096 * covered,
             length: 4096,
@@ -433,18 +496,43 @@ mod tests {
 
     #[test]
     fn roots_round_trip_in_order_only() {
-        let roots = vec![root(true, 3), root(false, 5), root(false, 8)];
+        let roots = vec![
+            root(true, 0, 0, 3),
+            root(true, 0, 1, 3),
+            root(false, 1, 0, 5),
+            root(false, 2, 0, 8),
+            root(false, 2, 1, 8),
+        ];
         assert_eq!(decode_roots(&encode_roots(&roots)), Some(roots));
         assert_eq!(decode_roots(&[]), Some(Vec::new()));
-        let late_base = vec![root(false, 3), root(true, 5)];
-        assert_eq!(decode_roots(&encode_roots(&late_base)), None);
-        let unordered = vec![root(true, 5), root(false, 5)];
-        assert_eq!(decode_roots(&encode_roots(&unordered)), None);
-        let many: Vec<Root> = (0..=MAX_DELTAS as u64).map(|c| root(false, c)).collect();
-        assert_eq!(decode_roots(&encode_roots(&many)), None);
-        let mut flags = encode_roots(&[root(true, 1)]);
+        let wrong = [
+            vec![root(false, 0, 0, 3), root(true, 1, 0, 5)],
+            vec![root(true, 0, 0, 5), root(false, 1, 0, 5)],
+            vec![root(true, 0, 0, 3), root(true, 0, 2, 3)],
+            vec![root(true, 0, 0, 3), root(true, 0, 1, 4)],
+            vec![root(true, 0, 0, 3), root(false, 0, 1, 3)],
+            vec![root(true, 0, 0, 3), root(false, 2, 0, 5)],
+            vec![root(true, 0, 0, 3), root(false, 1, 1, 5)],
+            vec![root(true, 1, 0, 3)],
+            vec![root(true, 0, 1, 3)],
+        ];
+        for roots in wrong {
+            assert_eq!(decode_roots(&encode_roots(&roots)), None, "{roots:?}");
+        }
+        let deltas = |runs: u32| -> Vec<Root> {
+            (0..runs)
+                .flat_map(|run| {
+                    (0..2).map(move |segment| root(false, run, segment, u64::from(run)))
+                })
+                .collect()
+        };
+        let max = u32::try_from(MAX_DELTAS).expect("fits");
+        let most = deltas(max);
+        assert_eq!(decode_roots(&encode_roots(&most)), Some(most));
+        assert_eq!(decode_roots(&encode_roots(&deltas(max + 1))), None);
+        let mut flags = encode_roots(&[root(true, 0, 0, 1)]);
         flags[4] = 2;
         assert_eq!(decode_roots(&flags), None);
-        assert_eq!(decode_roots(&[0; 39]), None);
+        assert_eq!(decode_roots(&[0; ROOT_SIZE - 1]), None);
     }
 }
