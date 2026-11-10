@@ -27,6 +27,7 @@ fn working(tenant: u32, generation: u32, day: u32) -> Working {
         oldest: DAY,
         today: day_public(&secret(tenant, day)).expect("public"),
         tomorrow: day_public(&secret(tenant, day + 1)).expect("public"),
+        seen: day,
     }
 }
 

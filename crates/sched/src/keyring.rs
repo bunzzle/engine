@@ -78,11 +78,19 @@ impl KeySource for Keyring {
 }
 
 impl Keys for Keyring {
+    fn tick(&self) {
+        self.batches.borrow_mut().sweep(rt::now());
+    }
+
+    fn settled(&self, day: u32) {
+        self.ring.settled(day);
+    }
+
     fn batch(&self, tenant: u32, generation: u32, shard: u16, first: u64) -> Batched<'_> {
         Box::pin(async move {
             let working = self
                 .ring
-                .open(tenant, generation)
+                .sealing(tenant, generation)
                 .await
                 .map_err(key_error)?;
             self.batches

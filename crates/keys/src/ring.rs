@@ -13,6 +13,9 @@ use crate::{Client, Error};
 
 pub type Connecting = Pin<Box<dyn Future<Output = Result<Client, Error>>>>;
 pub type Connect = Rc<dyn Fn() -> Connecting>;
+const REFRESH: Duration = Duration::from_secs(600);
+const DAY_MS: u64 = 86_400_000;
+
 type Waiters = Vec<Sender<Result<Working, Fault>>>;
 type Unwrapping = (Wrap, Vec<Sender<Result<Secret<32>, Fault>>>);
 
@@ -46,6 +49,22 @@ pub struct Working {
     pub oldest: u32,
     pub today: [u8; 32],
     pub tomorrow: [u8; 32],
+    pub seen: u32,
+}
+
+impl Working {
+    #[must_use]
+    pub fn next_day(&self) -> Self {
+        Self {
+            day: self.day + 1,
+            today: self.tomorrow,
+            ..self.clone()
+        }
+    }
+}
+
+pub fn wall_day() -> u32 {
+    u32::try_from(rt::wall_ms() / DAY_MS).unwrap_or(u32::MAX)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -71,6 +90,9 @@ pub struct RingStats {
     pub unwraps: u64,
     pub gone: u64,
     pub bad: u64,
+    pub refreshes: u64,
+    pub behind: u32,
+    pub settled: u32,
     pub tenants: CacheStats,
 }
 
@@ -95,6 +117,8 @@ struct Inner {
     tenants: RefCell<Cache<(u32, u32), Working>>,
     opening: RefCell<HashMap<(u32, u32), Waiters>>,
     unwrapping: RefCell<HashMap<(u32, u32, u16, u64), Unwrapping>>,
+    refreshed: RefCell<HashMap<(u32, u32), Instant>>,
+    settled: Cell<u32>,
     stats: Cell<RingStats>,
 }
 
@@ -131,6 +155,8 @@ impl Ring {
                 tenants: RefCell::new(Cache::new(settings.tenants)),
                 opening: RefCell::new(HashMap::new()),
                 unwrapping: RefCell::new(HashMap::new()),
+                refreshed: RefCell::new(HashMap::new()),
+                settled: Cell::new(0),
                 stats: Cell::new(RingStats::default()),
             }),
         }
@@ -226,6 +252,74 @@ impl Ring {
             }
             other => other,
         }
+    }
+
+    pub async fn sealing(&self, tenant: u32, generation: u32) -> Result<Working, Fault> {
+        let mut working = self.open(tenant, generation).await?;
+        let wall = wall_day();
+        self.count(|s| s.behind = wall.saturating_sub(working.seen));
+        if wall > working.seen.saturating_add(1) {
+            self.inner
+                .tenants
+                .borrow_mut()
+                .remove(&(tenant, generation));
+            working = self.open(tenant, generation).await?;
+        } else if wall > working.seen {
+            self.refresh(tenant, generation);
+        }
+        if wall > working.seen {
+            return Ok(working.next_day());
+        }
+        Ok(working)
+    }
+
+    pub fn settled(&self, day: u32) {
+        if self.failed() || day <= self.inner.settled.get() {
+            return;
+        }
+        let ring = self.clone();
+        rt::spawn(async move {
+            if let Ok(Answer::Done) = ring.call(&Request::Settled { day }).await {
+                ring.inner.settled.set(ring.inner.settled.get().max(day));
+                ring.count(|s| s.settled = s.settled.max(day));
+            }
+        });
+    }
+
+    pub fn refresh(&self, tenant: u32, generation: u32) {
+        let now = rt::now();
+        {
+            let mut refreshed = self.inner.refreshed.borrow_mut();
+            let key = (tenant, generation);
+            if refreshed
+                .get(&key)
+                .is_some_and(|at| now.saturating_duration_since(*at) < REFRESH)
+            {
+                return;
+            }
+            if refreshed.len() >= self.inner.settings.tenants {
+                refreshed.retain(|_, at| now.saturating_duration_since(*at) < REFRESH);
+            }
+            refreshed.insert(key, now);
+        }
+        self.count(|s| s.refreshes += 1);
+        let ring = self.clone();
+        rt::spawn(async move {
+            match ring.fetch(tenant, generation).await {
+                Ok(working) if !ring.failed() => ring
+                    .inner
+                    .tenants
+                    .borrow_mut()
+                    .put((tenant, generation), working),
+                Ok(_) => {}
+                Err(_) => {
+                    ring.inner
+                        .refreshed
+                        .borrow_mut()
+                        .remove(&(tenant, generation));
+                }
+            }
+        });
     }
 
     pub async fn unwrap(
@@ -343,6 +437,7 @@ impl Ring {
                     oldest,
                     today,
                     tomorrow,
+                    seen: wall_day(),
                 })
             }
             Ok(Answer::Refused(refused)) => Err(self.fault(None, Some(refused))),

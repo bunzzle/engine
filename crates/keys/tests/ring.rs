@@ -425,3 +425,64 @@ fn a_cancelled_open_leaves_the_ring_usable() {
         assert!(ring.open(4, 1).await.is_ok());
     });
 }
+
+const DAY_MS: i64 = 86_400_000;
+
+#[test]
+fn sealing_steps_one_day_and_refetches_keys_more_than_a_day_old() {
+    let driver = Rc::new(SimDriver::new(12, quiet()));
+    let jumps = Rc::clone(&driver);
+    run(&driver, async move {
+        let _server = serve("/a", 1).await;
+        create(1, 4).await;
+        create(1, 5).await;
+        let (connect, _) = hosts(&[1]);
+        let ring = Ring::new(connect, settings());
+        let opened = ring.open(4, 1).await.expect("open");
+        let today = ring.sealing(4, 1).await.expect("sealing");
+        assert_eq!((today.day, today.today), (DAY, opened.today));
+        let stale = ring.open(5, 1).await.expect("open");
+        assert_eq!(ring.stats().refreshes, 0);
+
+        jumps.jump_wall_clock(DAY_MS);
+        let next = ring.sealing(4, 1).await.expect("sealing");
+        assert_eq!((next.day, next.today), (DAY + 1, opened.tomorrow));
+        assert_eq!(ring.stats().behind, 1);
+        assert_eq!(ring.stats().refreshes, 1);
+        ring.sealing(4, 1).await.expect("sealing");
+        assert_eq!(ring.stats().refreshes, 1);
+
+        sleep(Duration::from_millis(50)).await;
+        jumps.jump_wall_clock(2 * DAY_MS);
+        let opens = ring.stats().opens;
+        let fetched = ring.sealing(5, 1).await.expect("sealing");
+        assert_eq!(ring.stats().opens, opens + 1);
+        let cached = ring.get(5, 1).expect("cached");
+        assert!(cached.day >= stale.day);
+        assert_eq!(cached.seen, stale.seen + 3);
+        assert_eq!((fetched.day, fetched.today), (cached.day, cached.today));
+    });
+}
+
+#[test]
+fn settled_is_sent_only_when_it_moves_forward() {
+    let driver = Rc::new(SimDriver::new(13, quiet()));
+    run(&driver, async {
+        let _server = serve("/a", 1).await;
+        let (connect, _) = hosts(&[1]);
+        let ring = Ring::new(connect, settings());
+        ring.hello().await.expect("hello");
+        ring.settled(DAY - 2);
+        sleep(Duration::from_millis(50)).await;
+        assert_eq!(ring.stats().settled, DAY - 2);
+        let calls = ring.stats().unavailable;
+        ring.settled(DAY - 5);
+        ring.settled(DAY - 2);
+        sleep(Duration::from_millis(50)).await;
+        assert_eq!(ring.stats().settled, DAY - 2);
+        ring.settled(DAY - 1);
+        sleep(Duration::from_millis(50)).await;
+        assert_eq!(ring.stats().settled, DAY - 1);
+        assert_eq!(ring.stats().unavailable, calls);
+    });
+}

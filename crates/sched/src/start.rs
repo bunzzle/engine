@@ -1,5 +1,6 @@
 use std::cell::{Cell, Ref, RefCell};
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
+use std::time::Duration;
 
 use control::{
     Ask, Call, KeyError, KeySource, Leases, Name, Naming, Object, Queues, Table, Update, Writer,
@@ -13,7 +14,7 @@ use crate::clock::Clock;
 use crate::error::Error;
 use crate::node::{Config, Note, Sched};
 use crate::requests::{KIND_REQUEST, RequestInputs, Requests, retain_request};
-use crate::sealing::Keys;
+use crate::sealing::{Holds, Keys};
 use crate::suppress::{self, Inputs, KIND_SUPPRESS, Suppressions};
 use crate::transport::Transport;
 
@@ -79,6 +80,8 @@ pub struct Parts<T> {
 pub(crate) struct Inner<T> {
     pub(crate) settings: Settings,
     keys: Rc<dyn Keys>,
+    pub(crate) holds: Holds,
+    ticker: Rc<Ticker>,
     cores: u16,
     pub(crate) spool: spool::Spool,
     pub(crate) sched: Sched<T>,
@@ -201,9 +204,12 @@ impl<T: Transport + 'static> Node<T> {
         leases.opened().await;
         barrier(links.steps).await;
 
-        let inner = Inner {
+        let ticker = Rc::new(Ticker::default());
+        let inner = Rc::new(Inner {
             settings,
             keys: Rc::clone(&parts.keys),
+            holds: Holds::default(),
+            ticker: Rc::clone(&ticker),
             cores,
             spool,
             sched,
@@ -216,21 +222,17 @@ impl<T: Transport + 'static> Node<T> {
             writer: RefCell::new(writer),
             writing: Cell::new(false),
             restored,
-        };
+        });
+        let ticks = maintain(Rc::downgrade(&inner), ticker);
         let running = Running {
             done: {
-                index_done.extend([config_done, names_done, leases_done, sched_done]);
+                index_done.extend([config_done, names_done, leases_done, sched_done, ticks]);
                 index_done
             },
             owner,
             changes,
         };
-        Ok((
-            Self {
-                inner: Rc::new(inner),
-            },
-            running,
-        ))
+        Ok((Self { inner }, running))
     }
 }
 
@@ -335,8 +337,14 @@ impl<T: Transport + 'static> Node<T> {
         Ok(self.inner.queues.rebind(name, pool).await?)
     }
 
+    pub fn ticks_late(&self) -> u64 {
+        self.inner.ticker.late.get()
+    }
+
     pub fn close(&self) {
         let inner = &self.inner;
+        inner.ticker.stopped.set(true);
+        inner.ticker.wake.notify();
         inner.sched.close();
         inner.queues.close();
         inner.leases.close();
@@ -363,6 +371,58 @@ async fn index_services(
         .await
         .map_err(spool::Error::from)?;
     Ok((suppressions, requests, vec![lists_done, requests_done]))
+}
+
+const TICK: Duration = Duration::from_secs(1);
+const LOW_EVERY: Duration = Duration::from_secs(60);
+
+#[derive(Default)]
+struct Ticker {
+    stopped: Cell<bool>,
+    wake: Notify,
+    late: Cell<u64>,
+}
+
+fn maintain<T: Transport + 'static>(inner: Weak<Inner<T>>, ticker: Rc<Ticker>) -> JoinHandle<()> {
+    spawn(async move {
+        let mut last = rt::now();
+        let mut low_at = last;
+        loop {
+            let woken = rt::timeout(TICK, ticker.wake.wait()).await.is_ok();
+            if ticker.stopped.get() {
+                return;
+            }
+            if woken {
+                continue;
+            }
+            let Some(inner) = inner.upgrade() else {
+                return;
+            };
+            let now = rt::now();
+            if now.saturating_duration_since(last) > TICK * 2 {
+                ticker.late.set(ticker.late.get() + 1);
+            }
+            last = now;
+            inner.keys.tick();
+            if now >= low_at {
+                low_at = now + LOW_EVERY;
+                settle(&inner);
+            }
+        }
+    })
+}
+
+fn settle<T: Transport + 'static>(inner: &Inner<T>) {
+    let low = [inner.spool.oldest_day(), inner.holds.oldest()]
+        .into_iter()
+        .flatten()
+        .fold(keys::wall_day(), u32::min);
+    inner.sched.report_low(low);
+    if let Some(low) = inner.sched.settled_low()
+        && low > 0
+    {
+        inner.keys.settled(low - 1);
+    }
 }
 
 fn start_leases(

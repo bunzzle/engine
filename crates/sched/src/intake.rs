@@ -5,6 +5,7 @@ use store::IndexRecord;
 use crate::error::Refusal;
 use crate::node::Arrival;
 use crate::requests::{Begun, Ticket};
+use crate::sealing::DayHold;
 use crate::start::Node;
 use crate::suppress::Hash;
 use crate::transport::Transport;
@@ -16,9 +17,14 @@ pub struct Draft {
     queues: Vec<u32>,
     taken: Vec<Taken>,
     leases: Leases<u32>,
+    holds: Vec<DayHold>,
 }
 
 impl Draft {
+    pub(crate) fn hold(&mut self, hold: DayHold) {
+        self.holds.push(hold);
+    }
+
     pub fn tenant(&self) -> u32 {
         self.tenant
     }
@@ -65,6 +71,7 @@ impl<T: Transport + 'static> Node<T> {
             queues: Vec::new(),
             taken: Vec::new(),
             leases: self.inner.leases.clone(),
+            holds: Vec::new(),
         })
     }
 
@@ -201,14 +208,16 @@ impl<T: Transport + 'static> Node<T> {
         }
         self.current(&draft)?;
         let arrival = Arrival::of(&message, draft.generation);
-        self.inner
-            .spool
-            .accept_indexed(vec![message], index)
-            .await
-            .map_err(|e| match e {
+        let accepted = self.inner.spool.accept_indexed(vec![message], index).await;
+        if let Err(error) = accepted {
+            for hold in draft.holds.drain(..) {
+                hold.keep();
+            }
+            return Err(match error {
                 spool::Error::Store(store::Error::Busy) => Refusal::Busy,
                 _ => Refusal::Failed,
-            })?;
+            });
+        }
         draft.taken.clear();
         self.inner.sched.enqueue(arrival);
         Ok(())
