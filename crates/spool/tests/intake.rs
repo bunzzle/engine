@@ -116,6 +116,20 @@ fn chunks(seed: u64, chunk: usize) -> Vec<Vec<u8>> {
         .collect()
 }
 
+fn streamed(seed: u64, chunk: usize) -> Vec<Vec<u8>> {
+    let full = seed % 3;
+    (0..=full)
+        .map(|n| {
+            let len = if n < full {
+                chunk
+            } else {
+                1 + usize::try_from((seed * 389) % 20_000).expect("fits")
+            };
+            bytes(seed ^ n, len)
+        })
+        .collect()
+}
+
 async fn draft(intake: &Spool, shard: u16, step: u64) -> Result<(Message, Accepted), Error> {
     let id = intake.id(shard).await?;
     let seed = id.key ^ u64::from(shard) << 40;
@@ -138,10 +152,17 @@ async fn draft(intake: &Spool, shard: u16, step: u64) -> Result<(Message, Accept
     let (body, expected) = if step.is_multiple_of(3) {
         let sealed = bytes(seed + 1, 100 + usize::try_from(seed % 1900).expect("fits"));
         (Body::Inline(sealed.clone()), Expected::Inline(sealed))
-    } else {
+    } else if step % 3 == 1 {
         let chunks = chunks(seed, intake.chunk());
         let written = intake.body(id, 7, &chunks).await?;
         (Body::Chain(written), Expected::Chain(chunks))
+    } else {
+        let chunks = streamed(seed, intake.stream_chunk());
+        let mut writer = intake.body_stream(id, 7);
+        for chunk in &chunks {
+            writer.push(chunk).await?;
+        }
+        (Body::Chain(writer.finish()?), Expected::Chain(chunks))
     };
     let accepted = Accepted {
         id,
@@ -260,7 +281,10 @@ fn workload(seed: u64, steps: u64, halt_after: Option<u64>, disk: Disk, model: &
         let (intake, owner) = Spool::new(opened, NODE, LIMITS).expect("limits");
         owners.push(machine.spawn_on(core, owner.run()));
         closers.push(intake.changes().clone());
-        workers.push(machine.spawn_on(core, work(intake, shards, steps, Rc::clone(model))));
+        for _ in 0..2 {
+            let work = work(intake.clone(), shards.clone(), steps / 2, Rc::clone(model));
+            workers.push(machine.spawn_on(core, work));
+        }
     }
     let client = booted.client;
     let finished = Rc::new(RefCell::new(false));
@@ -449,7 +473,15 @@ fn accepted_messages_come_back_whole() {
         .iter()
         .filter(|m| m.slices.len() == 3)
         .count();
-    assert!(chained > 0 && wide > 0, "{chained} chained, {wide} wide");
+    let full = model
+        .accepted
+        .iter()
+        .filter(|m| matches!(&m.body, Expected::Chain(c) if c.len() > 1 && c[0].len() == 65_480))
+        .count();
+    assert!(
+        chained > 0 && wide > 0 && full > 0,
+        "{chained} chained, {wide} wide, {full} streamed"
+    );
     drop(model);
     after(&outcome.driver, 2, shared);
 }
