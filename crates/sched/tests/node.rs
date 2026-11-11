@@ -392,6 +392,19 @@ async fn halted(driver: Rc<SimDriver>) {
     }
 }
 
+async fn unless_halted(driver: Rc<SimDriver>, work: impl Future<Output = ()>) {
+    let mut work = pin!(work);
+    let mut halt = pin!(halted(driver));
+    poll_fn(|cx| {
+        if work.as_mut().poll(cx).is_ready() || halt.as_mut().poll(cx).is_ready() {
+            Poll::Ready(())
+        } else {
+            Poll::Pending
+        }
+    })
+    .await;
+}
+
 fn durable(world: &mut World) {
     let spools = world.spools.clone();
     let mut finals = BTreeSet::new();
@@ -576,7 +589,7 @@ fn session(driver: &Rc<SimDriver>, world: &Shared, intake_on: bool, limit: Durat
             drop(client);
             drop(committer.await);
         };
-        let _ = timeout(Duration::from_secs(600), stop).await;
+        let _ = timeout(Duration::from_secs(600), unless_halted(power, stop)).await;
         session
     });
     world.borrow_mut().spools.clear();

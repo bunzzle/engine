@@ -625,6 +625,19 @@ async fn halted(driver: Rc<SimDriver>) {
     }
 }
 
+async fn unless_halted(driver: Rc<SimDriver>, work: impl Future<Output = ()>) {
+    let mut work = pin!(work);
+    let mut halt = pin!(halted(driver));
+    poll_fn(|cx| {
+        if work.as_mut().poll(cx).is_ready() || halt.as_mut().poll(cx).is_ready() {
+            Poll::Ready(())
+        } else {
+            Poll::Pending
+        }
+    })
+    .await;
+}
+
 #[derive(Default)]
 struct Session {
     finished: bool,
@@ -839,7 +852,11 @@ fn session(
             }
             sleep(Duration::from_secs(1)).await;
         };
-        let _ = timeout(Duration::from_secs(600), wind).await;
+        let _ = timeout(
+            Duration::from_secs(600),
+            unless_halted(Rc::clone(&power), wind),
+        )
+        .await;
         let session = observe(&nodes, finished);
         let stop = async move {
             ticker.await;
@@ -854,7 +871,7 @@ fn session(
             drop(client);
             drop(committer.await);
         };
-        let _ = timeout(Duration::from_secs(600), stop).await;
+        let _ = timeout(Duration::from_secs(600), unless_halted(power, stop)).await;
         session
     })
 }
