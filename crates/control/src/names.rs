@@ -103,7 +103,7 @@ impl Owned {
     }
 }
 
-struct Fixed;
+pub(crate) struct Fixed;
 
 struct Stored {
     head: Head,
@@ -115,7 +115,7 @@ struct Stored {
 const KEY_WAIT: Duration = Duration::from_millis(100);
 const KEY_WAIT_MAX: Duration = Duration::from_secs(5);
 
-async fn wait_keys(
+pub(crate) async fn wait_keys(
     keys: &dyn KeySource,
     tenant: u32,
     generation: u32,

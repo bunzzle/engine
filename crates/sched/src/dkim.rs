@@ -61,7 +61,17 @@ impl<T: Transport + 'static> Node<T> {
             public,
             blob,
         };
-        let update = held.writer().write(Object::Dkim(dkim.clone())).await?;
+        let sealing = control::tenant_keys(self.keys(), tenant, generation)
+            .await
+            .map_err(|error| control::Error::Keys {
+                tenant,
+                generation,
+                error,
+            })?;
+        let update = held
+            .writer()
+            .write_sealed(Object::Dkim(dkim.clone()), &sealing)
+            .await?;
         self.apply(&update);
         drop(held);
         self.broadcast(&update);

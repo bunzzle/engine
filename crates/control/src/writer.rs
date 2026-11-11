@@ -1,12 +1,17 @@
 use std::collections::BTreeMap;
 
+use crypto::TenantKeys;
 use store::{
-    Batch, CONTROL_BOOT, Change, Changes, Delivery, HEAD_ITEM, Keeper, Op, control_key, is_control,
-    split_key,
+    Batch, CONTROL_BOOT, Change, Changes, CoreFile, Delivery, HEAD_ITEM, Index, Keeper, Location,
+    Op, Record, control_key, is_control, split_key,
 };
 
 use crate::error::Error;
-use crate::record::{KIND_DKIM, KIND_NODE, KIND_POOL, KIND_TENANT, Object, SYSTEM, Update};
+use crate::names::{Fixed, wait_keys};
+use crate::queue::KeySource;
+use crate::record::{
+    KIND_DKIM, KIND_NODE, KIND_POOL, KIND_TENANT, Object, SYSTEM, Update, peek, sealed_label,
+};
 use crate::siphash::siphash;
 use crate::table::Snapshot;
 
@@ -37,6 +42,12 @@ pub fn entry_size(clear: usize) -> usize {
     ENTRY + clear.next_multiple_of(8)
 }
 
+struct Hidden {
+    location: Location,
+    tenant: u32,
+    clear: Box<[u8]>,
+}
+
 pub struct Loaded {
     shard: u16,
     version: u64,
@@ -44,13 +55,78 @@ pub struct Loaded {
     sizes: BTreeMap<(u8, u32), usize>,
     used: usize,
     skipped: u64,
+    waited: u64,
     naming: Option<u64>,
     dkim_next: u32,
+    hidden: Vec<Hidden>,
 }
 
 impl Loaded {
     pub fn naming_check(&self) -> Option<u64> {
         self.naming
+    }
+
+    pub fn waited(&self) -> u64 {
+        self.waited
+    }
+
+    pub async fn open(
+        &mut self,
+        snapshot: &mut Snapshot,
+        file: &CoreFile,
+        keys: &dyn KeySource,
+    ) -> Result<(), Error> {
+        let current: BTreeMap<u32, (u32, bool)> = snapshot
+            .objects
+            .iter()
+            .filter_map(|object| match object {
+                Object::Tenant(t) => Some((t.id, (t.generation, t.state.deleted()))),
+                Object::Pool(_) | Object::Dkim(_) => None,
+            })
+            .collect();
+        let gone = |tenant: u32, generation: u32| {
+            current
+                .get(&tenant)
+                .is_some_and(|&(g, deleted)| generation < g || (generation == g && deleted))
+        };
+        let reader = file.reader();
+        let mut groups: BTreeMap<(u32, u32), Vec<Hidden>> = BTreeMap::new();
+        for hidden in std::mem::take(&mut self.hidden) {
+            match sealed_label(&hidden.clear) {
+                Some(label) if !gone(label.tenant, label.generation) => groups
+                    .entry((label.tenant, label.generation))
+                    .or_default()
+                    .push(hidden),
+                _ => self.skipped += 1,
+            }
+        }
+        for ((tenant, generation), group) in groups {
+            let (sealing, waits) = wait_keys(keys, tenant, generation).await?;
+            self.waited += waits;
+            let Some(sealing) = sealing else {
+                self.skipped += group.len() as u64;
+                continue;
+            };
+            for hidden in group {
+                let buf = reader.read(hidden.location, hidden.tenant, &Fixed).await?;
+                let opened = Record::decode(&buf).ok().and_then(|record| {
+                    let parts = Index::parts(record.payload())?;
+                    if parts.clear != &*hidden.clear {
+                        return None;
+                    }
+                    let label = sealed_label(parts.clear)?;
+                    let secret = sealing.open(&label.bytes(), parts.sealed).ok()?;
+                    Update::decode_sealed(parts.clear, &secret)
+                });
+                match opened {
+                    Some(update) if update.object.tenant() == hidden.tenant => {
+                        snapshot.objects.push(update.object);
+                    }
+                    _ => self.skipped += 1,
+                }
+            }
+        }
+        Ok(())
     }
 
     pub fn writer(self, changes: Changes) -> Writer {
@@ -82,8 +158,10 @@ impl Writer {
             sizes: BTreeMap::new(),
             used: 0,
             skipped: 0,
+            waited: 0,
             naming: None,
             dkim_next: 1,
+            hidden: Vec::new(),
         };
         let mut objects = Vec::new();
         for (key, item) in state.entries() {
@@ -107,7 +185,23 @@ impl Writer {
                 loaded.track(kind, id, item.clear.len());
                 continue;
             }
-            if kind != KIND_TENANT && kind != KIND_POOL && kind != KIND_DKIM {
+            if kind == KIND_DKIM {
+                match peek(&item.clear).filter(|&(k, i, _)| k == kind && i == id) {
+                    Some((_, _, version)) => {
+                        loaded.version = loaded.version.max(version);
+                        loaded.dkim_next = loaded.dkim_next.max(id.saturating_add(1));
+                        loaded.track(kind, id, item.clear.len());
+                        loaded.hidden.push(Hidden {
+                            location: item.location,
+                            tenant: item.tenant,
+                            clear: item.clear.clone(),
+                        });
+                    }
+                    None => loaded.skipped += 1,
+                }
+                continue;
+            }
+            if kind != KIND_TENANT && kind != KIND_POOL {
                 continue;
             }
             let decoded = Update::decode(&item.clear).filter(|u| {
@@ -118,9 +212,6 @@ impl Writer {
                 continue;
             };
             loaded.version = loaded.version.max(update.version);
-            if kind == KIND_DKIM {
-                loaded.dkim_next = loaded.dkim_next.max(id.saturating_add(1));
-            }
             loaded.track(kind, id, item.clear.len());
             objects.push(update.object);
         }
@@ -198,12 +289,36 @@ impl Writer {
     }
 
     pub async fn write(&mut self, object: Object) -> Result<Update, Error> {
+        if object.sealed().is_some() {
+            return Err(Error::Invalid("kind"));
+        }
+        self.put(object, None).await
+    }
+
+    pub async fn write_sealed(
+        &mut self,
+        object: Object,
+        keys: &TenantKeys,
+    ) -> Result<Update, Error> {
+        if object.sealed().is_none() {
+            return Err(Error::Invalid("kind"));
+        }
+        self.put(object, Some(keys)).await
+    }
+
+    async fn put(&mut self, object: Object, keys: Option<&TenantKeys>) -> Result<Update, Error> {
         object.check()?;
         let update = Update {
             version: self.loaded.version + 1,
             object,
         };
         let clear = update.encode();
+        let sealed = match (update.object.sealed(), keys) {
+            (Some(label), Some(keys)) => keys
+                .seal(&label.bytes(), &update.secret())
+                .map_err(|_| Error::Invalid("seal"))?,
+            _ => Vec::new(),
+        };
         let (kind, id) = (update.object.kind(), update.object.id());
         let old = self.loaded.sizes.get(&(kind, id)).copied().unwrap_or(0);
         if self.loaded.used - old + entry_size(clear.len()) > self.loaded.budget {
@@ -222,7 +337,7 @@ impl Writer {
                 }),
                 clear: clear.clone(),
                 bodies: Vec::new(),
-                sealed: Vec::new(),
+                sealed,
             }],
         };
         self.changes.apply(batch).await?;
