@@ -15,6 +15,7 @@ pub const BACKOFF: [u64; 7] = [
 const THROTTLE: [u64; 3] = [MINUTE, 5 * MINUTE, 15 * MINUTE];
 const FULL: [u64; 2] = [HOUR, 4 * HOUR];
 const GREYLIST: u64 = 5 * MINUTE;
+const REPORT: [u64; 4] = [MINUTE, 5 * MINUTE, 15 * MINUTE, 30 * MINUTE];
 
 pub const LONGEST: u64 = 4 * HOUR;
 
@@ -60,6 +61,11 @@ pub fn delay(kind: Kind, attempts: u16) -> (u64, u8) {
             (next, CLASS_RETRY_AFTER)
         }
     }
+}
+
+pub fn report_retry(failures: u32) -> u64 {
+    let step = usize::try_from(failures.max(1) - 1).unwrap_or(usize::MAX);
+    ladder(&REPORT, step)
 }
 
 pub fn clamp(due: u64, now: u64) -> u64 {

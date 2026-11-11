@@ -528,7 +528,7 @@ fn session(driver: &Rc<SimDriver>, world: &Shared, intake_on: bool, limit: Durat
         let session = Session {
             finished,
             overdue: scheds.iter().map(Sched::overdue).sum(),
-            errors: scheds.iter().map(Sched::report_errors).sum(),
+            errors: scheds.iter().map(|s| s.report_errors().total()).sum(),
             refused: scheds.iter().map(Sched::refused).sum(),
             expired: scheds.iter().map(Sched::expired).sum(),
             dropped: scheds.iter().map(|s| s.unopened_stats().dropped).sum(),
