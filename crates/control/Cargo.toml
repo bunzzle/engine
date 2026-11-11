@@ -8,6 +8,7 @@ publish.workspace = true
 
 [dependencies]
 crypto = { path = "../crypto" }
+dkim = { path = "../dkim" }
 rt = { path = "../rt" }
 store = { path = "../store" }
 
