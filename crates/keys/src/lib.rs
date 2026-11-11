@@ -24,4 +24,4 @@ pub use ring::{Connect, Connecting, Fault, Ring, RingSettings, RingStats, Workin
 pub use server::{Server, Settings, Stats, Stream};
 pub use signers::Signers;
 pub use state::{Entry, State};
-pub use vault::{Keys, MAX_RETENTION, MODE, VERSION, Vault};
+pub use vault::{Keys, Listed, MAX_RETENTION, MODE, VERSION, Vault};

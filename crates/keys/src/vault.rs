@@ -31,6 +31,14 @@ pub struct Keys {
     pub tomorrow: [u8; 32],
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Listed {
+    pub tenant: u32,
+    pub generation: u32,
+    pub retention: u16,
+    pub oldest: u32,
+}
+
 pub struct Vault {
     dir: PathBuf,
     masters: [File; 2],
@@ -239,6 +247,19 @@ impl Vault {
 
     pub fn day(&self) -> u32 {
         self.state.day
+    }
+
+    pub fn listed(&self) -> Vec<Listed> {
+        self.state
+            .tenants
+            .iter()
+            .map(|(&tenant, entry)| Listed {
+                tenant,
+                generation: entry.generation,
+                retention: entry.retention,
+                oldest: entry.oldest,
+            })
+            .collect()
     }
 
     pub fn naming(&self) -> &Secret<16> {
