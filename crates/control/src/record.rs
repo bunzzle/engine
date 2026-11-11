@@ -12,6 +12,7 @@ pub const KIND_QUEUE: u8 = 3;
 pub const KIND_NODE: u8 = 4;
 pub const KIND_DKIM: u8 = 5;
 pub const KIND_ACCESS: u8 = 6;
+pub const KIND_DOMAIN: u8 = 7;
 pub const SYSTEM: u32 = 0;
 pub const MAX_POOLS: usize = 16;
 pub const MAX_ADDRESSES: usize = 64;
@@ -27,6 +28,7 @@ const ADDRESS: usize = 20;
 const DKIM: usize = 16;
 const DKIM_SECRET: usize = 4;
 const ACCESS: usize = 48;
+const DOMAIN: usize = 24;
 const DOMAINKEY: &str = "._domainkey.";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -152,12 +154,62 @@ pub struct Access {
     pub hash: [u8; 32],
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Verification {
+    Unverified,
+    Verified,
+}
+
+impl Verification {
+    fn code(self) -> u8 {
+        match self {
+            Self::Unverified => 1,
+            Self::Verified => 2,
+        }
+    }
+
+    fn from_code(code: u8) -> Option<Self> {
+        match code {
+            1 => Some(Self::Unverified),
+            2 => Some(Self::Verified),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Domain {
+    pub id: u32,
+    pub tenant: u32,
+    pub generation: u32,
+    pub state: Verification,
+    pub rsa: u32,
+    pub ed25519: u32,
+    pub name: Box<str>,
+}
+
+impl Domain {
+    pub fn covers(&self, domain: &str) -> bool {
+        let Some(at) = domain.len().checked_sub(self.name.len()) else {
+            return false;
+        };
+        let domain = domain.as_bytes();
+        domain[at..].eq_ignore_ascii_case(self.name.as_bytes())
+            && (at == 0 || domain[at - 1] == b'.')
+    }
+
+    pub fn names(&self, key: u32) -> bool {
+        key != 0 && (self.rsa == key || self.ed25519 == key)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Object {
     Tenant(Tenant),
     Pool(Pool),
     Dkim(Dkim),
     Access(Access),
+    Domain(Domain),
 }
 
 impl Object {
@@ -167,6 +219,7 @@ impl Object {
             Self::Pool(_) => KIND_POOL,
             Self::Dkim(_) => KIND_DKIM,
             Self::Access(_) => KIND_ACCESS,
+            Self::Domain(_) => KIND_DOMAIN,
         }
     }
 
@@ -176,6 +229,7 @@ impl Object {
             Self::Pool(p) => p.id,
             Self::Dkim(d) => d.id,
             Self::Access(a) => a.id,
+            Self::Domain(d) => d.id,
         }
     }
 
@@ -185,6 +239,7 @@ impl Object {
             Self::Pool(_) => SYSTEM,
             Self::Dkim(d) => d.tenant,
             Self::Access(a) => a.tenant,
+            Self::Domain(d) => d.tenant,
         }
     }
 
@@ -194,6 +249,13 @@ impl Object {
                 tenant: d.tenant,
                 generation: d.generation,
                 kind: KIND_DKIM,
+                id: d.id,
+                hash: None,
+            }),
+            Self::Domain(d) => Some(Label {
+                tenant: d.tenant,
+                generation: d.generation,
+                kind: KIND_DOMAIN,
                 id: d.id,
                 hash: None,
             }),
@@ -235,6 +297,20 @@ impl Object {
                 }
                 if a.scopes == Scopes::default() {
                     return Err(Error::Invalid("scopes"));
+                }
+            }
+            Self::Domain(d) => {
+                if d.id == 0 {
+                    return Err(Error::Invalid("domain id"));
+                }
+                if d.tenant == SYSTEM {
+                    return Err(Error::Invalid("tenant id"));
+                }
+                if !domain_ok(&d.name) {
+                    return Err(Error::Invalid("domain"));
+                }
+                if d.rsa != 0 && d.rsa == d.ed25519 {
+                    return Err(Error::Invalid("dkim keys"));
                 }
             }
         }
@@ -303,6 +379,15 @@ impl Update {
                 body[16..48].copy_from_slice(&a.hash);
                 out.extend_from_slice(&body);
             }
+            Object::Domain(d) => {
+                let mut body = [0; DOMAIN];
+                body[0..4].copy_from_slice(&d.generation.to_le_bytes());
+                body[4] = d.state.code();
+                body[8..12].copy_from_slice(&d.rsa.to_le_bytes());
+                body[12..16].copy_from_slice(&d.tenant.to_le_bytes());
+                body[16..20].copy_from_slice(&d.ed25519.to_le_bytes());
+                out.extend_from_slice(&body);
+            }
         }
         out
     }
@@ -310,6 +395,7 @@ impl Update {
     pub fn secret(&self) -> Vec<u8> {
         match &self.object {
             Object::Tenant(_) | Object::Pool(_) | Object::Access(_) => Vec::new(),
+            Object::Domain(d) => d.name.as_bytes().to_vec(),
             Object::Dkim(d) => {
                 let mut out = vec![0; DKIM_SECRET];
                 out[0] = u8::try_from(d.domain.len()).expect("domain checked");
@@ -336,6 +422,7 @@ impl Update {
             KIND_POOL if secret.is_empty() => Object::Pool(pool(id, rest)?),
             KIND_DKIM => Object::Dkim(dkim(id, rest, secret)?),
             KIND_ACCESS if secret.is_empty() => Object::Access(access(id, rest)?),
+            KIND_DOMAIN => Object::Domain(domain(id, rest, secret)?),
             _ => return None,
         };
         object.check().ok()?;
@@ -355,7 +442,9 @@ pub(crate) fn peek(clear: &[u8]) -> Option<(u8, u32, u64)> {
 
 pub(crate) fn sealed_label(clear: &[u8]) -> Option<Label> {
     let (kind, id, _) = peek(clear)?;
-    let body = clear.get(HEAD..HEAD + DKIM).filter(|_| kind == KIND_DKIM)?;
+    let body = clear
+        .get(HEAD..HEAD + DKIM)
+        .filter(|_| kind == KIND_DKIM || kind == KIND_DOMAIN)?;
     Some(Label {
         tenant: u32_at(body, 12)?,
         generation: u32_at(body, 0)?,
@@ -469,5 +558,20 @@ fn access(id: u32, rest: &[u8]) -> Option<Access> {
         scopes: Scopes::from_code(rest[4])?,
         pool: u32_at(rest, 8)?,
         hash: rest[16..48].try_into().ok()?,
+    })
+}
+
+fn domain(id: u32, rest: &[u8], secret: &[u8]) -> Option<Domain> {
+    if rest.len() != DOMAIN || rest[5..8] != [0; 3] || rest[20..24] != [0; 4] {
+        return None;
+    }
+    Some(Domain {
+        id,
+        tenant: u32_at(rest, 12)?,
+        generation: u32_at(rest, 0)?,
+        state: Verification::from_code(rest[4])?,
+        rsa: u32_at(rest, 8)?,
+        ed25519: u32_at(rest, 16)?,
+        name: str::from_utf8(secret).ok()?.into(),
     })
 }

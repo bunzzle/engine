@@ -10,8 +10,8 @@ use std::time::Duration;
 
 use aws_lc_rs::signature::{ED25519, RSA_PKCS1_2048_8192_SHA256, UnparsedPublicKey};
 use control::{
-    Created, Dkim, KeyError, KeySource, Naming, Object, Pool, Ready, Scope, Scopes, State, Table,
-    Tenant,
+    Created, Dkim, Domain, KeyError, KeySource, Naming, Object, Pool, Ready, Scope, Scopes, State,
+    Table, Tenant, Verification,
 };
 use crypto::{BatchKey, DkimAlg, Secret, Tenant as Root, TenantKeys, Wrap, day_public, open_batch};
 use index::{Entry, Op};
@@ -2328,6 +2328,146 @@ fn access_keys_check_on_every_core_until_revoked_across_restarts() {
         wait_for(&nodes, 1, 1, State::Suspended).await;
         for node in &nodes {
             assert!(node.table().check(&tokens.0, Scope::Smtp).is_none());
+        }
+    });
+}
+
+async fn domain_everywhere(nodes: &[Node<Idle>], domain: &Domain) {
+    for node in nodes {
+        while node.table().domain(domain.tenant, domain.id) != Some(domain) {
+            sleep(Duration::from_millis(1)).await;
+        }
+    }
+}
+
+fn domain_refused(result: Result<Domain, sched::Error>, what: &str) {
+    match result {
+        Err(sched::Error::Control(control::Error::Invalid(w))) => assert_eq!(w, what),
+        Err(sched::Error::Control(control::Error::Refused)) => assert_eq!("refused", what),
+        other => panic!("{other:?}"),
+    }
+}
+
+async fn bad_domain_writes(control: &Node<Idle>, made: &Domain, suffix: Domain, keys: [u32; 3]) {
+    let [ed, rsa, elsewhere] = keys;
+    assert!(matches!(
+        control.write(Object::Domain(made.clone())).await,
+        Err(sched::Error::Control(control::Error::Invalid("kind")))
+    ));
+    domain_refused(
+        control
+            .domain_write(Domain {
+                state: Verification::Verified,
+                ..suffix
+            })
+            .await,
+        "public suffix",
+    );
+    for (rsa, ed25519) in [(ed, 0), (0, rsa), (0, elsewhere), (0, 99)] {
+        domain_refused(
+            control
+                .domain_write(Domain {
+                    rsa,
+                    ed25519,
+                    ..made.clone()
+                })
+                .await,
+            "dkim keys",
+        );
+    }
+    domain_refused(
+        control
+            .domain_write(Domain {
+                name: "example.net".into(),
+                ..made.clone()
+            })
+            .await,
+        "refused",
+    );
+    domain_refused(
+        control
+            .domain_write(Domain {
+                tenant: 2,
+                ..made.clone()
+            })
+            .await,
+        "refused",
+    );
+}
+
+#[test]
+fn sender_domains_pick_their_keys_and_keep_named_keys() {
+    let driver = Rc::new(SimDriver::with_disk(45, Config::default(), created(45)));
+    let cluster = started_with_keys(&driver, 2);
+    let nodes = cluster.nodes.clone();
+    cluster.run(async move {
+        keys_listening().await;
+        ready(&nodes).await;
+        let control = nodes.iter().find(|n| n.controls()).expect("control core");
+        let other = nodes.iter().find(|n| !n.controls()).expect("other core");
+        domain_refused(other.domain_new(1, "example.org").await, "core");
+        domain_refused(control.domain_new(7, "example.org").await, "refused");
+        domain_refused(control.domain_new(1, "exa mple.org").await, "domain");
+        let made = control.domain_new(1, "Example.ORG").await.expect("new");
+        assert_eq!((made.id, &*made.name), (1, "example.org"));
+        assert_eq!(made.state, Verification::Unverified);
+        domain_refused(control.domain_new(1, "example.org").await, "refused");
+        let suffix = control.domain_new(1, "co.uk").await.expect("new");
+        let ed = control
+            .dkim_new(1, DkimAlg::Ed25519Sha256, "example.org", "s1")
+            .await
+            .expect("dkim");
+        let rsa = control
+            .dkim_new(1, DkimAlg::RsaSha256, "example.org", "s2")
+            .await
+            .expect("dkim");
+        let elsewhere = control
+            .dkim_new(1, DkimAlg::Ed25519Sha256, "example.net", "s1")
+            .await
+            .expect("dkim");
+        bad_domain_writes(control, &made, suffix, [ed.id, rsa.id, elsewhere.id]).await;
+        let verified = control
+            .domain_write(Domain {
+                state: Verification::Verified,
+                rsa: rsa.id,
+                ed25519: ed.id,
+                ..made
+            })
+            .await
+            .expect("write");
+        domain_everywhere(&nodes, &verified).await;
+        for node in &nodes {
+            let table = node.table();
+            let sender = table.sender(1, "news.example.org").expect("sender");
+            assert_eq!((sender.rsa, sender.ed25519), (rsa.id, ed.id));
+            assert!(table.sender(2, "example.org").is_none());
+        }
+        for key in [rsa.id, ed.id] {
+            assert!(matches!(
+                control.dkim_remove(1, key).await,
+                Err(sched::Error::Control(control::Error::Refused))
+            ));
+        }
+        assert!(matches!(
+            control.dkim_remove(2, elsewhere.id).await,
+            Err(sched::Error::Control(control::Error::Refused))
+        ));
+        control.dkim_remove(1, elsewhere.id).await.expect("remove");
+        let unsigned = control
+            .domain_write(Domain { rsa: 0, ..verified })
+            .await
+            .expect("write");
+        domain_everywhere(&nodes, &unsigned).await;
+        control.dkim_remove(1, rsa.id).await.expect("remove");
+        for node in &nodes {
+            while node.table().dkim(1, rsa.id).is_some()
+                || node.table().dkim(1, elsewhere.id).is_some()
+            {
+                sleep(Duration::from_millis(1)).await;
+            }
+            let digest = digest_of(b"x");
+            assert_eq!(node.sign(1, rsa.id, digest).await, Err(Refusal::Signer));
+            node.sign(1, ed.id, digest).await.expect("sign");
         }
     });
 }

@@ -2,6 +2,7 @@ mod access;
 mod clock;
 mod delete;
 mod dkim;
+mod domain;
 mod error;
 mod intake;
 mod keyring;

@@ -342,7 +342,10 @@ impl<T: Transport + 'static> Node<T> {
     }
 
     pub async fn write(&self, object: Object) -> Result<Update, Error> {
-        if matches!(object, Object::Dkim(_) | Object::Access(_)) {
+        if matches!(
+            object,
+            Object::Dkim(_) | Object::Access(_) | Object::Domain(_)
+        ) {
             return Err(control::Error::Invalid("kind").into());
         }
         let node = self.clone();
