@@ -7,8 +7,9 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use control::{
-    Access, Created, Dkim, Error, KIND_ACCESS, KIND_TENANT, KeyError, KeySource, Limits, Loaded,
-    Object, Pool, Ready, Scopes, Snapshot, State, Table, Tenant, Update, Writer,
+    Access, Created, Dkim, Domain, Error, KIND_ACCESS, KIND_TENANT, KeyError, KeySource, Limits,
+    Loaded, Object, Pool, Ready, Scopes, Snapshot, State, Table, Tenant, Update, Verification,
+    Writer,
 };
 use crypto::{DkimAlg, Secret, Tenant as Root, TenantKeys};
 use rt::sim::{Config, Disk, SimDriver, check};
@@ -512,6 +513,64 @@ fn removed_access_keys_stay_gone_and_their_ids_are_never_reused() {
         let mut writer = loaded.writer(node.changes.clone());
         assert_eq!(writer.skipped(), 0);
         assert_eq!(writer.reserve_access().await.expect("reserve"), 4);
+        node.close().await;
+    });
+}
+
+#[test]
+fn domains_load_sealed_and_removed_dkim_keys_stay_gone() {
+    let ((), driver) = on(1, Config::default(), created(1), || async {
+        let (node, loaded, _) = Node::open(BUDGET).await;
+        let mut writer = loaded.writer(node.changes.clone());
+        writer.write(tenant(4, State::Active)).await.expect("write");
+        for id in 1..=2 {
+            assert_eq!(writer.reserve_dkim().await.expect("reserve"), id);
+        }
+        writer
+            .write_sealed(dkim(1, 4), &keys(4, 1))
+            .await
+            .expect("write");
+        writer
+            .write_sealed(dkim(2, 4), &keys(4, 1))
+            .await
+            .expect("write");
+        assert_eq!(writer.reserve_domain().await.expect("reserve"), 1);
+        assert_eq!(writer.reserve_domain().await.expect("reserve"), 2);
+        let domain = Object::Domain(Domain {
+            id: 2,
+            tenant: 4,
+            generation: 1,
+            state: Verification::Verified,
+            rsa: 0,
+            ed25519: 1,
+            name: "example.org".into(),
+        });
+        assert!(matches!(
+            writer.write(domain.clone()).await,
+            Err(Error::Invalid("kind"))
+        ));
+        writer
+            .write_sealed(domain.clone(), &keys(4, 1))
+            .await
+            .expect("write");
+        assert!(matches!(
+            writer.remove(&domain).await,
+            Err(Error::Invalid("kind"))
+        ));
+        writer.remove(&dkim(2, 4)).await.expect("remove");
+        node.close().await;
+    });
+    on(2, Config::default(), driver.crash(), || async {
+        let (node, loaded, snapshot) = Node::open(BUDGET).await;
+        let table = table(snapshot);
+        let opened = table.domain(4, 2).expect("domain");
+        assert_eq!((&*opened.name, opened.ed25519), ("example.org", 1));
+        assert_eq!(table.sender(4, "a.example.org").map(|d| d.id), Some(2));
+        assert_eq!(table.dkims(4).map(|d| d.id).collect::<Vec<_>>(), [1]);
+        let mut writer = loaded.writer(node.changes.clone());
+        assert_eq!(writer.skipped(), 0);
+        assert_eq!(writer.reserve_domain().await.expect("reserve"), 3);
+        assert_eq!(writer.dkim_next(), 3);
         node.close().await;
     });
 }

@@ -4,7 +4,9 @@ use crypto::{Secret, sha256};
 use rt::Peers;
 
 use crate::access::{Grant, Scope, Token};
-use crate::record::{Access, Dkim, KIND_ACCESS, Object, Pool, State, Tenant, Update};
+use crate::record::{
+    Access, Dkim, Domain, KIND_ACCESS, KIND_DKIM, Object, Pool, State, Tenant, Update, Verification,
+};
 
 const DUMMY: [u8; 32] = [0; 32];
 
@@ -48,6 +50,7 @@ pub struct Table {
     pools: BTreeMap<u32, Pool>,
     dkims: BTreeMap<u32, Dkim>,
     accesses: BTreeMap<u32, Access>,
+    domains: BTreeMap<u32, Domain>,
     waiting: BTreeMap<u64, Pending>,
 }
 
@@ -59,6 +62,7 @@ impl Table {
         self.pools.clear();
         self.dkims.clear();
         self.accesses.clear();
+        self.domains.clear();
         for object in snapshot.objects {
             self.set(object);
         }
@@ -131,6 +135,23 @@ impl Table {
         self.accesses.values().filter(move |a| a.tenant == tenant)
     }
 
+    pub fn domain(&self, tenant: u32, id: u32) -> Option<&Domain> {
+        self.domains.get(&id).filter(|d| d.tenant == tenant)
+    }
+
+    pub fn domains(&self, tenant: u32) -> impl Iterator<Item = &Domain> {
+        self.domains.values().filter(move |d| d.tenant == tenant)
+    }
+
+    pub fn sender(&self, tenant: u32, domain: &str) -> Option<&Domain> {
+        let generation = self.tenants.get(&tenant)?.generation;
+        self.domains(tenant)
+            .filter(|d| {
+                d.generation == generation && d.state == Verification::Verified && d.covers(domain)
+            })
+            .max_by_key(|d| d.name.len())
+    }
+
     pub fn check(&self, token: &[u8], scope: Scope) -> Option<Grant> {
         let token = Token::parse(token);
         let (id, presented) = match &token {
@@ -194,12 +215,21 @@ impl Table {
             Object::Access(a) => {
                 self.accesses.insert(a.id, a);
             }
+            Object::Domain(d) => {
+                self.domains.insert(d.id, d);
+            }
         }
     }
 
     fn unset(&mut self, kind: u8, id: u32) {
-        if kind == KIND_ACCESS {
-            self.accesses.remove(&id);
+        match kind {
+            KIND_ACCESS => {
+                self.accesses.remove(&id);
+            }
+            KIND_DKIM => {
+                self.dkims.remove(&id);
+            }
+            _ => {}
         }
     }
 }
