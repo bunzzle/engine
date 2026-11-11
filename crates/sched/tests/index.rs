@@ -375,6 +375,14 @@ async fn configure(nodes: &[Node<Idle>], objects: Vec<Object>) {
     }
 }
 
+async fn regenerate(nodes: &[Node<Idle>], id: u32) {
+    let control = nodes.iter().find(|n| n.controls()).expect("control core");
+    let generation = control.table().tenant(id).expect("tenant").generation;
+    control.delete_tenant(id).await.expect("delete");
+    wait_for(nodes, id, generation, State::Deleted).await;
+    configure(nodes, vec![tenant(id, generation + 1, State::Active)]).await;
+}
+
 async fn wait_for(nodes: &[Node<Idle>], tenant: u32, generation: u32, state: State) {
     for node in nodes {
         while !node
@@ -613,7 +621,7 @@ fn suppressions_expire_and_end_with_a_new_generation() {
         let listed: Vec<&str> = page.listed.iter().map(|l| l.address.as_str()).collect();
         assert_eq!(listed, vec!["kept@example.org"]);
 
-        configure(&nodes, vec![tenant(1, 2, State::Active)]).await;
+        regenerate(&nodes, 1).await;
         wait_for(&nodes, 1, 2, State::Active).await;
         assert_eq!(
             lists.check(1, 1, &["kept@example.org"]).await,
@@ -796,7 +804,11 @@ async fn owned_shard(node: &Node<Idle>) -> u16 {
 }
 
 async fn seal_one(node: &Node<Idle>, shard: u16, n: u8) -> Sealed {
-    let mut draft = node.draft(1, None).expect("draft");
+    seal_for(node, 1, shard, n).await
+}
+
+async fn seal_for(node: &Node<Idle>, tenant: u32, shard: u16, n: u8) -> Sealed {
+    let mut draft = node.draft(tenant, None).expect("draft");
     let address = format!("s{n}@example.org");
     node.recipient(&mut draft, &address)
         .await
@@ -827,7 +839,7 @@ async fn seal_one(node: &Node<Idle>, shard: u16, n: u8) -> Sealed {
     };
     let message = Message {
         id: sealing.id(),
-        tenant: 1,
+        tenant,
         head,
         body,
         slices: vec![slice],
@@ -837,8 +849,12 @@ async fn seal_one(node: &Node<Idle>, shard: u16, n: u8) -> Sealed {
 }
 
 async fn opens(node: &Node<Idle>, sealed: &Sealed, n: u8) {
+    opens_for(node, 1, sealed, n).await;
+}
+
+async fn opens_for(node: &Node<Idle>, tenant: u32, sealed: &Sealed, n: u8) {
     let opener = node
-        .opener(1, 1, sealed.id, &sealed.clear, &sealed.wrap)
+        .opener(tenant, 1, sealed.id, &sealed.clear, &sealed.wrap)
         .await
         .expect("opener");
     let (envelope, headers) = opener.head(&sealed.head).expect("head");
@@ -1533,7 +1549,7 @@ fn a_new_generation_forgets_old_requests() {
         let ticket = fresh(node, 1, key, [4; 16]).await;
         accept(node, ticket, shard, "f@example.org").await;
         let stale = fresh(node, 1, b"stale", [5; 16]).await;
-        configure(&nodes, vec![tenant(1, 2, State::Active)]).await;
+        regenerate(&nodes, 1).await;
         wait_for(&nodes, 1, 2, State::Active).await;
         let mut draft = node.draft(1, None).expect("draft");
         node.recipient(&mut draft, "s@example.org")
@@ -2096,5 +2112,127 @@ fn dkim_keys_are_made_on_the_control_core_and_sign_on_every_core_after_a_restart
         sleep(Duration::from_millis(300)).await;
     });
     assert_eq!(audited(&driver, "load"), 2);
+    restarted.stop();
+}
+
+fn control_of(nodes: &[Node<Idle>]) -> &Node<Idle> {
+    nodes.iter().find(|n| n.controls()).expect("control core")
+}
+
+async fn never_opens(nodes: &[Node<Idle>], sealed: &Sealed) {
+    for node in nodes {
+        assert!(
+            node.opener(1, 1, sealed.id, &sealed.clear, &sealed.wrap)
+                .await
+                .is_err()
+        );
+    }
+}
+
+fn refused(result: &Result<control::Update, sched::Error>) {
+    assert!(
+        matches!(result, Err(sched::Error::Control(control::Error::Refused))),
+        "{result:?}"
+    );
+}
+
+#[test]
+fn a_deleted_tenant_is_refused_loses_its_mail_and_never_opens_again() {
+    let driver = Rc::new(SimDriver::with_disk(43, Config::default(), created(43)));
+    let cluster = started_with_keys(&driver, 2);
+    let nodes = cluster.nodes.clone();
+    let sealed = cluster.run(async move {
+        keys_listening().await;
+        ready(&nodes).await;
+        let node = &nodes[0];
+        let shard = owned_shard(node).await;
+        let gone = seal_for(node, 1, shard, 1).await;
+        let kept = seal_for(node, 2, shard, 2).await;
+        assert_eq!(node.spool().messages_of(1).len(), 1);
+        for node in &nodes {
+            opens_for(node, 1, &gone, 1).await;
+        }
+        let control = control_of(&nodes);
+        control.delete_tenant(1).await.expect("delete");
+        wait_for(&nodes, 1, 1, State::Deleted).await;
+        refused(&control.delete_tenant(1).await);
+        for object in [
+            tenant(1, 1, State::Active),
+            tenant(1, 1, State::Deleted),
+            tenant(1, 3, State::Active),
+            tenant(2, 1, State::Deleting),
+            tenant(2, 1, State::Deleted),
+        ] {
+            refused(&control.write(object).await);
+        }
+        for node in &nodes {
+            assert!(matches!(node.draft(1, None), Err(Refusal::Tenant)));
+            while !node.spool().messages_of(1).is_empty() {
+                sleep(Duration::from_millis(1)).await;
+            }
+        }
+        assert_eq!(nodes.iter().map(Node::tenant_drops).sum::<u64>(), 1);
+        never_opens(&nodes, &gone).await;
+        opens_for(node, 2, &kept, 2).await;
+        sleep(Duration::from_millis(300)).await;
+        (gone, kept)
+    });
+    assert_eq!(audited(&driver, "delete"), 1);
+    drop(cluster);
+    let driver = Rc::new(SimDriver::with_disk(44, Config::default(), driver.crash()));
+    let restarted = started_with_keys(&driver, 2);
+    let nodes = restarted.nodes.clone();
+    restarted.run(async move {
+        keys_listening().await;
+        wait_for(&nodes, 1, 1, State::Deleted).await;
+        let (gone, kept) = sealed;
+        never_opens(&nodes, &gone).await;
+        opens_for(&nodes[0], 2, &kept, 2).await;
+        for node in &nodes {
+            assert_eq!(node.spool().messages_of(1), Vec::new());
+        }
+        configure(&nodes, vec![tenant(1, 2, State::Active)]).await;
+        wait_for(&nodes, 1, 2, State::Active).await;
+        never_opens(&nodes, &gone).await;
+        let shard = owned_shard(&nodes[0]).await;
+        let mut draft = nodes[0]
+            .draft(1, None)
+            .expect("draft at the new generation");
+        nodes[0]
+            .recipient(&mut draft, "back@example.org")
+            .await
+            .expect("recipient");
+        nodes[0].sealing(&mut draft, shard).await.expect("sealing");
+    });
+    restarted.stop();
+}
+
+#[test]
+fn a_delete_cut_by_a_crash_finishes_after_a_restart() {
+    let driver = Rc::new(SimDriver::with_disk(45, Config::default(), created(45)));
+    let cluster = started_with_keys(&driver, 2);
+    let nodes = cluster.nodes.clone();
+    cluster.run(async move {
+        keys_listening().await;
+        ready(&nodes).await;
+        control_of(&nodes).delete_tenant(2).await.expect("delete");
+    });
+    drop(cluster);
+    let driver = Rc::new(SimDriver::with_disk(46, Config::default(), driver.crash()));
+    let restarted = started_with_keys(&driver, 2);
+    let nodes = restarted.nodes.clone();
+    restarted.run(async move {
+        assert_eq!(
+            nodes[0].table().tenant(2).map(|t| t.state),
+            Some(State::Deleting)
+        );
+        keys_listening().await;
+        wait_for(&nodes, 2, 1, State::Deleted).await;
+        for node in &nodes {
+            assert!(matches!(node.draft(2, None), Err(Refusal::Tenant)));
+        }
+        wait_for(&nodes, 1, 1, State::Active).await;
+        nodes[0].draft(1, None).expect("tenant 1 untouched");
+    });
     restarted.stop();
 }

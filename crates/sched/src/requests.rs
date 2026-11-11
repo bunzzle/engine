@@ -82,10 +82,7 @@ pub fn retain_request(table: &Table, now: u64, entry: &Entry) -> bool {
     let generation = u32::from_le_bytes(entry.value[..4].try_into().expect("4 bytes"));
     let accepted = u64::from_le_bytes(entry.value[4..12].try_into().expect("8 bytes"));
     let tenant = index::tenant(&entry.key);
-    let older = table
-        .tenant(tenant)
-        .is_some_and(|t| generation < t.generation);
-    !older && accepted.saturating_add(DAY) > now
+    !table.gone(tenant, generation) && accepted.saturating_add(DAY) > now
 }
 
 pub enum Begun {

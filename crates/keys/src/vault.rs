@@ -370,10 +370,20 @@ impl Vault {
             .is_some_and(|entry| entry.generation == generation)
     }
 
+    pub fn covers(&self, tenant: u32, generation: u32) -> bool {
+        self.state
+            .tenants
+            .get(&tenant)
+            .is_some_and(|entry| entry.generation <= generation)
+    }
+
     pub async fn delete(&mut self, tenant: u32, generation: u32) -> Result<(), Error> {
         self.check()?;
-        if !self.holds(tenant, generation) {
-            return Ok(());
+        if !self.covers(tenant, generation) {
+            return match self.state.tenants.get(&tenant) {
+                Some(_) => Err(Error::Generation),
+                None => Ok(()),
+            };
         }
         self.state.tenants.remove(&tenant);
         self.pending.remove(&tenant);

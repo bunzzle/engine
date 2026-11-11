@@ -132,3 +132,33 @@ fn spread(seed: u64) {
 fn every_core_ends_with_the_same_table() {
     check(0..20, spread);
 }
+
+#[test]
+fn deleting_deleted_and_older_generations_are_gone() {
+    let mut table = Table::default();
+    let state = |id, generation, state| {
+        Object::Tenant(Tenant {
+            state,
+            ..match tenant(id, generation) {
+                Object::Tenant(t) => t,
+                _ => unreachable!(),
+            }
+        })
+    };
+    table.load(Snapshot {
+        version: 0,
+        objects: vec![
+            state(1, 2, State::Active),
+            state(2, 3, State::Deleting),
+            state(3, 1, State::Deleted),
+            state(4, 1, State::Suspended),
+        ],
+    });
+    assert!(!table.gone(1, 2));
+    assert!(table.gone(1, 1));
+    assert!(!table.gone(1, 3));
+    assert!(table.gone(2, 3));
+    assert!(table.gone(3, 1));
+    assert!(!table.gone(4, 1));
+    assert!(!table.gone(9, 1));
+}

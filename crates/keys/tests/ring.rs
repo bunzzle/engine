@@ -558,3 +558,38 @@ fn calls_made_while_a_connect_fails_are_answered_not_left_waiting() {
         assert_eq!(ring.stats().connects, 0);
     });
 }
+
+#[test]
+fn a_forgotten_tenant_is_refused_on_every_call_but_delete() {
+    let driver = Rc::new(SimDriver::new(8, quiet()));
+    run(&driver, async {
+        let _server = serve("/a", 1).await;
+        create(1, 4).await;
+        create(1, 5).await;
+        let (connect, _) = hosts(&[1]);
+        let ring = Ring::new(connect, settings());
+        let working = ring.open(4, 1).await.expect("open");
+        let ed = DkimAlg::Ed25519Sha256;
+        let (_, blob) = ring.dkim_new(4, 1, 1, ed).await.expect("new");
+        ring.forget(4, 1);
+        assert!(ring.get(4, 1).is_none());
+        assert_eq!(ring.open(4, 1).await.err(), Some(Fault::Gone));
+        assert_eq!(ring.fresh(4, 1).await.err(), Some(Fault::Gone));
+        assert_eq!(ring.sealing(4, 1).await.err(), Some(Fault::Gone));
+        assert_eq!(ring.create(4, 1, 30).await, Err(Fault::Gone));
+        assert_eq!(ring.sign(4, 1, 1, ed, [1; 32]).await, Err(Fault::Gone));
+        assert_eq!(ring.load(4, 1, 1, ed, &blob).await, Err(Fault::Gone));
+        assert_eq!(ring.dkim_new(4, 1, 2, ed).await, Err(Fault::Gone));
+        let mut batches = Batches::new(BatchSettings::default());
+        let batch = batches.seal(&working, 0, 1, rt::now()).expect("seal");
+        let wrap = Wrap::decode(&batch.wrap).expect("wrap");
+        assert_eq!(
+            ring.unwrap(4, 1, 0, batch.id, &wrap).await.err(),
+            Some(Fault::Gone)
+        );
+        assert_eq!(ring.delete(4, 1).await, Ok(()));
+        assert!(ring.open(5, 1).await.is_ok());
+        assert_eq!(ring.delete(5, 0).await, Err(Fault::Conflict));
+        assert!(ring.open(5, 1).await.is_ok());
+    });
+}

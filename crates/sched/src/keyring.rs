@@ -5,7 +5,7 @@ use control::{Created, KeyError, KeySource, Ready};
 use crypto::{BatchKey, DkimAlg, TenantKeys, Wrap};
 use keys::{BatchSettings, BatchStats, Batches, Fault, Ring};
 
-use crate::sealing::{Batched, Keys, Loaded, Made, Oldest, Signed, Unsealable, Unwrapped};
+use crate::sealing::{Batched, Deleted, Keys, Loaded, Made, Oldest, Signed, Unsealable, Unwrapped};
 
 pub struct Keyring {
     ring: Ring,
@@ -85,6 +85,25 @@ impl Keys for Keyring {
 
     fn settled(&self, day: u32) {
         self.ring.settled(day);
+    }
+
+    fn forget(&self, tenant: u32, generation: u32) {
+        self.ring.forget(tenant, generation);
+        self.batches.borrow_mut().forget(tenant, generation);
+    }
+
+    fn forgotten(&self, tenant: u32, generation: u32) -> bool {
+        self.ring.forgotten(tenant, generation)
+    }
+
+    fn delete(&self, tenant: u32, generation: u32) -> Deleted<'_> {
+        Box::pin(async move {
+            self.forget(tenant, generation);
+            self.ring
+                .delete(tenant, generation)
+                .await
+                .map_err(key_error)
+        })
     }
 
     fn oldest(&self, tenant: u32, generation: u32) -> Oldest<'_> {
@@ -173,6 +192,9 @@ impl Keys for Keyring {
                 .unwrap(tenant, generation, shard, id, &wrap)
                 .await
                 .map_err(unsealable)?;
+            if self.ring.forgotten(tenant, generation) {
+                return Err(Unsealable::Gone);
+            }
             let mut batches = self.batches.borrow_mut();
             if let Some(key) = batches.cached(tenant, generation, shard, id) {
                 return Ok(key);

@@ -62,6 +62,7 @@ impl<T: Transport + 'static> Node<T> {
             blob,
         };
         let update = held.writer().write(Object::Dkim(dkim.clone())).await?;
+        self.apply(&update);
         drop(held);
         self.broadcast(&update);
         Ok(dkim)

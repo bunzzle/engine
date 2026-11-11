@@ -119,12 +119,13 @@ async fn wait_keys(
     keys: &dyn KeySource,
     tenant: u32,
     generation: u32,
-) -> Result<(TenantKeys, u64), Error> {
+) -> Result<(Option<TenantKeys>, u64), Error> {
     let mut pause = KEY_WAIT;
     let mut waits = 0;
     loop {
         match tenant_keys(keys, tenant, generation).await {
-            Ok(found) => return Ok((found, waits)),
+            Ok(found) => return Ok((Some(found), waits)),
+            Err(KeyError::Unknown) => return Ok((None, waits)),
             Err(KeyError::Unavailable | KeyError::Busy) => {
                 waits += 1;
                 rt::sleep(pause).await;
@@ -242,7 +243,12 @@ impl Drop for Held<'_> {
 }
 
 impl Queues {
-    pub async fn load(core: &Core, naming: Naming, keys: &dyn KeySource) -> Result<Loaded, Error> {
+    pub async fn load(
+        core: &Core,
+        naming: Naming,
+        keys: &dyn KeySource,
+        gone: &dyn Fn(u32, u32) -> bool,
+    ) -> Result<Loaded, Error> {
         let reader = core.file.reader();
         let mut owned = Owned::default();
         let mut skipped = 0;
@@ -289,8 +295,16 @@ impl Queues {
                 }
             }
             for ((tenant, generation), group) in found {
+                if gone(tenant, generation) {
+                    skipped += group.len() as u64;
+                    continue;
+                }
                 let (sealing, waits) = wait_keys(keys, tenant, generation).await?;
                 waited += waits;
+                let Some(sealing) = sealing else {
+                    skipped += group.len() as u64;
+                    continue;
+                };
                 for stored in group {
                     let queue = open(&stored.clear, &stored.hidden, &sealing).filter(|q| {
                         q.name.tenant == stored.tenant

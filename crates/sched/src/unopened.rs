@@ -30,6 +30,7 @@ pub struct UnopenedStats {
     pub quarantined: u64,
     pub deferred: u64,
     pub trips: u64,
+    pub forgotten: u64,
     pub tenants: BTreeMap<u32, u64>,
 }
 
@@ -47,6 +48,11 @@ impl Breaker {
             self.stats.trips += 1;
         }
         room
+    }
+
+    pub(crate) fn forgotten(&mut self) -> Action {
+        self.stats.forgotten += 1;
+        Action::Drop
     }
 
     pub(crate) fn decide(&mut self, tenant: u32, action: Action, now: u64) -> Action {

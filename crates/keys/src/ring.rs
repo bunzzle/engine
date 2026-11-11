@@ -126,6 +126,7 @@ struct Inner {
     unwrapping: RefCell<HashMap<(u32, u32, u16, u64), Unwrapping>>,
     loading: RefCell<HashMap<(u32, u32, u32), Loading>>,
     refreshed: RefCell<HashMap<(u32, u32), Instant>>,
+    gone: RefCell<HashMap<u32, u32>>,
     settled: Cell<u32>,
     settling: Cell<bool>,
     stats: Cell<RingStats>,
@@ -173,6 +174,7 @@ impl Ring {
                 unwrapping: RefCell::new(HashMap::new()),
                 loading: RefCell::new(HashMap::new()),
                 refreshed: RefCell::new(HashMap::new()),
+                gone: RefCell::new(HashMap::new()),
                 settled: Cell::new(0),
                 settling: Cell::new(false),
                 stats: Cell::new(RingStats::default()),
@@ -203,14 +205,41 @@ impl Ring {
         self.client().await.map(drop)
     }
 
+    pub fn forget(&self, tenant: u32, generation: u32) {
+        let mut gone = self.inner.gone.borrow_mut();
+        let through = gone.entry(tenant).or_insert(generation);
+        *through = (*through).max(generation);
+        drop(gone);
+        let key = (tenant, generation);
+        self.inner.tenants.borrow_mut().remove(&key);
+        self.inner.refreshed.borrow_mut().remove(&key);
+    }
+
+    pub fn forgotten(&self, tenant: u32, generation: u32) -> bool {
+        self.inner
+            .gone
+            .borrow()
+            .get(&tenant)
+            .is_some_and(|through| generation <= *through)
+    }
+
+    fn live(&self, tenant: u32, generation: u32) -> Result<(), Fault> {
+        if self.forgotten(tenant, generation) {
+            self.count(|s| s.gone += 1);
+            return Err(Fault::Gone);
+        }
+        Ok(())
+    }
+
     pub fn get(&self, tenant: u32, generation: u32) -> Option<Working> {
-        if self.failed() {
+        if self.failed() || self.forgotten(tenant, generation) {
             return None;
         }
         self.inner.tenants.borrow_mut().get(&(tenant, generation))
     }
 
     pub async fn open(&self, tenant: u32, generation: u32) -> Result<Working, Fault> {
+        self.live(tenant, generation)?;
         if let Some(found) = self.get(tenant, generation) {
             return Ok(found);
         }
@@ -229,8 +258,10 @@ impl Ring {
         if first {
             let ring = self.clone();
             rt::spawn(async move {
-                let result = ring.fetch(tenant, generation).await;
-                if let Ok(working) = &result
+                let mut result = ring.fetch(tenant, generation).await;
+                if ring.forgotten(tenant, generation) {
+                    result = Err(Fault::Gone);
+                } else if let Ok(working) = &result
                     && !ring.failed()
                 {
                     ring.inner.tenants.borrow_mut().put(key, working.clone());
@@ -289,6 +320,7 @@ impl Ring {
     }
 
     pub async fn fresh(&self, tenant: u32, generation: u32) -> Result<Working, Fault> {
+        self.live(tenant, generation)?;
         self.inner
             .tenants
             .borrow_mut()
@@ -313,6 +345,9 @@ impl Ring {
     }
 
     pub fn refresh(&self, tenant: u32, generation: u32) {
+        if self.forgotten(tenant, generation) {
+            return;
+        }
         let now = rt::now();
         {
             let mut refreshed = self.inner.refreshed.borrow_mut();
@@ -332,7 +367,7 @@ impl Ring {
         let ring = self.clone();
         rt::spawn(async move {
             match ring.fetch(tenant, generation).await {
-                Ok(working) if !ring.failed() => ring
+                Ok(working) if !ring.failed() && !ring.forgotten(tenant, generation) => ring
                     .inner
                     .tenants
                     .borrow_mut()
@@ -360,6 +395,7 @@ impl Ring {
             self.count(|s| s.bad += 1);
             return Err(Fault::Bad);
         }
+        self.live(tenant, generation)?;
         if self.failed() {
             self.count(|s| s.refused += 1);
             return Err(Fault::Failed);
@@ -389,6 +425,7 @@ impl Ring {
             rt::spawn(async move {
                 ring.count(|s| s.unwraps += 1);
                 let result = match ring.call(&request).await {
+                    Ok(Answer::Key(_)) if ring.forgotten(tenant, generation) => Err(Fault::Gone),
                     Ok(Answer::Key(secret)) => Ok(secret),
                     Ok(Answer::Refused(refused)) => Err(ring.fault(None, Some(refused))),
                     Ok(_) => Err(ring.fault(None, None)),
@@ -408,6 +445,7 @@ impl Ring {
     }
 
     pub async fn create(&self, tenant: u32, generation: u32, retention: u16) -> Result<(), Fault> {
+        self.live(tenant, generation)?;
         let request = Request::Create {
             tenant,
             generation,
@@ -425,6 +463,7 @@ impl Ring {
             Ok(_) => return Err(self.fault(None, None)),
             Err(error) => return Err(self.fault(Some(error), None)),
         }
+        self.live(tenant, generation)?;
         if !self.failed() {
             self.inner
                 .tenants
@@ -441,6 +480,7 @@ impl Ring {
         key: u32,
         alg: DkimAlg,
     ) -> Result<(Vec<u8>, Vec<u8>), Fault> {
+        self.live(tenant, generation)?;
         self.count(|s| s.dkim_new += 1);
         let request = Request::DkimNew {
             tenant,
@@ -462,6 +502,7 @@ impl Ring {
         alg: DkimAlg,
         blob: &[u8],
     ) -> Result<(), Fault> {
+        self.live(tenant, generation)?;
         let id = (tenant, generation, key);
         let (reply, mut answer) = rt::channel();
         let first = {
@@ -510,6 +551,7 @@ impl Ring {
         alg: DkimAlg,
         digest: [u8; 32],
     ) -> Result<Vec<u8>, Fault> {
+        self.live(tenant, generation)?;
         self.count(|s| s.signs += 1);
         let request = Request::Sign {
             tenant,
@@ -520,6 +562,17 @@ impl Ring {
         };
         match self.checked(&request).await? {
             Answer::Signature(signature) => Ok(signature),
+            _ => Err(self.fault(None, None)),
+        }
+    }
+
+    pub async fn delete(&self, tenant: u32, generation: u32) -> Result<(), Fault> {
+        self.forget(tenant, generation);
+        match self
+            .checked(&Request::Delete { tenant, generation })
+            .await?
+        {
+            Answer::Done => Ok(()),
             _ => Err(self.fault(None, None)),
         }
     }
