@@ -337,8 +337,12 @@ impl<T: Transport + 'static> Node<T> {
         self.inner.table.borrow_mut().apply(update.clone());
     }
 
+    pub(crate) fn note(&self, note: control::Note) {
+        self.inner.table.borrow_mut().take(note);
+    }
+
     pub async fn write(&self, object: Object) -> Result<Update, Error> {
-        if matches!(object, Object::Dkim(_)) {
+        if matches!(object, Object::Dkim(_) | Object::Access(_)) {
             return Err(control::Error::Invalid("kind").into());
         }
         let node = self.clone();
@@ -372,11 +376,11 @@ impl<T: Transport + 'static> Node<T> {
     }
 
     pub(crate) fn broadcast(&self, update: &Update) {
-        broadcast(
-            &self.inner.config,
-            self.inner.cores,
-            &control::Note::Update(update.clone()),
-        );
+        self.send(&control::Note::Update(update.clone()));
+    }
+
+    pub(crate) fn send(&self, note: &control::Note) {
+        broadcast(&self.inner.config, self.inner.cores, note);
     }
 
     async fn create_keys(&self, object: &Object) -> Result<(), control::Error> {
@@ -629,6 +633,7 @@ fn deleted(note: &control::Note) -> Vec<(u32, u32, bool)> {
     match note {
         control::Note::Snapshot(snapshot) => snapshot.objects.iter().filter_map(gone).collect(),
         control::Note::Update(update) => gone(&update.object).into_iter().collect(),
+        control::Note::Remove(_) => Vec::new(),
     }
 }
 

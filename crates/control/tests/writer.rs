@@ -7,8 +7,8 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use control::{
-    Created, Dkim, Error, KIND_TENANT, KeyError, KeySource, Limits, Loaded, Object, Pool, Ready,
-    Snapshot, State, Table, Tenant, Update, Writer,
+    Access, Created, Dkim, Error, KIND_ACCESS, KIND_TENANT, KeyError, KeySource, Limits, Loaded,
+    Object, Pool, Ready, Scopes, Snapshot, State, Table, Tenant, Update, Writer,
 };
 use crypto::{DkimAlg, Secret, Tenant as Root, TenantKeys};
 use rt::sim::{Config, Disk, SimDriver, check};
@@ -460,5 +460,58 @@ fn acknowledged_writes_survive_a_crash_at_every_disk_operation() {
                 panic::resume_unwind(failure);
             }
         }
+    });
+}
+
+fn access(id: u32, tenant: u32) -> Object {
+    Object::Access(Access {
+        id,
+        tenant,
+        generation: 1,
+        scopes: Scopes {
+            smtp: true,
+            api: false,
+        },
+        pool: 0,
+        hash: [id.to_le_bytes()[0]; 32],
+    })
+}
+
+#[test]
+fn removed_access_keys_stay_gone_and_their_ids_are_never_reused() {
+    let ((), driver) = on(1, Config::default(), created(1), || async {
+        let (node, loaded, _) = Node::open(BUDGET).await;
+        let mut writer = loaded.writer(node.changes.clone());
+        for id in 1..=3 {
+            assert_eq!(writer.reserve_access().await.expect("reserve"), id);
+            writer.write(access(id, 4)).await.expect("write");
+        }
+        let used = writer.used();
+        let version = writer.version();
+        let removal = writer.remove(&access(3, 4)).await.expect("remove");
+        assert_eq!(
+            (removal.version, removal.kind, removal.id),
+            (version + 1, KIND_ACCESS, 3)
+        );
+        assert!(writer.used() < used);
+        assert!(matches!(
+            writer.remove(&access(3, 4)).await,
+            Err(Error::Refused)
+        ));
+        assert!(matches!(
+            writer.remove(&tenant(4, State::Active)).await,
+            Err(Error::Invalid("kind"))
+        ));
+        writer.remove(&access(2, 4)).await.expect("remove");
+        node.close().await;
+    });
+    on(2, Config::default(), driver.crash(), || async {
+        let (node, loaded, snapshot) = Node::open(BUDGET).await;
+        let table = table(snapshot);
+        assert_eq!(table.accesses(4).map(|a| a.id).collect::<Vec<_>>(), [1]);
+        let mut writer = loaded.writer(node.changes.clone());
+        assert_eq!(writer.skipped(), 0);
+        assert_eq!(writer.reserve_access().await.expect("reserve"), 4);
+        node.close().await;
     });
 }
