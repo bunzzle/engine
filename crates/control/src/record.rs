@@ -116,7 +116,7 @@ impl Dkim {
             DkimAlg::RsaSha256 => "rsa",
             DkimAlg::Ed25519Sha256 => "ed25519",
         };
-        format!("v=DKIM1; k={k}; p={}", base64(&self.public))
+        format!("v=DKIM1; k={k}; p={}", dkim::base64::encode(&self.public))
     }
 
     fn check(&self) -> Result<(), Error> {
@@ -136,25 +136,6 @@ impl Dkim {
         }
         Ok(())
     }
-}
-
-fn base64(bytes: &[u8]) -> String {
-    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
-    for chunk in bytes.chunks(3) {
-        let n = chunk
-            .iter()
-            .enumerate()
-            .fold(0_u32, |n, (i, b)| n | u32::from(*b) << (16 - 8 * i));
-        for i in 0..4 {
-            if i <= chunk.len() {
-                out.push(char::from(TABLE[(n >> (18 - 6 * i)) as usize & 63]));
-            } else {
-                out.push('=');
-            }
-        }
-    }
-    out
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

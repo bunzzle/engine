@@ -67,6 +67,7 @@ name = "control"
 version = "0.0.0"
 dependencies = [
  "crypto",
+ "dkim",
  "rt",
  "store",
 ]
@@ -77,6 +78,14 @@ version = "0.0.0"
 dependencies = [
  "aws-lc-rs",
  "sys",
+]
+
+[[package]]
+name = "dkim"
+version = "0.0.0"
+dependencies = [
+ "aws-lc-rs",
+ "crypto",
 ]
 
 [[package]]

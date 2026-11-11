@@ -1,5 +1,6 @@
 mod dkim;
 mod error;
+mod hash;
 mod kdf;
 mod keys;
 mod record;
@@ -11,6 +12,7 @@ mod wrap;
 
 pub use dkim::{DKIM_LABEL, DkimAlg, DkimKey, dkim_label};
 pub use error::Error;
+pub use hash::{Sha256, sha256};
 pub use kdf::Prk;
 pub use keys::TenantKeys;
 pub use record::{AAD, BatchKey, aad};
