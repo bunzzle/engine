@@ -58,7 +58,7 @@ async fn create(host: u8, tenant: u32) {
     client.close();
 }
 
-async fn naming(host: u8) -> Secret<16> {
+async fn hello(host: u8) -> (Secret<16>, Secret<16>) {
     let client = Client::new(TcpStream::connect(at(host)).await.expect("connect"));
     let answer = client
         .call(&Request::Hello { node: 1 })
@@ -66,7 +66,7 @@ async fn naming(host: u8) -> Secret<16> {
         .expect("hello");
     client.close();
     match answer {
-        Answer::Hello { naming, .. } => naming,
+        Answer::Hello { naming, ids, .. } => (naming, ids),
         _ => panic!("expected hello"),
     }
 }
@@ -97,14 +97,14 @@ enum Fake {
     Closes,
 }
 
-async fn fake(host: u8, naming: Secret<16>, mode: Fake) -> Rc<Cell<u32>> {
+async fn fake(host: u8, keys: (Secret<16>, Secret<16>), mode: Fake) -> Rc<Cell<u32>> {
     let listener = TcpListener::bind(at(host), 4).await.expect("bind");
-    let naming = Rc::new(naming);
+    let keys = Rc::new(keys);
     let closed = Rc::new(Cell::new(0));
     let counted = Rc::clone(&closed);
     spawn(async move {
         while let Ok((stream, _)) = listener.accept().await {
-            let naming = Rc::clone(&naming);
+            let keys = Rc::clone(&keys);
             let closed = Rc::clone(&counted);
             spawn(async move {
                 let mut frames = Frames::default();
@@ -122,7 +122,8 @@ async fn fake(host: u8, naming: Secret<16>, mode: Fake) -> Rc<Cell<u32>> {
                                 greeted = true;
                                 Answer::Hello {
                                     day: DAY,
-                                    naming: Secret::new(*naming.expose()),
+                                    naming: keys.0.copy(),
+                                    ids: keys.1.copy(),
                                 }
                             }
                             Ok(Request::Open { .. }) if mode == Fake::Closes => Answer::Keys {
@@ -179,7 +180,10 @@ fn tenant_keys_open_once_on_first_use_and_stay_cached() {
         assert_eq!(ring.stats().opens, 1);
         assert_eq!(tries.get(), 1);
         assert_eq!(ring.day(), DAY);
-        assert_eq!(Some(*naming(1).await.expose()), ring.naming());
+        let (naming, ids) = hello(1).await;
+        assert_eq!(Some(*naming.expose()), ring.naming());
+        assert!(ring.ids() == Some(ids));
+        assert!(crypto::id_key(&naming) == hello(1).await.1);
         let cached = ring.get(4, 1).expect("cached");
         assert_eq!(cached.keys.open(&label, &sealed).expect("open"), b"mail");
         assert_eq!(ring.open(9, 1).await.err(), Some(Fault::Unknown));
@@ -317,7 +321,7 @@ fn a_stuck_connection_times_out_and_the_ring_reconnects() {
     run(&driver, async {
         let _server = serve("/a", 1).await;
         create(1, 4).await;
-        let closed = fake(2, naming(1).await, Fake::Silent).await;
+        let closed = fake(2, hello(1).await, Fake::Silent).await;
         let (connect, tries) = hosts(&[2, 1]);
         let ring = Ring::new(connect, settings());
         let begin = rt::now();
@@ -339,7 +343,7 @@ fn a_changed_naming_key_fails_the_ring_for_good() {
     run(&driver, async {
         let _first = serve("/a", 1).await;
         let _second = serve("/b", 3).await;
-        fake(2, naming(1).await, Fake::Closes).await;
+        fake(2, hello(1).await, Fake::Closes).await;
         let (connect, _) = hosts(&[2, 3]);
         let ring = Ring::new(connect, settings());
         assert!(ring.open(4, 1).await.is_ok());
@@ -353,6 +357,24 @@ fn a_changed_naming_key_fails_the_ring_for_good() {
         assert_eq!(ring.open(4, 1).await.err(), Some(Fault::Failed));
         assert_eq!(ring.hello().await.err(), Some(Error::Failed));
         assert!(ring.stats().refused >= 3);
+        assert_eq!(ring.stats().failed, 1);
+    });
+}
+
+#[test]
+fn a_changed_id_key_fails_the_ring_for_good() {
+    let driver = Rc::new(SimDriver::new(8, quiet()));
+    run(&driver, async {
+        let _first = serve("/a", 1).await;
+        let (naming, ids) = hello(1).await;
+        fake(2, (naming.copy(), ids), Fake::Closes).await;
+        fake(3, (naming, Secret::new([0; 16])), Fake::Closes).await;
+        let (connect, _) = hosts(&[2, 3]);
+        let ring = Ring::new(connect, settings());
+        assert!(ring.open(4, 1).await.is_ok());
+        sleep(Duration::from_millis(200)).await;
+        assert_eq!(ring.open(4, 2).await.err(), Some(Fault::Failed));
+        assert!(ring.failed());
         assert_eq!(ring.stats().failed, 1);
     });
 }
@@ -392,7 +414,12 @@ fn a_slow_vault_write_keeps_the_connection() {
 fn a_dropped_client_closes_its_connection() {
     let driver = Rc::new(SimDriver::new(7, quiet()));
     run(&driver, async {
-        let closed = fake(2, Secret::new([1; 16]), Fake::Silent).await;
+        let closed = fake(
+            2,
+            (Secret::new([1; 16]), Secret::new([2; 16])),
+            Fake::Silent,
+        )
+        .await;
         let client = Client::new(TcpStream::connect(at(2)).await.expect("connect"));
         assert!(matches!(
             client.call(&Request::Hello { node: 1 }).await,
