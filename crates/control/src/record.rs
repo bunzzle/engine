@@ -3,7 +3,7 @@ use std::net::{IpAddr, Ipv6Addr};
 use crypto::DkimAlg;
 
 use crate::error::Error;
-use crate::queue::{MAX_DOMAIN, domain_ok};
+use crate::queue::{Label, MAX_DOMAIN, domain_ok};
 
 pub const KIND_TENANT: u8 = 1;
 pub const KIND_POOL: u8 = 2;
@@ -23,6 +23,7 @@ const TENANT: usize = 32;
 const POOL: usize = 4;
 const ADDRESS: usize = 20;
 const DKIM: usize = 16;
+const DKIM_SECRET: usize = 4;
 const DOMAINKEY: &str = "._domainkey.";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -170,6 +171,19 @@ impl Object {
         }
     }
 
+    pub fn sealed(&self) -> Option<Label> {
+        match self {
+            Self::Dkim(d) => Some(Label {
+                tenant: d.tenant,
+                generation: d.generation,
+                kind: KIND_DKIM,
+                id: d.id,
+                hash: None,
+            }),
+            Self::Tenant(_) | Self::Pool(_) => None,
+        }
+    }
+
     pub fn check(&self) -> Result<(), Error> {
         match self {
             Self::Tenant(t) => {
@@ -246,40 +260,71 @@ impl Update {
                 let mut body = [0; DKIM];
                 body[0..4].copy_from_slice(&d.generation.to_le_bytes());
                 body[4] = d.alg.code();
-                body[5] = u8::try_from(d.domain.len()).expect("domain checked");
-                body[6] = u8::try_from(d.selector.len()).expect("selector checked");
-                let public = u16::try_from(d.public.len()).expect("public key checked");
                 let blob = u16::try_from(d.blob.len()).expect("blob checked");
-                body[8..10].copy_from_slice(&public.to_le_bytes());
-                body[10..12].copy_from_slice(&blob.to_le_bytes());
+                body[8..10].copy_from_slice(&blob.to_le_bytes());
                 body[12..16].copy_from_slice(&d.tenant.to_le_bytes());
                 out.extend_from_slice(&body);
-                out.extend_from_slice(d.domain.as_bytes());
-                out.extend_from_slice(d.selector.as_bytes());
-                out.extend_from_slice(&d.public);
                 out.extend_from_slice(&d.blob);
             }
         }
         out
     }
 
-    pub fn decode(bytes: &[u8]) -> Option<Self> {
-        let head = bytes.get(..HEAD)?;
-        if head[0] != FORMAT || head[2..4] != [0, 0] {
-            return None;
+    pub fn secret(&self) -> Vec<u8> {
+        match &self.object {
+            Object::Tenant(_) | Object::Pool(_) => Vec::new(),
+            Object::Dkim(d) => {
+                let mut out = vec![0; DKIM_SECRET];
+                out[0] = u8::try_from(d.domain.len()).expect("domain checked");
+                out[1] = u8::try_from(d.selector.len()).expect("selector checked");
+                let public = u16::try_from(d.public.len()).expect("public key checked");
+                out[2..4].copy_from_slice(&public.to_le_bytes());
+                out.extend_from_slice(d.domain.as_bytes());
+                out.extend_from_slice(d.selector.as_bytes());
+                out.extend_from_slice(&d.public);
+                out
+            }
         }
-        let id = u32::from_le_bytes(head[4..8].try_into().ok()?);
-        let version = u64::from_le_bytes(head[8..16].try_into().ok()?);
-        let rest = &bytes[HEAD..];
-        let object = match head[1] {
-            KIND_TENANT => Object::Tenant(tenant(id, rest)?),
-            KIND_POOL => Object::Pool(pool(id, rest)?),
-            KIND_DKIM => Object::Dkim(dkim(id, rest)?),
+    }
+
+    pub fn decode(bytes: &[u8]) -> Option<Self> {
+        Self::decode_sealed(bytes, &[])
+    }
+
+    pub fn decode_sealed(clear: &[u8], secret: &[u8]) -> Option<Self> {
+        let (kind, id, version) = peek(clear)?;
+        let rest = &clear[HEAD..];
+        let object = match kind {
+            KIND_TENANT if secret.is_empty() => Object::Tenant(tenant(id, rest)?),
+            KIND_POOL if secret.is_empty() => Object::Pool(pool(id, rest)?),
+            KIND_DKIM => Object::Dkim(dkim(id, rest, secret)?),
             _ => return None,
         };
         object.check().ok()?;
         Some(Self { version, object })
     }
+}
+
+pub(crate) fn peek(clear: &[u8]) -> Option<(u8, u32, u64)> {
+    let head = clear.get(..HEAD)?;
+    if head[0] != FORMAT || head[2..4] != [0, 0] {
+        return None;
+    }
+    let id = u32::from_le_bytes(head[4..8].try_into().ok()?);
+    let version = u64::from_le_bytes(head[8..16].try_into().ok()?);
+    Some((head[1], id, version))
+}
+
+pub(crate) fn sealed_label(clear: &[u8]) -> Option<Label> {
+    let (kind, id, _) = peek(clear)?;
+    let body = clear.get(HEAD..HEAD + DKIM).filter(|_| kind == KIND_DKIM)?;
+    Some(Label {
+        tenant: u32_at(body, 12)?,
+        generation: u32_at(body, 0)?,
+        kind,
+        id,
+        hash: None,
+    })
 }
 
 fn u32_at(bytes: &[u8], at: usize) -> Option<u32> {
@@ -339,22 +384,26 @@ fn pool(id: u32, rest: &[u8]) -> Option<Pool> {
     Some(Pool { id, addresses })
 }
 
-fn dkim(id: u32, rest: &[u8]) -> Option<Dkim> {
+fn dkim(id: u32, rest: &[u8], secret: &[u8]) -> Option<Dkim> {
     let body = rest.get(..DKIM)?;
-    if body[7] != 0 {
+    if body[5..8] != [0; 3] || body[10..12] != [0, 0] {
         return None;
     }
+    let blob = &rest[DKIM..];
+    if blob.len() != usize::from(u16::from_le_bytes(body[8..10].try_into().ok()?)) {
+        return None;
+    }
+    let fixed = secret.get(..DKIM_SECRET)?;
     let lengths = [
-        usize::from(body[5]),
-        usize::from(body[6]),
-        usize::from(u16::from_le_bytes(body[8..10].try_into().ok()?)),
-        usize::from(u16::from_le_bytes(body[10..12].try_into().ok()?)),
+        usize::from(fixed[0]),
+        usize::from(fixed[1]),
+        usize::from(u16::from_le_bytes(fixed[2..4].try_into().ok()?)),
     ];
-    let mut list = &rest[DKIM..];
+    let mut list = &secret[DKIM_SECRET..];
     if list.len() != lengths.iter().sum::<usize>() {
         return None;
     }
-    let [domain, selector, public, blob] = lengths.map(|length| {
+    let [domain, selector, public] = lengths.map(|length| {
         let (part, next) = list.split_at(length);
         list = next;
         part

@@ -154,11 +154,7 @@ impl<T: Transport + 'static> Node<T> {
         parts: Parts<T>,
     ) -> Result<(Self, Running), Error> {
         let cores = links.config.cores();
-        let control = if core.shards.contains(&CONTROL_SHARD) {
-            Some(Writer::load(&core.keeper, CONTROL_SHARD, settings.budget)?)
-        } else {
-            None
-        };
+        let control = load_control(&core, settings.budget, &*parts.keys).await?;
         let check = naming(control.as_ref().map(|(loaded, _)| loaded), &settings)?;
         let table = Rc::new(RefCell::new(Table::default()));
         let clock = parts.clock;
@@ -548,6 +544,19 @@ fn start_leases(
     let freed = leases.clone();
     spool.on_close(move |tenant, count| freed.free(&tenant, count));
     (leases, done)
+}
+
+async fn load_control(
+    core: &Core,
+    budget: usize,
+    keys: &dyn KeySource,
+) -> Result<Option<(control::Loaded, control::Snapshot)>, Error> {
+    if !core.shards.contains(&CONTROL_SHARD) {
+        return Ok(None);
+    }
+    let (mut loaded, mut snapshot) = Writer::load(&core.keeper, CONTROL_SHARD, budget)?;
+    loaded.open(&mut snapshot, &core.file, keys).await?;
+    Ok(Some((loaded, snapshot)))
 }
 
 async fn control_writer(

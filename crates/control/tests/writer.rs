@@ -1,4 +1,5 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
+use std::collections::BTreeSet;
 use std::env;
 use std::net::{IpAddr, Ipv4Addr};
 use std::panic::{self, AssertUnwindSafe};
@@ -6,10 +7,10 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use control::{
-    Dkim, Error, KIND_TENANT, Limits, Loaded, Object, Pool, Snapshot, State, Table, Tenant, Update,
-    Writer,
+    Created, Dkim, Error, KIND_TENANT, KeyError, KeySource, Limits, Loaded, Object, Pool, Ready,
+    Snapshot, State, Table, Tenant, Update, Writer,
 };
-use crypto::DkimAlg;
+use crypto::{DkimAlg, Secret, Tenant as Root, TenantKeys};
 use rt::sim::{Config, Disk, SimDriver, check};
 use rt::{JoinHandle, Runtime, spawn, timeout};
 use store::{
@@ -27,6 +28,36 @@ const OPTIONS: Options = Options {
     shards: 4,
 };
 
+#[derive(Default)]
+struct Toy {
+    unknown: BTreeSet<u32>,
+    asked: Cell<u32>,
+}
+
+fn keys(tenant: u32, generation: u32) -> TenantKeys {
+    TenantKeys::derive(tenant, generation, &Root::new(&Secret::new([1; 32])), 1)
+}
+
+impl KeySource for Toy {
+    fn get(&self, _: u32, _: u32) -> Option<TenantKeys> {
+        None
+    }
+
+    fn create(&self, _: u32, _: u32) -> Created<'_> {
+        Box::pin(std::future::ready(Ok(())))
+    }
+
+    fn ready(&self, tenant: u32, generation: u32) -> Ready<'_> {
+        self.asked.set(self.asked.get() + 1);
+        let answer = if self.unknown.contains(&tenant) {
+            Err(KeyError::Unknown)
+        } else {
+            Ok(keys(tenant, generation))
+        };
+        Box::pin(std::future::ready(answer))
+    }
+}
+
 struct Node {
     changes: Changes,
     owner: JoinHandle<Keeper>,
@@ -36,6 +67,10 @@ struct Node {
 
 impl Node {
     async fn open(budget: usize) -> (Self, Loaded, Snapshot) {
+        Self::open_with(budget, &Toy::default()).await
+    }
+
+    async fn open_with(budget: usize, source: &Toy) -> (Self, Loaded, Snapshot) {
         let setup = Setup {
             cores: 1,
             credits: 4,
@@ -52,7 +87,11 @@ impl Node {
             .open()
             .await
             .expect("open");
-        let (loaded, snapshot) = Writer::load(&core.keeper, 0, budget).expect("load");
+        let (mut loaded, mut snapshot) = Writer::load(&core.keeper, 0, budget).expect("load");
+        loaded
+            .open(&mut snapshot, &core.file, source)
+            .await
+            .expect("open");
         let (owner, changes) = Shards::new(core);
         let node = Self {
             changes,
@@ -142,7 +181,10 @@ fn dkim_ids_are_never_given_twice_across_restarts() {
         let mut writer = loaded.writer(node.changes.clone());
         assert_eq!(writer.reserve_dkim().await.expect("reserve"), 1);
         assert_eq!(writer.reserve_dkim().await.expect("reserve"), 2);
-        writer.write(dkim(1, 4)).await.expect("write");
+        writer
+            .write_sealed(dkim(1, 4), &keys(4, 1))
+            .await
+            .expect("write");
         node.close().await;
     });
     let ((), driver) = on(2, Config::default(), driver.crash(), || async {
@@ -153,7 +195,10 @@ fn dkim_ids_are_never_given_twice_across_restarts() {
         assert_eq!(table.dkims(4).count(), 1);
         let mut writer = loaded.writer(node.changes.clone());
         assert_eq!(writer.dkim_next(), 3);
-        writer.write(dkim(10, 4)).await.expect("write");
+        writer
+            .write_sealed(dkim(10, 4), &keys(4, 1))
+            .await
+            .expect("write");
         assert_eq!(writer.dkim_next(), 11);
         node.close().await;
     });
@@ -162,6 +207,68 @@ fn dkim_ids_are_never_given_twice_across_restarts() {
         let mut writer = loaded.writer(node.changes.clone());
         assert_eq!(writer.skipped(), 0);
         assert_eq!(writer.reserve_dkim().await.expect("reserve"), 11);
+        node.close().await;
+    });
+}
+
+#[test]
+fn dkim_records_open_only_with_their_tenant_keys() {
+    let ((), driver) = on(1, Config::default(), created(1), || async {
+        let (node, loaded, _) = Node::open(BUDGET).await;
+        let mut writer = loaded.writer(node.changes.clone());
+        assert!(matches!(
+            writer.write(dkim(1, 4)).await,
+            Err(Error::Invalid("kind"))
+        ));
+        assert!(matches!(
+            writer.write_sealed(pool(1), &keys(4, 1)).await,
+            Err(Error::Invalid("kind"))
+        ));
+        writer.write(tenant(4, State::Active)).await.expect("write");
+        writer.write(tenant(5, State::Active)).await.expect("write");
+        writer.write(tenant(6, State::Active)).await.expect("write");
+        for (id, owner) in [(1, 4), (2, 5), (3, 6)] {
+            writer
+                .write_sealed(dkim(id, owner), &keys(owner, 1))
+                .await
+                .expect("write");
+        }
+        assert!(matches!(
+            writer.write_sealed(dkim(4, 4), &keys(5, 1)).await,
+            Err(Error::Invalid("seal"))
+        ));
+        writer
+            .write(Object::Tenant(Tenant {
+                state: State::Deleted,
+                ..match tenant(6, State::Active) {
+                    Object::Tenant(t) => t,
+                    _ => unreachable!(),
+                }
+            }))
+            .await
+            .expect("write");
+        node.close().await;
+    });
+    on(2, Config::default(), driver.crash(), || async {
+        let source = Toy {
+            unknown: BTreeSet::from([5]),
+            ..Toy::default()
+        };
+        let (node, loaded, snapshot) = Node::open_with(BUDGET, &source).await;
+        assert_eq!(snapshot.version, 7);
+        let table = table(snapshot);
+        assert_eq!(
+            table.dkim(4, 1).map(|d| d.domain.as_ref()),
+            Some("example.org")
+        );
+        assert!(table.dkim(4, 4).is_none());
+        assert!(table.dkim(5, 2).is_none());
+        assert!(table.dkim(6, 3).is_none());
+        assert_eq!(source.asked.get(), 2);
+        let mut writer = loaded.writer(node.changes.clone());
+        assert_eq!(writer.skipped(), 2);
+        assert_eq!(writer.dkim_next(), 4);
+        assert_eq!(writer.write(pool(1)).await.expect("write").version, 8);
         node.close().await;
     });
 }

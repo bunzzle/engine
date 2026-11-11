@@ -89,7 +89,8 @@ fn records_round_trip() {
             version: 77,
             object,
         };
-        assert_eq!(Update::decode(&update.encode()), Some(update));
+        let decoded = Update::decode_sealed(&update.encode(), &update.secret());
+        assert_eq!(decoded, Some(update));
     }
 }
 
@@ -293,25 +294,60 @@ fn dkim_records_give_their_dns_name_and_text() {
 
 #[test]
 fn damaged_dkim_records_do_not_decode() {
-    let good = Update {
+    let update = Update {
         version: 1,
         object: Object::Dkim(dkim(DkimAlg::Ed25519Sha256)),
-    }
-    .encode();
-    assert!(Update::decode(&good).is_some());
+    };
+    let (good, secret) = (update.encode(), update.secret());
+    let decode = |clear: &[u8], secret: &[u8]| Update::decode_sealed(clear, secret);
+    assert!(decode(&good, &secret).is_some());
+    assert_eq!(Update::decode(&good), None);
     for at in [20, 21, 23, 24, 26] {
         let mut bad = good.clone();
         bad[at] ^= 0x40;
-        assert_eq!(Update::decode(&bad), None, "byte {at}");
+        assert_eq!(decode(&bad, &secret), None, "byte {at}");
+    }
+    for at in [0, 1, 2, 3] {
+        let mut bad = secret.clone();
+        bad[at] ^= 0x40;
+        assert_eq!(decode(&good, &bad), None, "secret byte {at}");
     }
     let mut zero_tenant = good.clone();
     zero_tenant[28..32].copy_from_slice(&[0; 4]);
-    assert_eq!(Update::decode(&zero_tenant), None);
-    let mut not_text = good.clone();
-    not_text[32] = 0xff;
-    assert_eq!(Update::decode(&not_text), None);
-    assert_eq!(Update::decode(&good[..good.len() - 1]), None);
-    let mut longer = good;
+    assert_eq!(decode(&zero_tenant, &secret), None);
+    let mut not_text = secret.clone();
+    not_text[4] = 0xff;
+    assert_eq!(decode(&good, &not_text), None);
+    assert_eq!(decode(&good[..good.len() - 1], &secret), None);
+    assert_eq!(decode(&good, &secret[..secret.len() - 1]), None);
+    let mut longer = good.clone();
     longer.push(0);
-    assert_eq!(Update::decode(&longer), None);
+    assert_eq!(decode(&longer, &secret), None);
+    let mut longer_secret = secret;
+    longer_secret.push(0);
+    assert_eq!(decode(&good, &longer_secret), None);
+}
+
+#[test]
+fn dkim_names_and_public_keys_stay_out_of_the_clear_part() {
+    let made = dkim(DkimAlg::Ed25519Sha256);
+    let update = Update {
+        version: 1,
+        object: Object::Dkim(made.clone()),
+    };
+    let clear = update.encode();
+    for hidden in [
+        made.domain.as_bytes(),
+        made.selector.as_bytes(),
+        &made.public,
+    ] {
+        assert!(!clear.windows(hidden.len()).any(|w| w == hidden));
+    }
+    assert!(clear.ends_with(&made.blob));
+    let tenant = Update {
+        version: 1,
+        object: Object::Tenant(tenant(1)),
+    };
+    assert_eq!(tenant.secret(), Vec::<u8>::new());
+    assert_eq!(Update::decode_sealed(&tenant.encode(), &[0]), None);
 }
