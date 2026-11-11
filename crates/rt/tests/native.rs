@@ -217,12 +217,16 @@ fn tcp_echo() {
 #[test]
 fn a_refused_connect_reports_an_error() {
     run(async {
-        let listener = TcpListener::bind(local(), 1).await.expect("bind");
-        let addr = listener.local_addr().await.expect("addr");
-        drop(listener);
-        let refused = TcpStream::connect(addr).await;
-        let kind = refused.err().map(|e| e.kind());
-        assert_eq!(kind, Some(io::ErrorKind::ConnectionRefused));
+        for _ in 0..10 {
+            let listener = TcpListener::bind(local(), 1).await.expect("bind");
+            let addr = listener.local_addr().await.expect("addr");
+            drop(listener);
+            if let Err(e) = TcpStream::connect(addr).await {
+                assert_eq!(e.kind(), io::ErrorKind::ConnectionRefused);
+                return;
+            }
+        }
+        panic!("every freed port was taken again");
     });
 }
 
