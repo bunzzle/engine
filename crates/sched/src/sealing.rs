@@ -40,12 +40,19 @@ pub type Oldest<'a> = Pin<Box<dyn Future<Output = Result<u32, KeyError>> + 'a>>;
 pub type Unwrapped<'a> = Pin<Box<dyn Future<Output = Result<Rc<BatchKey>, Unsealable>> + 'a>>;
 pub type Made<'a> = Pin<Box<dyn Future<Output = Result<(Vec<u8>, Vec<u8>), KeyError>> + 'a>>;
 pub type Loaded<'a> = Pin<Box<dyn Future<Output = Result<(), KeyError>> + 'a>>;
+pub type Deleted<'a> = Pin<Box<dyn Future<Output = Result<(), KeyError>> + 'a>>;
 pub type Signed<'a> = Pin<Box<dyn Future<Output = Result<Vec<u8>, KeyError>> + 'a>>;
 
 pub trait Keys: KeySource {
     fn tick(&self) {}
 
     fn settled(&self, _day: u32) {}
+
+    fn forget(&self, _tenant: u32, _generation: u32) {}
+
+    fn delete(&self, _tenant: u32, _generation: u32) -> Deleted<'_> {
+        Box::pin(async { Ok(()) })
+    }
 
     fn oldest(&self, _tenant: u32, _generation: u32) -> Oldest<'_> {
         Box::pin(async { Err(KeyError::Unavailable) })

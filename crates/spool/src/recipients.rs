@@ -327,6 +327,16 @@ impl Spool {
             .collect()
     }
 
+    pub fn messages_of(&self, tenant: u32) -> Vec<MessageId> {
+        let table = self.inner.table.borrow();
+        table
+            .messages
+            .iter()
+            .filter(|(_, entry)| entry.tenant == tenant)
+            .map(|(&(shard, key), _)| self.message_id(shard, key))
+            .collect()
+    }
+
     pub fn expired(&self, now: u64) -> Vec<MessageId> {
         let table = self.inner.table.borrow();
         table

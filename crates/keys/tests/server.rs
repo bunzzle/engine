@@ -756,7 +756,7 @@ fn a_sign_queued_before_a_delete_returns_no_signature() {
 }
 
 #[test]
-fn a_delete_of_another_generation_leaves_signs_alone() {
+fn a_delete_of_an_older_generation_is_refused_and_leaves_signs_alone() {
     let driver = Rc::new(SimDriver::new(26, quiet()));
     run(&driver, async {
         let _server = start(Settings::default()).await;
@@ -770,12 +770,15 @@ fn a_delete_of_another_generation_leaves_signs_alone() {
         let deleted = spawn(async move {
             let delete = Request::Delete {
                 tenant: 1,
-                generation: 2,
+                generation: 0,
             };
             deleting.call(&delete).await
         });
         assert!(matches!(signed.await.expect("sign"), Answer::Signature(_)));
-        assert!(done(&deleted.await.expect("delete")));
+        assert!(matches!(
+            deleted.await.expect("delete"),
+            Answer::Refused(Error::Generation)
+        ));
     });
 }
 

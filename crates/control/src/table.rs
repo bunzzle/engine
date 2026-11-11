@@ -76,6 +76,12 @@ impl Table {
         self.tenants.get(&id)
     }
 
+    pub fn gone(&self, tenant: u32, generation: u32) -> bool {
+        self.tenants.get(&tenant).is_some_and(|t| {
+            generation < t.generation || (generation == t.generation && t.state.deleted())
+        })
+    }
+
     pub fn pool(&self, id: u32) -> Option<&Pool> {
         self.pools.get(&id)
     }

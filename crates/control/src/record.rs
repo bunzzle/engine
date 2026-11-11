@@ -29,13 +29,21 @@ const DOMAINKEY: &str = "._domainkey.";
 pub enum State {
     Active,
     Suspended,
+    Deleting,
+    Deleted,
 }
 
 impl State {
+    pub fn deleted(self) -> bool {
+        matches!(self, Self::Deleting | Self::Deleted)
+    }
+
     fn code(self) -> u8 {
         match self {
             Self::Active => 1,
             Self::Suspended => 2,
+            Self::Deleting => 3,
+            Self::Deleted => 4,
         }
     }
 
@@ -43,6 +51,8 @@ impl State {
         match code {
             1 => Some(Self::Active),
             2 => Some(Self::Suspended),
+            3 => Some(Self::Deleting),
+            4 => Some(Self::Deleted),
             _ => None,
         }
     }

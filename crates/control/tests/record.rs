@@ -69,6 +69,14 @@ fn records_round_trip() {
             state: State::Suspended,
             ..tenant(u32::MAX)
         }),
+        Object::Tenant(Tenant {
+            state: State::Deleting,
+            ..tenant(2)
+        }),
+        Object::Tenant(Tenant {
+            state: State::Deleted,
+            ..tenant(3)
+        }),
         Object::Pool(pool(0)),
         Object::Pool(Pool {
             id: 2,

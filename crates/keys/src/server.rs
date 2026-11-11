@@ -314,8 +314,9 @@ impl Core {
                 return self.dkim_call(request, reply);
             }
             Request::Delete { tenant, generation } => {
-                self.dkim.retain(|id, _| id.0 != tenant);
-                if self.vault.holds(tenant, generation) {
+                self.dkim
+                    .retain(|id, _| id.0 != tenant || id.1 > generation);
+                if self.vault.covers(tenant, generation) {
                     self.deletes += 1;
                 }
                 match self.vault.delete(tenant, generation).await {

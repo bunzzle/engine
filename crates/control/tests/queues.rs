@@ -269,7 +269,7 @@ impl Node {
                     .await
                     .map_err(|_| None)?
                     .map_err(|_| None)?;
-                let loaded = Queues::load(&core, NAMING, opener.as_ref())
+                let loaded = Queues::load(&core, NAMING, opener.as_ref(), &|_, _| false)
                     .await
                     .map_err(Some)?;
                 Ok::<_, Option<Error>>((loaded, core))
@@ -628,7 +628,7 @@ fn a_sealed_payload_opens_only_under_its_own_label() {
 }
 
 #[test]
-fn start_waits_for_keys_asks_once_per_tenant_and_fails_on_unknown_ones() {
+fn start_waits_for_keys_asks_once_per_tenant_and_skips_unknown_ones() {
     let cores: u16 = 1;
     let sealer = Rc::new(Toy::default());
     let driver = Rc::new(SimDriver::with_disk(3, Config::default(), created(3)));
@@ -653,18 +653,10 @@ fn start_waits_for_keys_asks_once_per_tenant_and_fails_on_unknown_ones() {
         ..Toy::default()
     });
     let driver = Rc::new(SimDriver::with_disk(4, Config::default(), disk.clone()));
-    let failed = Node::try_start(&self::machine(&driver, cores), cores, &unknown).err();
-    assert!(
-        matches!(
-            failed,
-            Some(Some(Error::Keys {
-                tenant: 2,
-                generation: 1,
-                error: KeyError::Unknown,
-            }))
-        ),
-        "{failed:?}"
-    );
+    let machine = self::machine(&driver, cores);
+    let node = Node::start(&machine, cores, &unknown).expect("start without tenant 2");
+    assert_eq!((node.loaded, node.skipped), (24, 24));
+    machine.block_on(0, node.stop());
     let broken = Rc::new(Toy {
         failed: BTreeSet::from([1]),
         ..Toy::default()

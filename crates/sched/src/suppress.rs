@@ -127,10 +127,7 @@ pub fn retain(table: &Table, now: u64, entry: &Entry, oldest: bool) -> bool {
         return true;
     };
     let tenant = index::tenant(&entry.key);
-    if table
-        .tenant(tenant)
-        .is_some_and(|t| value.generation < t.generation)
-    {
+    if table.gone(tenant, value.generation) {
         return false;
     }
     !(oldest && value.suppression.until.is_some_and(|until| until <= now))

@@ -3,10 +3,11 @@ use std::rc::{Rc, Weak};
 use std::time::Duration;
 
 use control::{
-    Ask, Call, KeyError, KeySource, Leases, Name, Naming, Object, Queues, Table, Update, Writer,
-    broadcast, limit_core,
+    Ask, Call, KeyError, KeySource, Leases, Name, Naming, Object, Queues, State, Table, Update,
+    Writer, broadcast, limit_core,
 };
 use rt::{Ends, JoinHandle, Mesh, Notify, Peers, spawn};
+use spool::Pending;
 use store::Tiering;
 use store::{Changes, Core, Keeper};
 
@@ -81,7 +82,7 @@ pub(crate) struct Inner<T> {
     pub(crate) settings: Settings,
     keys: Rc<dyn Keys>,
     pub(crate) holds: Holds,
-    ticker: Rc<Ticker>,
+    pub(crate) ticker: Rc<Ticker>,
     cores: u16,
     pub(crate) spool: spool::Spool,
     pub(crate) sched: Sched<T>,
@@ -94,6 +95,7 @@ pub(crate) struct Inner<T> {
     writer: RefCell<Option<Writer>>,
     writing: Cell<bool>,
     restored: u64,
+    pub(crate) dropped: Cell<u64>,
 }
 
 pub struct Node<T> {
@@ -157,30 +159,32 @@ impl<T: Transport + 'static> Node<T> {
             None
         };
         let check = naming(control.as_ref().map(|(loaded, _)| loaded), &settings)?;
-        let loaded = Queues::load(&core, settings.naming, &*parts.keys).await?;
         let table = Rc::new(RefCell::new(Table::default()));
         let clock = parts.clock;
         retain_current(&mut core, &table, clock);
+
+        let applied = Rc::new(Notify::default());
+        let (config, config_done, deletions) =
+            start_config(links.config, &table, &applied, &parts.keys);
+        let control = control.map(|(loaded, snapshot)| {
+            broadcast(&config, cores, &control::Note::Snapshot(snapshot));
+            loaded
+        });
+        while !table.borrow().loaded() {
+            applied.wait().await;
+        }
+        let loaded = {
+            let gone = |tenant, generation| table.borrow().gone(tenant, generation);
+            Queues::load(&core, settings.naming, &*parts.keys, &gone).await?
+        };
         let kept = core.shards.clone();
         let (spool, shards, pending) =
             spool::Spool::open(core, settings.node, settings.spool).await?;
         let owner = spawn(shards.run());
         let changes = spool.changes().clone();
 
-        let applied = Rc::new(Notify::default());
-        let (config, config_done) = {
-            let table = Rc::clone(&table);
-            let applied = Rc::clone(&applied);
-            links.config.start(move |_, note| {
-                table.borrow_mut().take(note);
-                applied.notify();
-            })
-        };
         let writer = match control {
-            Some((loaded, snapshot)) => {
-                broadcast(&config, cores, &control::Note::Snapshot(snapshot));
-                Some(control_writer(loaded, changes.clone(), check).await?)
-            }
+            Some(loaded) => Some(control_writer(loaded, changes.clone(), check).await?),
             None => None,
         };
 
@@ -203,10 +207,6 @@ impl<T: Transport + 'static> Node<T> {
         let (leases, leases_done) =
             start_leases(links.leases, &table, &spool, settings.naming.shards);
 
-        while !table.borrow().loaded() {
-            applied.wait().await;
-        }
-
         let (sched, sched_done) = Sched::start(
             links.sched,
             spool.clone(),
@@ -217,9 +217,7 @@ impl<T: Transport + 'static> Node<T> {
         );
         sched.use_keys(Rc::clone(&parts.keys));
         let restored = pending.len() as u64;
-        sched.restore(pending, |tenant| {
-            table.borrow().tenant(tenant).map(|t| t.generation)
-        });
+        restore_live(&sched, pending, &table);
 
         leases.opened().await;
         barrier(links.steps).await;
@@ -242,17 +240,20 @@ impl<T: Transport + 'static> Node<T> {
             writer: RefCell::new(writer),
             writing: Cell::new(false),
             restored,
+            dropped: Cell::new(0),
         });
         let ticks = maintain(Rc::downgrade(&inner), ticker);
+        let drops = drop_deleted(Rc::downgrade(&inner), deletions);
+        index_done.extend([config_done, names_done, leases_done, sched_done]);
+        index_done.extend([ticks, drops]);
         let running = Running {
-            done: {
-                index_done.extend([config_done, names_done, leases_done, sched_done, ticks]);
-                index_done
-            },
+            done: index_done,
             owner,
             changes,
         };
-        Ok((Self { inner }, running))
+        let node = Self { inner };
+        node.resume_deletes();
+        Ok((node, running))
     }
 }
 
@@ -301,6 +302,18 @@ impl<T: Transport + 'static> Node<T> {
         self.inner.writer.borrow().is_some()
     }
 
+    pub(crate) async fn write_trusted(&self, object: Object) -> Result<Update, Error> {
+        let node = self.clone();
+        spawn(async move {
+            let mut held = node.hold()?;
+            let update = held.writer().write(object).await?;
+            drop(held);
+            node.broadcast(&update);
+            Ok(update)
+        })
+        .await
+    }
+
     pub async fn write(&self, object: Object) -> Result<Update, Error> {
         if matches!(object, Object::Dkim(_)) {
             return Err(control::Error::Invalid("kind").into());
@@ -347,11 +360,24 @@ impl<T: Transport + 'static> Node<T> {
             return Ok(());
         };
         let (id, generation) = (tenant.id, tenant.generation);
-        let known = self.inner.table.borrow().tenant(id).map(|t| t.generation);
+        if tenant.state == State::Deleted {
+            return Err(control::Error::Refused);
+        }
+        let known = self
+            .inner
+            .table
+            .borrow()
+            .tenant(id)
+            .map(|t| (t.generation, t.state));
         match known {
-            Some(current) if current == generation => return Ok(()),
-            None if generation != 1 => return Err(control::Error::Refused),
-            _ => {}
+            Some((current, state)) if current == generation && !state.deleted() => return Ok(()),
+            Some((current, State::Deleted))
+                if generation == current + 1 && !tenant.state.deleted() => {}
+            Some(_) => return Err(control::Error::Refused),
+            None if generation != 1 || tenant.state.deleted() => {
+                return Err(control::Error::Refused);
+            }
+            None => {}
         }
         self.inner
             .keys
@@ -414,9 +440,23 @@ async fn index_services(
 const TICK: Duration = Duration::from_secs(1);
 const LOW_EVERY: Duration = Duration::from_secs(60);
 
+fn drop_deleted<T: Transport + 'static>(
+    inner: Weak<Inner<T>>,
+    mut deletions: rt::Receiver<u32>,
+) -> JoinHandle<()> {
+    spawn(async move {
+        while let Some(tenant) = deletions.recv().await {
+            let Some(inner) = inner.upgrade() else {
+                return;
+            };
+            Node { inner }.drop_tenant(tenant).await;
+        }
+    })
+}
+
 #[derive(Default)]
-struct Ticker {
-    stopped: Cell<bool>,
+pub(crate) struct Ticker {
+    pub(crate) stopped: Cell<bool>,
     wake: Notify,
     late: Cell<u64>,
 }
@@ -503,6 +543,53 @@ fn naming(control: Option<&control::Loaded>, settings: &Settings) -> Result<u64,
         return Err(Error::Naming);
     }
     Ok(check)
+}
+
+fn restore_live<T: Transport + 'static>(
+    sched: &Sched<T>,
+    pending: Vec<Pending>,
+    table: &Rc<RefCell<Table>>,
+) {
+    let table = table.borrow();
+    let live = pending
+        .into_iter()
+        .filter(|m| !table.tenant(m.tenant).is_some_and(|t| t.state.deleted()))
+        .collect();
+    sched.restore(live, |tenant| table.tenant(tenant).map(|t| t.generation));
+}
+
+type Started = (Peers<control::Note>, JoinHandle<()>, rt::Receiver<u32>);
+
+fn start_config(
+    ends: Ends<control::Note>,
+    table: &Rc<RefCell<Table>>,
+    applied: &Rc<Notify>,
+    keys: &Rc<dyn Keys>,
+) -> Started {
+    let (deleting, deletions) = rt::channel();
+    let table = Rc::clone(table);
+    let applied = Rc::clone(applied);
+    let keys = Rc::clone(keys);
+    let (config, done) = ends.start(move |_, note| {
+        for (tenant, generation) in deleted(&note) {
+            keys.forget(tenant, generation);
+            let _ = deleting.send(tenant);
+        }
+        table.borrow_mut().take(note);
+        applied.notify();
+    });
+    (config, done, deletions)
+}
+
+fn deleted(note: &control::Note) -> Vec<(u32, u32)> {
+    let gone = |object: &Object| match object {
+        Object::Tenant(t) if t.state.deleted() => Some((t.id, t.generation)),
+        _ => None,
+    };
+    match note {
+        control::Note::Snapshot(snapshot) => snapshot.objects.iter().filter_map(gone).collect(),
+        control::Note::Update(update) => gone(&update.object).into_iter().collect(),
+    }
 }
 
 fn retain_current(core: &mut Core, table: &Rc<RefCell<Table>>, clock: Clock) {
