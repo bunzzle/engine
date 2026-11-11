@@ -31,6 +31,7 @@ impl fmt::Display for Error {
             } => {
                 let what = match error {
                     KeyError::Unavailable => "unavailable",
+                    KeyError::Busy => "busy",
                     KeyError::Unknown => "unknown",
                     KeyError::Failed => "failed",
                     KeyError::Conflict => "held by another generation",

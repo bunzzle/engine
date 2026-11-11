@@ -538,3 +538,23 @@ fn calls_made_while_connecting_wait_for_that_connection() {
         assert_eq!(ring.stats().unavailable, 0);
     });
 }
+
+#[test]
+fn calls_made_while_a_connect_fails_are_answered_not_left_waiting() {
+    let driver = Rc::new(SimDriver::new(7, quiet()));
+    run(&driver, async {
+        let (connect, tries) = hosts(&[2]);
+        let ring = Ring::new(connect, settings());
+        let tasks: Vec<_> = (4..10)
+            .map(|tenant| {
+                let ring = ring.clone();
+                spawn(async move { ring.open(tenant, 1).await })
+            })
+            .collect();
+        for task in tasks {
+            assert_eq!(task.await.err(), Some(Fault::Unavailable));
+        }
+        assert_eq!(tries.get(), 1);
+        assert_eq!(ring.stats().connects, 0);
+    });
+}

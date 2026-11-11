@@ -71,6 +71,7 @@ pub fn wall_day() -> u32 {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Fault {
     Unavailable,
+    Busy,
     Unknown,
     Failed,
     Conflict,
@@ -87,6 +88,7 @@ pub struct RingStats {
     pub opens: u64,
     pub unknown: u64,
     pub unavailable: u64,
+    pub busy: u64,
     pub failed: u64,
     pub unwraps: u64,
     pub gone: u64,
@@ -577,6 +579,7 @@ impl Ring {
             (_, Some(Error::Unknown)) => Fault::Unknown,
             (_, Some(Error::Generation | Error::Conflict)) => Fault::Conflict,
             (_, Some(Error::Gone)) => Fault::Gone,
+            (_, Some(Error::Busy)) => Fault::Busy,
             (_, Some(Error::Open)) => Fault::Bad,
             (_, Some(Error::Failed | Error::Unreadable))
             | (Some(Error::Failed | Error::Changed), _) => Fault::Failed,
@@ -586,6 +589,7 @@ impl Ring {
             Fault::Unknown | Fault::Conflict => s.unknown += 1,
             Fault::Failed => s.failed += 1,
             Fault::Unavailable => s.unavailable += 1,
+            Fault::Busy => s.busy += 1,
             Fault::Gone => s.gone += 1,
             Fault::Bad => s.bad += 1,
         });
@@ -632,7 +636,8 @@ impl Ring {
     async fn join(&self) -> Result<Rc<Client>, Error> {
         let (joined, mut connected) = rt::channel();
         self.inner.joining.borrow_mut().push(joined);
-        let _ = rt::timeout(self.inner.settings.deadline * 2, connected.recv()).await;
+        let settings = self.inner.settings;
+        let _ = rt::timeout(settings.deadline * 2 + settings.retry, connected.recv()).await;
         match &*self.inner.link.borrow() {
             Link::Up(client) if !client.is_closed() => Ok(Rc::clone(client)),
             _ => Err(Error::Closed),

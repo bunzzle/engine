@@ -305,6 +305,11 @@ impl<T: Transport + 'static> Node<T> {
         if matches!(object, Object::Dkim(_)) {
             return Err(control::Error::Invalid("kind").into());
         }
+        let node = self.clone();
+        spawn(async move { node.write_held(object).await }).await
+    }
+
+    async fn write_held(&self, object: Object) -> Result<Update, Error> {
         let mut held = self.hold()?;
         self.create_keys(&object).await?;
         let update = held.writer().write(object).await?;

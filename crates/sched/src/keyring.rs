@@ -35,6 +35,7 @@ fn key_error(fault: Fault) -> KeyError {
     match fault {
         Fault::Unknown | Fault::Gone => KeyError::Unknown,
         Fault::Unavailable => KeyError::Unavailable,
+        Fault::Busy => KeyError::Busy,
         Fault::Failed | Fault::Bad => KeyError::Failed,
         Fault::Conflict => KeyError::Conflict,
     }
@@ -42,7 +43,7 @@ fn key_error(fault: Fault) -> KeyError {
 
 fn unsealable(fault: Fault) -> Unsealable {
     match fault {
-        Fault::Unavailable => Unsealable::Unavailable,
+        Fault::Unavailable | Fault::Busy => Unsealable::Unavailable,
         Fault::Gone => Unsealable::Gone,
         Fault::Unknown | Fault::Conflict => Unsealable::Unknown,
         Fault::Bad => Unsealable::Bad,

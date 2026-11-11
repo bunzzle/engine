@@ -8,6 +8,7 @@ use crate::transport::Transport;
 fn refusal(error: KeyError) -> Refusal {
     match error {
         KeyError::Unavailable | KeyError::Unknown => Refusal::Keys,
+        KeyError::Busy => Refusal::Busy,
         KeyError::Failed | KeyError::Conflict => Refusal::Failed,
     }
 }
@@ -21,9 +22,22 @@ impl<T: Transport + 'static> Node<T> {
         selector: &str,
     ) -> Result<Dkim, Error> {
         Dkim::check_name(domain, selector)?;
+        let node = self.clone();
+        let (domain, selector) = (domain.into(), selector.into());
+        rt::spawn(async move { node.dkim_held(tenant, alg, domain, selector).await }).await
+    }
+
+    async fn dkim_held(
+        &self,
+        tenant: u32,
+        alg: DkimAlg,
+        domain: Box<str>,
+        selector: Box<str>,
+    ) -> Result<Dkim, Error> {
         let generation = self
             .table()
             .tenant(tenant)
+            .filter(|t| t.state == State::Active)
             .map(|t| t.generation)
             .ok_or(control::Error::Refused)?;
         let mut held = self.hold()?;
@@ -42,8 +56,8 @@ impl<T: Transport + 'static> Node<T> {
             tenant,
             generation,
             alg,
-            domain: domain.into(),
-            selector: selector.into(),
+            domain,
+            selector,
             public,
             blob,
         };

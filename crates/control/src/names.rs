@@ -125,7 +125,7 @@ async fn wait_keys(
     loop {
         match tenant_keys(keys, tenant, generation).await {
             Ok(found) => return Ok((found, waits)),
-            Err(KeyError::Unavailable) => {
+            Err(KeyError::Unavailable | KeyError::Busy) => {
                 waits += 1;
                 rt::sleep(pause).await;
                 pause = (pause * 2).min(KEY_WAIT_MAX);

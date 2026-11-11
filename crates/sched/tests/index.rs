@@ -1965,6 +1965,46 @@ fn verifies(dkim: &Dkim, message: &[u8], signed: &[u8]) {
     .expect("verify");
 }
 
+async fn dropped_calls_land_and_bursts_get_busy(
+    nodes: &[Node<Idle>],
+    control: &Node<Idle>,
+    rsa: &Dkim,
+) {
+    let message = b"burst";
+    let digest = digest_of(message);
+    let dropped = timeout(
+        Duration::ZERO,
+        control.dkim_new(1, DkimAlg::Ed25519Sha256, "example.org", "s4"),
+    )
+    .await;
+    assert!(dropped.is_err());
+    dkim_everywhere(nodes, 1, 4).await;
+    let dropped = timeout(Duration::ZERO, control.write(tenant(3, 1, State::Active))).await;
+    assert!(dropped.is_err());
+    wait_for(nodes, 3, 1, State::Active).await;
+    control
+        .write(tenant(3, 1, State::Suspended))
+        .await
+        .expect("writer returned");
+    let burst: Vec<_> = (0..8)
+        .map(|_| {
+            let (node, id) = (control.clone(), rsa.id);
+            spawn(async move { node.sign(1, id, digest).await })
+        })
+        .collect();
+    let mut busy = 0;
+    for task in burst {
+        match task.await {
+            Ok(signed) => verifies(rsa, message, &signed),
+            Err(refusal) => {
+                assert_eq!(refusal, Refusal::Busy);
+                busy += 1;
+            }
+        }
+    }
+    assert!(busy > 0 && busy < 8);
+}
+
 #[test]
 fn dkim_keys_are_made_on_the_control_core_and_sign_on_every_core_after_a_restart() {
     let driver = Rc::new(SimDriver::with_disk(41, Config::default(), created(41)));
@@ -2014,6 +2054,12 @@ fn dkim_keys_are_made_on_the_control_core_and_sign_on_every_core_after_a_restart
             assert_eq!(node.sign(1, 9, digest).await, Err(Refusal::Signer));
             assert_eq!(node.sign(5, first.id, digest).await, Err(Refusal::Tenant));
         }
+        configure(&nodes, vec![tenant(2, 1, State::Suspended)]).await;
+        wait_for(&nodes, 2, 1, State::Suspended).await;
+        assert!(matches!(
+            control.dkim_new(2, ed, "example.org", "s1").await,
+            Err(sched::Error::Control(control::Error::Refused))
+        ));
         vec![first, second]
     });
     assert_eq!(audited(&driver, "load"), 0);
@@ -2046,6 +2092,7 @@ fn dkim_keys_are_made_on_the_control_core_and_sign_on_every_core_after_a_restart
             .await
             .expect("new");
         assert_eq!(third.id, 3);
+        dropped_calls_land_and_bursts_get_busy(&nodes, control, &made[1]).await;
         sleep(Duration::from_millis(300)).await;
     });
     assert_eq!(audited(&driver, "load"), 2);
