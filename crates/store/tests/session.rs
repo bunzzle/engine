@@ -299,7 +299,12 @@ struct Answering {
 }
 
 impl Answering {
-    fn new((session, mut results): (Session, Results), delay: Duration) -> Self {
+    fn new(session: (Session, Results), delay: Duration) -> Self {
+        Self::owning(session, delay, &ALL)
+    }
+
+    fn owning((session, mut results): (Session, Results), delay: Duration, tags: &[u16]) -> Self {
+        let tags = tags.to_vec();
         let session = Rc::new(session);
         let answering = Rc::downgrade(&session);
         let (forward, forwarded) = channel();
@@ -311,7 +316,7 @@ impl Answering {
                         sleep(delay).await;
                         if let Some(session) = answering.upgrade() {
                             session
-                                .parts(sequence, parts(&ALL, sequence))
+                                .parts(sequence, parts(&tags, sequence))
                                 .expect("send parts");
                         }
                     }
@@ -412,6 +417,109 @@ fn a_full_journal_waits_for_the_checkpoint_in_flight() {
             published.await >= 2,
             "the journal wrapped through two checkpoints"
         );
+    });
+}
+
+fn replacing(claim: Claim, byte: u8, previous: Option<Location>) -> Submission {
+    let mut next = Submission {
+        claim,
+        ..submission(0, byte)
+    };
+    if let Some(location) = previous {
+        next.dead.push(Dead {
+            tenant: 1,
+            region: location.region,
+            epoch: location.epoch,
+            offset: location.offset,
+            length: location.size,
+        });
+    }
+    next
+}
+
+async fn to_the_reserve(core: &mut Answering) -> Option<Location> {
+    let mut previous = None;
+    let mut intake = 0u32;
+    loop {
+        match core.commit(replacing(Claim::Intake, 1, previous)).await {
+            Ok((_, locations)) => previous = Some(locations[0]),
+            Err(Error::Reserve) => break,
+            Err(e) => panic!("intake {intake}: {e}"),
+        }
+        intake += 1;
+        assert!(intake < 10_000, "intake never reached the reserve");
+    }
+    assert!(intake > 8);
+    previous
+}
+
+async fn intake_returns(core: &mut Answering, previous: Option<Location>) {
+    let mut tries = 0;
+    while let Err(e) = core.commit(replacing(Claim::Intake, 4, previous)).await {
+        assert!(matches!(e, Error::Reserve) && tries < 100, "{tries}: {e}");
+        tries += 1;
+        sleep(Duration::from_millis(10)).await;
+    }
+}
+
+#[test]
+fn an_abandoned_checkpoint_inside_the_reserve_starts_again_on_intake() {
+    run(14, async {
+        let (client, mut sessions, committer) = start(2, 2, Duration::from_hours(24)).await;
+        let (session, mut results) = sessions.pop().expect("late session");
+        let mut core = Answering::owning(sessions.remove(0), Duration::ZERO, &[0, 2]);
+        let previous = to_the_reserve(&mut core).await;
+        drop(spawn(async move {
+            let mut cuts = 0;
+            while let Some(event) = results.recv().await {
+                if let Event::Cut { sequence } = event {
+                    let replay = if cuts == 0 { sequence + 1 } else { sequence };
+                    cuts += 1;
+                    session
+                        .parts(sequence, parts(&[1, 3], replay))
+                        .expect("send parts");
+                }
+                if matches!(event, Event::Published { .. }) {
+                    return;
+                }
+            }
+        }));
+        intake_returns(&mut core, previous).await;
+        drop(client);
+        let published = core.finish();
+        drop(committer.await);
+        assert!(published.await >= 1);
+    });
+}
+
+#[test]
+fn a_stalled_checkpoint_refuses_intake_first_and_keeps_room_for_other_writes() {
+    run(13, async {
+        let (client, mut sessions, committer) = start(2, 2, Duration::from_hours(24)).await;
+        let silent = sessions.pop().expect("silent session");
+        let mut core = Answering::owning(sessions.remove(0), Duration::ZERO, &[0, 2]);
+        let mut previous = to_the_reserve(&mut core).await;
+        let claims = [Claim::Control, Claim::Internal].into_iter().cycle();
+        for (step, claim) in claims.take(8).enumerate() {
+            let (_, locations) = core
+                .commit(replacing(claim, 2, previous))
+                .await
+                .unwrap_or_else(|e| panic!("{claim:?} {step}: {e}"));
+            previous = Some(locations[0]);
+            let refused = core.commit(replacing(Claim::Intake, 3, previous)).await;
+            assert!(
+                matches!(refused, Err(Error::Reserve)),
+                "{step}: {refused:?}"
+            );
+        }
+        let (session, results) = silent;
+        let late = answer_cuts(session, results, vec![1, 3], true);
+        intake_returns(&mut core, previous).await;
+        assert!(matches!(late.await.last(), Some(Event::Published { .. })));
+        drop(client);
+        let published = core.finish();
+        drop(committer.await);
+        assert!(published.await >= 1);
     });
 }
 

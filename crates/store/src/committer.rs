@@ -67,6 +67,7 @@ pub struct Durable {
 }
 
 pub const PART_TIMEOUT: Duration = Duration::from_secs(60);
+const JOURNAL_RESERVE: u64 = 4;
 
 pub(crate) enum Reply {
     Once(Sender<Result<Durable, Error>>),
@@ -425,6 +426,22 @@ impl Committer {
         self.journal.size() - self.journal.free() >= self.journal.size() / 2
     }
 
+    fn hold_intake(&mut self, batch: Vec<(Submission, Reply)>) -> Vec<(Submission, Reply)> {
+        if self.journal.free() >= self.journal.size() / JOURNAL_RESERVE {
+            return batch;
+        }
+        if !self.checkpoint_in_flight() {
+            self.begin_checkpoint(None);
+        }
+        let (held, kept): (Vec<_>, Vec<_>) = batch
+            .into_iter()
+            .partition(|(submission, _)| submission.claim == Claim::Intake);
+        for (_, reply) in held {
+            self.reply(reply, Err(Error::Reserve));
+        }
+        kept
+    }
+
     fn allocate(&mut self, claim: Claim) -> Result<(u32, u64), Error> {
         if matches!(claim, Claim::State | Claim::Flush | Claim::Index) {
             return Err(Error::Invalid("claim"));
@@ -456,7 +473,7 @@ impl Committer {
             ..Load::default()
         };
         let base = load;
-        let mut batch = batch.into_iter();
+        let mut batch = self.hold_intake(batch).into_iter();
         while let Some((submission, reply)) = batch.next() {
             if !load.add(&submission).fits() {
                 if base.add(&submission).fits() {
