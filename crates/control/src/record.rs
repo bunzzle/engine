@@ -1,20 +1,29 @@
 use std::net::{IpAddr, Ipv6Addr};
 
+use crypto::DkimAlg;
+
 use crate::error::Error;
+use crate::queue::{MAX_DOMAIN, domain_ok};
 
 pub const KIND_TENANT: u8 = 1;
 pub const KIND_POOL: u8 = 2;
 pub const KIND_QUEUE: u8 = 3;
 pub const KIND_NODE: u8 = 4;
+pub const KIND_DKIM: u8 = 5;
 pub const SYSTEM: u32 = 0;
 pub const MAX_POOLS: usize = 16;
 pub const MAX_ADDRESSES: usize = 64;
+pub const MAX_SELECTOR: usize = 63;
+pub const MAX_PUBLIC: usize = 1024;
+pub const MAX_BLOB: usize = 3072;
 
 const FORMAT: u8 = 1;
 const HEAD: usize = 16;
 const TENANT: usize = 32;
 const POOL: usize = 4;
 const ADDRESS: usize = 20;
+const DKIM: usize = 16;
+const DOMAINKEY: &str = "._domainkey.";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum State {
@@ -63,9 +72,86 @@ pub struct Pool {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Dkim {
+    pub id: u32,
+    pub tenant: u32,
+    pub generation: u32,
+    pub alg: DkimAlg,
+    pub domain: Box<str>,
+    pub selector: Box<str>,
+    pub public: Vec<u8>,
+    pub blob: Vec<u8>,
+}
+
+impl Dkim {
+    pub fn check_name(domain: &str, selector: &str) -> Result<(), Error> {
+        if !domain_ok(domain) {
+            return Err(Error::Invalid("domain"));
+        }
+        if !domain_ok(selector)
+            || selector.len() > MAX_SELECTOR
+            || selector.len() + DOMAINKEY.len() + domain.len() > MAX_DOMAIN
+        {
+            return Err(Error::Invalid("selector"));
+        }
+        Ok(())
+    }
+
+    pub fn name(&self) -> String {
+        format!("{}{DOMAINKEY}{}", self.selector, self.domain)
+    }
+
+    pub fn txt(&self) -> String {
+        let k = match self.alg {
+            DkimAlg::RsaSha256 => "rsa",
+            DkimAlg::Ed25519Sha256 => "ed25519",
+        };
+        format!("v=DKIM1; k={k}; p={}", base64(&self.public))
+    }
+
+    fn check(&self) -> Result<(), Error> {
+        if self.tenant == SYSTEM {
+            return Err(Error::Invalid("tenant id"));
+        }
+        Self::check_name(&self.domain, &self.selector)?;
+        let public_ok = match self.alg {
+            DkimAlg::Ed25519Sha256 => self.public.len() == 32,
+            DkimAlg::RsaSha256 => !self.public.is_empty() && self.public.len() <= MAX_PUBLIC,
+        };
+        if !public_ok {
+            return Err(Error::Invalid("public key"));
+        }
+        if self.blob.is_empty() || self.blob.len() > MAX_BLOB {
+            return Err(Error::Invalid("blob"));
+        }
+        Ok(())
+    }
+}
+
+fn base64(bytes: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let n = chunk
+            .iter()
+            .enumerate()
+            .fold(0_u32, |n, (i, b)| n | u32::from(*b) << (16 - 8 * i));
+        for i in 0..4 {
+            if i <= chunk.len() {
+                out.push(char::from(TABLE[(n >> (18 - 6 * i)) as usize & 63]));
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Object {
     Tenant(Tenant),
     Pool(Pool),
+    Dkim(Dkim),
 }
 
 impl Object {
@@ -73,6 +159,7 @@ impl Object {
         match self {
             Self::Tenant(_) => KIND_TENANT,
             Self::Pool(_) => KIND_POOL,
+            Self::Dkim(_) => KIND_DKIM,
         }
     }
 
@@ -80,6 +167,7 @@ impl Object {
         match self {
             Self::Tenant(t) => t.id,
             Self::Pool(p) => p.id,
+            Self::Dkim(d) => d.id,
         }
     }
 
@@ -87,6 +175,7 @@ impl Object {
         match self {
             Self::Tenant(t) => t.id,
             Self::Pool(_) => SYSTEM,
+            Self::Dkim(d) => d.tenant,
         }
     }
 
@@ -114,6 +203,7 @@ impl Object {
                     return Err(Error::Invalid("addresses"));
                 }
             }
+            Self::Dkim(d) => d.check()?,
         }
         Ok(())
     }
@@ -161,6 +251,23 @@ impl Update {
                     out.extend_from_slice(&[0; ADDRESS - 18]);
                 }
             }
+            Object::Dkim(d) => {
+                let mut body = [0; DKIM];
+                body[0..4].copy_from_slice(&d.generation.to_le_bytes());
+                body[4] = d.alg.code();
+                body[5] = u8::try_from(d.domain.len()).expect("domain checked");
+                body[6] = u8::try_from(d.selector.len()).expect("selector checked");
+                let public = u16::try_from(d.public.len()).expect("public key checked");
+                let blob = u16::try_from(d.blob.len()).expect("blob checked");
+                body[8..10].copy_from_slice(&public.to_le_bytes());
+                body[10..12].copy_from_slice(&blob.to_le_bytes());
+                body[12..16].copy_from_slice(&d.tenant.to_le_bytes());
+                out.extend_from_slice(&body);
+                out.extend_from_slice(d.domain.as_bytes());
+                out.extend_from_slice(d.selector.as_bytes());
+                out.extend_from_slice(&d.public);
+                out.extend_from_slice(&d.blob);
+            }
         }
         out
     }
@@ -176,6 +283,7 @@ impl Update {
         let object = match head[1] {
             KIND_TENANT => Object::Tenant(tenant(id, rest)?),
             KIND_POOL => Object::Pool(pool(id, rest)?),
+            KIND_DKIM => Object::Dkim(dkim(id, rest)?),
             _ => return None,
         };
         object.check().ok()?;
@@ -238,4 +346,36 @@ fn pool(id: u32, rest: &[u8]) -> Option<Pool> {
         })
         .collect::<Option<_>>()?;
     Some(Pool { id, addresses })
+}
+
+fn dkim(id: u32, rest: &[u8]) -> Option<Dkim> {
+    let body = rest.get(..DKIM)?;
+    if body[7] != 0 {
+        return None;
+    }
+    let lengths = [
+        usize::from(body[5]),
+        usize::from(body[6]),
+        usize::from(u16::from_le_bytes(body[8..10].try_into().ok()?)),
+        usize::from(u16::from_le_bytes(body[10..12].try_into().ok()?)),
+    ];
+    let mut list = &rest[DKIM..];
+    if list.len() != lengths.iter().sum::<usize>() {
+        return None;
+    }
+    let [domain, selector, public, blob] = lengths.map(|length| {
+        let (part, next) = list.split_at(length);
+        list = next;
+        part
+    });
+    Some(Dkim {
+        id,
+        tenant: u32_at(body, 12)?,
+        generation: u32_at(body, 0)?,
+        alg: DkimAlg::from_code(body[4])?,
+        domain: str::from_utf8(domain).ok()?.into(),
+        selector: str::from_utf8(selector).ok()?.into(),
+        public: public.to_vec(),
+        blob: blob.to_vec(),
+    })
 }

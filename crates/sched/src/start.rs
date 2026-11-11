@@ -108,6 +108,25 @@ impl<T> Clone for Node<T> {
     }
 }
 
+pub(crate) struct Held<'a> {
+    slot: &'a RefCell<Option<Writer>>,
+    writing: &'a Cell<bool>,
+    writer: Option<Writer>,
+}
+
+impl Held<'_> {
+    pub(crate) fn writer(&mut self) -> &mut Writer {
+        self.writer.as_mut().expect("held until drop")
+    }
+}
+
+impl Drop for Held<'_> {
+    fn drop(&mut self) {
+        *self.slot.borrow_mut() = self.writer.take();
+        self.writing.set(false);
+    }
+}
+
 pub struct Running {
     done: Vec<JoinHandle<()>>,
     owner: JoinHandle<Keeper>,
@@ -283,30 +302,44 @@ impl<T: Transport + 'static> Node<T> {
     }
 
     pub async fn write(&self, object: Object) -> Result<Update, Error> {
+        if matches!(object, Object::Dkim(_)) {
+            return Err(control::Error::Invalid("kind").into());
+        }
+        let node = self.clone();
+        spawn(async move { node.write_held(object).await }).await
+    }
+
+    async fn write_held(&self, object: Object) -> Result<Update, Error> {
+        let mut held = self.hold()?;
+        self.create_keys(&object).await?;
+        let update = held.writer().write(object).await?;
+        drop(held);
+        self.broadcast(&update);
+        Ok(update)
+    }
+
+    pub(crate) fn hold(&self) -> Result<Held<'_>, Error> {
         let inner = &self.inner;
         if inner.writing.replace(true) {
             return Err(control::Error::Busy.into());
         }
-        let taken = inner.writer.borrow_mut().take();
-        let Some(mut writer) = taken else {
+        let Some(writer) = inner.writer.borrow_mut().take() else {
             inner.writing.set(false);
             return Err(control::Error::Invalid("core").into());
         };
-        if let Err(error) = self.create_keys(&object).await {
-            *inner.writer.borrow_mut() = Some(writer);
-            inner.writing.set(false);
-            return Err(error.into());
-        }
-        let written = writer.write(object).await;
-        *inner.writer.borrow_mut() = Some(writer);
-        inner.writing.set(false);
-        let update = written?;
+        Ok(Held {
+            slot: &inner.writer,
+            writing: &inner.writing,
+            writer: Some(writer),
+        })
+    }
+
+    pub(crate) fn broadcast(&self, update: &Update) {
         broadcast(
-            &inner.config,
-            inner.cores,
+            &self.inner.config,
+            self.inner.cores,
             &control::Note::Update(update.clone()),
         );
-        Ok(update)
     }
 
     async fn create_keys(&self, object: &Object) -> Result<(), control::Error> {

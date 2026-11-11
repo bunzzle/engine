@@ -143,6 +143,7 @@ impl Label {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum KeyError {
     Unavailable,
+    Busy,
     Unknown,
     Failed,
     Conflict,

@@ -164,6 +164,7 @@ dependencies = [
 name = "sched"
 version = "0.0.0"
 dependencies = [
+ "aws-lc-rs",
  "control",
  "crypto",
  "index",

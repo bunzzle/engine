@@ -4,7 +4,7 @@ use std::pin::Pin;
 use std::rc::Rc;
 use std::time::Duration;
 
-use crypto::{Secret, TenantKeys, Wrap};
+use crypto::{DkimAlg, Secret, TenantKeys, Wrap};
 use rt::{Instant, Sender};
 
 use crate::cache::{Cache, CacheStats};
@@ -18,6 +18,7 @@ const DAY_MS: u64 = 86_400_000;
 
 type Waiters = Vec<Sender<Result<Working, Fault>>>;
 type Unwrapping = (Wrap, Vec<Sender<Result<Secret<32>, Fault>>>);
+type Loading = (DkimAlg, Vec<u8>, Vec<Sender<Result<(), Fault>>>);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RingSettings {
@@ -70,6 +71,7 @@ pub fn wall_day() -> u32 {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Fault {
     Unavailable,
+    Busy,
     Unknown,
     Failed,
     Conflict,
@@ -86,11 +88,15 @@ pub struct RingStats {
     pub opens: u64,
     pub unknown: u64,
     pub unavailable: u64,
+    pub busy: u64,
     pub failed: u64,
     pub unwraps: u64,
     pub gone: u64,
     pub bad: u64,
     pub refreshes: u64,
+    pub dkim_new: u64,
+    pub loads: u64,
+    pub signs: u64,
     pub behind: u32,
     pub settled: u32,
     pub tenants: CacheStats,
@@ -111,12 +117,14 @@ struct Inner {
     settings: RingSettings,
     connect: Connect,
     link: RefCell<Link>,
+    joining: RefCell<Vec<Sender<()>>>,
     naming: RefCell<Option<Secret<16>>>,
     day: Cell<u32>,
     failed: Cell<bool>,
     tenants: RefCell<Cache<(u32, u32), Working>>,
     opening: RefCell<HashMap<(u32, u32), Waiters>>,
     unwrapping: RefCell<HashMap<(u32, u32, u16, u64), Unwrapping>>,
+    loading: RefCell<HashMap<(u32, u32, u32), Loading>>,
     refreshed: RefCell<HashMap<(u32, u32), Instant>>,
     settled: Cell<u32>,
     settling: Cell<bool>,
@@ -130,12 +138,18 @@ struct Pending<'a> {
 
 impl Drop for Pending<'_> {
     fn drop(&mut self) {
-        let mut link = self.ring.inner.link.borrow_mut();
-        if matches!(*link, Link::Connecting) {
-            *link = Link::Down {
-                retry_at: rt::now(),
-                pause: self.pause,
-            };
+        let inner = &self.ring.inner;
+        {
+            let mut link = inner.link.borrow_mut();
+            if matches!(*link, Link::Connecting) {
+                *link = Link::Down {
+                    retry_at: rt::now(),
+                    pause: self.pause,
+                };
+            }
+        }
+        for joined in inner.joining.borrow_mut().drain(..) {
+            let _ = joined.send(());
         }
     }
 }
@@ -150,12 +164,14 @@ impl Ring {
                     retry_at: rt::now(),
                     pause: settings.retry,
                 }),
+                joining: RefCell::new(Vec::new()),
                 naming: RefCell::new(None),
                 day: Cell::new(0),
                 failed: Cell::new(false),
                 tenants: RefCell::new(Cache::new(settings.tenants)),
                 opening: RefCell::new(HashMap::new()),
                 unwrapping: RefCell::new(HashMap::new()),
+                loading: RefCell::new(HashMap::new()),
                 refreshed: RefCell::new(HashMap::new()),
                 settled: Cell::new(0),
                 settling: Cell::new(false),
@@ -232,9 +248,10 @@ impl Ring {
         let client = self.client().await?;
         let settings = self.inner.settings;
         let limit = match request {
-            Request::Hello { .. } | Request::Open { .. } | Request::Unwrap { .. } => {
-                settings.deadline
-            }
+            Request::Hello { .. }
+            | Request::Open { .. }
+            | Request::Unwrap { .. }
+            | Request::Sign { .. } => settings.deadline,
             _ => settings.slow,
         };
         match client.call_within(request, limit).await {
@@ -417,6 +434,108 @@ impl Ring {
         Ok(())
     }
 
+    pub async fn dkim_new(
+        &self,
+        tenant: u32,
+        generation: u32,
+        key: u32,
+        alg: DkimAlg,
+    ) -> Result<(Vec<u8>, Vec<u8>), Fault> {
+        self.count(|s| s.dkim_new += 1);
+        let request = Request::DkimNew {
+            tenant,
+            generation,
+            key,
+            alg,
+        };
+        match self.checked(&request).await? {
+            Answer::Dkim { public, blob } => Ok((public, blob)),
+            _ => Err(self.fault(None, None)),
+        }
+    }
+
+    pub async fn load(
+        &self,
+        tenant: u32,
+        generation: u32,
+        key: u32,
+        alg: DkimAlg,
+        blob: &[u8],
+    ) -> Result<(), Fault> {
+        let id = (tenant, generation, key);
+        let (reply, mut answer) = rt::channel();
+        let first = {
+            let mut loading = self.inner.loading.borrow_mut();
+            let (asked, asked_blob, waiting) = loading
+                .entry(id)
+                .or_insert_with(|| (alg, blob.to_vec(), Vec::new()));
+            if (*asked, asked_blob.as_slice()) != (alg, blob) {
+                drop(loading);
+                self.count(|s| s.bad += 1);
+                return Err(Fault::Conflict);
+            }
+            waiting.push(reply);
+            waiting.len() == 1
+        };
+        if first {
+            let ring = self.clone();
+            let request = Request::Load {
+                tenant,
+                generation,
+                key,
+                alg,
+                blob: blob.to_vec(),
+            };
+            rt::spawn(async move {
+                ring.count(|s| s.loads += 1);
+                let result = match ring.checked(&request).await {
+                    Ok(Answer::Done) => Ok(()),
+                    Ok(_) => Err(ring.fault(None, None)),
+                    Err(fault) => Err(fault),
+                };
+                let waiting = ring.inner.loading.borrow_mut().remove(&id);
+                for waiter in waiting.map(|(_, _, waiting)| waiting).unwrap_or_default() {
+                    let _ = waiter.send(result);
+                }
+            });
+        }
+        answer.recv().await.unwrap_or(Err(Fault::Unavailable))
+    }
+
+    pub async fn sign(
+        &self,
+        tenant: u32,
+        generation: u32,
+        key: u32,
+        alg: DkimAlg,
+        digest: [u8; 32],
+    ) -> Result<Vec<u8>, Fault> {
+        self.count(|s| s.signs += 1);
+        let request = Request::Sign {
+            tenant,
+            generation,
+            key,
+            alg,
+            digest,
+        };
+        match self.checked(&request).await? {
+            Answer::Signature(signature) => Ok(signature),
+            _ => Err(self.fault(None, None)),
+        }
+    }
+
+    async fn checked(&self, request: &Request) -> Result<Answer, Fault> {
+        if self.failed() {
+            self.count(|s| s.refused += 1);
+            return Err(Fault::Failed);
+        }
+        match self.call(request).await {
+            Ok(Answer::Refused(refused)) => Err(self.fault(None, Some(refused))),
+            Ok(answer) => Ok(answer),
+            Err(error) => Err(self.fault(Some(error), None)),
+        }
+    }
+
     async fn fetch(&self, tenant: u32, generation: u32) -> Result<Working, Fault> {
         self.count(|s| s.opens += 1);
         let answer = self.call(&Request::Open { tenant, generation }).await;
@@ -458,8 +577,9 @@ impl Ring {
     fn fault(&self, error: Option<Error>, refused: Option<Error>) -> Fault {
         let fault = match (error, refused) {
             (_, Some(Error::Unknown)) => Fault::Unknown,
-            (_, Some(Error::Generation)) => Fault::Conflict,
+            (_, Some(Error::Generation | Error::Conflict)) => Fault::Conflict,
             (_, Some(Error::Gone)) => Fault::Gone,
+            (_, Some(Error::Busy)) => Fault::Busy,
             (_, Some(Error::Open)) => Fault::Bad,
             (_, Some(Error::Failed | Error::Unreadable))
             | (Some(Error::Failed | Error::Changed), _) => Fault::Failed,
@@ -469,6 +589,7 @@ impl Ring {
             Fault::Unknown | Fault::Conflict => s.unknown += 1,
             Fault::Failed => s.failed += 1,
             Fault::Unavailable => s.unavailable += 1,
+            Fault::Busy => s.busy += 1,
             Fault::Gone => s.gone += 1,
             Fault::Bad => s.bad += 1,
         });
@@ -482,14 +603,17 @@ impl Ring {
         }
         let pause = match &*self.inner.link.borrow() {
             Link::Up(client) if !client.is_closed() => return Ok(Rc::clone(client)),
-            Link::Up(_) => self.inner.settings.retry,
-            Link::Connecting => return Err(Error::Closed),
+            Link::Up(_) => Some(self.inner.settings.retry),
+            Link::Connecting => None,
             Link::Down { retry_at, pause } => {
                 if rt::now() < *retry_at {
                     return Err(Error::Closed);
                 }
-                *pause
+                Some(*pause)
             }
+        };
+        let Some(pause) = pause else {
+            return self.join().await;
         };
         *self.inner.link.borrow_mut() = Link::Connecting;
         let pending = Pending { ring: self, pause };
@@ -507,6 +631,17 @@ impl Ring {
         *self.inner.link.borrow_mut() = next;
         drop(pending);
         connected
+    }
+
+    async fn join(&self) -> Result<Rc<Client>, Error> {
+        let (joined, mut connected) = rt::channel();
+        self.inner.joining.borrow_mut().push(joined);
+        let settings = self.inner.settings;
+        let _ = rt::timeout(settings.deadline * 2 + settings.retry, connected.recv()).await;
+        match &*self.inner.link.borrow() {
+            Link::Up(client) if !client.is_closed() => Ok(Rc::clone(client)),
+            _ => Err(Error::Closed),
+        }
     }
 
     async fn connect(&self) -> Result<Rc<Client>, Error> {

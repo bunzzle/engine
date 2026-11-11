@@ -8,8 +8,11 @@ use std::rc::Rc;
 use std::task::Poll;
 use std::time::Duration;
 
-use control::{Created, KeyError, KeySource, Naming, Object, Pool, Ready, State, Table, Tenant};
-use crypto::{BatchKey, Secret, Tenant as Root, TenantKeys, Wrap, day_public, open_batch};
+use aws_lc_rs::signature::{ED25519, RSA_PKCS1_2048_8192_SHA256, UnparsedPublicKey};
+use control::{
+    Created, Dkim, KeyError, KeySource, Naming, Object, Pool, Ready, State, Table, Tenant,
+};
+use crypto::{BatchKey, DkimAlg, Secret, Tenant as Root, TenantKeys, Wrap, day_public, open_batch};
 use index::{Entry, Op};
 use keys::{
     Audit, BatchSettings, Batches, Client as KeyClient, Connect, Ring, RingSettings, Server,
@@ -1020,6 +1023,10 @@ fn body_chunks_open_in_order_and_a_cut_stream_is_refused() {
 }
 
 fn unwraps(driver: &SimDriver) -> u64 {
+    audited(driver, "unwrap")
+}
+
+fn audited(driver: &SimDriver, op: &str) -> u64 {
     let disk = driver.disk();
     let Some(audit) = disk.contents(&Path::new(KEYS_DIR).join("audit")) else {
         return 0;
@@ -1027,7 +1034,7 @@ fn unwraps(driver: &SimDriver) -> u64 {
     String::from_utf8(audit.to_vec())
         .expect("text")
         .lines()
-        .filter(|line| line.contains(" unwrap 1 1 "))
+        .filter(|line| line.contains(&format!(" {op} 1 1 ")))
         .filter_map(|line| line.rsplit(' ').next()?.parse::<u64>().ok())
         .sum()
 }
@@ -1930,4 +1937,164 @@ fn index_survives_crashes_on_two_cores() {
 #[test]
 fn index_survives_crashes_on_four_cores() {
     check(0..4, |seed| index_crash(seed, 4));
+}
+
+async fn dkim_everywhere(nodes: &[Node<Idle>], tenant: u32, id: u32) {
+    for node in nodes {
+        while node.table().dkim(tenant, id).is_none() {
+            sleep(Duration::from_millis(1)).await;
+        }
+    }
+}
+
+fn digest_of(message: &[u8]) -> [u8; 32] {
+    aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, message)
+        .as_ref()
+        .try_into()
+        .expect("32 bytes")
+}
+
+fn verifies(dkim: &Dkim, message: &[u8], signed: &[u8]) {
+    match dkim.alg {
+        DkimAlg::Ed25519Sha256 => {
+            UnparsedPublicKey::new(&ED25519, &dkim.public).verify(&digest_of(message), signed)
+        }
+        DkimAlg::RsaSha256 => UnparsedPublicKey::new(&RSA_PKCS1_2048_8192_SHA256, &dkim.public)
+            .verify(message, signed),
+    }
+    .expect("verify");
+}
+
+async fn dropped_calls_land_and_bursts_get_busy(
+    nodes: &[Node<Idle>],
+    control: &Node<Idle>,
+    rsa: &Dkim,
+) {
+    let message = b"burst";
+    let digest = digest_of(message);
+    let dropped = timeout(
+        Duration::ZERO,
+        control.dkim_new(1, DkimAlg::Ed25519Sha256, "example.org", "s4"),
+    )
+    .await;
+    assert!(dropped.is_err());
+    dkim_everywhere(nodes, 1, 4).await;
+    let dropped = timeout(Duration::ZERO, control.write(tenant(3, 1, State::Active))).await;
+    assert!(dropped.is_err());
+    wait_for(nodes, 3, 1, State::Active).await;
+    control
+        .write(tenant(3, 1, State::Suspended))
+        .await
+        .expect("writer returned");
+    let burst: Vec<_> = (0..8)
+        .map(|_| {
+            let (node, id) = (control.clone(), rsa.id);
+            spawn(async move { node.sign(1, id, digest).await })
+        })
+        .collect();
+    let mut busy = 0;
+    for task in burst {
+        match task.await {
+            Ok(signed) => verifies(rsa, message, &signed),
+            Err(refusal) => {
+                assert_eq!(refusal, Refusal::Busy);
+                busy += 1;
+            }
+        }
+    }
+    assert!(busy > 0 && busy < 8);
+}
+
+#[test]
+fn dkim_keys_are_made_on_the_control_core_and_sign_on_every_core_after_a_restart() {
+    let driver = Rc::new(SimDriver::with_disk(41, Config::default(), created(41)));
+    let cluster = started_with_keys(&driver, 2);
+    let nodes = cluster.nodes.clone();
+    let made = cluster.run(async move {
+        keys_listening().await;
+        ready(&nodes).await;
+        let control = nodes.iter().find(|n| n.controls()).expect("control core");
+        let other = nodes.iter().find(|n| !n.controls()).expect("other core");
+        let ed = DkimAlg::Ed25519Sha256;
+        assert!(matches!(
+            other.dkim_new(1, ed, "example.org", "s1").await,
+            Err(sched::Error::Control(control::Error::Invalid("core")))
+        ));
+        assert!(matches!(
+            control.dkim_new(1, ed, "example.org", "s_1").await,
+            Err(sched::Error::Control(control::Error::Invalid("selector")))
+        ));
+        assert!(matches!(
+            control.dkim_new(7, ed, "example.org", "s1").await,
+            Err(sched::Error::Control(control::Error::Refused))
+        ));
+        let first = control
+            .dkim_new(1, ed, "example.org", "s1")
+            .await
+            .expect("new");
+        let second = control
+            .dkim_new(1, DkimAlg::RsaSha256, "example.org", "s2")
+            .await
+            .expect("new");
+        assert_eq!((first.id, second.id), (1, 2));
+        assert!(second.txt().starts_with("v=DKIM1; k=rsa; p=MIIBIjAN"));
+        assert!(matches!(
+            control.write(Object::Dkim(first.clone())).await,
+            Err(sched::Error::Control(control::Error::Invalid("kind")))
+        ));
+        dkim_everywhere(&nodes, 1, 2).await;
+        let message = b"from:a@example.org";
+        let digest = digest_of(message);
+        for node in &nodes {
+            for made in [&first, &second] {
+                let signed = node.sign(1, made.id, digest).await.expect("sign");
+                verifies(made, message, &signed);
+            }
+            assert_eq!(node.sign(2, first.id, digest).await, Err(Refusal::Signer));
+            assert_eq!(node.sign(1, 9, digest).await, Err(Refusal::Signer));
+            assert_eq!(node.sign(5, first.id, digest).await, Err(Refusal::Tenant));
+        }
+        configure(&nodes, vec![tenant(2, 1, State::Suspended)]).await;
+        wait_for(&nodes, 2, 1, State::Suspended).await;
+        assert!(matches!(
+            control.dkim_new(2, ed, "example.org", "s1").await,
+            Err(sched::Error::Control(control::Error::Refused))
+        ));
+        vec![first, second]
+    });
+    assert_eq!(audited(&driver, "load"), 0);
+    drop(cluster);
+    let driver = Rc::new(SimDriver::with_disk(42, Config::default(), driver.crash()));
+    let restarted = started_with_keys(&driver, 2);
+    let nodes = restarted.nodes.clone();
+    restarted.run(async move {
+        keys_listening().await;
+        wait_for(&nodes, 1, 1, State::Active).await;
+        dkim_everywhere(&nodes, 1, 2).await;
+        let message = b"to:b@example.org";
+        let digest = digest_of(message);
+        for node in &nodes {
+            for made in &made {
+                let tasks: Vec<_> = (0..4)
+                    .map(|_| {
+                        let (node, id) = (node.clone(), made.id);
+                        spawn(async move { node.sign(1, id, digest).await })
+                    })
+                    .collect();
+                for task in tasks {
+                    verifies(made, message, &task.await.expect("sign"));
+                }
+            }
+        }
+        let control = nodes.iter().find(|n| n.controls()).expect("control core");
+        let third = control
+            .dkim_new(1, DkimAlg::Ed25519Sha256, "example.org", "s3")
+            .await
+            .expect("new");
+        assert_eq!(third.id, 3);
+        dropped_calls_land_and_bursts_get_busy(&nodes, control, &made[1]).await;
+        sleep(Duration::from_millis(300)).await;
+    });
+    assert_eq!(audited(&driver, "load"), 2);
+    restarted.stop();
 }

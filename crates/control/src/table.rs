@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use rt::Peers;
 
-use crate::record::{Object, Pool, Tenant, Update};
+use crate::record::{Dkim, Object, Pool, Tenant, Update};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Note {
@@ -28,6 +28,7 @@ pub struct Table {
     version: u64,
     tenants: BTreeMap<u32, Tenant>,
     pools: BTreeMap<u32, Pool>,
+    dkims: BTreeMap<u32, Dkim>,
     waiting: BTreeMap<u64, Object>,
 }
 
@@ -37,6 +38,7 @@ impl Table {
         self.version = snapshot.version;
         self.tenants.clear();
         self.pools.clear();
+        self.dkims.clear();
         for object in snapshot.objects {
             self.set(object);
         }
@@ -78,6 +80,14 @@ impl Table {
         self.pools.get(&id)
     }
 
+    pub fn dkim(&self, tenant: u32, id: u32) -> Option<&Dkim> {
+        self.dkims.get(&id).filter(|d| d.tenant == tenant)
+    }
+
+    pub fn dkims(&self, tenant: u32) -> impl Iterator<Item = &Dkim> {
+        self.dkims.values().filter(move |d| d.tenant == tenant)
+    }
+
     pub fn tenants(&self) -> impl Iterator<Item = &Tenant> {
         self.tenants.values()
     }
@@ -103,6 +113,9 @@ impl Table {
             }
             Object::Pool(p) => {
                 self.pools.insert(p.id, p);
+            }
+            Object::Dkim(d) => {
+                self.dkims.insert(d.id, d);
             }
         }
     }

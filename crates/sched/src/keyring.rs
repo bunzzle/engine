@@ -2,10 +2,10 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use control::{Created, KeyError, KeySource, Ready};
-use crypto::{BatchKey, TenantKeys, Wrap};
+use crypto::{BatchKey, DkimAlg, TenantKeys, Wrap};
 use keys::{BatchSettings, BatchStats, Batches, Fault, Ring};
 
-use crate::sealing::{Batched, Keys, Oldest, Unsealable, Unwrapped};
+use crate::sealing::{Batched, Keys, Loaded, Made, Oldest, Signed, Unsealable, Unwrapped};
 
 pub struct Keyring {
     ring: Ring,
@@ -35,6 +35,7 @@ fn key_error(fault: Fault) -> KeyError {
     match fault {
         Fault::Unknown | Fault::Gone => KeyError::Unknown,
         Fault::Unavailable => KeyError::Unavailable,
+        Fault::Busy => KeyError::Busy,
         Fault::Failed | Fault::Bad => KeyError::Failed,
         Fault::Conflict => KeyError::Conflict,
     }
@@ -42,7 +43,7 @@ fn key_error(fault: Fault) -> KeyError {
 
 fn unsealable(fault: Fault) -> Unsealable {
     match fault {
-        Fault::Unavailable => Unsealable::Unavailable,
+        Fault::Unavailable | Fault::Busy => Unsealable::Unavailable,
         Fault::Gone => Unsealable::Gone,
         Fault::Unknown | Fault::Conflict => Unsealable::Unknown,
         Fault::Bad => Unsealable::Bad,
@@ -92,6 +93,47 @@ impl Keys for Keyring {
                 .fresh(tenant, generation)
                 .await
                 .map(|working| working.oldest)
+                .map_err(key_error)
+        })
+    }
+
+    fn dkim_new(&self, tenant: u32, generation: u32, key: u32, alg: DkimAlg) -> Made<'_> {
+        Box::pin(async move {
+            self.ring
+                .dkim_new(tenant, generation, key, alg)
+                .await
+                .map_err(key_error)
+        })
+    }
+
+    fn dkim_load<'a>(
+        &'a self,
+        tenant: u32,
+        generation: u32,
+        key: u32,
+        alg: DkimAlg,
+        blob: &'a [u8],
+    ) -> Loaded<'a> {
+        Box::pin(async move {
+            self.ring
+                .load(tenant, generation, key, alg, blob)
+                .await
+                .map_err(key_error)
+        })
+    }
+
+    fn sign(
+        &self,
+        tenant: u32,
+        generation: u32,
+        key: u32,
+        alg: DkimAlg,
+        digest: [u8; 32],
+    ) -> Signed<'_> {
+        Box::pin(async move {
+            self.ring
+                .sign(tenant, generation, key, alg, digest)
+                .await
                 .map_err(key_error)
         })
     }
