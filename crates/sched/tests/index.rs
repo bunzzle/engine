@@ -2160,6 +2160,8 @@ fn a_deleted_tenant_is_refused_loses_its_mail_and_never_opens_again() {
             tenant(1, 1, State::Active),
             tenant(1, 1, State::Deleted),
             tenant(1, 3, State::Active),
+            tenant(2, 1, State::Deleting),
+            tenant(2, 1, State::Deleted),
         ] {
             refused(&control.write(object).await);
         }

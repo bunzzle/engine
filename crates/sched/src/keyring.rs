@@ -92,6 +92,10 @@ impl Keys for Keyring {
         self.batches.borrow_mut().forget(tenant, generation);
     }
 
+    fn forgotten(&self, tenant: u32, generation: u32) -> bool {
+        self.ring.forgotten(tenant, generation)
+    }
+
     fn delete(&self, tenant: u32, generation: u32) -> Deleted<'_> {
         Box::pin(async move {
             self.forget(tenant, generation);

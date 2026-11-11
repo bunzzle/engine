@@ -1,5 +1,5 @@
 use std::cell::{Cell, RefCell};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::pin::Pin;
 use std::rc::Rc;
 use std::time::Duration;
@@ -126,7 +126,7 @@ struct Inner {
     unwrapping: RefCell<HashMap<(u32, u32, u16, u64), Unwrapping>>,
     loading: RefCell<HashMap<(u32, u32, u32), Loading>>,
     refreshed: RefCell<HashMap<(u32, u32), Instant>>,
-    gone: RefCell<HashSet<(u32, u32)>>,
+    gone: RefCell<HashMap<u32, u32>>,
     settled: Cell<u32>,
     settling: Cell<bool>,
     stats: Cell<RingStats>,
@@ -174,7 +174,7 @@ impl Ring {
                 unwrapping: RefCell::new(HashMap::new()),
                 loading: RefCell::new(HashMap::new()),
                 refreshed: RefCell::new(HashMap::new()),
-                gone: RefCell::new(HashSet::new()),
+                gone: RefCell::new(HashMap::new()),
                 settled: Cell::new(0),
                 settling: Cell::new(false),
                 stats: Cell::new(RingStats::default()),
@@ -206,14 +206,21 @@ impl Ring {
     }
 
     pub fn forget(&self, tenant: u32, generation: u32) {
+        let mut gone = self.inner.gone.borrow_mut();
+        let through = gone.entry(tenant).or_insert(generation);
+        *through = (*through).max(generation);
+        drop(gone);
         let key = (tenant, generation);
-        self.inner.gone.borrow_mut().insert(key);
         self.inner.tenants.borrow_mut().remove(&key);
         self.inner.refreshed.borrow_mut().remove(&key);
     }
 
     pub fn forgotten(&self, tenant: u32, generation: u32) -> bool {
-        self.inner.gone.borrow().contains(&(tenant, generation))
+        self.inner
+            .gone
+            .borrow()
+            .get(&tenant)
+            .is_some_and(|through| generation <= *through)
     }
 
     fn live(&self, tenant: u32, generation: u32) -> Result<(), Fault> {

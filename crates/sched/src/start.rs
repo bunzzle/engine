@@ -96,6 +96,7 @@ pub(crate) struct Inner<T> {
     writing: Cell<bool>,
     restored: u64,
     pub(crate) dropped: Cell<u64>,
+    pub(crate) delete_retries: Cell<u64>,
 }
 
 pub struct Node<T> {
@@ -241,6 +242,7 @@ impl<T: Transport + 'static> Node<T> {
             writing: Cell::new(false),
             restored,
             dropped: Cell::new(0),
+            delete_retries: Cell::new(0),
         });
         let ticks = maintain(Rc::downgrade(&inner), ticker);
         let drops = drop_deleted(Rc::downgrade(&inner), deletions);
@@ -302,16 +304,41 @@ impl<T: Transport + 'static> Node<T> {
         self.inner.writer.borrow().is_some()
     }
 
-    pub(crate) async fn write_trusted(&self, object: Object) -> Result<Update, Error> {
+    pub(crate) async fn write_state(
+        &self,
+        tenant: u32,
+        generation: u32,
+        state: State,
+    ) -> Result<Update, Error> {
         let node = self.clone();
         spawn(async move {
             let mut held = node.hold()?;
+            let current = node
+                .table()
+                .tenant(tenant)
+                .filter(|t| t.generation == generation)
+                .cloned()
+                .ok_or(control::Error::Refused)?;
+            let allowed = match state {
+                State::Deleting => !current.state.deleted(),
+                State::Deleted => current.state == State::Deleting,
+                State::Active | State::Suspended => false,
+            };
+            if !allowed {
+                return Err(control::Error::Refused.into());
+            }
+            let object = Object::Tenant(control::Tenant { state, ..current });
             let update = held.writer().write(object).await?;
+            node.apply(&update);
             drop(held);
             node.broadcast(&update);
             Ok(update)
         })
         .await
+    }
+
+    pub(crate) fn apply(&self, update: &Update) {
+        self.inner.table.borrow_mut().apply(update.clone());
     }
 
     pub async fn write(&self, object: Object) -> Result<Update, Error> {
@@ -326,6 +353,7 @@ impl<T: Transport + 'static> Node<T> {
         let mut held = self.hold()?;
         self.create_keys(&object).await?;
         let update = held.writer().write(object).await?;
+        self.apply(&update);
         drop(held);
         self.broadcast(&update);
         Ok(update)
@@ -360,7 +388,7 @@ impl<T: Transport + 'static> Node<T> {
             return Ok(());
         };
         let (id, generation) = (tenant.id, tenant.generation);
-        if tenant.state == State::Deleted {
+        if tenant.state.deleted() {
             return Err(control::Error::Refused);
         }
         let known = self
@@ -571,9 +599,11 @@ fn start_config(
     let applied = Rc::clone(applied);
     let keys = Rc::clone(keys);
     let (config, done) = ends.start(move |_, note| {
-        for (tenant, generation) in deleted(&note) {
+        for (tenant, generation, now) in deleted(&note) {
             keys.forget(tenant, generation);
-            let _ = deleting.send(tenant);
+            if now {
+                let _ = deleting.send(tenant);
+            }
         }
         table.borrow_mut().take(note);
         applied.notify();
@@ -581,9 +611,10 @@ fn start_config(
     (config, done, deletions)
 }
 
-fn deleted(note: &control::Note) -> Vec<(u32, u32)> {
+fn deleted(note: &control::Note) -> Vec<(u32, u32, bool)> {
     let gone = |object: &Object| match object {
-        Object::Tenant(t) if t.state.deleted() => Some((t.id, t.generation)),
+        Object::Tenant(t) if t.state.deleted() => Some((t.id, t.generation, true)),
+        Object::Tenant(t) if t.generation > 1 => Some((t.id, t.generation - 1, false)),
         _ => None,
     };
     match note {

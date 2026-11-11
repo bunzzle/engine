@@ -50,6 +50,10 @@ pub trait Keys: KeySource {
 
     fn forget(&self, _tenant: u32, _generation: u32) {}
 
+    fn forgotten(&self, _tenant: u32, _generation: u32) -> bool {
+        false
+    }
+
     fn delete(&self, _tenant: u32, _generation: u32) -> Deleted<'_> {
         Box::pin(async { Ok(()) })
     }

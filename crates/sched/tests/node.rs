@@ -54,6 +54,7 @@ struct World {
     durable: BTreeSet<Key>,
     expiries: BTreeMap<MessageKey, u64>,
     cancelling: BTreeSet<MessageKey>,
+    forgotten: BTreeSet<MessageKey>,
     overlaps: u64,
     early: u64,
     again: u64,
@@ -105,7 +106,13 @@ impl Keys for Shredded {
     fn oldest(&self, _: u32, _: u32) -> Oldest<'_> {
         Box::pin(async { Ok(1) })
     }
+
+    fn forgotten(&self, _: u32, generation: u32) -> bool {
+        generation == FORGOTTEN
+    }
 }
+
+const FORGOTTEN: u32 = 9;
 
 struct Simulated {
     world: Shared,
@@ -159,16 +166,26 @@ impl Transport for Simulated {
             }
         }
         sleep(Duration::from_millis(1 + self.below(2_000))).await;
-        let (fault, mixed) = match self.below(40) {
-            0 => (Some(Unsealable::Unavailable), false),
-            1 => (Some(Unsealable::Unknown), false),
-            2 => (Some(Unsealable::Gone), false),
-            3 => (Some(Unsealable::Gone), true),
-            _ => (None, false),
+        let (fault, mixed, generation) = match self.below(40) {
+            0 => (Some(Unsealable::Unavailable), false, 1),
+            1 => (Some(Unsealable::Unknown), false, 1),
+            2 => (Some(Unsealable::Gone), false, 1),
+            3 => (Some(Unsealable::Gone), true, 1),
+            4 => (Some(Unsealable::Unknown), false, FORGOTTEN),
+            _ => (None, false, 1),
         };
         let mut world = self.world.borrow_mut();
+        let message = (attempt.message.shard, attempt.message.key);
+        let (fault, mixed, generation) = if world.forgotten.contains(&message) {
+            (Some(Unsealable::Unknown), false, FORGOTTEN)
+        } else {
+            (fault, mixed, generation)
+        };
+        if generation == FORGOTTEN {
+            world.forgotten.insert(message);
+        }
         if let Some(fault) = fault {
-            if fault == Unsealable::Gone && !mixed {
+            if (fault == Unsealable::Gone && !mixed) || generation == FORGOTTEN {
                 world
                     .cancelling
                     .insert((attempt.message.shard, attempt.message.key));
@@ -183,7 +200,7 @@ impl Transport for Simulated {
                     } else {
                         Answer::Unopened {
                             fault,
-                            generation: 1,
+                            generation,
                             day: 0,
                         }
                     };
@@ -402,6 +419,7 @@ struct Session {
     dropped: u64,
     held: u64,
     deferred: u64,
+    forgotten: u64,
 }
 
 type Feed = (usize, Spool, Vec<u16>);
@@ -534,6 +552,7 @@ fn session(driver: &Rc<SimDriver>, world: &Shared, intake_on: bool, limit: Durat
             dropped: scheds.iter().map(|s| s.unopened_stats().dropped).sum(),
             held: scheds.iter().map(|s| s.unopened_stats().held).sum(),
             deferred: scheds.iter().map(|s| s.unopened_stats().deferred).sum(),
+            forgotten: scheds.iter().map(|s| s.unopened_stats().forgotten).sum(),
         };
         if power.is_halted() {
             return session;
@@ -597,6 +616,10 @@ fn one_session(seed: u64) {
     assert!(
         run.dropped > 0 && run.held > 0 && run.deferred > 0,
         "seed {seed}: unopened answers not seen"
+    );
+    assert!(
+        run.forgotten > 0,
+        "seed {seed}: no forgotten generation dropped"
     );
     let world = world.borrow();
     verify(seed, &world);

@@ -685,11 +685,19 @@ impl<T: Transport + 'static> Sched<T> {
             }
         }
         let now = self.inner.clock.now();
-        let chosen =
+        let forgotten = self
+            .inner
+            .keys
+            .get()
+            .is_some_and(|keys| keys.forgotten(route.tenant, generation));
+        let chosen = if forgotten {
+            self.inner.breaker.borrow_mut().forgotten()
+        } else {
             self.inner
                 .breaker
                 .borrow_mut()
-                .decide(route.tenant, action(fault, day, oldest), now);
+                .decide(route.tenant, action(fault, day, oldest), now)
+        };
         let note = match chosen {
             Action::Drop => Note::Dropped {
                 route,
