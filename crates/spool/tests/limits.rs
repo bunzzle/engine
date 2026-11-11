@@ -94,6 +94,29 @@ fn limits_over_one_commit_or_a_record_are_refused_at_start() {
     LIMITS.validate(OPTIONS.region_size).expect("test limits");
 }
 
+async fn stream_refusals(intake: &Spool, id: MessageId) {
+    let stream = intake.stream_chunk();
+    let mut writer = intake.body_stream(id, 7);
+    assert!(matches!(writer.push(&[]).await, Err(Error::Limit("chunk"))));
+    assert!(matches!(
+        writer.push(&vec![0; stream + 1]).await,
+        Err(Error::Limit("chunk"))
+    ));
+    writer.push(&[1; 100]).await.expect("last chunk");
+    assert!(matches!(
+        writer.push(&[1; 100]).await,
+        Err(Error::Limit("chunk"))
+    ));
+    let mut over = intake.body_stream(id, 7);
+    over.push(&vec![0; stream]).await.expect("full chunk");
+    assert!(matches!(over.push(&[1]).await, Err(Error::Limit("body"))));
+    drop((writer, over));
+    assert!(matches!(
+        intake.body_stream(id, 7).finish(),
+        Err(Error::Limit("chunk"))
+    ));
+}
+
 #[test]
 fn intake_refuses_messages_over_the_limits() {
     let setup = Rc::new(SimDriver::new(1, Config::default()));
@@ -161,6 +184,7 @@ fn intake_refuses_messages_over_the_limits() {
             intake.body(id, 7, &many).await,
             Err(Error::Limit("body"))
         ));
+        stream_refusals(&intake, id).await;
         let mut wide = Vec::new();
         for _ in 0..4 {
             let id = intake.id(0).await.expect("id");

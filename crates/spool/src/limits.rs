@@ -1,4 +1,4 @@
-use store::{INDEX_SIZE, MAX_PAYLOAD, RECORD_HEADER_SIZE, fits};
+use store::{INDEX_SIZE, MAX_PAYLOAD, MAX_SECTOR_SIZE, RECORD_HEADER_SIZE, fits, record_size};
 
 use crate::error::Error;
 
@@ -37,6 +37,7 @@ impl Default for Limits {
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Bounds {
     pub(crate) chunk: usize,
+    pub(crate) stream: usize,
     pub(crate) ranges: usize,
 }
 
@@ -55,9 +56,11 @@ impl Limits {
             .min(MAX_PAYLOAD)
             .checked_sub(RECORD_HEADER_SIZE + crate::bodies::CHUNK_FIXED)
             .ok_or(Error::Limit("region"))?;
-        let ranges = usize::try_from(self.body.div_ceil(region_size / 2))
-            .map_err(|_| Error::Limit("body"))?
-            + 1;
+        let stream =
+            chunk.min(MAX_SECTOR_SIZE as usize - RECORD_HEADER_SIZE - crate::bodies::CHUNK_FIXED);
+        let per = record_size(crate::bodies::CHUNK_FIXED + stream) as u64;
+        let ranges =
+            usize::try_from(self.body.div_ceil(per)).map_err(|_| Error::Limit("body"))? + 1;
         if self.inline > MAX_PAYLOAD - INDEX_SIZE {
             return Err(Error::Limit("inline"));
         }
@@ -68,6 +71,10 @@ impl Limits {
         if !fits(1, 1, 0, dead) {
             return Err(Error::Limit("recipients"));
         }
-        Ok(Bounds { chunk, ranges })
+        Ok(Bounds {
+            chunk,
+            stream,
+            ranges,
+        })
     }
 }

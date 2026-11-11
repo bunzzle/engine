@@ -6,7 +6,7 @@ use store::{
     MAX_PAYLOAD, Op, Shards, fits, message_key, record_size, split_key,
 };
 
-use crate::bodies::{Writer, Written};
+use crate::bodies::{CHUNK_FIXED, Writer, Written};
 use crate::error::Error;
 use crate::items::{BODY_ITEM, HeadClear, WRAP, encode_slice, slice_item};
 use crate::limits::{Bounds, Limits, SLICE};
@@ -203,6 +203,19 @@ impl Spool {
         inner.writer.write(id.shard, tenant, id.key, chunks).await
     }
 
+    pub fn stream_chunk(&self) -> usize {
+        self.inner.bounds.stream
+    }
+
+    pub fn body_stream(&self, id: MessageId, tenant: u32) -> BodyWriter {
+        BodyWriter {
+            inner: Rc::clone(&self.inner),
+            written: Written::new(id.shard, id.key, tenant),
+            size: 0,
+            last: false,
+        }
+    }
+
     pub async fn accept(&self, messages: Vec<Message>) -> Result<(), Error> {
         self.accept_indexed(messages, None).await
     }
@@ -349,6 +362,41 @@ impl Spool {
             ops,
         };
         Ok((batch, written))
+    }
+}
+
+pub struct BodyWriter {
+    inner: Rc<Inner>,
+    written: Written,
+    size: u64,
+    last: bool,
+}
+
+impl BodyWriter {
+    pub async fn push(&mut self, sealed: &[u8]) -> Result<(), Error> {
+        let inner = &self.inner;
+        if self.last || sealed.is_empty() || sealed.len() > inner.bounds.stream {
+            return Err(Error::Limit("chunk"));
+        }
+        let size = self.size + record_size(CHUNK_FIXED + sealed.len()) as u64;
+        if size > inner.limits.body {
+            return Err(Error::Limit("body"));
+        }
+        let first = self.written.ranges.len();
+        inner
+            .writer
+            .append(&mut self.written, first, &[sealed])
+            .await?;
+        self.size = size;
+        self.last = sealed.len() < inner.bounds.stream;
+        Ok(())
+    }
+
+    pub fn finish(self) -> Result<Written, Error> {
+        if self.written.ranges.is_empty() {
+            return Err(Error::Limit("chunk"));
+        }
+        Ok(self.written)
     }
 }
 

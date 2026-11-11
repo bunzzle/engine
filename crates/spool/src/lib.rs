@@ -8,7 +8,7 @@ mod recipients;
 
 pub use bodies::{KIND_BODY_CHUNK, Written, decode_chunk};
 pub use error::Error;
-pub use intake::{Body, Head, Message, MessageId, Slice, Spool};
+pub use intake::{Body, BodyWriter, Head, Message, MessageId, Slice, Spool};
 pub use items::{
     BODY_ITEM, HEAD_CLEAR, HeadClear, SLICE_BASE, STATE_BASE, STATE_CLEAR, Stamp, StateClear, WRAP,
     head_parts, slice_item, slice_parts, state_item,
