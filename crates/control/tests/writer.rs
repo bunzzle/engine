@@ -6,9 +6,10 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use control::{
-    Error, KIND_TENANT, Limits, Loaded, Object, Pool, Snapshot, State, Table, Tenant, Update,
+    Dkim, Error, KIND_TENANT, Limits, Loaded, Object, Pool, Snapshot, State, Table, Tenant, Update,
     Writer,
 };
+use crypto::DkimAlg;
 use rt::sim::{Config, Disk, SimDriver, check};
 use rt::{JoinHandle, Runtime, spawn, timeout};
 use store::{
@@ -119,6 +120,50 @@ fn table(snapshot: Snapshot) -> Table {
     let mut table = Table::default();
     table.load(snapshot);
     table
+}
+
+fn dkim(id: u32, tenant: u32) -> Object {
+    Object::Dkim(Dkim {
+        id,
+        tenant,
+        generation: 1,
+        alg: DkimAlg::Ed25519Sha256,
+        domain: "example.org".into(),
+        selector: "s1".into(),
+        public: vec![7; 32],
+        blob: vec![9; 80],
+    })
+}
+
+#[test]
+fn dkim_ids_are_never_given_twice_across_restarts() {
+    let ((), driver) = on(1, Config::default(), created(1), || async {
+        let (node, loaded, _) = Node::open(BUDGET).await;
+        let mut writer = loaded.writer(node.changes.clone());
+        assert_eq!(writer.reserve_dkim().await.expect("reserve"), 1);
+        assert_eq!(writer.reserve_dkim().await.expect("reserve"), 2);
+        writer.write(dkim(1, 4)).await.expect("write");
+        node.close().await;
+    });
+    let ((), driver) = on(2, Config::default(), driver.crash(), || async {
+        let (node, loaded, snapshot) = Node::open(BUDGET).await;
+        let table = table(snapshot);
+        assert_eq!(table.dkim(4, 1).map(|d| d.selector.as_ref()), Some("s1"));
+        assert!(table.dkim(5, 1).is_none());
+        assert_eq!(table.dkims(4).count(), 1);
+        let mut writer = loaded.writer(node.changes.clone());
+        assert_eq!(writer.dkim_next(), 3);
+        writer.write(dkim(10, 4)).await.expect("write");
+        assert_eq!(writer.dkim_next(), 11);
+        node.close().await;
+    });
+    on(3, Config::default(), driver.crash(), || async {
+        let (node, loaded, _) = Node::open(BUDGET).await;
+        let mut writer = loaded.writer(node.changes.clone());
+        assert_eq!(writer.skipped(), 0);
+        assert_eq!(writer.reserve_dkim().await.expect("reserve"), 11);
+        node.close().await;
+    });
 }
 
 #[test]

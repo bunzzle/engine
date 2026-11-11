@@ -44,6 +44,7 @@ pub enum Refusal {
     Message,
     Busy,
     Keys,
+    Signer,
     Failed,
 }
 
@@ -65,6 +66,7 @@ impl fmt::Display for Refusal {
             Self::Message => "message does not match its recipients",
             Self::Busy => "over the limit, try again later",
             Self::Keys => "tenant keys unavailable, try again later",
+            Self::Signer => "signing key not found",
             Self::Failed => "temporary failure",
         };
         f.write_str(what)

@@ -15,5 +15,8 @@ rt = { path = "../rt" }
 spool = { path = "../spool" }
 store = { path = "../store" }
 
+[dev-dependencies]
+aws-lc-rs = "=1.18.2"
+
 [lints]
 workspace = true

@@ -4,7 +4,8 @@ use std::path::Path;
 use std::rc::Rc;
 use std::time::Duration;
 
-use crypto::{BatchKey, Plain, Secret, Wrap, seal_batch};
+use aws_lc_rs::signature::{ED25519, UnparsedPublicKey};
+use crypto::{BatchKey, DkimAlg, Plain, Secret, Wrap, seal_batch};
 use keys::proto::{Answer, Frames, Request};
 use keys::{
     Audit, BatchSettings, Batches, Client, Connect, Error, Fault, Ring, RingSettings, Server,
@@ -484,5 +485,56 @@ fn settled_is_sent_only_when_it_moves_forward() {
         sleep(Duration::from_millis(50)).await;
         assert_eq!(ring.stats().settled, DAY - 1);
         assert_eq!(ring.stats().unavailable, calls);
+    });
+}
+
+#[test]
+fn dkim_keys_are_made_loaded_and_sign_through_the_ring() {
+    let driver = Rc::new(SimDriver::new(5, quiet()));
+    run(&driver, async {
+        let _server = serve("/a", 1).await;
+        create(1, 4).await;
+        let (connect, _) = hosts(&[1]);
+        let ring = Ring::new(connect, settings());
+        let ed = DkimAlg::Ed25519Sha256;
+        let (public, blob) = ring.dkim_new(4, 1, 1, ed).await.expect("new");
+        let digest = [6; 32];
+        let signed = ring.sign(4, 1, 1, ed, digest).await.expect("sign");
+        UnparsedPublicKey::new(&ED25519, &public)
+            .verify(&digest, &signed)
+            .expect("verify");
+        assert_eq!(ring.sign(4, 1, 2, ed, digest).await, Err(Fault::Unknown));
+        assert_eq!(ring.load(4, 1, 2, ed, &blob).await, Err(Fault::Bad));
+        assert_eq!(ring.load(4, 1, 1, ed, &blob).await, Ok(()));
+        let (_, other) = ring.dkim_new(4, 1, 3, ed).await.expect("new");
+        assert_eq!(ring.load(4, 1, 1, ed, &other).await, Err(Fault::Conflict));
+        assert_eq!(ring.dkim_new(9, 1, 1, ed).await, Err(Fault::Unknown));
+        let stats = ring.stats();
+        assert_eq!((stats.dkim_new, stats.loads, stats.signs), (3, 3, 2));
+    });
+}
+
+#[test]
+fn calls_made_while_connecting_wait_for_that_connection() {
+    let driver = Rc::new(SimDriver::new(6, quiet()));
+    run(&driver, async {
+        let _server = serve("/a", 1).await;
+        for tenant in 4..10 {
+            create(1, tenant).await;
+        }
+        let (connect, tries) = hosts(&[1]);
+        let ring = Ring::new(connect, settings());
+        let tasks: Vec<_> = (4..10)
+            .map(|tenant| {
+                let ring = ring.clone();
+                spawn(async move { ring.open(tenant, 1).await })
+            })
+            .collect();
+        for task in tasks {
+            assert!(task.await.is_ok());
+        }
+        assert_eq!(tries.get(), 1);
+        assert_eq!(ring.stats().connects, 1);
+        assert_eq!(ring.stats().unavailable, 0);
     });
 }

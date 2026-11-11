@@ -5,7 +5,7 @@ use std::rc::Rc;
 
 use control::{KeyError, KeySource};
 use crypto::{
-    AAD, BatchKey, ChunkKey, Opener as ChunkOpener, Sealer as ChunkSealer, TAG, Wrap, aad,
+    AAD, BatchKey, ChunkKey, DkimAlg, Opener as ChunkOpener, Sealer as ChunkSealer, TAG, Wrap, aad,
 };
 use keys::Batch;
 use spool::{
@@ -38,6 +38,9 @@ pub enum Unsealable {
 pub type Batched<'a> = Pin<Box<dyn Future<Output = Result<Rc<Batch>, KeyError>> + 'a>>;
 pub type Oldest<'a> = Pin<Box<dyn Future<Output = Result<u32, KeyError>> + 'a>>;
 pub type Unwrapped<'a> = Pin<Box<dyn Future<Output = Result<Rc<BatchKey>, Unsealable>> + 'a>>;
+pub type Made<'a> = Pin<Box<dyn Future<Output = Result<(Vec<u8>, Vec<u8>), KeyError>> + 'a>>;
+pub type Loaded<'a> = Pin<Box<dyn Future<Output = Result<(), KeyError>> + 'a>>;
+pub type Signed<'a> = Pin<Box<dyn Future<Output = Result<Vec<u8>, KeyError>> + 'a>>;
 
 pub trait Keys: KeySource {
     fn tick(&self) {}
@@ -45,6 +48,32 @@ pub trait Keys: KeySource {
     fn settled(&self, _day: u32) {}
 
     fn oldest(&self, _tenant: u32, _generation: u32) -> Oldest<'_> {
+        Box::pin(async { Err(KeyError::Unavailable) })
+    }
+
+    fn dkim_new(&self, _tenant: u32, _generation: u32, _key: u32, _alg: DkimAlg) -> Made<'_> {
+        Box::pin(async { Err(KeyError::Unavailable) })
+    }
+
+    fn dkim_load<'a>(
+        &'a self,
+        _tenant: u32,
+        _generation: u32,
+        _key: u32,
+        _alg: DkimAlg,
+        _blob: &'a [u8],
+    ) -> Loaded<'a> {
+        Box::pin(async { Err(KeyError::Unavailable) })
+    }
+
+    fn sign(
+        &self,
+        _tenant: u32,
+        _generation: u32,
+        _key: u32,
+        _alg: DkimAlg,
+        _digest: [u8; 32],
+    ) -> Signed<'_> {
         Box::pin(async { Err(KeyError::Unavailable) })
     }
 

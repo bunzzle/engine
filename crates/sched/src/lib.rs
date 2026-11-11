@@ -1,4 +1,5 @@
 mod clock;
+mod dkim;
 mod error;
 mod intake;
 mod keyring;
@@ -29,8 +30,8 @@ pub use requests::{
     retain_request,
 };
 pub use sealing::{
-    Batched, Keys, LABEL_BODY, LABEL_HEAD, LABEL_REPLY, LABEL_SLICE, Oldest, Opener, Sealing,
-    Unsealable, Unwrapped,
+    Batched, Keys, LABEL_BODY, LABEL_HEAD, LABEL_REPLY, LABEL_SLICE, Loaded, Made, Oldest, Opener,
+    Sealing, Signed, Unsealable, Unwrapped,
 };
 pub use start::{CONTROL_SHARD, Links, Meshes, Node, Parts, Running, Settings};
 pub use suppress::{

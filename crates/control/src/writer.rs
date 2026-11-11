@@ -6,7 +6,7 @@ use store::{
 };
 
 use crate::error::Error;
-use crate::record::{KIND_NODE, KIND_POOL, KIND_TENANT, Object, SYSTEM, Update};
+use crate::record::{KIND_DKIM, KIND_NODE, KIND_POOL, KIND_TENANT, Object, SYSTEM, Update};
 use crate::siphash::siphash;
 use crate::table::Snapshot;
 
@@ -14,6 +14,8 @@ pub const ENTRY: usize = 64;
 
 const CHECK: usize = 16;
 const CHECK_FORMAT: u8 = 1;
+const NAMING_CHECK: u32 = 0;
+const DKIM_IDS: u32 = 1;
 
 pub fn naming_check(key: &[u8; 16]) -> u64 {
     siphash(key, b"bunzzle naming check")
@@ -43,6 +45,7 @@ pub struct Loaded {
     used: usize,
     skipped: u64,
     naming: Option<u64>,
+    dkim_next: u32,
 }
 
 impl Loaded {
@@ -80,6 +83,7 @@ impl Writer {
             used: 0,
             skipped: 0,
             naming: None,
+            dkim_next: 1,
         };
         let mut objects = Vec::new();
         for (key, item) in state.entries() {
@@ -89,16 +93,21 @@ impl Writer {
             let (boot, id) = split_key(key.message);
             let kind = u8::try_from(CONTROL_BOOT - boot).unwrap_or(u8::MAX);
             if kind == KIND_NODE {
-                match decode_check(&item.clear).filter(|_| id == 0) {
-                    Some(check) => {
-                        loaded.naming = Some(check);
-                        loaded.track(kind, id, item.clear.len());
+                match (id, decode_check(&item.clear)) {
+                    (NAMING_CHECK, Some(check)) => loaded.naming = Some(check),
+                    (DKIM_IDS, Some(next)) => {
+                        let next = u32::try_from(next).unwrap_or(u32::MAX);
+                        loaded.dkim_next = loaded.dkim_next.max(next);
                     }
-                    None => loaded.skipped += 1,
+                    _ => {
+                        loaded.skipped += 1;
+                        continue;
+                    }
                 }
+                loaded.track(kind, id, item.clear.len());
                 continue;
             }
-            if kind != KIND_TENANT && kind != KIND_POOL {
+            if kind != KIND_TENANT && kind != KIND_POOL && kind != KIND_DKIM {
                 continue;
             }
             let decoded = Update::decode(&item.clear).filter(|u| {
@@ -109,6 +118,9 @@ impl Writer {
                 continue;
             };
             loaded.version = loaded.version.max(update.version);
+            if kind == KIND_DKIM {
+                loaded.dkim_next = loaded.dkim_next.max(id.saturating_add(1));
+            }
             loaded.track(kind, id, item.clear.len());
             objects.push(update.object);
         }
@@ -136,10 +148,37 @@ impl Writer {
     }
 
     pub async fn set_naming_check(&mut self, check: u64) -> Result<(), Error> {
-        let clear = encode_check(check);
+        self.put_node(NAMING_CHECK, check).await?;
+        self.loaded.naming = Some(check);
+        Ok(())
+    }
+
+    pub fn dkim_next(&self) -> u32 {
+        self.loaded.dkim_next
+    }
+
+    pub async fn reserve_dkim(&mut self) -> Result<u32, Error> {
+        let id = self.loaded.dkim_next;
+        let next = id.checked_add(1).ok_or(Error::Full)?;
+        self.put_node(DKIM_IDS, u64::from(next)).await?;
+        self.loaded.dkim_next = next;
+        Ok(id)
+    }
+
+    async fn put_node(&mut self, id: u32, value: u64) -> Result<(), Error> {
+        let clear = encode_check(value);
+        let old = self
+            .loaded
+            .sizes
+            .get(&(KIND_NODE, id))
+            .copied()
+            .unwrap_or(0);
+        if old == 0 && self.loaded.used + entry_size(clear.len()) > self.loaded.budget {
+            return Err(Error::Full);
+        }
         let batch = Batch {
             shard: self.loaded.shard,
-            message: control_key(KIND_NODE, 0),
+            message: control_key(KIND_NODE, id),
             tenant: SYSTEM,
             ops: vec![Op {
                 item: HEAD_ITEM,
@@ -154,8 +193,7 @@ impl Writer {
             }],
         };
         self.changes.apply(batch).await?;
-        self.loaded.naming = Some(check);
-        self.loaded.track(KIND_NODE, 0, clear.len());
+        self.loaded.track(KIND_NODE, id, clear.len());
         Ok(())
     }
 
@@ -189,6 +227,9 @@ impl Writer {
         };
         self.changes.apply(batch).await?;
         self.loaded.version = update.version;
+        if kind == KIND_DKIM {
+            self.loaded.dkim_next = self.loaded.dkim_next.max(id.saturating_add(1));
+        }
         self.loaded.track(kind, id, clear.len());
         Ok(update)
     }
