@@ -16,7 +16,10 @@ use crate::error::Error;
 use crate::queue::{
     Head, KeyError, KeySource, Label, Name, Queue, Tenancy, naming_shard, queue_shard, tenant_keys,
 };
-use crate::record::KIND_QUEUE;
+use crate::record::{KIND_FLOOR, KIND_QUEUE, SYSTEM};
+
+const FLOOR: usize = 16;
+const FLOOR_FORMAT: u8 = 1;
 
 pub enum Call {
     Name(Name),
@@ -27,6 +30,10 @@ pub enum Call {
     Forget {
         tenant: u32,
         domain: Box<str>,
+        ticket: u64,
+    },
+    ForgetTenant {
+        tenant: u32,
         ticket: u64,
     },
     Forgot {
@@ -79,7 +86,32 @@ struct Owned {
     queues: BTreeMap<u32, Queue>,
     next: BTreeMap<u16, u64>,
     ids: BTreeMap<u16, u32>,
+    floors: BTreeMap<u16, u64>,
+    leftovers: BTreeMap<u32, Leftover>,
     busy: BTreeMap<Lock, VecDeque<Job>>,
+}
+
+#[derive(Clone, Copy)]
+struct Leftover {
+    shard: u16,
+    tenant: u32,
+    generation: u32,
+}
+
+fn encode_floor(next: u64) -> Vec<u8> {
+    let mut out = vec![0; FLOOR];
+    out[0] = FLOOR_FORMAT;
+    out[1] = KIND_FLOOR;
+    out[8..].copy_from_slice(&next.to_le_bytes());
+    out
+}
+
+fn decode_floor(clear: &[u8]) -> Option<u64> {
+    let ok = clear.len() == FLOOR
+        && clear[0] == FLOOR_FORMAT
+        && clear[1] == KIND_FLOOR
+        && clear[2..8] == [0; 6];
+    ok.then(|| u64::from_le_bytes(clear[8..].try_into().expect("8 bytes")))
 }
 
 impl Owned {
@@ -93,6 +125,17 @@ impl Owned {
             }
         }
         None
+    }
+
+    fn floor(&mut self, shard: u16, id: u32, clear: &[u8]) -> bool {
+        let Some(floor) = decode_floor(clear).filter(|_| id == u32::from(shard)) else {
+            return false;
+        };
+        self.floors.insert(shard, floor);
+        if let Some(next) = self.next.get_mut(&shard) {
+            *next = (*next).max(floor);
+        }
+        true
     }
 
     fn insert(&mut self, queue: Queue) {
@@ -263,7 +306,14 @@ impl Queues {
                     continue;
                 }
                 let (boot, id) = split_key(key.message);
-                if CONTROL_BOOT - boot != u32::from(KIND_QUEUE) {
+                let kind = CONTROL_BOOT - boot;
+                if kind == u32::from(KIND_FLOOR) {
+                    if !owned.floor(shard, id, &item.clear) {
+                        skipped += 1;
+                    }
+                    continue;
+                }
+                if kind != u32::from(KIND_QUEUE) {
                     continue;
                 }
                 if let Some(next) = owned.next.get_mut(&shard) {
@@ -297,6 +347,16 @@ impl Queues {
             for ((tenant, generation), group) in found {
                 if gone(tenant, generation) {
                     skipped += group.len() as u64;
+                    for stored in group {
+                        owned.leftovers.insert(
+                            stored.head.id,
+                            Leftover {
+                                shard,
+                                tenant,
+                                generation,
+                            },
+                        );
+                    }
                     continue;
                 }
                 let (sealing, waits) = wait_keys(keys, tenant, generation).await?;
@@ -392,7 +452,93 @@ impl Queues {
             owned.names.remove(name);
             owned.insert(queue);
         }
-        let (reply, mut answer) = channel();
+        let mut answer = self.forget_everywhere(|ticket| Call::Forget {
+            tenant: name.tenant,
+            domain: name.domain.clone(),
+            ticket,
+        });
+        drop(held);
+        answer.recv().await.ok_or(Error::Refused)?;
+        Ok(target.unwrap_or(id))
+    }
+
+    pub async fn sweep(
+        &self,
+        tenant: u32,
+        swept: &dyn Fn(u32, u32) -> bool,
+    ) -> Result<usize, Error> {
+        let shards = self.inner.naming.shards;
+        let mut removed = 0;
+        loop {
+            let busy: Vec<Lock> = self
+                .inner
+                .owned
+                .borrow()
+                .busy
+                .keys()
+                .filter(|lock| lock.0 == tenant)
+                .cloned()
+                .collect();
+            for lock in busy {
+                drop(self.lock(lock).await);
+            }
+            let found: Vec<(u32, Option<Lock>)> = {
+                let owned = self.inner.owned.borrow();
+                let queues = owned
+                    .queues
+                    .values()
+                    .filter(|q| q.name.tenant == tenant && swept(tenant, q.name.generation))
+                    .map(|q| (q.id, Some((tenant, q.name.domain.clone()))));
+                let leftovers = owned
+                    .leftovers
+                    .iter()
+                    .filter(|(_, l)| l.tenant == tenant && swept(tenant, l.generation))
+                    .map(|(&id, _)| (id, None));
+                queues.chain(leftovers).collect()
+            };
+            if found.is_empty() {
+                break;
+            }
+            for (id, lock) in found {
+                let held = match lock {
+                    Some(lock) => Some(self.lock(lock).await),
+                    None => None,
+                };
+                let shard = {
+                    let owned = self.inner.owned.borrow();
+                    let queue = owned
+                        .queues
+                        .get(&id)
+                        .filter(|q| swept(tenant, q.name.generation))
+                        .map(|_| queue_shard(id, shards));
+                    let leftover = owned
+                        .leftovers
+                        .get(&id)
+                        .filter(|l| swept(tenant, l.generation))
+                        .map(|l| l.shard);
+                    queue.or(leftover)
+                };
+                if let Some(shard) = shard {
+                    self.raise_floor(shard).await?;
+                    self.drop_queue(shard, id, tenant).await?;
+                    removed += 1;
+                }
+                drop(held);
+            }
+        }
+        if removed > 0 {
+            let mut answer = self.forget_everywhere(|ticket| Call::ForgetTenant { tenant, ticket });
+            answer.recv().await.ok_or(Error::Refused)?;
+        }
+        Ok(removed)
+    }
+
+    pub fn leftovers(&self) -> usize {
+        self.inner.owned.borrow().leftovers.len()
+    }
+
+    fn forget_everywhere(&self, call: impl Fn(u64) -> Call) -> rt::Receiver<()> {
+        let (reply, answer) = channel();
         let ticket = self.inner.tickets.get();
         self.inner.tickets.set(ticket + 1);
         self.inner
@@ -400,18 +546,72 @@ impl Queues {
             .borrow_mut()
             .insert(ticket, (self.inner.cores, reply));
         for core in 0..self.inner.cores {
-            self.send(
-                core,
-                Call::Forget {
-                    tenant: name.tenant,
-                    domain: name.domain.clone(),
-                    ticket,
-                },
-            );
+            self.send(core, call(ticket));
         }
-        drop(held);
-        answer.recv().await.ok_or(Error::Refused)?;
-        Ok(target.unwrap_or(id))
+        answer
+    }
+
+    async fn raise_floor(&self, shard: u16) -> Result<(), Error> {
+        let (next, floor) = {
+            let owned = self.inner.owned.borrow();
+            let next = owned
+                .next
+                .get(&shard)
+                .copied()
+                .ok_or(Error::Invalid("shard"))?;
+            (next, owned.floors.get(&shard).copied().unwrap_or(0))
+        };
+        if floor >= next {
+            return Ok(());
+        }
+        let batch = Batch {
+            shard,
+            message: control_key(KIND_FLOOR, u32::from(shard)),
+            tenant: SYSTEM,
+            ops: vec![Op {
+                item: HEAD_ITEM,
+                change: Change::Put(Delivery {
+                    status: 0,
+                    attempts: 0,
+                    due: 0,
+                }),
+                clear: encode_floor(next),
+                bodies: Vec::new(),
+                sealed: Vec::new(),
+            }],
+        };
+        self.inner.changes.apply(batch).await?;
+        let mut owned = self.inner.owned.borrow_mut();
+        let floor = owned.floors.entry(shard).or_default();
+        *floor = (*floor).max(next);
+        Ok(())
+    }
+
+    async fn drop_queue(&self, shard: u16, id: u32, tenant: u32) -> Result<(), Error> {
+        let batch = Batch {
+            shard,
+            message: control_key(KIND_QUEUE, id),
+            tenant,
+            ops: vec![Op {
+                item: HEAD_ITEM,
+                change: Change::Drop,
+                clear: Vec::new(),
+                bodies: Vec::new(),
+                sealed: Vec::new(),
+            }],
+        };
+        self.inner.changes.apply(batch).await?;
+        let mut owned = self.inner.owned.borrow_mut();
+        if let Some(queue) = owned.queues.remove(&id)
+            && owned.names.get(&queue.name) == Some(&id)
+        {
+            owned.names.remove(&queue.name);
+        }
+        owned.leftovers.remove(&id);
+        if let Some(count) = owned.ids.get_mut(&shard) {
+            *count = count.saturating_sub(1);
+        }
+        Ok(())
     }
 
     pub fn entry(&self, id: u32) -> Option<Queue> {
@@ -493,6 +693,10 @@ impl Queues {
                 ticket,
             } => {
                 self.inner.cache.borrow_mut().forget(tenant, &domain);
+                self.send(from, Call::Forgot { ticket });
+            }
+            Call::ForgetTenant { tenant, ticket } => {
+                self.inner.cache.borrow_mut().forget_tenant(tenant);
                 self.send(from, Call::Forgot { ticket });
             }
             Call::Forgot { ticket } => {

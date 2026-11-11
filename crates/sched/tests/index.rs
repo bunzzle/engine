@@ -2238,6 +2238,147 @@ fn a_delete_cut_by_a_crash_finishes_after_a_restart() {
     restarted.stop();
 }
 
+async fn records_left(control: &Node<Idle>, count: usize) {
+    while control.control_records() != Some(count) {
+        sleep(Duration::from_millis(1)).await;
+    }
+}
+
+async fn queues_gone(nodes: &[Node<Idle>], ids: &[u32]) {
+    for node in nodes {
+        while ids.iter().any(|id| node.queues().entry(*id).is_some())
+            || node.queues().leftovers() > 0
+        {
+            sleep(Duration::from_millis(1)).await;
+        }
+    }
+}
+
+fn swept_name(tenant: u32, n: u32) -> control::Name {
+    control::Name {
+        tenant,
+        domain: format!("d{n}.example.org").into(),
+        generation: 1,
+        pool: 1,
+    }
+}
+
+#[test]
+fn a_deleted_tenant_loses_its_control_records_and_queues_on_every_core() {
+    let smtp = Scopes {
+        smtp: true,
+        api: false,
+    };
+    let driver = Rc::new(SimDriver::with_disk(47, Config::default(), created(47)));
+    let cluster = started_with_keys(&driver, 2);
+    let nodes = cluster.nodes.clone();
+    let ids = cluster.run(async move {
+        keys_listening().await;
+        ready(&nodes).await;
+        let control = control_of(&nodes);
+        let dkim = control
+            .dkim_new(1, DkimAlg::Ed25519Sha256, "example.org", "s1")
+            .await
+            .expect("dkim");
+        let domain = control.domain_new(1, "example.org").await.expect("domain");
+        let (access, _) = control.access_new(1, smtp, 0).await.expect("access");
+        control.access_new(2, smtp, 0).await.expect("access");
+        records_left(control, 4).await;
+        let mut ids = Vec::new();
+        for n in 0..8 {
+            ids.push(
+                nodes[0]
+                    .queues()
+                    .name(&swept_name(1, n))
+                    .await
+                    .expect("name"),
+            );
+        }
+        let kept = nodes[1]
+            .queues()
+            .name(&swept_name(2, 0))
+            .await
+            .expect("name");
+        control.delete_tenant(1).await.expect("delete");
+        wait_for(&nodes, 1, 1, State::Deleted).await;
+        records_left(control, 1).await;
+        queues_gone(&nodes, &ids).await;
+        for node in &nodes {
+            let table = node.table();
+            assert!(table.access(access.id).is_none());
+            assert!(table.dkim(1, dkim.id).is_none());
+            assert!(table.domain(1, domain.id).is_none());
+        }
+        assert!(nodes.iter().any(|n| n.queues().entry(kept).is_some()));
+        ids
+    });
+    drop(cluster);
+    let driver = Rc::new(SimDriver::with_disk(48, Config::default(), driver.crash()));
+    let restarted = started_with_keys(&driver, 2);
+    let nodes = restarted.nodes.clone();
+    restarted.run(async move {
+        assert_eq!(control_of(&nodes).control_records(), Some(1));
+        for node in &nodes {
+            assert_eq!(node.queues().stats().skipped, 0);
+        }
+        keys_listening().await;
+        configure(&nodes, vec![tenant(1, 2, State::Active)]).await;
+        wait_for(&nodes, 1, 2, State::Active).await;
+        let fresh = control::Name {
+            generation: 2,
+            ..swept_name(1, 0)
+        };
+        let id = nodes[0].queues().name(&fresh).await.expect("fresh");
+        assert!(!ids.contains(&id));
+    });
+    restarted.stop();
+}
+
+fn a_sweep_cut_by_a_crash(seed: u64) {
+    let smtp = Scopes {
+        smtp: true,
+        api: false,
+    };
+    let driver = Rc::new(SimDriver::with_disk(seed, Config::default(), created(seed)));
+    let cluster = started_with_keys(&driver, 2);
+    let nodes = cluster.nodes.clone();
+    cluster.run(async move {
+        keys_listening().await;
+        ready(&nodes).await;
+        let control = control_of(&nodes);
+        for _ in 0..4 {
+            control.access_new(1, smtp, 0).await.expect("access");
+        }
+        control.access_new(2, smtp, 0).await.expect("access");
+        control.delete_tenant(1).await.expect("delete");
+        while control.table().tenant(1).map(|t| t.state) != Some(State::Deleted) {
+            sleep(Duration::from_micros(50)).await;
+        }
+    });
+    drop(cluster);
+    let driver = Rc::new(SimDriver::with_disk(
+        seed + 1,
+        Config::default(),
+        driver.crash(),
+    ));
+    let restarted = started_with_keys(&driver, 2);
+    let nodes = restarted.nodes.clone();
+    restarted.run(async move {
+        assert_eq!(control_of(&nodes).control_records(), Some(1), "seed {seed}");
+        for node in &nodes {
+            assert_eq!(node.table().accesses(1).count(), 0);
+        }
+    });
+    restarted.stop();
+}
+
+#[test]
+fn a_sweep_cut_by_a_crash_finishes_at_start() {
+    for seed in 0..6 {
+        a_sweep_cut_by_a_crash(900 + seed * 2);
+    }
+}
+
 async fn access_everywhere(nodes: &[Node<Idle>], id: u32, present: bool) {
     for node in nodes {
         while node.table().access(id).is_some() != present {

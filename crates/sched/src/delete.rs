@@ -6,6 +6,26 @@ use rt::{sleep, spawn};
 
 use crate::error::Error;
 use crate::start::{Inner, Node};
+
+pub(crate) async fn sweep_queues<T: Transport + 'static>(inner: &Weak<Inner<T>>, tenant: u32) {
+    let mut pause = RETRY;
+    loop {
+        let Some(node) = live(inner) else {
+            return;
+        };
+        let queues = node.queues().clone();
+        let table = std::rc::Rc::clone(&node.inner.table);
+        drop(node);
+        let swept = |tenant, generation| table.borrow().swept(tenant, generation);
+        if queues.sweep(tenant, &swept).await.is_ok() {
+            return;
+        }
+        if !nap(inner, pause).await {
+            return;
+        }
+        pause = (pause * 2).min(RETRY_MAX);
+    }
+}
 use crate::transport::Transport;
 
 const RETRY: Duration = Duration::from_millis(100);
@@ -83,7 +103,7 @@ impl<T: Transport + 'static> Node<T> {
                     return;
                 };
                 match node.write_state(tenant, generation, State::Deleted).await {
-                    Ok(_) | Err(Error::Control(control::Error::Refused)) => return,
+                    Ok(_) | Err(Error::Control(control::Error::Refused)) => break,
                     Err(_) => {}
                 }
                 drop(node);
@@ -91,7 +111,42 @@ impl<T: Transport + 'static> Node<T> {
                     return;
                 }
             }
+            let mut pause = RETRY;
+            loop {
+                let Some(node) = live(&inner) else {
+                    return;
+                };
+                if node.sweep_control().await.is_ok() {
+                    return;
+                }
+                drop(node);
+                if !nap(&inner, pause).await {
+                    return;
+                }
+                pause = (pause * 2).min(RETRY_MAX);
+            }
         }));
+    }
+
+    pub(crate) async fn sweep_control(&self) -> Result<usize, Error> {
+        let node = self.clone();
+        spawn(async move {
+            let mut held = node.hold()?;
+            let table = std::rc::Rc::clone(&node.inner.table);
+            let swept = |tenant, generation| table.borrow().swept(tenant, generation);
+            let mut removed = Vec::new();
+            let result = held.writer().sweep(&swept, &mut removed).await;
+            for &removal in &removed {
+                node.note(control::Note::Remove(removal));
+            }
+            drop(held);
+            for &removal in &removed {
+                node.send(&control::Note::Remove(removal));
+            }
+            result?;
+            Ok(removed.len())
+        })
+        .await
     }
 }
 

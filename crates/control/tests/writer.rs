@@ -7,9 +7,9 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use control::{
-    Access, Created, Dkim, Domain, Error, KIND_ACCESS, KIND_TENANT, KeyError, KeySource, Limits,
-    Loaded, Object, Pool, Ready, Scopes, Snapshot, State, Table, Tenant, Update, Verification,
-    Writer,
+    Access, Created, Dkim, Domain, Error, KIND_ACCESS, KIND_DKIM, KIND_DOMAIN, KIND_TENANT,
+    KeyError, KeySource, Limits, Loaded, Object, Pool, Ready, Scopes, Snapshot, State, Table,
+    Tenant, Update, Verification, Writer,
 };
 use crypto::{DkimAlg, Secret, Tenant as Root, TenantKeys};
 use rt::sim::{Config, Disk, SimDriver, check};
@@ -518,6 +518,87 @@ fn removed_access_keys_stay_gone_and_their_ids_are_never_reused() {
 }
 
 #[test]
+fn a_sweep_removes_every_record_of_swept_tenants_only() {
+    let domain = Object::Domain(Domain {
+        id: 1,
+        tenant: 4,
+        generation: 1,
+        state: Verification::Unverified,
+        rsa: 0,
+        ed25519: 0,
+        name: "example.org".into(),
+    });
+    let ((), driver) = on(1, Config::default(), created(1), || async move {
+        let (node, loaded, _) = Node::open(BUDGET).await;
+        let mut writer = loaded.writer(node.changes.clone());
+        writer
+            .write(tenant(4, State::Active))
+            .await
+            .expect("tenant");
+        assert_eq!(writer.reserve_dkim().await.expect("reserve"), 1);
+        assert_eq!(writer.reserve_domain().await.expect("reserve"), 1);
+        assert_eq!(writer.reserve_access().await.expect("reserve"), 1);
+        assert_eq!(writer.reserve_access().await.expect("reserve"), 2);
+        writer
+            .write_sealed(dkim(1, 4), &keys(4, 1))
+            .await
+            .expect("dkim");
+        writer
+            .write_sealed(domain, &keys(4, 1))
+            .await
+            .expect("domain");
+        writer.write(access(1, 4)).await.expect("access");
+        writer.write(access(2, 5)).await.expect("access");
+        assert_eq!(writer.owned_records(), 4);
+        let (used, version) = (writer.used(), writer.version());
+        let mut removed = Vec::new();
+        writer
+            .sweep(&|tenant, _| tenant == 4, &mut removed)
+            .await
+            .expect("sweep");
+        let mut kinds: Vec<(u64, u8, u32)> =
+            removed.iter().map(|r| (r.version, r.kind, r.id)).collect();
+        kinds.sort_unstable();
+        assert_eq!(
+            kinds.iter().map(|k| k.0).collect::<Vec<_>>(),
+            [version + 1, version + 2, version + 3]
+        );
+        let mut found: Vec<(u8, u32)> = kinds.iter().map(|k| (k.1, k.2)).collect();
+        found.sort_unstable();
+        assert_eq!(found, [(KIND_DKIM, 1), (KIND_ACCESS, 1), (KIND_DOMAIN, 1)]);
+        assert!(writer.used() < used);
+        assert_eq!(writer.owned_records(), 1);
+        removed.clear();
+        writer
+            .sweep(&|tenant, _| tenant == 4, &mut removed)
+            .await
+            .expect("sweep");
+        assert_eq!(removed.len(), 0);
+        node.close().await;
+    });
+    on(2, Config::default(), driver.crash(), || async {
+        let (node, loaded, snapshot) = Node::open(BUDGET).await;
+        let table = table(snapshot);
+        assert_eq!(table.accesses(5).map(|a| a.id).collect::<Vec<_>>(), [2]);
+        assert_eq!(table.accesses(4).count(), 0);
+        assert_eq!(table.dkims(4).count(), 0);
+        assert!(table.domain(4, 1).is_none());
+        let writer = loaded.writer(node.changes.clone());
+        assert_eq!(writer.skipped(), 0);
+        assert_eq!(writer.owned_records(), 1);
+        assert_eq!(
+            (
+                writer.dkim_next(),
+                writer.access_next(),
+                writer.domain_next()
+            ),
+            (2, 3, 2)
+        );
+        node.close().await;
+    });
+}
+
+#[test]
 fn domains_load_sealed_and_removed_dkim_keys_stay_gone() {
     let ((), driver) = on(1, Config::default(), created(1), || async {
         let (node, loaded, _) = Node::open(BUDGET).await;
@@ -554,7 +635,7 @@ fn domains_load_sealed_and_removed_dkim_keys_stay_gone() {
             .await
             .expect("write");
         assert!(matches!(
-            writer.remove(&domain).await,
+            writer.remove(&pool(1)).await,
             Err(Error::Invalid("kind"))
         ));
         writer.remove(&dkim(2, 4)).await.expect("remove");

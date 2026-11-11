@@ -5,7 +5,8 @@ use rt::Peers;
 
 use crate::access::{Grant, Scope, Token};
 use crate::record::{
-    Access, Dkim, Domain, KIND_ACCESS, KIND_DKIM, Object, Pool, State, Tenant, Update, Verification,
+    Access, Dkim, Domain, KIND_ACCESS, KIND_DKIM, KIND_DOMAIN, Object, Pool, State, Tenant, Update,
+    Verification,
 };
 
 const DUMMY: [u8; 32] = [0; 32];
@@ -112,6 +113,12 @@ impl Table {
     pub fn gone(&self, tenant: u32, generation: u32) -> bool {
         self.tenants.get(&tenant).is_some_and(|t| {
             generation < t.generation || (generation == t.generation && t.state.deleted())
+        })
+    }
+
+    pub fn swept(&self, tenant: u32, generation: u32) -> bool {
+        self.tenants.get(&tenant).is_some_and(|t| {
+            generation < t.generation || (generation == t.generation && t.state == State::Deleted)
         })
     }
 
@@ -228,6 +235,9 @@ impl Table {
             }
             KIND_DKIM => {
                 self.dkims.remove(&id);
+            }
+            KIND_DOMAIN => {
+                self.domains.remove(&id);
             }
             _ => {}
         }
