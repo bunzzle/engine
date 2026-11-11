@@ -12,6 +12,7 @@ use store::Tiering;
 use store::{Changes, Core, Keeper};
 
 use crate::clock::Clock;
+use crate::delete::sweep_queues;
 use crate::error::Error;
 use crate::node::{Config, Note, Sched};
 use crate::requests::{KIND_REQUEST, RequestInputs, Requests, retain_request};
@@ -181,7 +182,10 @@ impl<T: Transport + 'static> Node<T> {
         let changes = spool.changes().clone();
 
         let writer = match control {
-            Some(loaded) => Some(control_writer(loaded, changes.clone(), check).await?),
+            Some(loaded) => {
+                let writer = control_writer(loaded, changes.clone(), check).await?;
+                Some(sweep_at_start(writer, &table, &config, cores).await?)
+            }
             None => None,
         };
 
@@ -298,6 +302,14 @@ impl<T: Transport + 'static> Node<T> {
 
     pub fn controls(&self) -> bool {
         self.inner.writer.borrow().is_some()
+    }
+
+    pub fn control_records(&self) -> Option<usize> {
+        self.inner
+            .writer
+            .borrow()
+            .as_ref()
+            .map(Writer::owned_records)
     }
 
     pub(crate) async fn write_state(
@@ -473,14 +485,19 @@ const LOW_EVERY: Duration = Duration::from_secs(60);
 
 fn drop_deleted<T: Transport + 'static>(
     inner: Weak<Inner<T>>,
-    mut deletions: rt::Receiver<u32>,
+    mut deletions: rt::Receiver<(u32, bool)>,
 ) -> JoinHandle<()> {
     spawn(async move {
-        while let Some(tenant) = deletions.recv().await {
-            let Some(inner) = inner.upgrade() else {
+        while let Some((tenant, now)) = deletions.recv().await {
+            let Some(strong) = inner.upgrade() else {
                 return;
             };
-            Node { inner }.drop_tenant(tenant).await;
+            if now {
+                Node { inner: strong }.drop_tenant(tenant).await;
+            } else {
+                drop(strong);
+            }
+            sweep_queues(&inner, tenant).await;
         }
     })
 }
@@ -566,6 +583,22 @@ async fn load_control(
     Ok(Some((loaded, snapshot)))
 }
 
+async fn sweep_at_start(
+    mut writer: Writer,
+    table: &RefCell<Table>,
+    config: &Peers<control::Note>,
+    cores: u16,
+) -> Result<Writer, Error> {
+    let mut removed = Vec::new();
+    let swept = |tenant, generation| table.borrow().swept(tenant, generation);
+    let result = writer.sweep(&swept, &mut removed).await;
+    for removal in removed {
+        broadcast(config, cores, &control::Note::Remove(removal));
+    }
+    result?;
+    Ok(writer)
+}
+
 async fn control_writer(
     loaded: control::Loaded,
     changes: Changes,
@@ -602,7 +635,11 @@ fn restore_live<T: Transport + 'static>(
     sched.restore(live, |tenant| table.tenant(tenant).map(|t| t.generation));
 }
 
-type Started = (Peers<control::Note>, JoinHandle<()>, rt::Receiver<u32>);
+type Started = (
+    Peers<control::Note>,
+    JoinHandle<()>,
+    rt::Receiver<(u32, bool)>,
+);
 
 fn start_config(
     ends: Ends<control::Note>,
@@ -617,9 +654,7 @@ fn start_config(
     let (config, done) = ends.start(move |_, note| {
         for (tenant, generation, now) in deleted(&note) {
             keys.forget(tenant, generation);
-            if now {
-                let _ = deleting.send(tenant);
-            }
+            let _ = deleting.send((tenant, now));
         }
         table.borrow_mut().take(note);
         applied.notify();

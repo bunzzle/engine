@@ -109,6 +109,27 @@ impl Cache {
         found.len()
     }
 
+    pub fn forget_tenant(&mut self, tenant: u32) -> usize {
+        let low = Name {
+            tenant,
+            domain: "".into(),
+            generation: 0,
+            pool: 0,
+        };
+        let found: Vec<(Name, usize)> = self
+            .index
+            .range(low..)
+            .take_while(|(name, _)| name.tenant == tenant)
+            .map(|(name, &at)| (name.clone(), at))
+            .collect();
+        for (name, at) in &found {
+            self.index.remove(name);
+            self.slots[*at] = None;
+            self.free.push(*at);
+        }
+        found.len()
+    }
+
     fn evict(&mut self) -> usize {
         loop {
             let at = self.hand;

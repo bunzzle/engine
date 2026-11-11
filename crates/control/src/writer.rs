@@ -63,6 +63,7 @@ pub struct Loaded {
     dkim_next: u32,
     access_next: u32,
     domain_next: u32,
+    owners: BTreeMap<(u8, u32), (u32, u32)>,
     hidden: Vec<Hidden>,
 }
 
@@ -178,6 +179,7 @@ impl Writer {
             dkim_next: 1,
             access_next: 1,
             domain_next: 1,
+            owners: BTreeMap::new(),
             hidden: Vec::new(),
         };
         let mut objects = Vec::new();
@@ -216,11 +218,19 @@ impl Writer {
                         loaded.version = loaded.version.max(version);
                         loaded.bump(kind, id);
                         loaded.track(kind, id, item.clear.len());
-                        loaded.hidden.push(Hidden {
-                            location: item.location,
-                            tenant: item.tenant,
-                            clear: item.clear.clone(),
-                        });
+                        match sealed_label(&item.clear).filter(|l| l.tenant == item.tenant) {
+                            Some(label) => {
+                                loaded
+                                    .owners
+                                    .insert((kind, id), (label.tenant, label.generation));
+                                loaded.hidden.push(Hidden {
+                                    location: item.location,
+                                    tenant: item.tenant,
+                                    clear: item.clear.clone(),
+                                });
+                            }
+                            None => loaded.skipped += 1,
+                        }
                     }
                     None => loaded.skipped += 1,
                 }
@@ -239,6 +249,9 @@ impl Writer {
             loaded.version = loaded.version.max(update.version);
             loaded.bump(kind, id);
             loaded.track(kind, id, item.clear.len());
+            if let Some(owner) = update.object.owner() {
+                loaded.owners.insert((kind, id), owner);
+            }
             objects.push(update.object);
         }
         let snapshot = Snapshot {
@@ -307,10 +320,36 @@ impl Writer {
     }
 
     pub async fn remove(&mut self, object: &Object) -> Result<Removal, Error> {
-        let (kind, id) = (object.kind(), object.id());
-        if kind != KIND_ACCESS && kind != KIND_DKIM {
+        if object.owner().is_none() {
             return Err(Error::Invalid("kind"));
         }
+        self.drop_record(object.kind(), object.id(), object.tenant())
+            .await
+    }
+
+    pub async fn sweep(
+        &mut self,
+        swept: &dyn Fn(u32, u32) -> bool,
+        removed: &mut Vec<Removal>,
+    ) -> Result<(), Error> {
+        let found: Vec<(u8, u32, u32)> = self
+            .loaded
+            .owners
+            .iter()
+            .filter(|(_, (tenant, generation))| swept(*tenant, *generation))
+            .map(|(&(kind, id), &(tenant, _))| (kind, id, tenant))
+            .collect();
+        for (kind, id, tenant) in found {
+            removed.push(self.drop_record(kind, id, tenant).await?);
+        }
+        Ok(())
+    }
+
+    pub fn owned_records(&self) -> usize {
+        self.loaded.owners.len()
+    }
+
+    async fn drop_record(&mut self, kind: u8, id: u32, tenant: u32) -> Result<Removal, Error> {
         let size = self
             .loaded
             .sizes
@@ -320,7 +359,7 @@ impl Writer {
         let batch = Batch {
             shard: self.loaded.shard,
             message: control_key(kind, id),
-            tenant: object.tenant(),
+            tenant,
             ops: vec![Op {
                 item: HEAD_ITEM,
                 change: Change::Drop,
@@ -331,6 +370,7 @@ impl Writer {
         };
         self.changes.apply(batch).await?;
         self.loaded.sizes.remove(&(kind, id));
+        self.loaded.owners.remove(&(kind, id));
         self.loaded.used -= size;
         self.loaded.version += 1;
         Ok(Removal {
@@ -428,6 +468,9 @@ impl Writer {
         self.loaded.version = update.version;
         self.loaded.bump(kind, id);
         self.loaded.track(kind, id, clear.len());
+        if let Some(owner) = update.object.owner() {
+            self.loaded.owners.insert((kind, id), owner);
+        }
         Ok(update)
     }
 }

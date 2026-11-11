@@ -13,6 +13,7 @@ pub const KIND_NODE: u8 = 4;
 pub const KIND_DKIM: u8 = 5;
 pub const KIND_ACCESS: u8 = 6;
 pub const KIND_DOMAIN: u8 = 7;
+pub const KIND_FLOOR: u8 = 8;
 pub const SYSTEM: u32 = 0;
 pub const MAX_POOLS: usize = 16;
 pub const MAX_ADDRESSES: usize = 64;
@@ -240,6 +241,15 @@ impl Object {
             Self::Dkim(d) => d.tenant,
             Self::Access(a) => a.tenant,
             Self::Domain(d) => d.tenant,
+        }
+    }
+
+    pub fn owner(&self) -> Option<(u32, u32)> {
+        match self {
+            Self::Tenant(_) | Self::Pool(_) => None,
+            Self::Dkim(d) => Some((d.tenant, d.generation)),
+            Self::Access(a) => Some((a.tenant, a.generation)),
+            Self::Domain(d) => Some((d.tenant, d.generation)),
         }
     }
 

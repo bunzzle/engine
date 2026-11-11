@@ -57,6 +57,7 @@ struct Toy {
     failed: BTreeSet<u32>,
     unavailable: Cell<u32>,
     asked: Cell<u32>,
+    shredded: Cell<u32>,
 }
 
 impl Toy {
@@ -66,7 +67,7 @@ impl Toy {
             self.unavailable.set(self.unavailable.get() - 1);
             return Err(KeyError::Unavailable);
         }
-        if self.unknown.contains(&tenant) {
+        if self.unknown.contains(&tenant) || self.shredded.get() == tenant {
             return Err(KeyError::Unknown);
         }
         if self.failed.contains(&tenant) {
@@ -231,10 +232,24 @@ struct Node {
 
 impl Node {
     fn start(machine: &Machine, cores: u16, sealer: &Rc<Toy>) -> Option<Self> {
-        Self::try_start(machine, cores, sealer).ok()
+        Self::try_start(machine, cores, sealer, |_, _| false).ok()
     }
 
-    fn try_start(machine: &Machine, cores: u16, sealer: &Rc<Toy>) -> Result<Self, Option<Error>> {
+    fn start_gone(
+        machine: &Machine,
+        cores: u16,
+        sealer: &Rc<Toy>,
+        gone: fn(u32, u32) -> bool,
+    ) -> Option<Self> {
+        Self::try_start(machine, cores, sealer, gone).ok()
+    }
+
+    fn try_start(
+        machine: &Machine,
+        cores: u16,
+        sealer: &Rc<Toy>,
+        gone: fn(u32, u32) -> bool,
+    ) -> Result<Self, Option<Error>> {
         let setup = Setup {
             cores,
             credits: 4,
@@ -269,7 +284,7 @@ impl Node {
                     .await
                     .map_err(|_| None)?
                     .map_err(|_| None)?;
-                let loaded = Queues::load(&core, NAMING, opener.as_ref(), &|_, _| false)
+                let loaded = Queues::load(&core, NAMING, opener.as_ref(), &gone)
                     .await
                     .map_err(Some)?;
                 Ok::<_, Option<Error>>((loaded, core))
@@ -495,6 +510,161 @@ fn rebind_moves_or_drains_and_survives_a_restart() {
     machine.block_on(0, node.stop());
 }
 
+fn first_gone(tenant: u32, generation: u32) -> bool {
+    tenant == 1 && generation == 1
+}
+
+fn sweep_all(machine: &Machine, node: &Node, tenant: u32) -> usize {
+    let mut removed = 0;
+    for (at, queues) in node.queues.iter().enumerate() {
+        let queues = queues.clone();
+        removed += machine
+            .block_on(
+                at + 1,
+                async move { queues.sweep(tenant, &first_gone).await },
+            )
+            .expect("sweep");
+    }
+    removed
+}
+
+#[test]
+fn swept_queues_leave_every_core_and_their_ids_are_never_given_again() {
+    let cores: u16 = 2;
+    let sealer = Rc::new(Toy::default());
+    let driver = Rc::new(SimDriver::with_disk(3, Config::default(), created(3)));
+    let machine = machine(&driver, cores);
+    let node = Node::start(&machine, cores, &sealer).expect("start");
+    let kept: Vec<Name> = DOMAINS.iter().map(|d| name(2, 1, 1, d)).collect();
+    let gone: Vec<Name> = DOMAINS.iter().map(|d| name(1, 1, 1, d)).collect();
+    let asker = node.queues[0].clone();
+    let (kept_ids, gone_ids) = {
+        let (kept, gone) = (kept.clone(), gone.clone());
+        machine.block_on(1, async move {
+            let mut ids = (Vec::new(), Vec::new());
+            for n in &kept {
+                ids.0.push(asker.name(n).await.expect("kept"));
+            }
+            for n in &gone {
+                ids.1.push(asker.name(n).await.expect("gone"));
+            }
+            ids
+        })
+    };
+    assert_eq!(node.queues[0].cached(), 24);
+    assert_eq!(sweep_all(&machine, &node, 2), 0);
+    assert_eq!(sweep_all(&machine, &node, 1), 12);
+    assert_eq!(sweep_all(&machine, &node, 1), 0);
+    assert_eq!(node.queues[0].cached(), 12);
+    let core_of = |n: &Name| usize::from(naming_shard(&KEY, n.tenant, &n.domain, SHARDS) % cores);
+    for (n, id) in gone.iter().zip(&gone_ids) {
+        let owner = &node.queues[core_of(n)];
+        assert_eq!(owner.owned(n), None);
+        assert!(owner.entry(*id).is_none());
+        assert_eq!(owner.holder(*id), None);
+    }
+    for (n, id) in kept.iter().zip(&kept_ids) {
+        assert_eq!(node.queues[core_of(n)].owned(n), Some(*id));
+    }
+    machine.block_on(0, node.stop());
+    let driver = Rc::new(SimDriver::with_disk(4, Config::default(), driver.crash()));
+    let machine = self::machine(&driver, cores);
+    let node = Node::start(&machine, cores, &sealer).expect("restart");
+    assert_eq!((node.skipped, node.loaded), (0, 12));
+    let asker = node.queues[1].clone();
+    let fresh: Vec<Name> = DOMAINS.iter().map(|d| name(1, 2, 1, d)).collect();
+    let fresh_ids = machine.block_on(2, async move {
+        let mut ids = Vec::new();
+        for n in &fresh {
+            ids.push(asker.name(n).await.expect("fresh"));
+        }
+        ids
+    });
+    for id in &fresh_ids {
+        assert!(
+            !gone_ids.contains(id) && !kept_ids.contains(id),
+            "id {id} given again"
+        );
+    }
+    machine.block_on(0, node.stop());
+}
+
+#[test]
+fn queues_of_gone_tenants_skipped_at_start_are_swept_later() {
+    let cores: u16 = 2;
+    let sealer = Rc::new(Toy::default());
+    let driver = Rc::new(SimDriver::with_disk(5, Config::default(), created(5)));
+    let machine = machine(&driver, cores);
+    let node = Node::start(&machine, cores, &sealer).expect("start");
+    let asker = node.queues[0].clone();
+    machine.block_on(1, async move {
+        for d in DOMAINS {
+            asker.name(&name(1, 1, 1, d)).await.expect("name");
+            asker.name(&name(2, 1, 1, d)).await.expect("name");
+        }
+    });
+    machine.block_on(0, node.stop());
+    let driver = Rc::new(SimDriver::with_disk(6, Config::default(), driver.crash()));
+    let machine = self::machine(&driver, cores);
+    let node = Node::start_gone(&machine, cores, &sealer, first_gone).expect("restart");
+    assert_eq!((node.skipped, node.loaded), (12, 12));
+    let left: usize = node.queues.iter().map(Queues::leftovers).sum();
+    assert_eq!(left, 12);
+    assert_eq!(sweep_all(&machine, &node, 1), 12);
+    assert_eq!(node.queues.iter().map(Queues::leftovers).sum::<usize>(), 0);
+    machine.block_on(0, node.stop());
+    let driver = Rc::new(SimDriver::with_disk(7, Config::default(), driver.crash()));
+    let machine = self::machine(&driver, cores);
+    let node = Node::start_gone(&machine, cores, &sealer, first_gone).expect("restart");
+    assert_eq!((node.skipped, node.loaded), (0, 12));
+    machine.block_on(0, node.stop());
+}
+
+fn racing_sweep(seed: u64) {
+    let cores: u16 = 1;
+    let sealer = Rc::new(Toy::default());
+    let driver = Rc::new(SimDriver::with_disk(seed, Config::default(), created(seed)));
+    let machine = machine(&driver, cores);
+    let node = Node::start(&machine, cores, &sealer).expect("start");
+    let queues = node.queues[0].clone();
+    let shred = Rc::clone(&sealer);
+    let ids = machine.block_on(1, async move {
+        let asked: Vec<_> = DOMAINS
+            .iter()
+            .map(|d| {
+                let queues = queues.clone();
+                let n = name(1, 1, 1, d);
+                rt::spawn(async move { queues.name(&n).await.ok() })
+            })
+            .collect();
+        rt::sleep(Duration::from_micros(seed % 400)).await;
+        shred.shredded.set(1);
+        queues.sweep(1, &first_gone).await.expect("sweep");
+        let mut ids = Vec::new();
+        for asked in asked {
+            ids.extend(asked.await);
+        }
+        ids
+    });
+    for id in ids {
+        assert!(
+            node.queues[0].entry(id).is_none(),
+            "seed {seed}: queue {id} kept"
+        );
+    }
+    for d in DOMAINS {
+        assert_eq!(node.queues[0].owned(&name(1, 1, 1, d)), None);
+    }
+    machine.block_on(0, node.stop());
+}
+
+#[test]
+fn names_racing_a_sweep_leave_no_queue_behind() {
+    for seed in 0..16 {
+        racing_sweep(100 + seed);
+    }
+}
+
 #[test]
 fn records_that_do_not_open_or_decode_are_skipped_at_start() {
     let cores: u16 = 1;
@@ -662,7 +832,8 @@ fn start_waits_for_keys_asks_once_per_tenant_and_skips_unknown_ones() {
         ..Toy::default()
     });
     let driver = Rc::new(SimDriver::with_disk(6, Config::default(), disk.clone()));
-    let failed = Node::try_start(&self::machine(&driver, cores), cores, &broken).err();
+    let failed =
+        Node::try_start(&self::machine(&driver, cores), cores, &broken, |_, _| false).err();
     assert!(
         matches!(
             failed,
