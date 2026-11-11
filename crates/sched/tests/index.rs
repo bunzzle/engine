@@ -10,7 +10,8 @@ use std::time::Duration;
 
 use aws_lc_rs::signature::{ED25519, RSA_PKCS1_2048_8192_SHA256, UnparsedPublicKey};
 use control::{
-    Created, Dkim, KeyError, KeySource, Naming, Object, Pool, Ready, State, Table, Tenant,
+    Created, Dkim, KeyError, KeySource, Naming, Object, Pool, Ready, Scope, Scopes, State, Table,
+    Tenant,
 };
 use crypto::{BatchKey, DkimAlg, Secret, Tenant as Root, TenantKeys, Wrap, day_public, open_batch};
 use index::{Entry, Op};
@@ -2235,4 +2236,98 @@ fn a_delete_cut_by_a_crash_finishes_after_a_restart() {
         nodes[0].draft(1, None).expect("tenant 1 untouched");
     });
     restarted.stop();
+}
+
+async fn access_everywhere(nodes: &[Node<Idle>], id: u32, present: bool) {
+    for node in nodes {
+        while node.table().access(id).is_some() != present {
+            sleep(Duration::from_millis(1)).await;
+        }
+    }
+}
+
+#[test]
+fn access_keys_check_on_every_core_until_revoked_across_restarts() {
+    let smtp = Scopes {
+        smtp: true,
+        api: false,
+    };
+    let driver = Rc::new(SimDriver::with_disk(43, Config::default(), created(43)));
+    let cluster = started(&driver, 2);
+    let nodes = cluster.nodes.clone();
+    let tokens = cluster.run(async move {
+        ready(&nodes).await;
+        let control = nodes.iter().find(|n| n.controls()).expect("control core");
+        let other = nodes.iter().find(|n| !n.controls()).expect("other core");
+        assert!(matches!(
+            other.access_new(1, smtp, 0).await,
+            Err(sched::Error::Control(control::Error::Invalid("core")))
+        ));
+        assert!(matches!(
+            control.access_new(7, smtp, 0).await,
+            Err(sched::Error::Control(control::Error::Refused))
+        ));
+        assert!(matches!(
+            control.access_new(1, smtp, 5).await,
+            Err(sched::Error::Control(control::Error::Invalid("pool")))
+        ));
+        assert!(matches!(
+            control.access_new(1, Scopes::default(), 0).await,
+            Err(sched::Error::Control(control::Error::Invalid("scopes")))
+        ));
+        let (first, kept) = control.access_new(1, smtp, 0).await.expect("new");
+        let (second, revoked) = control.access_new(1, smtp, 1).await.expect("new");
+        assert_eq!((first.id, second.id), (1, 2));
+        assert!(matches!(
+            control.write(Object::Access(first.clone())).await,
+            Err(sched::Error::Control(control::Error::Invalid("kind")))
+        ));
+        access_everywhere(&nodes, 2, true).await;
+        for node in &nodes {
+            let table = node.table();
+            let grant = table.check(&kept, Scope::Smtp).expect("grant");
+            assert_eq!((grant.access, grant.tenant, grant.pool), (1, 1, 1));
+            assert!(table.check(&kept, Scope::Api).is_none());
+            assert!(table.check(&revoked, Scope::Smtp).is_some());
+        }
+        assert!(matches!(
+            control.access_revoke(2, 2).await,
+            Err(sched::Error::Control(control::Error::Refused))
+        ));
+        control.access_revoke(1, 2).await.expect("revoke");
+        assert!(matches!(
+            control.access_revoke(1, 2).await,
+            Err(sched::Error::Control(control::Error::Refused))
+        ));
+        access_everywhere(&nodes, 2, false).await;
+        for node in &nodes {
+            assert!(node.table().check(&revoked, Scope::Smtp).is_none());
+        }
+        (kept.to_vec(), revoked.to_vec())
+    });
+    drop(cluster);
+    let driver = Rc::new(SimDriver::with_disk(44, Config::default(), driver.crash()));
+    let restarted = started(&driver, 2);
+    let nodes = restarted.nodes.clone();
+    restarted.run(async move {
+        wait_for(&nodes, 1, 1, State::Active).await;
+        access_everywhere(&nodes, 1, true).await;
+        for node in &nodes {
+            let table = node.table();
+            assert!(table.check(&tokens.0, Scope::Smtp).is_some());
+            assert!(table.check(&tokens.1, Scope::Smtp).is_none());
+            assert!(table.access(2).is_none());
+        }
+        let control = nodes.iter().find(|n| n.controls()).expect("control core");
+        let (third, _) = control.access_new(1, smtp, 0).await.expect("new");
+        assert_eq!(third.id, 3);
+        control
+            .write(tenant(1, 1, State::Suspended))
+            .await
+            .expect("suspend");
+        wait_for(&nodes, 1, 1, State::Suspended).await;
+        for node in &nodes {
+            assert!(node.table().check(&tokens.0, Scope::Smtp).is_none());
+        }
+    });
 }

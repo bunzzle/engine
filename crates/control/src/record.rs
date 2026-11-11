@@ -2,6 +2,7 @@ use std::net::{IpAddr, Ipv6Addr};
 
 use crypto::DkimAlg;
 
+use crate::access::Scopes;
 use crate::error::Error;
 use crate::queue::{Label, MAX_DOMAIN, domain_ok};
 
@@ -10,6 +11,7 @@ pub const KIND_POOL: u8 = 2;
 pub const KIND_QUEUE: u8 = 3;
 pub const KIND_NODE: u8 = 4;
 pub const KIND_DKIM: u8 = 5;
+pub const KIND_ACCESS: u8 = 6;
 pub const SYSTEM: u32 = 0;
 pub const MAX_POOLS: usize = 16;
 pub const MAX_ADDRESSES: usize = 64;
@@ -24,6 +26,7 @@ const POOL: usize = 4;
 const ADDRESS: usize = 20;
 const DKIM: usize = 16;
 const DKIM_SECRET: usize = 4;
+const ACCESS: usize = 48;
 const DOMAINKEY: &str = "._domainkey.";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -140,10 +143,21 @@ impl Dkim {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Access {
+    pub id: u32,
+    pub tenant: u32,
+    pub generation: u32,
+    pub scopes: Scopes,
+    pub pool: u32,
+    pub hash: [u8; 32],
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Object {
     Tenant(Tenant),
     Pool(Pool),
     Dkim(Dkim),
+    Access(Access),
 }
 
 impl Object {
@@ -152,6 +166,7 @@ impl Object {
             Self::Tenant(_) => KIND_TENANT,
             Self::Pool(_) => KIND_POOL,
             Self::Dkim(_) => KIND_DKIM,
+            Self::Access(_) => KIND_ACCESS,
         }
     }
 
@@ -160,6 +175,7 @@ impl Object {
             Self::Tenant(t) => t.id,
             Self::Pool(p) => p.id,
             Self::Dkim(d) => d.id,
+            Self::Access(a) => a.id,
         }
     }
 
@@ -168,6 +184,7 @@ impl Object {
             Self::Tenant(t) => t.id,
             Self::Pool(_) => SYSTEM,
             Self::Dkim(d) => d.tenant,
+            Self::Access(a) => a.tenant,
         }
     }
 
@@ -180,7 +197,7 @@ impl Object {
                 id: d.id,
                 hash: None,
             }),
-            Self::Tenant(_) | Self::Pool(_) => None,
+            Self::Tenant(_) | Self::Pool(_) | Self::Access(_) => None,
         }
     }
 
@@ -209,6 +226,17 @@ impl Object {
                 }
             }
             Self::Dkim(d) => d.check()?,
+            Self::Access(a) => {
+                if a.id == 0 {
+                    return Err(Error::Invalid("access id"));
+                }
+                if a.tenant == SYSTEM {
+                    return Err(Error::Invalid("tenant id"));
+                }
+                if a.scopes == Scopes::default() {
+                    return Err(Error::Invalid("scopes"));
+                }
+            }
         }
         Ok(())
     }
@@ -266,13 +294,22 @@ impl Update {
                 out.extend_from_slice(&body);
                 out.extend_from_slice(&d.blob);
             }
+            Object::Access(a) => {
+                let mut body = [0; ACCESS];
+                body[0..4].copy_from_slice(&a.generation.to_le_bytes());
+                body[4] = a.scopes.code();
+                body[8..12].copy_from_slice(&a.pool.to_le_bytes());
+                body[12..16].copy_from_slice(&a.tenant.to_le_bytes());
+                body[16..48].copy_from_slice(&a.hash);
+                out.extend_from_slice(&body);
+            }
         }
         out
     }
 
     pub fn secret(&self) -> Vec<u8> {
         match &self.object {
-            Object::Tenant(_) | Object::Pool(_) => Vec::new(),
+            Object::Tenant(_) | Object::Pool(_) | Object::Access(_) => Vec::new(),
             Object::Dkim(d) => {
                 let mut out = vec![0; DKIM_SECRET];
                 out[0] = u8::try_from(d.domain.len()).expect("domain checked");
@@ -298,6 +335,7 @@ impl Update {
             KIND_TENANT if secret.is_empty() => Object::Tenant(tenant(id, rest)?),
             KIND_POOL if secret.is_empty() => Object::Pool(pool(id, rest)?),
             KIND_DKIM => Object::Dkim(dkim(id, rest, secret)?),
+            KIND_ACCESS if secret.is_empty() => Object::Access(access(id, rest)?),
             _ => return None,
         };
         object.check().ok()?;
@@ -417,5 +455,19 @@ fn dkim(id: u32, rest: &[u8], secret: &[u8]) -> Option<Dkim> {
         selector: str::from_utf8(selector).ok()?.into(),
         public: public.to_vec(),
         blob: blob.to_vec(),
+    })
+}
+
+fn access(id: u32, rest: &[u8]) -> Option<Access> {
+    if rest.len() != ACCESS || rest[5..8] != [0; 3] {
+        return None;
+    }
+    Some(Access {
+        id,
+        tenant: u32_at(rest, 12)?,
+        generation: u32_at(rest, 0)?,
+        scopes: Scopes::from_code(rest[4])?,
+        pool: u32_at(rest, 8)?,
+        hash: rest[16..48].try_into().ok()?,
     })
 }

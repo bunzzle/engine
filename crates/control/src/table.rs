@@ -1,13 +1,31 @@
 use std::collections::BTreeMap;
 
+use crypto::{Secret, sha256};
 use rt::Peers;
 
-use crate::record::{Dkim, Object, Pool, Tenant, Update};
+use crate::access::{Grant, Scope, Token};
+use crate::record::{Access, Dkim, KIND_ACCESS, Object, Pool, State, Tenant, Update};
+
+const DUMMY: [u8; 32] = [0; 32];
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Note {
     Snapshot(Snapshot),
     Update(Update),
+    Remove(Removal),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Removal {
+    pub version: u64,
+    pub kind: u8,
+    pub id: u32,
+}
+
+#[derive(Debug)]
+enum Pending {
+    Set(Object),
+    Remove(u8, u32),
 }
 
 pub fn broadcast(peers: &Peers<Note>, cores: u16, note: &Note) {
@@ -29,7 +47,8 @@ pub struct Table {
     tenants: BTreeMap<u32, Tenant>,
     pools: BTreeMap<u32, Pool>,
     dkims: BTreeMap<u32, Dkim>,
-    waiting: BTreeMap<u64, Object>,
+    accesses: BTreeMap<u32, Access>,
+    waiting: BTreeMap<u64, Pending>,
 }
 
 impl Table {
@@ -39,6 +58,7 @@ impl Table {
         self.tenants.clear();
         self.pools.clear();
         self.dkims.clear();
+        self.accesses.clear();
         for object in snapshot.objects {
             self.set(object);
         }
@@ -50,12 +70,21 @@ impl Table {
         match note {
             Note::Snapshot(snapshot) => self.load(snapshot),
             Note::Update(update) => self.apply(update),
+            Note::Remove(removal) => self.remove(removal),
         }
     }
 
     pub fn apply(&mut self, update: Update) {
-        if update.version > self.version {
-            self.waiting.insert(update.version, update.object);
+        self.wait(update.version, Pending::Set(update.object));
+    }
+
+    pub fn remove(&mut self, removal: Removal) {
+        self.wait(removal.version, Pending::Remove(removal.kind, removal.id));
+    }
+
+    fn wait(&mut self, version: u64, pending: Pending) {
+        if version > self.version {
+            self.waiting.insert(version, pending);
         }
         self.drain();
     }
@@ -94,6 +123,42 @@ impl Table {
         self.dkims.values().filter(move |d| d.tenant == tenant)
     }
 
+    pub fn access(&self, id: u32) -> Option<&Access> {
+        self.accesses.get(&id)
+    }
+
+    pub fn accesses(&self, tenant: u32) -> impl Iterator<Item = &Access> {
+        self.accesses.values().filter(move |a| a.tenant == tenant)
+    }
+
+    pub fn check(&self, token: &[u8], scope: Scope) -> Option<Grant> {
+        let token = Token::parse(token);
+        let (id, presented) = match &token {
+            Some(token) => (token.id(), token.hash()),
+            None => (0, sha256(&DUMMY)),
+        };
+        let found = self
+            .accesses
+            .get(&id)
+            .filter(|a| a.scopes.has(scope))
+            .and_then(|a| {
+                let tenant = self.tenants.get(&a.tenant)?;
+                (tenant.generation == a.generation).then_some((a, tenant))
+            });
+        let expected = found.map_or(DUMMY, |(a, _)| a.hash);
+        let same = Secret::new(presented) == Secret::new(expected);
+        let (access, tenant) = found.filter(|_| same)?;
+        (tenant.state == State::Active).then_some(Grant {
+            access: access.id,
+            tenant: access.tenant,
+            generation: access.generation,
+            pool: match access.pool {
+                0 => tenant.default_pool,
+                pool => pool,
+            },
+        })
+    }
+
     pub fn tenants(&self) -> impl Iterator<Item = &Tenant> {
         self.tenants.values()
     }
@@ -106,8 +171,11 @@ impl Table {
         if !self.loaded {
             return;
         }
-        while let Some(object) = self.waiting.remove(&(self.version + 1)) {
-            self.set(object);
+        while let Some(pending) = self.waiting.remove(&(self.version + 1)) {
+            match pending {
+                Pending::Set(object) => self.set(object),
+                Pending::Remove(kind, id) => self.unset(kind, id),
+            }
             self.version += 1;
         }
     }
@@ -123,6 +191,15 @@ impl Table {
             Object::Dkim(d) => {
                 self.dkims.insert(d.id, d);
             }
+            Object::Access(a) => {
+                self.accesses.insert(a.id, a);
+            }
+        }
+    }
+
+    fn unset(&mut self, kind: u8, id: u32) {
+        if kind == KIND_ACCESS {
+            self.accesses.remove(&id);
         }
     }
 }

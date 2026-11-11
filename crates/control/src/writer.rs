@@ -10,10 +10,11 @@ use crate::error::Error;
 use crate::names::{Fixed, wait_keys};
 use crate::queue::KeySource;
 use crate::record::{
-    KIND_DKIM, KIND_NODE, KIND_POOL, KIND_TENANT, Object, SYSTEM, Update, peek, sealed_label,
+    KIND_ACCESS, KIND_DKIM, KIND_NODE, KIND_POOL, KIND_TENANT, Object, SYSTEM, Update, peek,
+    sealed_label,
 };
 use crate::siphash::siphash;
-use crate::table::Snapshot;
+use crate::table::{Removal, Snapshot};
 
 pub const ENTRY: usize = 64;
 
@@ -21,6 +22,7 @@ const CHECK: usize = 16;
 const CHECK_FORMAT: u8 = 1;
 const NAMING_CHECK: u32 = 0;
 const DKIM_IDS: u32 = 1;
+const ACCESS_IDS: u32 = 2;
 
 pub fn naming_check(key: &[u8; 16]) -> u64 {
     siphash(key, b"bunzzle naming check")
@@ -58,6 +60,7 @@ pub struct Loaded {
     waited: u64,
     naming: Option<u64>,
     dkim_next: u32,
+    access_next: u32,
     hidden: Vec<Hidden>,
 }
 
@@ -81,7 +84,7 @@ impl Loaded {
             .iter()
             .filter_map(|object| match object {
                 Object::Tenant(t) => Some((t.id, (t.generation, t.state.deleted()))),
-                Object::Pool(_) | Object::Dkim(_) => None,
+                Object::Pool(_) | Object::Dkim(_) | Object::Access(_) => None,
             })
             .collect();
         let gone = |tenant: u32, generation: u32| {
@@ -161,6 +164,7 @@ impl Writer {
             waited: 0,
             naming: None,
             dkim_next: 1,
+            access_next: 1,
             hidden: Vec::new(),
         };
         let mut objects = Vec::new();
@@ -176,6 +180,10 @@ impl Writer {
                     (DKIM_IDS, Some(next)) => {
                         let next = u32::try_from(next).unwrap_or(u32::MAX);
                         loaded.dkim_next = loaded.dkim_next.max(next);
+                    }
+                    (ACCESS_IDS, Some(next)) => {
+                        let next = u32::try_from(next).unwrap_or(u32::MAX);
+                        loaded.access_next = loaded.access_next.max(next);
                     }
                     _ => {
                         loaded.skipped += 1;
@@ -201,7 +209,7 @@ impl Writer {
                 }
                 continue;
             }
-            if kind != KIND_TENANT && kind != KIND_POOL {
+            if ![KIND_TENANT, KIND_POOL, KIND_ACCESS].contains(&kind) {
                 continue;
             }
             let decoded = Update::decode(&item.clear).filter(|u| {
@@ -212,6 +220,9 @@ impl Writer {
                 continue;
             };
             loaded.version = loaded.version.max(update.version);
+            if kind == KIND_ACCESS {
+                loaded.access_next = loaded.access_next.max(id.saturating_add(1));
+            }
             loaded.track(kind, id, item.clear.len());
             objects.push(update.object);
         }
@@ -254,6 +265,52 @@ impl Writer {
         self.put_node(DKIM_IDS, u64::from(next)).await?;
         self.loaded.dkim_next = next;
         Ok(id)
+    }
+
+    pub fn access_next(&self) -> u32 {
+        self.loaded.access_next
+    }
+
+    pub async fn reserve_access(&mut self) -> Result<u32, Error> {
+        let id = self.loaded.access_next;
+        let next = id.checked_add(1).ok_or(Error::Full)?;
+        self.put_node(ACCESS_IDS, u64::from(next)).await?;
+        self.loaded.access_next = next;
+        Ok(id)
+    }
+
+    pub async fn remove(&mut self, object: &Object) -> Result<Removal, Error> {
+        let (kind, id) = (object.kind(), object.id());
+        if kind != KIND_ACCESS {
+            return Err(Error::Invalid("kind"));
+        }
+        let size = self
+            .loaded
+            .sizes
+            .get(&(kind, id))
+            .copied()
+            .ok_or(Error::Refused)?;
+        let batch = Batch {
+            shard: self.loaded.shard,
+            message: control_key(kind, id),
+            tenant: object.tenant(),
+            ops: vec![Op {
+                item: HEAD_ITEM,
+                change: Change::Drop,
+                clear: Vec::new(),
+                bodies: Vec::new(),
+                sealed: Vec::new(),
+            }],
+        };
+        self.changes.apply(batch).await?;
+        self.loaded.sizes.remove(&(kind, id));
+        self.loaded.used -= size;
+        self.loaded.version += 1;
+        Ok(Removal {
+            version: self.loaded.version,
+            kind,
+            id,
+        })
     }
 
     async fn put_node(&mut self, id: u32, value: u64) -> Result<(), Error> {
@@ -344,6 +401,9 @@ impl Writer {
         self.loaded.version = update.version;
         if kind == KIND_DKIM {
             self.loaded.dkim_next = self.loaded.dkim_next.max(id.saturating_add(1));
+        }
+        if kind == KIND_ACCESS {
+            self.loaded.access_next = self.loaded.access_next.max(id.saturating_add(1));
         }
         self.loaded.track(kind, id, clear.len());
         Ok(update)
