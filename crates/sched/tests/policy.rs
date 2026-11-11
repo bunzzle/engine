@@ -1,6 +1,6 @@
 use sched::{
-    BACKOFF, CLASS_FULL, CLASS_GREYLIST, CLASS_RETRY_AFTER, CLASS_THROTTLE, Kind, LONGEST, clamp,
-    delay,
+    BACKOFF, CLASS_FULL, CLASS_GREYLIST, CLASS_RETRY_AFTER, CLASS_THROTTLE, Kind, LONGEST,
+    ReportErrors, clamp, delay, report_retry,
 };
 
 const MINUTE: u64 = 60_000;
@@ -39,4 +39,40 @@ fn due_times_past_the_longest_delay_are_clamped() {
     assert_eq!(clamp(500, 1_000), 500);
     assert_eq!(clamp(1_000 + LONGEST, 1_000), 1_000 + LONGEST);
     assert_eq!(clamp(u64::MAX, 1_000), 1_000 + LONGEST);
+}
+
+#[test]
+fn failed_report_writes_wait_longer_each_time_up_to_half_an_hour() {
+    let waits: Vec<u64> = (0..7).map(report_retry).collect();
+    assert_eq!(
+        waits,
+        [1, 1, 5, 15, 30, 30, 30].map(|m| m * MINUTE).to_vec()
+    );
+    assert_eq!(report_retry(u32::MAX), 30 * MINUTE);
+}
+
+#[test]
+fn failed_report_writes_are_counted_by_kind() {
+    let mut errors = ReportErrors::default();
+    for error in [
+        store::Error::Full,
+        store::Error::Reserve,
+        store::Error::JournalFull,
+        store::Error::Busy,
+        store::Error::Failed,
+        store::Error::NotFound,
+    ] {
+        errors.count(&spool::Error::Store(error));
+    }
+    errors.count(&spool::Error::State("gone"));
+    assert_eq!(
+        errors,
+        ReportErrors {
+            space: 3,
+            busy: 1,
+            failed: 1,
+            other: 2,
+        }
+    );
+    assert_eq!(errors.total(), 7);
 }

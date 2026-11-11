@@ -19,11 +19,11 @@ pub use error::{Error, Refusal};
 pub use intake::{Draft, domain_of};
 pub use keyring::Keyring;
 pub use lanes::{Entry, Lanes, Limits, QueueId, Take, ranges};
-pub use node::{Arrival, Claim, Config, Note, Route, Sched, queue_core};
+pub use node::{Arrival, Claim, Config, Note, ReportErrors, Route, Sched, queue_core};
 pub use normal::{MAX_ADDRESS, normalize, punycode};
 pub use policy::{
     Answer, BACKOFF, CLASS_FULL, CLASS_GREYLIST, CLASS_RETRY_AFTER, CLASS_THROTTLE, Kind, LONGEST,
-    clamp, delay,
+    clamp, delay, report_retry,
 };
 pub use requests::{
     Begun, DAY, INLINE_IDS, KIND_REQUEST, REQUEST_SHAPE, RequestInputs, Requests, Ticket,

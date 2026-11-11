@@ -12,7 +12,7 @@ use spool::{Done, Error, Message, MessageId, Outcome, Pending, Reply, Report, Sp
 
 use crate::clock::Clock;
 use crate::lanes::{Entry, Lanes, Limits, QueueId, Take, ranges};
-use crate::policy::{Answer, BACKOFF, Kind, clamp, delay};
+use crate::policy::{Answer, BACKOFF, Kind, clamp, delay, report_retry};
 use crate::sealing::{Keys, Unsealable};
 use crate::transport::{Answered, Attempt, Claimed, Transport};
 use crate::unopened::{Action, Breaker, UnopenedStats, action};
@@ -86,6 +86,7 @@ pub enum Note {
         route: Route,
         reports: Vec<(u32, Option<u64>)>,
         done: Option<Done>,
+        wait: u64,
     },
     Low {
         core: u16,
@@ -151,8 +152,33 @@ struct Inner<T> {
     closed: Cell<bool>,
     attempts: RefCell<BTreeMap<u64, u64>>,
     next_attempt: Cell<u64>,
-    report_errors: Cell<u64>,
+    report_errors: Cell<ReportErrors>,
+    report_streak: Cell<u32>,
     refused: Cell<u64>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ReportErrors {
+    pub space: u64,
+    pub busy: u64,
+    pub failed: u64,
+    pub other: u64,
+}
+
+impl ReportErrors {
+    pub fn total(self) -> u64 {
+        self.space + self.busy + self.failed + self.other
+    }
+
+    pub fn count(&mut self, error: &Error) {
+        use store::Error as E;
+        match error {
+            Error::Store(E::Full | E::Reserve | E::JournalFull) => self.space += 1,
+            Error::Store(E::Busy) => self.busy += 1,
+            Error::Store(E::Failed | E::Io(_)) => self.failed += 1,
+            _ => self.other += 1,
+        }
+    }
 }
 
 pub struct Sched<T> {
@@ -196,7 +222,8 @@ impl<T: Transport + 'static> Sched<T> {
             closed: Cell::new(false),
             attempts: RefCell::new(BTreeMap::new()),
             next_attempt: Cell::new(0),
-            report_errors: Cell::new(0),
+            report_errors: Cell::new(ReportErrors::default()),
+            report_streak: Cell::new(0),
             refused: Cell::new(0),
         });
         let sched = Self { inner };
@@ -238,7 +265,7 @@ impl<T: Transport + 'static> Sched<T> {
             .count()
     }
 
-    pub fn report_errors(&self) -> u64 {
+    pub fn report_errors(&self) -> ReportErrors {
         self.inner.report_errors.get()
     }
 
@@ -402,7 +429,8 @@ impl<T: Transport + 'static> Sched<T> {
                 route,
                 reports,
                 done,
-            } => self.reported(route, &reports, done),
+                wait,
+            } => self.reported(route, &reports, done, wait),
             Note::Low { core, day } => {
                 if self.inner.index != 0 || core >= self.inner.cores {
                     self.refuse();
@@ -585,27 +613,42 @@ impl<T: Transport + 'static> Sched<T> {
                 .collect();
             let recipients: Vec<u32> = back.iter().map(|(r, _)| *r).collect();
             let spool = &sched.inner.spool;
-            let done = spool.report(route.message, reports).await.ok();
-            if done.is_none() {
-                spool.release(route.message, &recipients);
-                sched
-                    .inner
-                    .report_errors
-                    .set(sched.inner.report_errors.get() + 1);
-            }
+            let written = spool.report(route.message, reports).await;
+            let streak = &sched.inner.report_streak;
+            let wait = match &written {
+                Ok(_) => {
+                    streak.set(0);
+                    0
+                }
+                Err(error) => {
+                    spool.release(route.message, &recipients);
+                    let mut errors = sched.inner.report_errors.get();
+                    errors.count(error);
+                    sched.inner.report_errors.set(errors);
+                    streak.set(streak.get().saturating_add(1));
+                    report_retry(streak.get())
+                }
+            };
             let core = queue_core(route.queue, sched.inner.config.shards, sched.inner.cores);
             sched.send(
                 core,
                 Note::Reported {
                     route,
                     reports: back,
-                    done,
+                    done: written.ok(),
+                    wait,
                 },
             );
         }));
     }
 
-    fn reported(&self, route: Route, reports: &[(u32, Option<u64>)], done: Option<Done>) {
+    fn reported(
+        &self,
+        route: Route,
+        reports: &[(u32, Option<u64>)],
+        done: Option<Done>,
+        wait: u64,
+    ) {
         let now = self.inner.clock.now();
         let relane = match done {
             Some(Done::Kept) => reports
@@ -615,7 +658,7 @@ impl<T: Transport + 'static> Sched<T> {
             Some(Done::Dropped) => Vec::new(),
             None => reports
                 .iter()
-                .map(|(r, due)| (*r, due.unwrap_or(0).max(now + BACKOFF[0])))
+                .map(|(r, due)| (*r, due.unwrap_or(0).max(now + wait)))
                 .collect(),
         };
         self.relane(route, relane, now);
@@ -695,6 +738,7 @@ impl<T: Transport + 'static> Sched<T> {
                     .map(|(r, due)| (r, Some(due)))
                     .collect(),
                 done: None,
+                wait: BACKOFF[0],
             },
         );
     }
@@ -721,6 +765,7 @@ impl<T: Transport + 'static> Sched<T> {
                     route,
                     reports,
                     done,
+                    wait: BACKOFF[0],
                 },
             );
         }));
