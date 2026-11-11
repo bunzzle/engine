@@ -1,10 +1,11 @@
+use std::fmt::Write;
 use std::fs;
 use std::io;
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
-use keys::{Audit, Server, Settings, Vault};
+use keys::{Audit, Listed, Server, Settings, Vault};
 use rt::{Native, Runtime, UnixListener};
 
 const DAY_MS: u64 = 86_400_000;
@@ -15,6 +16,9 @@ pub enum Command {
     Init {
         dir: PathBuf,
     },
+    List {
+        dir: PathBuf,
+    },
     Run {
         dir: PathBuf,
         socket: PathBuf,
@@ -22,13 +26,13 @@ pub enum Command {
     },
 }
 
-pub const USAGE: &str =
-    "usage: bunzzle keys init <dir>\n       bunzzle keys run <dir> <socket> <engine uid>";
+pub const USAGE: &str = "usage: bunzzle keys init <dir>\n       bunzzle keys list <dir>\n       bunzzle keys run <dir> <socket> <engine uid>";
 
 impl Command {
     pub fn parse(args: &[String]) -> Option<Self> {
         match args {
             [init, dir] if init == "init" => Some(Self::Init { dir: dir.into() }),
+            [list, dir] if list == "list" => Some(Self::List { dir: dir.into() }),
             [run, dir, socket, engine] if run == "run" => Some(Self::Run {
                 dir: dir.into(),
                 socket: socket.into(),
@@ -161,6 +165,18 @@ pub fn run(command: Command) -> Result<(), String> {
                     .map_err(|e| e.to_string())
             })
         }
+        Command::List { dir } => {
+            private_dir(&dir, uid)?;
+            let _lock = lock(&dir)?;
+            let listed = runtime()?.block_on(async move {
+                Vault::open(&dir)
+                    .await
+                    .map(|vault| (vault.day(), vault.listed()))
+                    .map_err(|e| e.to_string())
+            })?;
+            print!("{}", listing(listed.0, &listed.1));
+            Ok(())
+        }
         Command::Run {
             dir,
             socket,
@@ -176,6 +192,18 @@ pub fn run(command: Command) -> Result<(), String> {
             runtime()?.block_on(serve(dir, socket, engine))
         }
     }
+}
+
+pub fn listing(day: u32, listed: &[Listed]) -> String {
+    let mut out = format!("day {day}\ntenant generation retention oldest\n");
+    for entry in listed {
+        let _ = writeln!(
+            out,
+            "{} {} {} {}",
+            entry.tenant, entry.generation, entry.retention, entry.oldest
+        );
+    }
+    out
 }
 
 fn wall_ms() -> u64 {
@@ -206,7 +234,9 @@ mod tests {
     use std::os::unix::net::UnixListener;
     use std::path::PathBuf;
 
-    use super::{Command, bind, clear_socket, lock, private_dir, socket_path};
+    use keys::Listed;
+
+    use super::{Command, bind, clear_socket, listing, lock, private_dir, socket_path};
 
     fn scratch(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("bunzzle-keys-{}-{name}", std::process::id()));
@@ -230,9 +260,35 @@ mod tests {
             Command::parse(&args(&["run", "/k", "/s", "80"])),
             Some(Command::Run { engine: 80, .. })
         ));
+        assert!(matches!(
+            Command::parse(&args(&["list", "/k"])),
+            Some(Command::List { .. })
+        ));
         assert!(Command::parse(&args(&["run", "/k", "/s", "x"])).is_none());
         assert!(Command::parse(&args(&["run", "/k"])).is_none());
         assert!(Command::parse(&args(&[])).is_none());
+    }
+
+    #[test]
+    fn the_listing_shows_tenants_without_key_material() {
+        let listed = [
+            Listed {
+                tenant: 4,
+                generation: 2,
+                retention: 30,
+                oldest: 20_100,
+            },
+            Listed {
+                tenant: 9,
+                generation: 1,
+                retention: 7,
+                oldest: 20_110,
+            },
+        ];
+        assert_eq!(
+            listing(20_120, &listed),
+            "day 20120\ntenant generation retention oldest\n4 2 30 20100\n9 1 7 20110\n"
+        );
     }
 
     #[test]

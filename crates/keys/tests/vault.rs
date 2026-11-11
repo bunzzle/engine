@@ -79,6 +79,12 @@ fn state_survives_a_restart() {
         assert_eq!(*vault.naming().expose(), before.4);
         assert_ne!(keys.today, keys.tomorrow);
         assert!(vault.keys(2, 1).is_ok());
+        let listed: Vec<(u32, u32, u16, u32)> = vault
+            .listed()
+            .iter()
+            .map(|l| (l.tenant, l.generation, l.retention, l.oldest))
+            .collect();
+        assert_eq!(listed, [(1, 1, 30, 100), (2, 1, 30, 100)]);
     });
 }
 
