@@ -238,6 +238,7 @@ impl Core {
             Request::Hello { .. } => match Secret::from_slice(self.vault.naming().expose()) {
                 Ok(naming) => Answer::Hello {
                     day: self.vault.day(),
+                    ids: crypto::id_key(&naming),
                     naming,
                 },
                 Err(_) => self.refused(Error::Failed),

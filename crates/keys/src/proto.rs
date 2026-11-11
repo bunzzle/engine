@@ -63,6 +63,7 @@ pub enum Answer {
     Hello {
         day: u32,
         naming: Secret<16>,
+        ids: Secret<16>,
     },
     Keys {
         day: u32,
@@ -374,8 +375,13 @@ impl Answer {
     pub fn encode(&self, id: u32, out: &mut Plain) {
         match self {
             Self::Done => frame(out, 0x80, id, &[]),
-            Self::Hello { day, naming } => {
-                frame(out, 0x81, id, &[&day.to_le_bytes(), naming.expose()]);
+            Self::Hello { day, naming, ids } => {
+                frame(
+                    out,
+                    0x81,
+                    id,
+                    &[&day.to_le_bytes(), naming.expose(), ids.expose()],
+                );
             }
             Self::Keys {
                 day,
@@ -422,6 +428,7 @@ impl Answer {
             0x81 => Self::Hello {
                 day: r.u32()?,
                 naming: r.secret()?,
+                ids: r.secret()?,
             },
             0x82 => Self::Keys {
                 day: r.u32()?,
@@ -448,7 +455,7 @@ impl Answer {
     pub fn size(&self) -> usize {
         HEAD + match self {
             Self::Done => 0,
-            Self::Hello { .. } => 20,
+            Self::Hello { .. } => 36,
             Self::Keys { .. } => 121,
             Self::Key(_) => 32,
             Self::Dkim { public, blob } => 4 + public.len() + blob.len(),
@@ -597,6 +604,7 @@ mod tests {
             Answer::Hello {
                 day: 1,
                 naming: Secret::new([2; 16]),
+                ids: Secret::new([9; 16]),
             },
             Answer::Keys {
                 day: 1,

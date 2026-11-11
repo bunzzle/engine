@@ -118,7 +118,7 @@ struct Inner {
     connect: Connect,
     link: RefCell<Link>,
     joining: RefCell<Vec<Sender<()>>>,
-    naming: RefCell<Option<Secret<16>>>,
+    naming: RefCell<Option<(Secret<16>, Secret<16>)>>,
     day: Cell<u32>,
     failed: Cell<bool>,
     tenants: RefCell<Cache<(u32, u32), Working>>,
@@ -191,7 +191,19 @@ impl Ring {
     }
 
     pub fn naming(&self) -> Option<[u8; 16]> {
-        self.inner.naming.borrow().as_ref().map(|key| *key.expose())
+        self.inner
+            .naming
+            .borrow()
+            .as_ref()
+            .map(|(key, _)| *key.expose())
+    }
+
+    pub fn ids(&self) -> Option<Secret<16>> {
+        self.inner
+            .naming
+            .borrow()
+            .as_ref()
+            .map(|(_, ids)| ids.copy())
     }
 
     pub fn stats(&self) -> RingStats {
@@ -706,16 +718,16 @@ impl Ring {
             node: settings.node,
         };
         let answer = client.call_within(&hello, settings.deadline).await;
-        let Ok(Answer::Hello { day, naming }) = answer else {
+        let Ok(Answer::Hello { day, naming, ids }) = answer else {
             client.close();
             return Err(answer.err().unwrap_or(Error::Bad));
         };
         let changed = {
             let mut known = self.inner.naming.borrow_mut();
-            if let Some(key) = known.as_ref() {
-                !(*key == naming)
+            if let Some((key, known_ids)) = known.as_ref() {
+                !(*key == naming && *known_ids == ids)
             } else {
-                *known = Some(naming);
+                *known = Some((naming, ids));
                 false
             }
         };
