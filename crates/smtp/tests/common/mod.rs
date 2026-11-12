@@ -3,6 +3,7 @@
 use smtp::{Config, Event, Reply, Server, reply};
 
 pub const LIMIT: u64 = 1 << 16;
+pub const MESSAGES: u32 = 1000;
 pub const TOKEN: &[u8] = b"bz_good";
 pub const PLAIN: &str = "AHVzZXIAYnpfZ29vZA==";
 
@@ -43,6 +44,7 @@ impl Client {
             name: "mx.example.org".into(),
             message,
             implicit,
+            messages: MESSAGES,
         });
         let output = server.output();
         Self {

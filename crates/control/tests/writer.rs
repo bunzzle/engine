@@ -144,6 +144,7 @@ fn tenant(id: u32, state: State) -> Object {
         limits: Limits {
             rate: 100,
             burst: 10,
+            connections: 0,
             queued: 10_000,
         },
     })

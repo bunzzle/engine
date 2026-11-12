@@ -14,13 +14,13 @@ use aws_lc_rs::signature::{ED25519, RSA_PKCS1_2048_8192_SHA256, UnparsedPublicKe
 use control::{Domain, Object, Pool, Scopes, State, Tenant, Verification};
 use crypto::{DkimAlg, Ids};
 use dkim::BodyHash;
-use intake::{Config as SessionConfig, Conn, End, Listener, listen};
+use intake::{Config as SessionConfig, Conn, End, Guard, Limits, Listener, data_hold, listen};
 use keys::{
     Audit, BatchSettings, Client as KeyClient, Connect, Ring, RingSettings, Server as KeyServer,
     Settings as KeySettings, Vault,
 };
 use rt::sim::{Config, Disk, Machine, SimDriver, Stalls, check};
-use rt::{JoinHandle, Runtime, TcpListener, TcpStream, sleep, spawn, timeout};
+use rt::{JoinHandle, Mesh, Runtime, TcpListener, TcpStream, sleep, spawn, timeout};
 use sched::{
     Answer, Answered, Attempt, Body, Claimed, Clock, Fault, Keyring, Keys, Meshes, Node, Parts,
     Running, Settings, Transport,
@@ -462,7 +462,13 @@ impl Ports {
     }
 }
 
-async fn listen_with(node: &Node<Idle>, seed: u64, config: SessionConfig) -> Ports {
+fn guard(limits: Limits) -> Guard {
+    let mesh = Mesh::new(1);
+    let ends = mesh.take(0).expect("ends");
+    Guard::start(ends, [7; 16], limits).0
+}
+
+async fn listen_with(node: &Node<Idle>, seed: u64, config: SessionConfig, guard: Guard) -> Ports {
     let config = Rc::new(config);
     let acceptor = acceptor(seed);
     let mut listeners = Vec::new();
@@ -475,6 +481,7 @@ async fn listen_with(node: &Node<Idle>, seed: u64, config: SessionConfig) -> Por
             socket,
             Rc::clone(&acceptor),
             Rc::clone(&config),
+            guard.clone(),
             implicit,
         ));
     }
@@ -482,7 +489,8 @@ async fn listen_with(node: &Node<Idle>, seed: u64, config: SessionConfig) -> Por
 }
 
 async fn listen_on(node: &Node<Idle>, seed: u64) -> Ports {
-    listen_with(node, seed, SessionConfig::new("mx1.example.net".into())).await
+    let config = SessionConfig::new("mx1.example.net".into());
+    listen_with(node, seed, config, guard(Limits::default())).await
 }
 
 struct Smtp {
@@ -1000,12 +1008,19 @@ fn listeners_cap_connections_time_out_handshakes_and_close() {
         let nodes = cluster.nodes.clone();
         cluster.run(async move {
             prepare(&nodes).await;
-            let mut config = SessionConfig::new("mx1.example.net".into());
-            config.connections = 2;
-            let listening = listen_with(&nodes[0], seed, config).await;
+            let config = SessionConfig::new("mx1.example.net".into());
+            let limits = Limits {
+                sessions: 3,
+                ..Limits::default()
+            };
+            let listening = listen_with(&nodes[0], seed, config, guard(limits)).await;
             let tls = client_config(simulated(seed + 100));
             let first = Smtp::connect(SUBMIT, &tls).await;
             let second = Smtp::connect(SUBMIT, &tls).await;
+            let silent = TcpStream::connect(SocketAddr::from((HOST, IMPLICIT)))
+                .await
+                .expect("connect");
+            let started = rt::now();
             let io = TcpStream::connect(SocketAddr::from((HOST, SUBMIT)))
                 .await
                 .expect("connect");
@@ -1014,10 +1029,6 @@ fn listeners_cap_connections_time_out_handshakes_and_close() {
             assert!(matches!(third.read(&mut seen).await, Ok(0) | Err(_)));
             assert_eq!(listening.refused(), 1);
 
-            let silent = TcpStream::connect(SocketAddr::from((HOST, IMPLICIT)))
-                .await
-                .expect("connect");
-            let started = rt::now();
             until("handshake", || listening.ended(End::Tls) == 1).await;
             let waited = rt::now().saturating_duration_since(started);
             assert!(
@@ -1032,4 +1043,109 @@ fn listeners_cap_connections_time_out_handshakes_and_close() {
         });
         cluster.stop();
     });
+}
+
+#[test]
+fn abuse_limits_refuse_at_connect_auth_and_data() {
+    check(0..2, |seed| {
+        let driver = Rc::new(SimDriver::with_disk(seed, Config::default(), created(seed)));
+        let cluster = started(&driver, 1).expect("start");
+        let nodes = cluster.nodes.clone();
+        cluster.run(async move {
+            let tokens = prepare(&nodes).await;
+            let Object::Tenant(mut first) = tenant(1) else {
+                unreachable!()
+            };
+            first.limits.connections = 1;
+            control_of(&nodes)
+                .write(Object::Tenant(first))
+                .await
+                .expect("write");
+            until("limit", || {
+                nodes[0]
+                    .table()
+                    .tenant(1)
+                    .is_some_and(|t| t.limits.connections == 1)
+            })
+            .await;
+            let limits = Limits {
+                per_net: 2,
+                net_failures: 2,
+                budget: data_hold(&nodes[0]),
+                ..Limits::default()
+            };
+            let guard = guard(limits);
+            let config = SessionConfig::new("mx1.example.net".into());
+            let listening = listen_with(&nodes[0], seed, config, guard.clone()).await;
+            let tls = client_config(simulated(seed + 100));
+
+            let mut a = Smtp::connect(SUBMIT, &tls).await;
+            let mut b = Smtp::connect(IMPLICIT, &tls).await;
+            assert_eq!(refusal(SUBMIT).await, "421 4.7.0 Too many connections");
+            assert_eq!(refusal(IMPLICIT).await, "");
+            assert_eq!(listening.ended(End::Refused), 2);
+
+            assert!(a.login(&tokens.first).await.starts_with("235 "));
+            assert_eq!(
+                b.login(&tokens.first).await,
+                "421 4.7.0 Too many connections"
+            );
+            let mut d = Smtp::connect(SUBMIT, &tls).await;
+            assert!(d.login(&tokens.second).await.starts_with("235 "));
+
+            let replies = a
+                .transaction("bounce@example.org", &["x@example.com"])
+                .await;
+            assert!(replies.iter().all(|r| r.starts_with("250 ")), "{replies:?}");
+            assert!(a.command("DATA").await.starts_with("354 "));
+            d.transaction("bounce@example.net", &["x@example.com"])
+                .await;
+            assert_eq!(d.command("DATA").await, "451 4.3.2 System busy");
+            a.send(&stuffed(&message("ann@example.org", "", 500, seed)))
+                .await;
+            assert!(a.reply().await.starts_with("250 2.0.0 "));
+            d.transaction("bounce@example.net", &["x@example.com"])
+                .await;
+            let reply = d.data(&message("ann@example.net", "", 500, seed)).await;
+            assert!(reply.starts_with("550 5.7.1"), "{reply}");
+            assert_eq!(guard.stats().busy, 1);
+
+            let mut c = Smtp::connect(SUBMIT, &tls).await;
+            assert!(c.login(b"bz_wrong").await.starts_with("535 "));
+            let wrong = format!("AUTH PLAIN {}", dkim::base64::encode(b"\0user\0bz_wrong"));
+            assert!(c.command(&wrong).await.starts_with("535 "));
+            assert_eq!(
+                c.command(&wrong).await,
+                "421 4.7.0 Too many authentication failures"
+            );
+            assert_eq!(
+                refusal(SUBMIT).await,
+                "421 4.7.0 Too many authentication failures"
+            );
+
+            drop((a, b, c, d));
+            listening.close().await;
+            let stats = guard.stats();
+            assert_eq!((stats.sessions, stats.reserved), (0, 0));
+            within("slots", Duration::from_secs(1), || {
+                let owner = guard.stats().owner;
+                owner.open == 0 && owner.tenant_open == 0
+            })
+            .await;
+        });
+        cluster.stop();
+    });
+}
+
+async fn refusal(port: u16) -> String {
+    let io = TcpStream::connect(SocketAddr::from((HOST, port)))
+        .await
+        .expect("connect");
+    let mut conn = Conn::plain(io);
+    let mut seen = Vec::new();
+    while matches!(conn.read(&mut seen).await, Ok(n) if n > 0) {}
+    String::from_utf8(seen)
+        .expect("ascii")
+        .trim_end()
+        .to_string()
 }

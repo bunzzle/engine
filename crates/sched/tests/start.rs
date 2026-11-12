@@ -98,11 +98,13 @@ fn tenant(id: u32, rate: u32, state: State) -> Object {
         2 => TenantLimits {
             rate,
             burst: 500,
+            connections: 0,
             queued: QUEUED_TWO,
         },
         3 => TenantLimits {
             rate: 100,
             burst: 20,
+            connections: 0,
             queued: QUEUED_THREE,
         },
         _ => TenantLimits::default(),

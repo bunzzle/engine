@@ -69,6 +69,7 @@ impl State {
 pub struct Limits {
     pub rate: u32,
     pub burst: u32,
+    pub connections: u32,
     pub queued: u64,
 }
 
@@ -350,6 +351,7 @@ impl Update {
                 body[8..12].copy_from_slice(&t.default_pool.to_le_bytes());
                 body[12..16].copy_from_slice(&t.limits.rate.to_le_bytes());
                 body[16..20].copy_from_slice(&t.limits.burst.to_le_bytes());
+                body[20..24].copy_from_slice(&t.limits.connections.to_le_bytes());
                 body[24..32].copy_from_slice(&t.limits.queued.to_le_bytes());
                 out.extend_from_slice(&body);
                 for pool in &t.pools {
@@ -470,7 +472,7 @@ fn u32_at(bytes: &[u8], at: usize) -> Option<u32> {
 
 fn tenant(id: u32, rest: &[u8]) -> Option<Tenant> {
     let body = rest.get(..TENANT)?;
-    if body[6..8] != [0, 0] || body[20..24] != [0; 4] {
+    if body[6..8] != [0, 0] {
         return None;
     }
     let count = usize::from(body[5]);
@@ -490,6 +492,7 @@ fn tenant(id: u32, rest: &[u8]) -> Option<Tenant> {
         limits: Limits {
             rate: u32_at(body, 12)?,
             burst: u32_at(body, 16)?,
+            connections: u32_at(body, 20)?,
             queued: u64::from_le_bytes(body[24..32].try_into().ok()?),
         },
     })

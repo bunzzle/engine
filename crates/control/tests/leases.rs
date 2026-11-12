@@ -21,16 +21,19 @@ fn limits(tenant: u32) -> Option<Limits> {
         RATED => Some(Limits {
             rate: RATE,
             burst: BURST,
+            connections: 0,
             queued: 0,
         }),
         QUEUED => Some(Limits {
             rate: 0,
             burst: 0,
+            connections: 0,
             queued: LIMIT,
         }),
         BOTH => Some(Limits {
             rate: RATE,
             burst: BURST,
+            connections: 0,
             queued: LIMIT,
         }),
         _ => None,
@@ -353,6 +356,7 @@ fn spread(seed: u64) {
     let limits = Limits {
         rate: RATE,
         burst: BURST,
+        connections: 0,
         queued: 0,
     };
     let mut gcra = Gcra::default();
@@ -405,6 +409,7 @@ fn gcra_gives_the_whole_burst_after_idle() {
     let limits = Limits {
         rate: RATE,
         burst: BURST,
+        connections: 0,
         queued: 0,
     };
     let mut gcra = Gcra::default();
@@ -415,6 +420,7 @@ fn gcra_gives_the_whole_burst_after_idle() {
     assert_eq!(refused.next, Some(start + Duration::from_millis(1)));
     let wide = Limits {
         burst: 500,
+        connections: 0,
         ..limits
     };
     let mut gcra = Gcra::default();

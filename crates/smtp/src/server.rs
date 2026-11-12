@@ -14,13 +14,14 @@ const AUTH_LINE: usize = 12_288;
 const ERRORS: u32 = 20;
 const AUTH_FAILURES: u32 = 3;
 const OVERSHOOT: u32 = 1000;
-const CHUNK: usize = 65_536;
+pub const CHUNK: usize = 65_536;
 
 #[derive(Clone, Debug)]
 pub struct Config {
     pub name: String,
     pub message: u64,
     pub implicit: bool,
+    pub messages: u32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -135,6 +136,7 @@ pub struct Server {
     errors: u32,
     failures: u32,
     overshoot: u32,
+    messages: u32,
 }
 
 impl Server {
@@ -157,6 +159,7 @@ impl Server {
             errors: 0,
             failures: 0,
             overshoot: 0,
+            messages: 0,
         }
     }
 
@@ -343,6 +346,10 @@ impl Server {
         self.mode = Mode::Command;
         self.transaction = None;
         self.send(reply);
+        self.messages = self.messages.saturating_add(1);
+        if self.messages >= self.config.messages && !self.closed() {
+            self.close(&reply::MESSAGES);
+        }
     }
 
     fn step(&mut self) -> bool {

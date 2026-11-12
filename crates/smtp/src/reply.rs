@@ -44,7 +44,7 @@ impl Reply {
         self.code == 452 && self.status == "4.5.3"
     }
 
-    pub(crate) fn write(&self, out: &mut Vec<u8>) {
+    pub fn write(&self, out: &mut Vec<u8>) {
         out.extend_from_slice(self.code.to_string().as_bytes());
         out.push(b' ');
         if !self.status.is_empty() {
@@ -94,6 +94,7 @@ pub const SYNC: Reply = Reply::new(554, "5.5.0", "Protocol synchronization error
 pub const ERRORS: Reply = Reply::new(421, "4.7.0", "Too many errors");
 pub const AUTH_FAILURES: Reply = Reply::new(421, "4.7.0", "Too many authentication failures");
 pub const OVERSHOOT: Reply = Reply::new(421, "4.5.3", "Too many recipients");
+pub const MESSAGES: Reply = Reply::new(421, "4.7.0", "Too many messages");
 pub const DISCARD: Reply = Reply::new(421, "4.3.4", "Message too big");
 
 #[cfg(test)]
