@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use control::{Domain, Object, Pool, Scopes, State, Tenant, Verification};
 use crypto::{DkimAlg, Ids};
-use intake::{Config as SessionConfig, Conn, End, serve};
+use intake::{Config as SessionConfig, Conn, End, Listener, listen};
 use keys::{
     Audit, BatchSettings, Client as KeyClient, Connect, Ring, RingSettings, Server as KeyServer,
     Settings as KeySettings, Vault,
@@ -337,83 +337,45 @@ fn client_config(provider: Arc<CryptoProvider>) -> Arc<ClientConfig> {
     Arc::new(config)
 }
 
-type Ends = Rc<RefCell<Vec<End>>>;
+struct Ports(Vec<Listener>);
 
-struct Listening {
-    stop: Rc<Cell<bool>>,
-    started: Rc<Cell<usize>>,
-    ends: Ends,
-    tasks: Vec<JoinHandle<()>>,
-}
+impl Ports {
+    fn ended(&self, end: End) -> u64 {
+        self.0.iter().map(|l| l.ended(end)).sum()
+    }
 
-impl Listening {
+    fn refused(&self) -> u64 {
+        self.0.iter().map(Listener::refused).sum()
+    }
+
     async fn close(self) {
-        self.stop.set(true);
-        for task in self.tasks {
-            task.await;
-        }
-        while self.ends.borrow().len() < self.started.get() {
-            sleep(Duration::from_millis(10)).await;
+        for listener in self.0 {
+            listener.close().await;
         }
     }
 }
 
-fn listen(node: &Node<Idle>, seed: u64, ends: &Ends) -> Listening {
-    let stop: Rc<Cell<bool>> = Rc::default();
-    let started: Rc<Cell<usize>> = Rc::default();
-    let mut tasks = Vec::new();
-    let config = Rc::new(SessionConfig::new("mx1.example.net".into()));
+async fn listen_with(node: &Node<Idle>, seed: u64, config: SessionConfig) -> Ports {
+    let config = Rc::new(config);
     let acceptor = acceptor(seed);
-    for port in [SUBMIT, IMPLICIT] {
-        let (node, config, acceptor, ends, stop, started) = (
+    let mut listeners = Vec::new();
+    for (port, implicit) in [(SUBMIT, false), (IMPLICIT, true)] {
+        let socket = TcpListener::bind(SocketAddr::from((HOST, port)), 64)
+            .await
+            .expect("bind");
+        listeners.push(listen(
             node.clone(),
-            Rc::clone(&config),
+            socket,
             Rc::clone(&acceptor),
-            Rc::clone(ends),
-            Rc::clone(&stop),
-            Rc::clone(&started),
-        );
-        tasks.push(spawn(async move {
-            let listener = TcpListener::bind(SocketAddr::from((HOST, port)), 64)
-                .await
-                .expect("bind");
-            let mut n = 0usize;
-            while !stop.get() {
-                let Ok(Ok((io, _))) = timeout(Duration::from_millis(50), listener.accept()).await
-                else {
-                    continue;
-                };
-                n += 1;
-                started.set(started.get() + 1);
-                let (node, config, acceptor, ends) = (
-                    node.clone(),
-                    Rc::clone(&config),
-                    Rc::clone(&acceptor),
-                    Rc::clone(&ends),
-                );
-                spawn(async move {
-                    let conn = if port == IMPLICIT {
-                        let Ok(Ok(stream)) = timeout(config.handshake, acceptor.accept(io)).await
-                        else {
-                            ends.borrow_mut().push(End::Tls);
-                            return;
-                        };
-                        Conn::tls(stream)
-                    } else {
-                        Conn::plain(io)
-                    };
-                    let end = serve(&node, &acceptor, conn, &config, n).await;
-                    ends.borrow_mut().push(end);
-                });
-            }
-        }));
+            Rc::clone(&config),
+            implicit,
+        ));
     }
-    Listening {
-        stop,
-        started,
-        ends: Rc::clone(ends),
-        tasks,
-    }
+    Ports(listeners)
+}
+
+async fn listen_on(node: &Node<Idle>, seed: u64) -> Ports {
+    listen_with(node, seed, SessionConfig::new("mx1.example.net".into())).await
 }
 
 struct Smtp {
@@ -564,11 +526,9 @@ fn accepted_messages_survive_a_restart_and_refusals_store_nothing() {
         let driver = Rc::new(SimDriver::with_disk(seed, Config::default(), created(seed)));
         let cluster = started(&driver, 2).expect("start");
         let nodes = cluster.nodes.clone();
-        let ends: Ends = Rc::default();
-        let seen = Rc::clone(&ends);
         let (accepted, used) = cluster.run(async move {
             let tokens = prepare(&nodes).await;
-            let listening = listen(&nodes[0], seed, &seen);
+            let listening = listen_on(&nodes[0], seed).await;
             let tls = client_config(simulated(seed + 100));
             let mut accepted = BTreeSet::new();
             let mut smtp = Smtp::connect(SUBMIT, &tls).await;
@@ -630,16 +590,12 @@ fn accepted_messages_survive_a_restart_and_refusals_store_nothing() {
             assert!(reply.starts_with("250 2.0.0 "), "{reply}");
             accepted.insert(opaque_id(&nodes[0], &reply));
             assert!(implicit.command("QUIT").await.starts_with("221 "));
+            assert_eq!(listening.ended(End::Io), 0, "seed {seed}");
             listening.close().await;
             assert_eq!(stored(&nodes), accepted, "seed {seed}");
             (accepted, nodes[0].leases().used(&1))
         });
         assert_eq!(used, 17, "seed {seed}: slots kept");
-        assert!(
-            ends.borrow().iter().all(|e| *e != End::Io),
-            "{:?}",
-            ends.borrow()
-        );
         cluster.stop();
         let driver = Rc::new(SimDriver::with_disk(
             seed + 1,
@@ -665,11 +621,9 @@ fn idle_sessions_close_without_a_reply() {
         let driver = Rc::new(SimDriver::with_disk(seed, Config::default(), created(seed)));
         let cluster = started(&driver, 1).expect("start");
         let nodes = cluster.nodes.clone();
-        let ends: Ends = Rc::default();
-        let seen = Rc::clone(&ends);
         cluster.run(async move {
             prepare(&nodes).await;
-            let listening = listen(&nodes[0], seed, &seen);
+            let listening = listen_on(&nodes[0], seed).await;
             let tls = client_config(simulated(seed + 100));
             let mut idle = Smtp::connect(SUBMIT, &tls).await;
             let started = rt::now();
@@ -679,9 +633,13 @@ fn idle_sessions_close_without_a_reply() {
                 waited >= Duration::from_secs(59) && waited <= Duration::from_secs(61),
                 "{waited:?}"
             );
+            until("ended", || listening.ended(End::Timeout) == 1).await;
+            assert_eq!(
+                listening.ended(End::Done) + listening.ended(End::Dropped),
+                0
+            );
             listening.close().await;
         });
-        assert_eq!(ends.borrow().as_slice(), [End::Timeout]);
         cluster.stop();
     });
 }
@@ -762,8 +720,7 @@ fn answered_messages_survive_a_crash_during_sessions() {
             let nodes = cluster.nodes.clone();
             let (seen, power, token) = (Rc::clone(&load), Rc::clone(&driver), tokens.first);
             cluster.run(async move {
-                let ends: Ends = Rc::default();
-                let _listening = listen(&nodes[0], seed, &ends);
+                let _listening = listen_on(&nodes[0], seed).await;
                 let tls = client_config(simulated(seed + 100));
                 let clients: Vec<_> = (0..4)
                     .map(|n| {
@@ -823,4 +780,46 @@ fn answered_messages_survive_a_crash_during_sessions() {
         crashed_with_mail.get() > 0,
         "no crash after an accepted message"
     );
+}
+
+#[test]
+fn listeners_cap_connections_time_out_handshakes_and_close() {
+    check(0..2, |seed| {
+        let driver = Rc::new(SimDriver::with_disk(seed, Config::default(), created(seed)));
+        let cluster = started(&driver, 1).expect("start");
+        let nodes = cluster.nodes.clone();
+        cluster.run(async move {
+            prepare(&nodes).await;
+            let mut config = SessionConfig::new("mx1.example.net".into());
+            config.connections = 2;
+            let listening = listen_with(&nodes[0], seed, config).await;
+            let tls = client_config(simulated(seed + 100));
+            let first = Smtp::connect(SUBMIT, &tls).await;
+            let second = Smtp::connect(SUBMIT, &tls).await;
+            let io = TcpStream::connect(SocketAddr::from((HOST, SUBMIT)))
+                .await
+                .expect("connect");
+            let mut third = Conn::plain(io);
+            let mut seen = Vec::new();
+            assert!(matches!(third.read(&mut seen).await, Ok(0) | Err(_)));
+            assert_eq!(listening.refused(), 1);
+
+            let silent = TcpStream::connect(SocketAddr::from((HOST, IMPLICIT)))
+                .await
+                .expect("connect");
+            let started = rt::now();
+            until("handshake", || listening.ended(End::Tls) == 1).await;
+            let waited = rt::now().saturating_duration_since(started);
+            assert!(
+                waited >= Duration::from_secs(9) && waited <= Duration::from_secs(11),
+                "{waited:?}"
+            );
+            drop((first, second, silent, third));
+            until("dropped", || listening.ended(End::Dropped) == 2).await;
+            listening.close().await;
+            let late = TcpStream::connect(SocketAddr::from((HOST, SUBMIT))).await;
+            assert!(late.is_err());
+        });
+        cluster.stop();
+    });
 }
