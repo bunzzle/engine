@@ -27,6 +27,7 @@ const LOOP: Reply = Reply::new(554, "5.4.6", "Too many Received fields");
 pub struct Config {
     pub name: String,
     pub lifetime: u64,
+    pub connections: usize,
     pub handshake: Duration,
     pub auth: Duration,
     pub idle: Duration,
@@ -39,6 +40,7 @@ impl Config {
         Self {
             name,
             lifetime: 5 * 86_400_000,
+            connections: 1024,
             handshake: Duration::from_secs(10),
             auth: Duration::from_secs(60),
             idle: Duration::from_secs(300),
