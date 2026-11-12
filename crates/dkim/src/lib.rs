@@ -9,5 +9,5 @@ mod verify;
 pub use canon::BodyHash;
 pub use error::Error;
 pub use header::{Field, parse};
-pub use sign::{SIGNED, Template, digest, header_list, signed, unsigned};
+pub use sign::{SIGNED, Template, digest, header_list, pending, signed, unsigned};
 pub use verify::{Check, check};

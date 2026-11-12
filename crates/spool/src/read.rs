@@ -27,6 +27,10 @@ pub struct Opened {
     pub wrap: [u8; WRAP],
     pub head: Vec<u8>,
     pub body: Source,
+    pub pins: Pinned,
+}
+
+pub struct Pinned {
     _pins: Vec<Pin>,
 }
 
@@ -107,7 +111,7 @@ impl Spool {
             wrap,
             head,
             body,
-            _pins: pinned,
+            pins: Pinned { _pins: pinned },
         })
     }
 

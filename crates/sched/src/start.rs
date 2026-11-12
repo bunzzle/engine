@@ -217,6 +217,7 @@ impl<T: Transport + 'static> Node<T> {
             settings.sched,
         );
         sched.use_keys(Rc::clone(&parts.keys));
+        sched.use_table(Rc::clone(&table));
         let restored = pending.len() as u64;
         restore_live(&sched, pending, &table);
 

@@ -6,7 +6,7 @@ use std::pin::pin;
 use std::rc::Rc;
 use std::task::Poll;
 
-use control::{Tenancy, queue_shard};
+use control::{Table, Tenancy, queue_shard};
 use rt::{Ends, JoinHandle, Notify, Peers, sleep_until, spawn};
 use spool::{
     Done, Error, Message, MessageId, Outcome, Pending, Reply, Report, Spool, Stamp, Stored,
@@ -16,6 +16,7 @@ use crate::clock::Clock;
 use crate::lanes::{Entry, Lanes, Limits, QueueId, Take, ranges};
 use crate::policy::{Answer, BACKOFF, Kind, clamp, delay, report_retry};
 use crate::sealing::{Keys, Unsealable};
+use crate::sign::{Outgoing, Signing};
 use crate::transport::{Answered, Attempt, Claimed, Transport};
 use crate::unopened::{Action, Breaker, UnopenedStats, action};
 
@@ -163,6 +164,7 @@ struct Inner<T> {
     refused: Cell<u64>,
     unreadable: Cell<u64>,
     damaged: RefCell<BTreeMap<MessageId, u8>>,
+    signing: OnceCell<Rc<Signing>>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -235,6 +237,7 @@ impl<T: Transport + 'static> Sched<T> {
             refused: Cell::new(0),
             unreadable: Cell::new(0),
             damaged: RefCell::new(BTreeMap::new()),
+            signing: OnceCell::new(),
         });
         let sched = Self { inner };
         let handler = sched.clone();
@@ -285,6 +288,23 @@ impl<T: Transport + 'static> Sched<T> {
 
     pub fn unreadable(&self) -> u64 {
         self.inner.unreadable.get()
+    }
+
+    pub fn unsigned(&self) -> u64 {
+        self.inner.signing.get().map_or(0, |s| s.unsigned())
+    }
+
+    pub fn signed_cached(&self) -> usize {
+        self.inner.signing.get().map_or(0, |s| s.cached())
+    }
+
+    pub fn use_table(&self, table: Rc<RefCell<Table>>) {
+        if let Some(keys) = self.inner.keys.get() {
+            let _ = self
+                .inner
+                .signing
+                .set(Rc::new(Signing::new(Rc::clone(keys), table)));
+        }
     }
 
     pub fn retry_now(&self, queue: QueueId) {
@@ -583,10 +603,10 @@ impl<T: Transport + 'static> Sched<T> {
         } else {
             Err(Error::State("tenant"))
         };
-        let message = match opened {
-            Ok(message) => {
+        let opened = match opened {
+            Ok(opened) => {
                 self.inner.damaged.borrow_mut().remove(&route.message);
-                message
+                opened
             }
             Err(error) => {
                 self.skip(route, &claimed, &error);
@@ -602,13 +622,17 @@ impl<T: Transport + 'static> Sched<T> {
             tenant: route.tenant,
             message: route.message,
             recipients: claimed.clone(),
-            stored: message,
+            outgoing: Outgoing::new(stored, opened, self.inner.signing.get().cloned()),
         };
         let answers = self.inner.transport.send(attempt).await;
         self.inner.attempts.borrow_mut().remove(&id);
         let now = self.inner.clock.now();
         let mut by_recipient: BTreeMap<u32, Answered> =
             answers.into_iter().map(|a| (a.recipient, a)).collect();
+        let Some(open) = self.later(route, claimed, &mut by_recipient, now) else {
+            return;
+        };
+        claimed = open;
         let unopened = by_recipient.values().find_map(|a| match a.answer {
             Answer::Unopened {
                 fault,
@@ -641,7 +665,7 @@ impl<T: Transport + 'static> Sched<T> {
                 let outcome = match answer {
                     Answer::Delivered => Outcome::Delivered,
                     Answer::Failed => Outcome::Failed,
-                    Answer::Unopened { .. } => {
+                    Answer::Unopened { .. } | Answer::Later(_) => {
                         let (wait, class) = delay(Kind::Temporary, c.attempts.saturating_add(1));
                         Outcome::Deferred {
                             due: now + wait,
@@ -672,10 +696,44 @@ impl<T: Transport + 'static> Sched<T> {
         self.send(self.owner(route.message), Note::Report { route, reports });
     }
 
+    fn later(
+        &self,
+        route: Route,
+        claimed: Vec<Claimed>,
+        by_recipient: &mut BTreeMap<u32, Answered>,
+        now: u64,
+    ) -> Option<Vec<Claimed>> {
+        let (later, open): (Vec<Claimed>, Vec<Claimed>) = claimed.into_iter().partition(|c| {
+            by_recipient
+                .get(&c.recipient)
+                .is_some_and(|a| matches!(a.answer, Answer::Later(_)))
+        });
+        if later.is_empty() {
+            return Some(open);
+        }
+        let recipients = later
+            .iter()
+            .map(|c| {
+                let wait = match by_recipient.remove(&c.recipient).map(|a| a.answer) {
+                    Some(Answer::Later(wait)) => wait,
+                    _ => 0,
+                };
+                (c.recipient, now + wait)
+            })
+            .collect();
+        self.send(
+            self.owner(route.message),
+            Note::Released { route, recipients },
+        );
+        (!open.is_empty()).then_some(open)
+    }
+
     fn skip(&self, route: Route, claimed: &[Claimed], error: &Error) {
         self.inner.unreadable.set(self.inner.unreadable.get() + 1);
         let now = self.inner.clock.now();
-        let tries = if matches!(error, Error::Store(store::Error::Damaged { .. })) {
+        let tries = if matches!(error, Error::Store(store::Error::NotFound)) {
+            0
+        } else {
             let mut damaged = self.inner.damaged.borrow_mut();
             if damaged.len() >= DAMAGED_KEPT && !damaged.contains_key(&route.message) {
                 damaged.clear();
@@ -683,8 +741,6 @@ impl<T: Transport + 'static> Sched<T> {
             let tries = damaged.entry(route.message).or_default();
             *tries += 1;
             *tries
-        } else {
-            0
         };
         let note = if tries >= DAMAGED_TRIES {
             self.inner.damaged.borrow_mut().remove(&route.message);

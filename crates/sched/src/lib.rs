@@ -3,6 +3,7 @@ mod clock;
 mod delete;
 mod dkim;
 mod domain;
+mod envelope;
 mod error;
 mod intake;
 mod keyring;
@@ -12,12 +13,14 @@ mod normal;
 mod policy;
 mod requests;
 mod sealing;
+mod sign;
 mod start;
 mod suppress;
 mod transport;
 mod unopened;
 
 pub use clock::Clock;
+pub use envelope::{Envelope, Recipient, Required, Ret, decode_slice, encode_slice};
 pub use error::{Error, Refusal};
 pub use intake::{Draft, domain_of};
 pub use keyring::Keyring;
@@ -36,6 +39,7 @@ pub use sealing::{
     Batched, Deleted, Keys, LABEL_BODY, LABEL_HEAD, LABEL_REPLY, LABEL_SLICE, Loaded, Made, Oldest,
     Opener, Sealing, Signed, Unsealable, Unwrapped,
 };
+pub use sign::{Body, Fault, KEYS_WAIT, Outgoing, Plain, Prepared, SIGNED_KEPT};
 pub use start::{CONTROL_SHARD, Links, Meshes, Node, Parts, Running, Settings};
 pub use suppress::{
     Ask, Hash, Inputs, KIND_SUPPRESS, Listed, Page, Reason, SEAL_SUPPRESS, SHAPE, Suppression,

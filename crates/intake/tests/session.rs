@@ -1,5 +1,5 @@
 use std::cell::{Cell, RefCell};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::future::poll_fn;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::Path;
@@ -9,8 +9,11 @@ use std::sync::Arc;
 use std::task::Poll;
 use std::time::Duration;
 
+use aws_lc_rs::digest::{Digest, SHA256};
+use aws_lc_rs::signature::{ED25519, RSA_PKCS1_2048_8192_SHA256, UnparsedPublicKey};
 use control::{Domain, Object, Pool, Scopes, State, Tenant, Verification};
 use crypto::{DkimAlg, Ids};
+use dkim::BodyHash;
 use intake::{Config as SessionConfig, Conn, End, Listener, listen};
 use keys::{
     Audit, BatchSettings, Client as KeyClient, Connect, Ring, RingSettings, Server as KeyServer,
@@ -19,7 +22,8 @@ use keys::{
 use rt::sim::{Config, Disk, Machine, SimDriver, Stalls, check};
 use rt::{JoinHandle, Runtime, TcpListener, TcpStream, sleep, spawn, timeout};
 use sched::{
-    Answered, Attempt, Clock, Keyring, Keys, Meshes, Node, Parts, Running, Settings, Transport,
+    Answer, Answered, Attempt, Body, Claimed, Clock, Fault, Keyring, Keys, Meshes, Node, Parts,
+    Running, Settings, Transport,
 };
 use spool::MessageId;
 use store::{Client, Committer, DataFile, Options, SLOT_SIZE, Setup, boot};
@@ -48,15 +52,98 @@ const CA: &[u8] = include_bytes!("data/ca.pem");
 const CERT: &[u8] = include_bytes!("data/a.pem");
 const KEY: &str = "302e020100300506032b65700422042098cded488e5305ce6644e0188d522eac4a19a7722043c25e621026562f2dda6d";
 
-struct Idle;
+#[derive(Default)]
+struct Seen {
+    publics: RefCell<BTreeMap<String, Vec<u8>>>,
+    verified: RefCell<BTreeMap<MessageId, usize>>,
+    delivered: RefCell<BTreeSet<MessageId>>,
+    faults: RefCell<Vec<&'static str>>,
+    deliver: Cell<bool>,
+    hold: Cell<bool>,
+}
+
+struct Idle(Rc<Seen>);
 
 impl Transport for Idle {
-    fn send(&self, _: Attempt) -> impl Future<Output = Vec<Answered>> {
-        std::future::ready(Vec::new())
+    async fn send(&self, attempt: Attempt) -> Vec<Answered> {
+        let seen = &self.0;
+        let claimed = attempt.recipients.clone();
+        if seen.hold.get() {
+            return answered(&claimed, Answer::Later(1_000));
+        }
+        let mut prepared = match attempt.outgoing.prepare().await {
+            Ok(prepared) => prepared,
+            Err(fault) => {
+                seen.faults.borrow_mut().push(match fault {
+                    Fault::Unopened { .. } => "unopened",
+                    Fault::Keys => "keys",
+                    Fault::Signer(_) => "signer",
+                    Fault::Format(_) => "format",
+                });
+                return fault.answers(&claimed);
+            }
+        };
+        let mut hash = BodyHash::new();
+        match &mut prepared.body {
+            Body::Inline(body) => hash.update(body),
+            Body::Chain(plain) => {
+                while let Some(chunk) = plain.next().await.expect("plain chunk") {
+                    hash.update(&chunk);
+                }
+            }
+        }
+        let count = verified(prepared.header(), &hash.finish(), &seen.publics.borrow());
+        seen.verified.borrow_mut().insert(attempt.message, count);
+        if !seen.deliver.get() {
+            return Vec::new();
+        }
+        seen.delivered.borrow_mut().insert(attempt.message);
+        answered(&claimed, Answer::Delivered)
     }
 }
 
+fn answered(claimed: &[Claimed], answer: Answer) -> Vec<Answered> {
+    claimed
+        .iter()
+        .map(|c| Answered {
+            recipient: c.recipient,
+            answer,
+            reply: Vec::new(),
+        })
+        .collect()
+}
+
+fn verified(header: &[u8], body: &[u8; 32], publics: &BTreeMap<String, Vec<u8>>) -> usize {
+    let fields = dkim::parse(header).expect("header");
+    assert!(fields[0].is("received"), "received first");
+    let mut count = 0;
+    for at in 0..fields.len() {
+        if !fields[at].is("dkim-signature") {
+            continue;
+        }
+        let check = dkim::check(&fields, at, body).expect("signature");
+        if let Some(public) = publics.get(&check.selector) {
+            let valid = match check.alg {
+                DkimAlg::Ed25519Sha256 => UnparsedPublicKey::new(&ED25519, public)
+                    .verify(&check.digest, &check.signature)
+                    .is_ok(),
+                DkimAlg::RsaSha256 => {
+                    let digest = Digest::import_less_safe(&check.digest, &SHA256).expect("digest");
+                    UnparsedPublicKey::new(&RSA_PKCS1_2048_8192_SHA256, public)
+                        .verify_digest(&digest, &check.signature)
+                        .is_ok()
+                }
+            };
+            assert!(valid, "signature by {}", check.selector);
+        }
+        count += 1;
+    }
+    count
+}
+
 struct Cluster {
+    seen: Rc<Seen>,
+    keys: Rc<RefCell<Vec<SocketAddr>>>,
     machine: Machine,
     nodes: Vec<Node<Idle>>,
     runnings: Vec<Running>,
@@ -71,6 +158,8 @@ impl Cluster {
 
     fn stop(self) {
         let Self {
+            seen: _,
+            keys: _,
             machine,
             nodes,
             runnings,
@@ -118,8 +207,10 @@ fn settings() -> Settings {
     }
 }
 
-fn keys_up(machine: &Machine) {
-    drop(machine.spawn_on(0, async {
+fn keys_up(machine: &Machine) -> Rc<RefCell<Vec<SocketAddr>>> {
+    let peers = Rc::new(RefCell::new(Vec::new()));
+    let seen = Rc::clone(&peers);
+    drop(machine.spawn_on(0, async move {
         let dir = Path::new(KEYS_DIR);
         let vault = match Vault::open(dir).await {
             Ok(vault) => vault,
@@ -128,10 +219,12 @@ fn keys_up(machine: &Machine) {
         let audit = Audit::open(dir).await.expect("audit");
         let server = Rc::new(KeyServer::start(vault, audit, KeySettings::default()));
         let listener = TcpListener::bind(KEYS_AT, 16).await.expect("bind");
-        while let Ok((stream, _)) = listener.accept().await {
+        while let Ok((stream, peer)) = listener.accept().await {
+            seen.borrow_mut().push(peer);
             server.serve(stream);
         }
     }));
+    peers
 }
 
 fn keyring() -> Rc<dyn Keys> {
@@ -159,12 +252,14 @@ fn started(driver: &Rc<SimDriver>, cores: u16) -> Option<Cluster> {
         .ok()?
         .ok()?;
     let committer = machine.spawn_on(0, booted.committer.run());
-    keys_up(&machine);
+    let keys = keys_up(&machine);
+    let seen = Rc::new(Seen::default());
     let meshes = Arc::new(Meshes::new(cores));
     let mut tasks = Vec::new();
     for start in booted.starts {
         let index = start.index();
         let links = meshes.take(index).expect("links");
+        let transport = Idle(Rc::clone(&seen));
         tasks.push(machine.spawn_on(usize::from(index) + 1, async move {
             let core = timeout(Duration::from_secs(60), start.open())
                 .await
@@ -172,7 +267,7 @@ fn started(driver: &Rc<SimDriver>, cores: u16) -> Option<Cluster> {
                 .ok()?;
             let parts = Parts {
                 keys: keyring(),
-                transport: Idle,
+                transport,
                 clock: Clock::at(rt::wall_ms(), rt::now()),
             };
             let started = Node::start(core, links, settings(), parts);
@@ -192,6 +287,8 @@ fn started(driver: &Rc<SimDriver>, cores: u16) -> Option<Cluster> {
         .into_iter()
         .unzip();
     Some(Cluster {
+        seen,
+        keys,
         machine,
         nodes,
         runnings,
@@ -205,11 +302,16 @@ fn control_of(nodes: &[Node<Idle>]) -> &Node<Idle> {
 }
 
 async fn until(name: &str, what: impl Fn() -> bool) {
-    for _ in 0..10_000 {
+    within(name, Duration::from_secs(50), what).await;
+}
+
+async fn within(name: &str, limit: Duration, what: impl Fn() -> bool) {
+    let step = Duration::from_millis(5);
+    for _ in 0..limit.as_millis() / step.as_millis() {
         if what() {
             return;
         }
-        sleep(Duration::from_millis(5)).await;
+        sleep(step).await;
     }
     panic!("{name} not reached");
 }
@@ -217,6 +319,8 @@ async fn until(name: &str, what: impl Fn() -> bool) {
 struct Tokens {
     first: Vec<u8>,
     second: Vec<u8>,
+    publics: BTreeMap<String, Vec<u8>>,
+    domain: Domain,
 }
 
 async fn prepare(nodes: &[Node<Idle>]) -> Tokens {
@@ -255,7 +359,7 @@ async fn prepare(nodes: &[Node<Idle>]) -> Tokens {
     })
     .await;
     let domain = control.domain_new(1, "example.org").await.expect("domain");
-    control
+    let domain = control
         .domain_write(Domain {
             state: Verification::Verified,
             rsa: rsa.id,
@@ -291,6 +395,8 @@ async fn prepare(nodes: &[Node<Idle>]) -> Tokens {
     Tokens {
         first: first_token.to_vec(),
         second: second_token.to_vec(),
+        publics: [("e1".into(), ed.public), ("r1".into(), rsa.public)].into(),
+        domain,
     }
 }
 
@@ -613,6 +719,109 @@ fn accepted_messages_survive_a_restart_and_refusals_store_nothing() {
             }
         });
         restarted.stop();
+    });
+}
+
+fn attempts(nodes: &[Node<Idle>], id: MessageId) -> Option<u16> {
+    let node = nodes
+        .iter()
+        .find(|n| n.spool().messages_of(1).contains(&id))?;
+    let spool = node.spool();
+    Some(spool.recipient(id, 0)?.attempts + spool.recipient(id, 1)?.attempts)
+}
+
+#[test]
+fn attempts_carry_verified_signatures_and_wait_for_keys() {
+    check(0..2, |seed| {
+        let driver = Rc::new(SimDriver::with_disk(seed, Config::default(), created(seed)));
+        let cluster = started(&driver, 2).expect("start");
+        let nodes = cluster.nodes.clone();
+        let seen = Rc::clone(&cluster.seen);
+        let peers = Rc::clone(&cluster.keys);
+        let sim = Rc::clone(&driver);
+        cluster.run(async move {
+            let tokens = prepare(&nodes).await;
+            seen.publics.replace(tokens.publics.clone());
+            seen.deliver.set(true);
+            let listening = listen_on(&nodes[0], seed).await;
+            let tls = client_config(simulated(seed + 100));
+            let mut smtp = Smtp::connect(SUBMIT, &tls).await;
+            assert!(smtp.login(&tokens.first).await.starts_with("235 "));
+            let to = ["a@example.com", "b@example.net"];
+            let mut sent = Vec::new();
+            for (n, size) in [200, 70_000, 300_000].into_iter().enumerate() {
+                smtp.transaction("bounce@example.org", &to).await;
+                let body = message("Ann <ann@example.org>", "", size, seed * 10 + n as u64);
+                let reply = smtp.data(&body).await;
+                assert!(reply.starts_with("250 2.0.0 "), "{reply}");
+                sent.push(opaque_id(&nodes[0], &reply));
+            }
+            until("signed and delivered", || {
+                let verified = seen.verified.borrow();
+                sent.iter().all(|id| verified.get(id) == Some(&2)) && stored(&nodes).is_empty()
+            })
+            .await;
+
+            seen.hold.set(true);
+            smtp.transaction("bounce@example.org", &to).await;
+            let reply = smtp.data(&message("ann@example.org", "", 9000, seed)).await;
+            let waiting = opaque_id(&nodes[0], &reply);
+            sim.set_reachable(KEYS_AT.ip(), false);
+            for peer in peers.borrow().iter() {
+                sim.reset_connection(*peer);
+            }
+            seen.hold.set(false);
+            until("keys down", || seen.faults.borrow().contains(&"keys")).await;
+            assert_eq!(attempts(&nodes, waiting), Some(0), "seed {seed}");
+            assert!(!seen.verified.borrow().contains_key(&waiting));
+            sim.set_reachable(KEYS_AT.ip(), true);
+            within(
+                "signed after keys came back",
+                Duration::from_secs(300),
+                || seen.verified.borrow().get(&waiting) == Some(&2) && stored(&nodes).is_empty(),
+            )
+            .await;
+
+            seen.deliver.set(false);
+            smtp.transaction("bounce@example.org", &to).await;
+            let reply = smtp.data(&message("ann@example.org", "", 300, seed)).await;
+            let orphan = opaque_id(&nodes[0], &reply);
+            until("signed once", || {
+                seen.verified.borrow().contains_key(&orphan)
+            })
+            .await;
+            let control = control_of(&nodes);
+            let old = tokens.domain.rsa;
+            let fresh = control
+                .dkim_new(1, DkimAlg::RsaSha256, "example.org", "r2")
+                .await
+                .expect("rsa");
+            control
+                .domain_write(Domain {
+                    rsa: fresh.id,
+                    ..tokens.domain.clone()
+                })
+                .await
+                .expect("rotate");
+            control.dkim_remove(1, old).await.expect("remove");
+            until("removed", || {
+                nodes.iter().all(|n| n.table().dkim(1, old).is_none())
+            })
+            .await;
+            seen.deliver.set(true);
+            within(
+                "failed with the removed key",
+                Duration::from_secs(300),
+                || stored(&nodes).is_empty(),
+            )
+            .await;
+            assert!(seen.faults.borrow().contains(&"signer"), "seed {seed}");
+            assert!(!seen.delivered.borrow().contains(&orphan), "seed {seed}");
+            assert!(nodes.iter().all(|n| n.sched().unsigned() == 0));
+            assert!(smtp.command("QUIT").await.starts_with("221 "));
+            listening.close().await;
+        });
+        cluster.stop();
     });
 }
 

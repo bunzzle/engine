@@ -11,8 +11,8 @@ use tls::Acceptor;
 
 use crate::assemble::{Signer, Stamp, assemble};
 use crate::conn::Conn;
-use crate::envelope::{Envelope, Recipient, encode_slice};
 use crate::header::{Checked, Fault, HEADER_CAP, HeaderBuffer, check};
+use sched::{Envelope, Recipient, encode_slice};
 
 const SENDER_DOMAIN: Reply = Reply::new(550, "5.7.1", "Sender domain not verified");
 const FROM_DOMAIN: Reply = Reply::new(550, "5.7.1", "From domain not verified");

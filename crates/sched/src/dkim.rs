@@ -1,7 +1,10 @@
-use control::{Dkim, KeyError, Object, State};
+use std::cell::RefCell;
+
+use control::{Dkim, KeyError, Object, State, Table};
 use crypto::DkimAlg;
 
 use crate::error::{Error, Refusal};
+use crate::sealing::Keys;
 use crate::start::Node;
 use crate::transport::Transport;
 
@@ -79,36 +82,44 @@ impl<T: Transport + 'static> Node<T> {
     }
 
     pub async fn sign(&self, tenant: u32, key: u32, digest: [u8; 32]) -> Result<Vec<u8>, Refusal> {
-        let (generation, alg) = self.signer(tenant, key, |d| (d.generation, d.alg))?;
-        let keys = self.keys();
-        match keys.sign(tenant, generation, key, alg, digest).await {
-            Err(KeyError::Unknown) => {}
-            signed => return signed.map_err(refusal),
-        }
-        let blob = self.signer(tenant, key, |d| d.blob.clone())?;
-        keys.dkim_load(tenant, generation, key, alg, &blob)
-            .await
-            .map_err(refusal)?;
-        keys.sign(tenant, generation, key, alg, digest)
-            .await
-            .map_err(refusal)
+        sign(&self.inner.table, self.keys(), tenant, key, digest).await
     }
+}
 
-    fn signer<R>(
-        &self,
-        tenant: u32,
-        key: u32,
-        take: impl FnOnce(&Dkim) -> R,
-    ) -> Result<R, Refusal> {
-        let table = self.table();
-        let current = table
-            .tenant(tenant)
-            .filter(|t| t.state == State::Active)
-            .ok_or(Refusal::Tenant)?;
-        table
-            .dkim(tenant, key)
-            .filter(|d| d.generation == current.generation)
-            .map(take)
-            .ok_or(Refusal::Signer)
+pub(crate) async fn sign(
+    table: &RefCell<Table>,
+    keys: &dyn Keys,
+    tenant: u32,
+    key: u32,
+    digest: [u8; 32],
+) -> Result<Vec<u8>, Refusal> {
+    let (generation, alg) = signer(&table.borrow(), tenant, key, |d| (d.generation, d.alg))?;
+    match keys.sign(tenant, generation, key, alg, digest).await {
+        Err(KeyError::Unknown) => {}
+        signed => return signed.map_err(refusal),
     }
+    let blob = signer(&table.borrow(), tenant, key, |d| d.blob.clone())?;
+    keys.dkim_load(tenant, generation, key, alg, &blob)
+        .await
+        .map_err(refusal)?;
+    keys.sign(tenant, generation, key, alg, digest)
+        .await
+        .map_err(refusal)
+}
+
+pub(crate) fn signer<R>(
+    table: &Table,
+    tenant: u32,
+    key: u32,
+    take: impl FnOnce(&Dkim) -> R,
+) -> Result<R, Refusal> {
+    let current = table
+        .tenant(tenant)
+        .filter(|t| t.state == State::Active)
+        .ok_or(Refusal::Tenant)?;
+    table
+        .dkim(tenant, key)
+        .filter(|d| d.generation == current.generation)
+        .map(take)
+        .ok_or(Refusal::Signer)
 }
