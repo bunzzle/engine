@@ -30,6 +30,7 @@ const LIMITS: Limits = Limits {
     recipients: 3000,
     inline: 2048,
     body: 512 * 1024,
+    read: 1024 * 1024,
 };
 
 type Key = (u16, u64);

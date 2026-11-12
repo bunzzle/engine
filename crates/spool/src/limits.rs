@@ -22,6 +22,7 @@ pub struct Limits {
     pub recipients: u32,
     pub inline: usize,
     pub body: u64,
+    pub read: u32,
 }
 
 impl Default for Limits {
@@ -30,6 +31,7 @@ impl Default for Limits {
             recipients: 1000,
             inline: 4096,
             body: 64 * 1024 * 1024,
+            read: 1024 * 1024,
         }
     }
 }
@@ -63,6 +65,9 @@ impl Limits {
             usize::try_from(self.body.div_ceil(per)).map_err(|_| Error::Limit("body"))? + 1;
         if self.inline > MAX_PAYLOAD - INDEX_SIZE {
             return Err(Error::Limit("inline"));
+        }
+        if self.read == 0 || !self.read.is_multiple_of(MAX_SECTOR_SIZE) {
+            return Err(Error::Limit("read"));
         }
         if self.recipients == 0 {
             return Err(Error::Limit("recipients"));

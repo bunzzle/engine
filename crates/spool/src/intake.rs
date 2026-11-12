@@ -3,7 +3,7 @@ use std::rc::Rc;
 
 use store::{
     Batch, Change, Changes, Client, Core, Delivery, HEAD_ITEM, INDEX_SIZE, Ids, IndexRecord,
-    MAX_PAYLOAD, Op, Shards, fits, message_key, record_size, split_key,
+    MAX_PAYLOAD, Op, Reader, Shards, fits, message_key, record_size, split_key,
 };
 
 use crate::bodies::{CHUNK_FIXED, Writer, Written};
@@ -72,13 +72,14 @@ type Closer = Rc<dyn Fn(u32, u64)>;
 
 pub(crate) struct Inner {
     pub(crate) node: u32,
-    limits: Limits,
+    pub(crate) limits: Limits,
     bounds: Bounds,
     pub(crate) region_size: u64,
     pub(crate) changes: Changes,
     client: Client,
     pub(crate) ids: RefCell<Ids>,
     writer: Writer,
+    pub(crate) reader: Reader,
     pub(crate) table: RefCell<Table>,
     closer: RefCell<Option<Closer>>,
 }
@@ -111,6 +112,7 @@ impl Spool {
         let bounds = limits.check(region_size)?;
         let client = core.session.client().clone();
         let writer = Writer::new(client.clone(), core.file.clone());
+        let reader = core.file.reader();
         let ids = RefCell::new(core.ids.clone());
         let table = RefCell::new(table);
         let (shards, changes) = Shards::new(core);
@@ -123,6 +125,7 @@ impl Spool {
             client,
             ids,
             writer,
+            reader,
             table,
             closer: RefCell::new(None),
         };

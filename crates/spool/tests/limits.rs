@@ -18,6 +18,7 @@ const LIMITS: Limits = Limits {
     recipients: 3000,
     inline: 1024,
     body: 64 * 1024,
+    read: 1024 * 1024,
 };
 
 #[test]
@@ -83,6 +84,11 @@ fn limits_over_one_commit_or_a_record_are_refused_at_start() {
         },
         Limits {
             body: 64 * 1024 * 1024 * 1024,
+            ..LIMITS
+        },
+        Limits { read: 0, ..LIMITS },
+        Limits {
+            read: 1024 * 1024 + 4096,
             ..LIMITS
         },
     ] {

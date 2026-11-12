@@ -106,6 +106,7 @@ fn settings() -> Settings {
             recipients: 100,
             inline: 2048,
             body: 1024 * 1024,
+            read: 1024 * 1024,
         },
         naming: control::Naming {
             key: NAMING,

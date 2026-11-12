@@ -97,27 +97,40 @@ impl Reader {
     }
 
     pub async fn range(&self, range: Range) -> Result<Buf, Error> {
+        let buf = self.part(range, 0, range.length).await?;
+        if checksum(&buf) != range.checksum {
+            return Err(Error::Damaged {
+                region: range.region,
+                offset: range.offset,
+            });
+        }
+        Ok(buf)
+    }
+
+    pub async fn part(&self, range: Range, at: u32, len: u32) -> Result<Buf, Error> {
         let damaged = Error::Damaged {
             region: range.region,
             offset: range.offset,
         };
-        let length = u64::from(range.length);
-        let inside = range
-            .offset
-            .checked_add(length)
-            .is_some_and(|end| end <= self.region_size);
+        let inside = at.checked_add(len).is_some_and(|end| end <= range.length)
+            && range
+                .offset
+                .checked_add(u64::from(range.length))
+                .is_some_and(|end| end <= self.region_size);
         if range.region >= self.region_count || !inside {
             return Err(damaged);
         }
         let _pin = self.pins.pin(range.region);
-        let offset =
-            self.regions_offset + u64::from(range.region) * self.region_size + range.offset;
-        let len = range.length as usize;
+        let offset = self.regions_offset
+            + u64::from(range.region) * self.region_size
+            + range.offset
+            + u64::from(at);
+        let len = len as usize;
         let (read, buf) = self
             .file
             .read_at(Buf::aligned(len, self.sector), offset)
             .await;
-        if read? != len || checksum(&buf) != range.checksum {
+        if read? != len {
             return Err(damaged);
         }
         Ok(buf)

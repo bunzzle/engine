@@ -24,6 +24,7 @@ const LIMITS: Limits = Limits {
     recipients: 1000,
     inline: 1024,
     body: 64 * 1024,
+    read: 1024 * 1024,
 };
 
 struct Node {

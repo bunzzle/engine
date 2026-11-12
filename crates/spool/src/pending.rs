@@ -20,7 +20,7 @@ pub struct Pending {
     pub recipients: Vec<Open>,
 }
 
-struct Fixed;
+pub(crate) struct Fixed;
 
 impl Owner for Fixed {
     fn locate(&self, _: Location) -> impl Future<Output = Option<Location>> {

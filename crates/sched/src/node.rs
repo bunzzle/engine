@@ -8,7 +8,9 @@ use std::task::Poll;
 
 use control::{Tenancy, queue_shard};
 use rt::{Ends, JoinHandle, Notify, Peers, sleep_until, spawn};
-use spool::{Done, Error, Message, MessageId, Outcome, Pending, Reply, Report, Spool, Stamp};
+use spool::{
+    Done, Error, Message, MessageId, Outcome, Pending, Reply, Report, Spool, Stamp, Stored,
+};
 
 use crate::clock::Clock;
 use crate::lanes::{Entry, Lanes, Limits, QueueId, Take, ranges};
@@ -19,6 +21,9 @@ use crate::unopened::{Action, Breaker, UnopenedStats, action};
 
 const HOLD: u64 = 3_600_000;
 const QUARANTINE: u64 = u64::MAX / 2;
+const UNREADABLE: u64 = 30_000;
+const DAMAGED_TRIES: u8 = 3;
+const DAMAGED_KEPT: usize = 4096;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Config {
@@ -77,6 +82,7 @@ pub enum Note {
     Claimed {
         route: Route,
         answers: Vec<(u32, Claim)>,
+        stored: Option<Stored>,
     },
     Report {
         route: Route,
@@ -155,6 +161,8 @@ struct Inner<T> {
     report_errors: Cell<ReportErrors>,
     report_streak: Cell<u32>,
     refused: Cell<u64>,
+    unreadable: Cell<u64>,
+    damaged: RefCell<BTreeMap<MessageId, u8>>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -225,6 +233,8 @@ impl<T: Transport + 'static> Sched<T> {
             report_errors: Cell::new(ReportErrors::default()),
             report_streak: Cell::new(0),
             refused: Cell::new(0),
+            unreadable: Cell::new(0),
+            damaged: RefCell::new(BTreeMap::new()),
         });
         let sched = Self { inner };
         let handler = sched.clone();
@@ -271,6 +281,10 @@ impl<T: Transport + 'static> Sched<T> {
 
     pub fn refused(&self) -> u64 {
         self.inner.refused.get()
+    }
+
+    pub fn unreadable(&self) -> u64 {
+        self.inner.unreadable.get()
     }
 
     pub fn retry_now(&self, queue: QueueId) {
@@ -423,7 +437,11 @@ impl<T: Transport + 'static> Sched<T> {
                 recipients,
                 forced,
             } => self.claim(route, &recipients, forced),
-            Note::Claimed { route, answers } => self.claimed(route, answers),
+            Note::Claimed {
+                route,
+                answers,
+                stored,
+            } => self.claimed(route, answers, stored),
             Note::Report { route, reports } => self.report(route, reports),
             Note::Reported {
                 route,
@@ -476,10 +494,45 @@ impl<T: Transport + 'static> Sched<T> {
             answers.push((r, answer));
         }
         let core = queue_core(route.queue, self.inner.config.shards, self.inner.cores);
-        self.send(core, Note::Claimed { route, answers });
+        if !answers
+            .iter()
+            .any(|(_, a)| matches!(a, Claim::Claimed { .. }))
+        {
+            self.send(
+                core,
+                Note::Claimed {
+                    route,
+                    answers,
+                    stored: None,
+                },
+            );
+            return;
+        }
+        let sched = self.clone();
+        drop(spawn(async move {
+            let spool = &sched.inner.spool;
+            let stored = spool.stored(id).await.ok();
+            if stored.is_none() {
+                let due = sched.inner.clock.now() + UNREADABLE;
+                for (r, answer) in &mut answers {
+                    if matches!(answer, Claim::Claimed { .. }) {
+                        spool.release(id, &[*r]);
+                        *answer = Claim::Early(due);
+                    }
+                }
+            }
+            sched.send(
+                core,
+                Note::Claimed {
+                    route,
+                    answers,
+                    stored,
+                },
+            );
+        }));
     }
 
-    fn claimed(&self, route: Route, answers: Vec<(u32, Claim)>) {
+    fn claimed(&self, route: Route, answers: Vec<(u32, Claim)>, stored: Option<Stored>) {
         let now = self.inner.clock.now();
         let mut relane = Vec::new();
         let mut claimed = Vec::new();
@@ -515,14 +568,31 @@ impl<T: Transport + 'static> Sched<T> {
             .borrow_mut()
             .done(route.queue, refused, now);
         self.inner.notify.notify();
-        if claimed.is_empty() {
+        let Some(stored) = stored.filter(|_| !claimed.is_empty()) else {
             return;
-        }
+        };
         let sched = self.clone();
-        drop(spawn(async move { sched.attempt(route, claimed).await }));
+        drop(spawn(
+            async move { sched.attempt(route, claimed, stored).await },
+        ));
     }
 
-    async fn attempt(&self, route: Route, mut claimed: Vec<Claimed>) {
+    async fn attempt(&self, route: Route, mut claimed: Vec<Claimed>, stored: Stored) {
+        let opened = if stored.tenant == route.tenant && stored.id == route.message {
+            self.inner.spool.open_stored(&stored).await
+        } else {
+            Err(Error::State("tenant"))
+        };
+        let message = match opened {
+            Ok(message) => {
+                self.inner.damaged.borrow_mut().remove(&route.message);
+                message
+            }
+            Err(error) => {
+                self.skip(route, &claimed, &error);
+                return;
+            }
+        };
         let id = self.inner.next_attempt.get();
         self.inner.next_attempt.set(id + 1);
         let started = self.inner.clock.now();
@@ -532,6 +602,7 @@ impl<T: Transport + 'static> Sched<T> {
             tenant: route.tenant,
             message: route.message,
             recipients: claimed.clone(),
+            stored: message,
         };
         let answers = self.inner.transport.send(attempt).await;
         self.inner.attempts.borrow_mut().remove(&id);
@@ -599,6 +670,52 @@ impl<T: Transport + 'static> Sched<T> {
             })
             .collect();
         self.send(self.owner(route.message), Note::Report { route, reports });
+    }
+
+    fn skip(&self, route: Route, claimed: &[Claimed], error: &Error) {
+        self.inner.unreadable.set(self.inner.unreadable.get() + 1);
+        let now = self.inner.clock.now();
+        let tries = if matches!(error, Error::Store(store::Error::Damaged { .. })) {
+            let mut damaged = self.inner.damaged.borrow_mut();
+            if damaged.len() >= DAMAGED_KEPT && !damaged.contains_key(&route.message) {
+                damaged.clear();
+            }
+            let tries = damaged.entry(route.message).or_default();
+            *tries += 1;
+            *tries
+        } else {
+            0
+        };
+        let note = if tries >= DAMAGED_TRIES {
+            self.inner.damaged.borrow_mut().remove(&route.message);
+            Note::Report {
+                route,
+                reports: claimed
+                    .iter()
+                    .map(|c| {
+                        let (wait, class) = delay(Kind::Temporary, c.attempts.saturating_add(1));
+                        Report {
+                            recipient: c.recipient,
+                            outcome: Outcome::Deferred {
+                                due: now + wait,
+                                class,
+                                notified: c.notified,
+                            },
+                            reply: None,
+                        }
+                    })
+                    .collect(),
+            }
+        } else {
+            Note::Released {
+                route,
+                recipients: claimed
+                    .iter()
+                    .map(|c| (c.recipient, now + UNREADABLE))
+                    .collect(),
+            }
+        };
+        self.send(self.owner(route.message), note);
     }
 
     fn report(&self, route: Route, reports: Vec<Report>) {
@@ -746,7 +863,7 @@ impl<T: Transport + 'static> Sched<T> {
                     .map(|(r, due)| (r, Some(due)))
                     .collect(),
                 done: None,
-                wait: BACKOFF[0],
+                wait: 0,
             },
         );
     }

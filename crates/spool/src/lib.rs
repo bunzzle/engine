@@ -4,6 +4,7 @@ mod intake;
 mod items;
 mod limits;
 mod pending;
+mod read;
 mod recipients;
 
 pub use bodies::{KIND_BODY_CHUNK, Written, decode_chunk};
@@ -15,4 +16,5 @@ pub use items::{
 };
 pub use limits::{Limits, SLICE};
 pub use pending::{Open, Pending};
+pub use read::{Chunks, Opened, Source, Stored, StoredBody};
 pub use recipients::{Done, Outcome, Recipient, Reply, Report, Status};

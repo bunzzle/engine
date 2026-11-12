@@ -137,6 +137,12 @@ struct Lookup {
     reply: Sender<Result<Vec<Found>, Error>>,
 }
 
+struct Items {
+    shard: u16,
+    keys: Vec<Key>,
+    reply: Sender<Result<Vec<Option<Item>>, Error>>,
+}
+
 struct Scan {
     shard: u16,
     partition: (u8, u32),
@@ -156,6 +162,7 @@ enum Input {
     Change(Request),
     Index(Indexing),
     Lookup(Lookup),
+    Items(Items),
     Scan(Scan),
     Partitions(u8, Sender<Vec<(u16, u32)>>),
     Retire(Retire),
@@ -263,6 +270,15 @@ impl Changes {
             reply,
         };
         if self.sender.send(Input::Lookup(lookup)).is_err() {
+            return Err(Error::Failed);
+        }
+        answer.recv().await.unwrap_or(Err(Error::Failed))
+    }
+
+    pub async fn items(&self, shard: u16, keys: Vec<Key>) -> Result<Vec<Option<Item>>, Error> {
+        let (reply, mut answer) = channel();
+        let items = Items { shard, keys, reply };
+        if self.sender.send(Input::Items(items)).is_err() {
             return Err(Error::Failed);
         }
         answer.recv().await.unwrap_or(Err(Error::Failed))
@@ -393,6 +409,9 @@ impl Shards {
                 Input::Change(request) => self.request(request),
                 Input::Index(indexing) => self.index(indexing),
                 Input::Lookup(lookup) => self.lookup(lookup).await,
+                Input::Items(items) => {
+                    let _ = items.reply.send(self.items(items.shard, &items.keys));
+                }
                 Input::Scan(scan) => self.scan(scan).await,
                 Input::Partitions(kind, reply) => {
                     let _ = reply.send(self.kept_partitions(kind));
@@ -574,6 +593,14 @@ impl Shards {
             }
         }
         let _ = lookup.reply.send(Ok(found));
+    }
+
+    fn items(&self, shard: u16, keys: &[Key]) -> Result<Vec<Option<Item>>, Error> {
+        if !self.owned.contains(&shard) {
+            return Err(Error::Invalid("owner"));
+        }
+        let state = self.keeper.state(shard).ok_or(Error::Invalid("owner"))?;
+        Ok(keys.iter().map(|key| state.get(*key).cloned()).collect())
     }
 
     fn kept_partitions(&self, kind: u8) -> Vec<(u16, u32)> {
