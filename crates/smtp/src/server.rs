@@ -73,13 +73,19 @@ enum Hello {
 enum Mode {
     Command,
     Plain,
-    Login { password: bool },
+    Login(Prompt),
     Overflow,
     Data,
     Chunk { left: u64, last: bool },
     Skip { left: u64, reply: Reply },
     Wait(Wait),
     Closed,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Prompt {
+    User,
+    Token,
 }
 
 #[derive(Debug)]
@@ -341,7 +347,7 @@ impl Server {
 
     fn step(&mut self) -> bool {
         match self.mode {
-            Mode::Command | Mode::Plain | Mode::Login { .. } => self.line(),
+            Mode::Command | Mode::Plain | Mode::Login(_) => self.line(),
             Mode::Overflow => self.overflow(),
             Mode::Data => self.data_bytes(),
             Mode::Chunk { left, last } => self.chunk(left, last),
@@ -384,7 +390,7 @@ impl Server {
         self.start = next;
         match self.mode {
             Mode::Plain => self.plain(&line),
-            Mode::Login { password } => self.login(&line, password),
+            Mode::Login(prompt) => self.login(&line, prompt),
             _ => self.command(&line, crlf),
         }
         true
@@ -489,10 +495,10 @@ impl Server {
             }
         } else if mechanism.eq_ignore_ascii_case(b"LOGIN") {
             if let Some(initial) = initial {
-                self.login(initial, false);
+                self.login(initial, Prompt::User);
             } else {
                 self.output.extend_from_slice(b"334 VXNlcm5hbWU6\r\n");
-                self.mode = Mode::Login { password: false };
+                self.mode = Mode::Login(Prompt::User);
             }
         } else {
             self.send(&reply::MECHANISM);
@@ -519,33 +525,32 @@ impl Server {
             return;
         };
         let parts: Vec<&[u8]> = decoded.split(|&b| b == 0).collect();
-        let [authorize, user, password] = parts.as_slice() else {
+        let [authorize, user, token] = parts.as_slice() else {
             return self.send(&reply::AUTH_SYNTAX);
         };
-        if user.is_empty() || password.is_empty() {
+        if user.is_empty() || token.is_empty() {
             return self.send(&reply::AUTH_SYNTAX);
         }
         if !authorize.is_empty() && authorize != user {
             return self.auth_failed(&reply::AUTH_FAILED);
         }
-        self.events
-            .push_back(Event::Auth(Secret(password.to_vec())));
+        self.events.push_back(Event::Auth(Secret(token.to_vec())));
         self.mode = Mode::Wait(Wait::Auth);
     }
 
-    fn login(&mut self, line: &[u8], password: bool) {
+    fn login(&mut self, line: &[u8], prompt: Prompt) {
         let Some(decoded) = self.response(line) else {
             return;
         };
         if decoded.is_empty() {
             return self.send(&reply::AUTH_SYNTAX);
         }
-        if password {
+        if prompt == Prompt::Token {
             self.events.push_back(Event::Auth(Secret(decoded)));
             self.mode = Mode::Wait(Wait::Auth);
         } else {
             self.output.extend_from_slice(b"334 UGFzc3dvcmQ6\r\n");
-            self.mode = Mode::Login { password: true };
+            self.mode = Mode::Login(Prompt::Token);
         }
     }
 
