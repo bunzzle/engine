@@ -1,3 +1,4 @@
+use std::net::IpAddr;
 use std::time::Duration;
 
 use control::{Grant, Scope};
@@ -11,6 +12,7 @@ use tls::Acceptor;
 
 use crate::assemble::{Signer, Stamp, assemble};
 use crate::conn::Conn;
+use crate::guard::{Guard, Refused, Reserved, Slot};
 use crate::header::{Checked, Fault, HEADER_CAP, HeaderBuffer, check};
 use sched::{Envelope, Recipient, encode_slice};
 
@@ -22,12 +24,14 @@ const POOL: Reply = Reply::new(550, "5.7.1", "Pool not allowed");
 const SUPPRESSED: Reply = Reply::new(550, "5.7.1", "Recipient suppressed");
 const HEADER: Reply = Reply::new(554, "5.6.0", "Message header not accepted");
 const LOOP: Reply = Reply::new(554, "5.4.6", "Too many Received fields");
+const TENANT_FULL: Reply = Reply::new(421, "4.7.0", "Too many connections");
+const BUSY: Reply = Reply::new(451, "4.3.2", "System busy");
 
 #[derive(Clone, Debug)]
 pub struct Config {
     pub name: String,
     pub lifetime: u64,
-    pub connections: usize,
+    pub messages: u32,
     pub handshake: Duration,
     pub auth: Duration,
     pub idle: Duration,
@@ -40,7 +44,7 @@ impl Config {
         Self {
             name,
             lifetime: 5 * 86_400_000,
-            connections: 1024,
+            messages: 1000,
             handshake: Duration::from_secs(10),
             auth: Duration::from_secs(60),
             idle: Duration::from_secs(300),
@@ -57,6 +61,7 @@ pub enum End {
     Timeout,
     Io,
     Tls,
+    Refused,
 }
 
 pub fn message_limit<T: Transport + 'static>(node: &Node<T>) -> u64 {
@@ -65,22 +70,35 @@ pub fn message_limit<T: Transport + 'static>(node: &Node<T>) -> u64 {
     HEADER_CAP as u64 + spool.stream_records() * plain
 }
 
+pub fn data_hold<T: Transport + 'static>(node: &Node<T>) -> usize {
+    let spool = node.spool();
+    HEADER_CAP + 2 * smtp::CHUNK + 2 * spool.stream_chunk().max(spool.limits().inline)
+}
+
 pub async fn serve<T: Transport + 'static>(
     node: &Node<T>,
     acceptor: &Acceptor,
     conn: Conn,
     config: &Config,
+    guard: &Guard,
+    (ip, net): (IpAddr, Slot),
     shard: usize,
 ) -> End {
     let server = Server::new(smtp::Config {
         name: config.name.clone(),
         message: message_limit(node),
         implicit: conn.secure(),
+        messages: config.messages,
     });
     let mut session = Session {
         node,
         acceptor,
         config,
+        guard,
+        ip,
+        net: Some(net),
+        tenant: None,
+        hold: data_hold(node),
         conn: Some(conn),
         server,
         grant: None,
@@ -100,6 +118,11 @@ struct Session<'a, T> {
     node: &'a Node<T>,
     acceptor: &'a Acceptor,
     config: &'a Config,
+    guard: &'a Guard,
+    ip: IpAddr,
+    net: Option<Slot>,
+    tenant: Option<Slot>,
+    hold: usize,
     conn: Option<Conn>,
     server: Server,
     grant: Option<Grant>,
@@ -128,6 +151,7 @@ struct Data {
     pending: Vec<u8>,
     stream: Option<(Sealer, BodyWriter)>,
     refused: Option<Reply>,
+    _hold: Reserved,
 }
 
 struct Ready {
@@ -211,11 +235,11 @@ impl<T: Transport + 'static> Session<'_, T> {
         match event {
             Event::Starttls => self.starttls().await?,
             Event::Auth(secret) => {
-                self.grant = self.node.table().check(secret.expose(), Scope::Smtp);
-                let answer = if self.grant.is_some() {
-                    Ok(())
-                } else {
-                    Err(reply::AUTH_FAILED)
+                self.flush().await?;
+                let grant = self.node.table().check(secret.expose(), Scope::Smtp);
+                let answer = match grant {
+                    Some(grant) => self.admit(grant).await,
+                    None => Err(self.failed().await),
                 };
                 self.server.auth(answer);
             }
@@ -261,6 +285,35 @@ impl<T: Transport + 'static> Session<'_, T> {
                 Ok(())
             }
             _ => Err(End::Tls),
+        }
+    }
+
+    async fn admit(&mut self, grant: Grant) -> Result<(), Reply> {
+        let limit = self
+            .node
+            .table()
+            .tenant(grant.tenant)
+            .map_or(0, |tenant| tenant.limits.connections);
+        if limit > 0 {
+            let slot =
+                self.guard.open_tenant(grant.tenant, limit).await.map_err(
+                    |refused| match refused {
+                        Refused::Unanswered => reply::AUTH_TEMPORARY,
+                        Refused::Full | Refused::Banned => TENANT_FULL,
+                    },
+                )?;
+            self.tenant = Some(slot);
+        }
+        self.grant = Some(grant);
+        self.net = None;
+        Ok(())
+    }
+
+    async fn failed(&mut self) -> Reply {
+        match self.guard.failed(self.ip).await {
+            Ok(false) => reply::AUTH_FAILED,
+            Ok(true) => reply::AUTH_FAILURES,
+            Err(_) => reply::AUTH_TEMPORARY,
         }
     }
 
@@ -313,6 +366,7 @@ impl<T: Transport + 'static> Session<'_, T> {
         let Some(tx) = self.tx.as_mut() else {
             return Err(reply::SEQUENCE);
         };
+        let hold = self.guard.reserve(self.hold).ok_or(BUSY)?;
         let shards = self.node.spool().shards();
         let shard = *shards
             .get(self.shard % shards.len().max(1))
@@ -336,6 +390,7 @@ impl<T: Transport + 'static> Session<'_, T> {
             pending: Vec::new(),
             stream: None,
             refused: None,
+            _hold: hold,
         });
         Ok(())
     }

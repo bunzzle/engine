@@ -1,6 +1,6 @@
 mod common;
 
-use common::{Client, LIMIT, PLAIN};
+use common::{Client, LIMIT, MESSAGES, PLAIN};
 use smtp::{Reply, reply};
 
 fn lines(text: &str) -> Vec<&str> {
@@ -131,6 +131,7 @@ fn bytes_before_the_greeting_or_after_ehlo_close_the_session() {
         name: "mx.example.org".into(),
         message: LIMIT,
         implicit: true,
+        messages: MESSAGES,
     });
     server.input(b"EHLO x\r\n");
     assert!(matches!(server.poll(), Some(smtp::Event::Close)));
@@ -461,6 +462,23 @@ fn twenty_errors_close_the_session_but_overshoot_does_not_count() {
     assert!(!client.server.closed());
     text.push_str(&client.send(b"XYZZY\r\n"));
     assert!(text.ends_with("500 5.5.2 Command unrecognized\r\n421 4.7.0 Too many errors\r\n"));
+    assert!(client.server.closed());
+}
+
+#[test]
+fn the_session_closes_after_its_last_allowed_message() {
+    let mut client = Client::ready();
+    for n in 1..MESSAGES {
+        assert_eq!(
+            data(&mut client, b"a\r\n.\r\n"),
+            format!("250 2.0.0 id{n}\r\n")
+        );
+    }
+    let text = data(&mut client, b"a\r\n.\r\n");
+    assert_eq!(
+        text,
+        format!("250 2.0.0 id{MESSAGES}\r\n421 4.7.0 Too many messages\r\n")
+    );
     assert!(client.server.closed());
 }
 

@@ -16,6 +16,7 @@ fn tenant(id: u32) -> Tenant {
         limits: Limits {
             rate: 500,
             burst: 50,
+            connections: 64,
             queued: 1 << 40,
         },
     }
@@ -157,7 +158,7 @@ fn damaged_records_do_not_decode() {
     }
     .encode();
     assert!(Update::decode(&good).is_some());
-    for at in [0, 1, 2, 3, 22, 23, 36, 37, 38, 39] {
+    for at in [0, 1, 2, 3, 22, 23] {
         let mut bad = good.clone();
         bad[at] ^= 0x40;
         assert_eq!(Update::decode(&bad), None, "byte {at}");
@@ -169,6 +170,17 @@ fn damaged_records_do_not_decode() {
     let mut zero = good.clone();
     zero[4..8].copy_from_slice(&0u32.to_le_bytes());
     assert_eq!(Update::decode(&zero), None);
+    assert_eq!(good[36..40], 64u32.to_le_bytes());
+    let mut open = good.clone();
+    open[36..40].copy_from_slice(&[0; 4]);
+    let Some(Update {
+        object: Object::Tenant(read),
+        ..
+    }) = Update::decode(&open)
+    else {
+        panic!("tenant without a connection limit");
+    };
+    assert_eq!(read.limits.connections, 0);
     let pool = Update {
         version: 1,
         object: Object::Pool(pool(1)),
