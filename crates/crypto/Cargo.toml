@@ -7,7 +7,7 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
-aws-lc-rs = "=1.18.2"
+aws-lc-rs = "=1.19.0"
 sys = { path = "../sys" }
 
 [lints]
