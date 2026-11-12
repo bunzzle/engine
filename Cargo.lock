@@ -139,6 +139,7 @@ dependencies = [
 name = "intake"
 version = "0.0.0"
 dependencies = [
+ "aws-lc-rs",
  "control",
  "crypto",
  "dkim",
@@ -258,6 +259,7 @@ dependencies = [
  "aws-lc-rs",
  "control",
  "crypto",
+ "dkim",
  "index",
  "keys",
  "rt",

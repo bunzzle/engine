@@ -43,6 +43,7 @@ pub enum Answer {
         generation: u32,
         day: u32,
     },
+    Later(u64),
 }
 
 pub fn delay(kind: Kind, attempts: u16) -> (u64, u8) {

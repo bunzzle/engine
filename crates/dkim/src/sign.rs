@@ -53,10 +53,7 @@ pub fn unsigned(template: &Template, fields: &[Field], body: &[u8; 32]) -> Resul
     if template.expiry <= template.time {
         return Err(Error::Expiry);
     }
-    let alg = match template.alg {
-        DkimAlg::RsaSha256 => "rsa-sha256",
-        DkimAlg::Ed25519Sha256 => "ed25519-sha256",
-    };
+    let alg = alg_name(template.alg);
     let mut out = Folder::new("DKIM-Signature:");
     for tag in [
         "v=1;".to_owned(),
@@ -99,6 +96,27 @@ pub fn signed(unsigned: &[u8], signature: &[u8]) -> Result<Vec<u8>, Error> {
     out.word("b=", false);
     out.run(&base64::encode(signature));
     Ok(out.finish())
+}
+
+fn alg_name(alg: DkimAlg) -> &'static str {
+    match alg {
+        DkimAlg::RsaSha256 => "rsa-sha256",
+        DkimAlg::Ed25519Sha256 => "ed25519-sha256",
+    }
+}
+
+pub fn pending<'a>(field: &Field<'a>, alg: DkimAlg) -> Result<&'a [u8], Error> {
+    if !field.is("dkim-signature") {
+        return Err(Error::Missing("dkim-signature"));
+    }
+    let tags = Tags::parse(field)?;
+    if tags.get("a") != Some(alg_name(alg).as_bytes()) {
+        return Err(Error::Algorithm);
+    }
+    if tags.get("b") != Some(b"") {
+        return Err(Error::Unsigned);
+    }
+    tags.require("bh")
 }
 
 pub fn digest(fields: &[Field], at: usize) -> Result<[u8; 32], Error> {

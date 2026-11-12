@@ -7,8 +7,8 @@ use aws_lc_rs::signature::{
 };
 use crypto::{DkimAlg, DkimKey, Plain};
 use dkim::{
-    BodyHash, Check, Error, SIGNED, Template, base64, check, digest, header_list, parse, signed,
-    unsigned,
+    BodyHash, Check, Error, SIGNED, Template, base64, check, digest, header_list, parse, pending,
+    signed, unsigned,
 };
 
 const RFC_ED25519: &str = "DKIM-Signature: v=1; a=ed25519-sha256; c=relaxed/relaxed;\r\n d=football.example.com; i=@football.example.com;\r\n q=dns/txt; s=brisbane; t=1528637909; h=from : to :\r\n subject : date : message-id : from : subject : date;\r\n bh=2jUSOH9NhtVGCQWNr9BrIAPreKQjO6Sn7XIkfJVOzv8=;\r\n b=/gCrinpcQOoIfuHNQIbq4pgh9kyIK3AQUdt9OdqQehSwhEIug4D11Bus\r\n Fa3bT3FY5OsU7ZbnKELq+eXdp1Q1Dw==\r\n";
@@ -164,6 +164,32 @@ fn own_signatures_verify_and_stay_within_the_line_width() {
             assert!(line.len() <= 79, "{}", String::from_utf8_lossy(line));
         }
     }
+}
+
+#[test]
+fn pending_fields_give_their_body_hash_and_refuse_the_rest() {
+    let fields = parse(HEADERS.as_bytes()).expect("parse");
+    let hash = body_hash(BODY);
+    for alg in [DkimAlg::RsaSha256, DkimAlg::Ed25519Sha256] {
+        let field = unsigned(&template(alg), &fields, &hash).expect("unsigned");
+        let stored = parse(&field).expect("stored");
+        let bh: Vec<u8> = pending(&stored[0], alg)
+            .expect("pending")
+            .iter()
+            .copied()
+            .filter(|b| !b.is_ascii_whitespace())
+            .collect();
+        assert_eq!(bh, base64::encode(&hash).into_bytes());
+        let other = match alg {
+            DkimAlg::RsaSha256 => DkimAlg::Ed25519Sha256,
+            DkimAlg::Ed25519Sha256 => DkimAlg::RsaSha256,
+        };
+        assert_eq!(pending(&stored[0], other), Err(Error::Algorithm));
+        let done = signed(&field, &[1; 64]).expect("signed");
+        let done = parse(&done).expect("signed field");
+        assert_eq!(pending(&done[0], alg), Err(Error::Unsigned));
+    }
+    assert!(pending(&fields[0], DkimAlg::RsaSha256).is_err());
 }
 
 #[test]

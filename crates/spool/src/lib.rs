@@ -16,5 +16,5 @@ pub use items::{
 };
 pub use limits::{Limits, SLICE};
 pub use pending::{Open, Pending};
-pub use read::{Chunks, Opened, Source, Stored, StoredBody};
+pub use read::{Chunks, Opened, Pinned, Source, Stored, StoredBody};
 pub use recipients::{Done, Outcome, Recipient, Reply, Report, Status};

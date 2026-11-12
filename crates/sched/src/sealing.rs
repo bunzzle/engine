@@ -343,20 +343,30 @@ impl<T: Transport + 'static> Node<T> {
         clear: &HeadClear,
         wrap: &[u8; WRAP],
     ) -> Result<Opener, Unsealable> {
-        let decoded = Wrap::decode(wrap).map_err(|_| Unsealable::Bad)?;
-        if (decoded.generation, decoded.shard, decoded.day) != (generation, id.shard, clear.day) {
-            return Err(Unsealable::Bad);
-        }
-        let key = self
-            .keys()
-            .batch_key(tenant, generation, id.shard, clear.batch_key, decoded)
-            .await?;
-        Ok(Opener {
-            tenant,
-            generation,
-            message: id.bytes(),
-            key,
-            replies: RefCell::new(BTreeSet::new()),
-        })
+        opener(self.keys(), tenant, generation, id, clear, wrap).await
     }
+}
+
+pub(crate) async fn opener(
+    keys: &dyn Keys,
+    tenant: u32,
+    generation: u32,
+    id: MessageId,
+    clear: &HeadClear,
+    wrap: &[u8; WRAP],
+) -> Result<Opener, Unsealable> {
+    let decoded = Wrap::decode(wrap).map_err(|_| Unsealable::Bad)?;
+    if (decoded.generation, decoded.shard, decoded.day) != (generation, id.shard, clear.day) {
+        return Err(Unsealable::Bad);
+    }
+    let key = keys
+        .batch_key(tenant, generation, id.shard, clear.batch_key, decoded)
+        .await?;
+    Ok(Opener {
+        tenant,
+        generation,
+        message: id.bytes(),
+        key,
+        replies: RefCell::new(BTreeSet::new()),
+    })
 }

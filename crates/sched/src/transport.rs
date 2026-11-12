@@ -1,7 +1,8 @@
-use spool::{MessageId, Opened, Stamp};
+use spool::{MessageId, Stamp};
 
 use crate::lanes::QueueId;
 use crate::policy::Answer;
+use crate::sign::Outgoing;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Claimed {
@@ -17,7 +18,7 @@ pub struct Attempt {
     pub tenant: u32,
     pub message: MessageId,
     pub recipients: Vec<Claimed>,
-    pub stored: Opened,
+    pub outgoing: Outgoing,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
