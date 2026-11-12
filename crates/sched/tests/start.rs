@@ -290,6 +290,7 @@ fn settings() -> Settings {
             recipients: MOST,
             inline: 2048,
             body: 512 * 1024,
+            read: 1024 * 1024,
         },
         naming: Naming {
             key: *b"naming key 16 by",

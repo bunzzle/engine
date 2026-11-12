@@ -208,6 +208,7 @@ fn settings_named(key: [u8; 16]) -> Settings {
             recipients: 100,
             inline: 2048,
             body: 64 * 1024,
+            read: 1024 * 1024,
         },
         naming: Naming {
             key,

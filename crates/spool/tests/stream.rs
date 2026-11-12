@@ -18,6 +18,7 @@ const LIMITS: Limits = Limits {
     recipients: 100,
     inline: 1024,
     body: 512 * 1024,
+    read: 1024 * 1024,
 };
 
 async fn abandon(intake: Spool, shard: u16, chunks: usize) {

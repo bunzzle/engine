@@ -38,6 +38,7 @@ const LIMITS: spool::Limits = spool::Limits {
     recipients: 3000,
     inline: 2048,
     body: 512 * 1024,
+    read: 1024 * 1024,
 };
 
 type MessageKey = (u16, u64);

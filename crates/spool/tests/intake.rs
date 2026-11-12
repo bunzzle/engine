@@ -8,8 +8,8 @@ use std::time::Duration;
 use rt::sim::{Config, Disk, Faults, Machine, SimDriver, Stalls, check};
 use rt::{JoinHandle, Runtime, sleep, spawn, timeout};
 use spool::{
-    BODY_ITEM, Body, Error, Head, HeadClear, Limits, Message, MessageId, SLICE, Slice, Spool,
-    decode_chunk, slice_item, slice_parts,
+    BODY_ITEM, Body, Error, Head, HeadClear, Limits, Message, MessageId, SLICE, Slice, Source,
+    Spool, StoredBody, decode_chunk, slice_item, slice_parts,
 };
 use store::{
     CoreFile, DataFile, HEAD_ITEM, Index, Keeper, Location, Options, Owner, Range, Record,
@@ -35,6 +35,7 @@ const LIMITS: Limits = Limits {
     recipients: 3000,
     inline: 2048,
     body: 512 * 1024,
+    read: 64 * 1024,
 };
 
 struct Nobody;
@@ -78,6 +79,7 @@ struct Accepted {
 struct Model {
     accepted: Vec<Accepted>,
     boots: BTreeMap<u16, u32>,
+    sliced: usize,
 }
 
 type Shared = Rc<RefCell<Model>>;
@@ -181,6 +183,44 @@ async fn draft(intake: &Spool, shard: u16, step: u64) -> Result<(Message, Accept
     Ok((message, accepted))
 }
 
+async fn read_back(intake: &Spool, expected: &Accepted, model: &Shared) -> bool {
+    let Ok(stored) = intake.stored(expected.id).await else {
+        return false;
+    };
+    assert_eq!(stored.tenant, expected.tenant);
+    assert_eq!(stored.clear, expected.head.clear);
+    if let StoredBody::Chain(ranges) = &stored.body
+        && ranges.iter().any(|r| r.length > LIMITS.read)
+    {
+        model.borrow_mut().sliced += 1;
+    }
+    let Ok(opened) = intake.open_stored(&stored).await else {
+        return false;
+    };
+    assert_eq!(opened.wrap, expected.head.wrap);
+    assert_eq!(opened.head, expected.head.sealed);
+    let found = match opened.body {
+        Source::Inline(sealed) => Expected::Inline(sealed),
+        Source::Chain(mut chunks) => {
+            let mut all = Vec::new();
+            loop {
+                match chunks.next().await {
+                    Ok(Some(chunk)) => all.push(chunk),
+                    Ok(None) => break,
+                    Err(_) => return false,
+                }
+            }
+            Expected::Chain(all)
+        }
+    };
+    assert_eq!(
+        found, expected.body,
+        "message {} read back",
+        expected.id.key
+    );
+    true
+}
+
 async fn work(intake: Spool, shards: Vec<u16>, steps: u64, model: Shared) -> bool {
     let mut step = 0;
     let mut group = 0;
@@ -207,7 +247,14 @@ async fn work(intake: Spool, shards: Vec<u16>, steps: u64, model: Shared) -> boo
             step += 1;
         }
         match intake.accept(messages).await {
-            Ok(()) => model.borrow_mut().accepted.extend(accepted),
+            Ok(()) => {
+                for expected in &accepted {
+                    if !read_back(&intake, expected, &model).await {
+                        return false;
+                    }
+                }
+                model.borrow_mut().accepted.extend(accepted);
+            }
             Err(Error::Store(
                 store::Error::Reserve | store::Error::Full | store::Error::Invalid("batch"),
             )) => sleep(Duration::from_millis(1)).await,
@@ -479,8 +526,9 @@ fn accepted_messages_come_back_whole() {
         .filter(|m| matches!(&m.body, Expected::Chain(c) if c.len() > 1 && c[0].len() == 65_480))
         .count();
     assert!(
-        chained > 0 && wide > 0 && full > 0,
-        "{chained} chained, {wide} wide, {full} streamed"
+        chained > 0 && wide > 0 && full > 0 && model.sliced > 0,
+        "{chained} chained, {wide} wide, {full} streamed, {} sliced",
+        model.sliced
     );
     drop(model);
     after(&outcome.driver, 2, shared);

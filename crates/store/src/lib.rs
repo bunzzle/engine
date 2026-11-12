@@ -64,7 +64,7 @@ pub use superblock::{
     COPIES, Checkpoint, CheckpointCopy, FORMAT, MAX_SECTOR_SIZE, MAX_SHARDS, MIN_SECTOR_SIZE,
     SLOT_SIZE, Superblock, ZONE_SIZE,
 };
-pub use sys::crc32c::checksum;
+pub use sys::crc32c::{Hasher as Crc32c, checksum};
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 pub use threads::launch;
 pub use usage::{Count, Usage};
