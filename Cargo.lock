@@ -136,6 +136,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "intake"
+version = "0.0.0"
+dependencies = [
+ "crypto",
+ "dkim",
+]
+
+[[package]]
 name = "jobserver"
 version = "0.1.35"
 source = "registry+https://github.com/rust-lang/crates.io-index"
