@@ -203,6 +203,15 @@ impl Spool {
         inner.writer.write(id.shard, tenant, id.key, chunks).await
     }
 
+    pub fn shards(&self) -> Vec<u16> {
+        self.inner.ids.borrow().shards().collect()
+    }
+
+    pub fn stream_records(&self) -> u64 {
+        let per = record_size(CHUNK_FIXED + self.inner.bounds.stream) as u64;
+        self.inner.limits.body / per
+    }
+
     pub fn stream_chunk(&self) -> usize {
         self.inner.bounds.stream
     }

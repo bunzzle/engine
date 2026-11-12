@@ -268,6 +268,10 @@ impl<T: Transport + 'static> Node<T> {
         &*self.inner.keys
     }
 
+    pub fn ids(&self) -> Option<crypto::Secret<16>> {
+        self.inner.keys.ids()
+    }
+
     pub fn sched(&self) -> &Sched<T> {
         &self.inner.sched
     }
