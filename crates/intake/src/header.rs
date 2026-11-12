@@ -72,6 +72,10 @@ impl HeaderBuffer {
         self.done
     }
 
+    pub fn section(&self) -> &[u8] {
+        &self.section
+    }
+
     pub fn finish(self) -> Vec<u8> {
         self.section
     }

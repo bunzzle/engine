@@ -34,6 +34,10 @@ impl Ids {
         Some(key)
     }
 
+    pub fn shards(&self) -> impl Iterator<Item = u16> + '_ {
+        self.shards.keys().copied()
+    }
+
     pub fn boot(&self, shard: u16) -> Option<u32> {
         self.shards.get(&shard).map(|counter| counter.boot)
     }

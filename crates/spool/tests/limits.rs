@@ -107,6 +107,8 @@ async fn stream_refusals(intake: &Spool, id: MessageId) {
         writer.push(&[1; 100]).await,
         Err(Error::Limit("chunk"))
     ));
+    assert_eq!(intake.stream_records(), 1);
+    assert!(intake.shards().contains(&id.shard));
     let mut over = intake.body_stream(id, 7);
     over.push(&vec![0; stream]).await.expect("full chunk");
     assert!(matches!(over.push(&[1]).await, Err(Error::Limit("body"))));

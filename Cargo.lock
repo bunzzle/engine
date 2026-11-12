@@ -139,8 +139,16 @@ dependencies = [
 name = "intake"
 version = "0.0.0"
 dependencies = [
+ "control",
  "crypto",
  "dkim",
+ "keys",
+ "rt",
+ "sched",
+ "smtp",
+ "spool",
+ "store",
+ "tls",
 ]
 
 [[package]]

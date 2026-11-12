@@ -5,7 +5,8 @@ use std::rc::Rc;
 
 use control::{KeyError, KeySource};
 use crypto::{
-    AAD, BatchKey, ChunkKey, DkimAlg, Opener as ChunkOpener, Sealer as ChunkSealer, TAG, Wrap, aad,
+    AAD, BatchKey, ChunkKey, DkimAlg, Opener as ChunkOpener, Sealer as ChunkSealer, Secret, TAG,
+    Wrap, aad,
 };
 use keys::Batch;
 use spool::{
@@ -75,6 +76,10 @@ pub trait Keys: KeySource {
         _blob: &'a [u8],
     ) -> Loaded<'a> {
         Box::pin(async { Err(KeyError::Unavailable) })
+    }
+
+    fn ids(&self) -> Option<Secret<16>> {
+        None
     }
 
     fn sign(

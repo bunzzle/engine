@@ -2,7 +2,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use control::{Created, KeyError, KeySource, Ready};
-use crypto::{BatchKey, DkimAlg, TenantKeys, Wrap};
+use crypto::{BatchKey, DkimAlg, Secret, TenantKeys, Wrap};
 use keys::{BatchSettings, BatchStats, Batches, Fault, Ring};
 
 use crate::sealing::{Batched, Deleted, Keys, Loaded, Made, Oldest, Signed, Unsealable, Unwrapped};
@@ -79,6 +79,10 @@ impl KeySource for Keyring {
 }
 
 impl Keys for Keyring {
+    fn ids(&self) -> Option<Secret<16>> {
+        self.ring.ids()
+    }
+
     fn tick(&self) {
         self.batches.borrow_mut().sweep(rt::now());
     }

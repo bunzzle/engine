@@ -7,8 +7,18 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+control = { path = "../control" }
 crypto = { path = "../crypto" }
 dkim = { path = "../dkim" }
+rt = { path = "../rt" }
+sched = { path = "../sched" }
+smtp = { path = "../smtp" }
+spool = { path = "../spool" }
+tls = { path = "../tls" }
+
+[dev-dependencies]
+keys = { path = "../keys" }
+store = { path = "../store" }
 
 [lints]
 workspace = true
