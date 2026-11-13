@@ -1,0 +1,16 @@
+[package]
+name = "node"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+config = { path = "../config" }
+intake = { path = "../intake" }
+sys = { path = "../sys" }
+tls = { path = "../tls" }
+
+[lints]
+workspace = true

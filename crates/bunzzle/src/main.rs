@@ -1,5 +1,6 @@
 mod keys;
 
+use std::path::Path;
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
@@ -17,6 +18,20 @@ fn main() -> ExitCode {
                     ExitCode::FAILURE
                 }
             }
+        }
+        Some((mode, [path])) if mode == "check" => match node::check(Path::new(path)) {
+            Ok(_) => {
+                println!("{path}: ok");
+                ExitCode::SUCCESS
+            }
+            Err(error) => {
+                eprintln!("bunzzle check: {error}");
+                ExitCode::FAILURE
+            }
+        },
+        Some((mode, _)) if mode == "check" => {
+            eprintln!("usage: bunzzle check <config>");
+            ExitCode::from(2)
         }
         _ => {
             println!("bunzzle {}", env!("CARGO_PKG_VERSION"));
