@@ -89,9 +89,36 @@ fn hangup_reloads_certificates_and_keeps_the_old_pair_on_failure() {
             settle(&watch, 1, 1).await;
             assert_eq!(certs.current().cert[0].to_vec(), der(B));
             control.raise(Signal::Terminate);
-            assert_eq!(watch.stop_requested().await, Signal::Terminate);
+            assert_eq!(
+                watch.stop_requested().await.expect("signal"),
+                Signal::Terminate
+            );
             control.raise(Signal::Hangup);
             settle(&watch, 2, 1).await;
+            watch.close().await;
+        });
+    });
+}
+
+#[test]
+fn a_failed_signal_receive_requests_a_stop_with_the_error() {
+    check(0..20, |seed| {
+        let driver = Rc::new(SimDriver::new(seed, Config::default()));
+        let control = Rc::clone(&driver);
+        Runtime::new(driver).block_on(async move {
+            write_file(CHAIN, A).await;
+            write_file(KEY, &pem(KEY_A)).await;
+            let certs = Arc::new(
+                Certs::read(Path::new(CHAIN), Path::new(KEY))
+                    .await
+                    .expect("read"),
+            );
+            let signals = Signals::listen(&[Signal::Hangup, Signal::Terminate])
+                .await
+                .expect("listen");
+            let watch = watch(signals, certs, PathBuf::from(CHAIN), PathBuf::from(KEY));
+            control.fail_signals();
+            assert!(watch.stop_requested().await.is_err());
             watch.close().await;
         });
     });

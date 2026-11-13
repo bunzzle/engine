@@ -180,16 +180,17 @@ pub async fn run<T: Transport + 'static>(
             )
         })
         .collect();
-    match watched {
-        Some(watched) => {
-            watched.stop_requested().await;
-            watched.close().await;
-            for core in 1..cores {
-                peers.send(core, Order::Stop);
-            }
+    let stopped = if let Some(watched) = watched {
+        let requested = watched.stop_requested().await;
+        watched.close().await;
+        for core in 1..cores {
+            peers.send(core, Order::Stop);
         }
-        None => orders.until(|o| o.stop.get()).await,
-    }
+        requested.map(drop).map_err(Error::Io)
+    } else {
+        orders.until(|o| o.stop.get()).await;
+        Ok(())
+    };
     let closing: Vec<_> = listeners
         .into_iter()
         .map(|listener| spawn(listener.close()))
@@ -202,7 +203,7 @@ pub async fn run<T: Transport + 'static>(
     drop(up.running.stop().await);
     drop(up.guarding);
     peers.close();
-    Ok(())
+    stopped
 }
 
 async fn start<T: Transport + 'static>(

@@ -14,7 +14,7 @@ use tls::Certs;
 struct Shared {
     stop: Notify,
     stopping: Notify,
-    requested: Cell<Option<Signal>>,
+    requested: Cell<Option<Result<Signal, io::ErrorKind>>>,
     reloaded: Cell<u64>,
     failed: Cell<u64>,
 }
@@ -33,10 +33,10 @@ impl Watch {
         self.shared.failed.get()
     }
 
-    pub async fn stop_requested(&self) -> Signal {
+    pub async fn stop_requested(&self) -> io::Result<Signal> {
         loop {
-            if let Some(signal) = self.shared.requested.get() {
-                return signal;
+            if let Some(requested) = self.shared.requested.get() {
+                return requested.map_err(io::Error::from);
             }
             self.shared.stopping.wait().await;
         }
@@ -64,17 +64,22 @@ pub fn watch(signals: Signals, certs: Arc<Certs>, chain: PathBuf, key: PathBuf) 
                     };
                     counter.set(counter.get() + 1);
                 }
-                Ok(signal) => {
-                    if state.requested.get().is_none() {
-                        state.requested.set(Some(signal));
-                    }
-                    state.stopping.notify();
+                Ok(signal) => request(&state, Ok(signal)),
+                Err(e) => {
+                    request(&state, Err(e.kind()));
+                    return;
                 }
-                Err(_) => return,
             }
         }
     });
     Watch { shared, task }
+}
+
+fn request(state: &Shared, requested: Result<Signal, io::ErrorKind>) {
+    if state.requested.get().is_none() {
+        state.requested.set(Some(requested));
+    }
+    state.stopping.notify();
 }
 
 async fn recv_or_stop(signals: &Signals, stop: &Notify) -> Option<io::Result<Signal>> {

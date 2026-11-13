@@ -234,3 +234,26 @@ fn boot_stops_when_keys_does_not_answer() {
     });
     assert!(matches!(failed, Ok(Err(Error::Keys(_)))), "{failed:?}");
 }
+
+#[test]
+fn a_failed_signal_watch_stops_the_node_with_the_error() {
+    let driver = created(8);
+    let signals = Rc::clone(&driver);
+    let Booted {
+        machine,
+        cores,
+        committer,
+    } = booted(&driver, config(7), CORES);
+    machine.block_on(0, async move {
+        drop(serving().await);
+        signals.fail_signals();
+        let mut cores = cores.into_iter();
+        let first = cores.next().expect("core 0").await;
+        assert!(matches!(first, Err(Error::Io(_))), "{first:?}");
+        for core in cores {
+            core.await.expect("stopped");
+        }
+        drop(committer.await);
+        assert!(TcpStream::connect(smtp()).await.is_err());
+    });
+}

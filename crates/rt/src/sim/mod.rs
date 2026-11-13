@@ -118,6 +118,7 @@ struct State {
     halted: bool,
     uid: u32,
     signals: u32,
+    signals_failed: bool,
 }
 
 fn bad_handle() -> io::Error {
@@ -395,6 +396,9 @@ impl State {
                 let Some(Resource::Signals(mask)) = self.handles.get(&handle) else {
                     return Ok(Completion::Signals(Err(bad_handle())));
                 };
+                if self.signals_failed {
+                    return Ok(Completion::Signals(Err(io::Error::other("signals failed"))));
+                }
                 let bits = self.signals & mask;
                 if bits == 0 {
                     return Err(Op::RecvSignals { handle });
@@ -644,6 +648,7 @@ impl SimDriver {
                 halted: false,
                 uid: 0,
                 signals: 0,
+                signals_failed: false,
             }),
         }
     }
@@ -696,6 +701,12 @@ impl SimDriver {
             state.signals |= signal.bit();
             state.retry_waiting();
         }
+    }
+
+    pub fn fail_signals(&self) {
+        let mut state = self.state.borrow_mut();
+        state.signals_failed = true;
+        state.retry_waiting();
     }
 
     pub fn reset_connection(&self, local: SocketAddr) {
