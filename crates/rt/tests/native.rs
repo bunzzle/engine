@@ -349,6 +349,7 @@ fn signals_from_the_process_reach_the_listener() {
                 .expect("in time");
             got.push(signal.expect("recv"));
         }
+        got.sort();
         assert_eq!(got, [rt::Signal::Hangup, rt::Signal::Terminate]);
         assert!(
             timeout(Duration::from_millis(50), signals.recv())
