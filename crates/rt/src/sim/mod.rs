@@ -21,6 +21,7 @@ pub use machine::{Machine, Stalls};
 pub use rng::Rng;
 
 use crate::driver::{Completion, Driver, Handle, Op, OpId, Stat, Unpark};
+use crate::signal::Signal;
 use crate::time::Instant;
 use net::{Delivery, Net, Socket};
 use sys::buf::Buf;
@@ -82,6 +83,7 @@ impl Default for Config {
 enum Resource {
     File(PathBuf),
     Socket(u64),
+    Signals(u32),
 }
 
 enum Event {
@@ -115,6 +117,7 @@ struct State {
     disk_ops: u64,
     halted: bool,
     uid: u32,
+    signals: u32,
 }
 
 fn bad_handle() -> io::Error {
@@ -388,6 +391,27 @@ impl State {
             unix @ (Op::ListenUnix { .. } | Op::AcceptUnix { .. } | Op::ConnectUnix { .. }) => {
                 self.unix(unix)
             }
+            Op::ListenSignals { mask } => {
+                if mask == 0 {
+                    return Ok(Completion::Handle(Err(io::ErrorKind::InvalidInput.into())));
+                }
+                if self.listened() != 0 {
+                    return Ok(Completion::Handle(Err(io::ErrorKind::AlreadyExists.into())));
+                }
+                self.signals &= !mask;
+                Ok(Completion::Handle(Ok(self.add(Resource::Signals(mask)))))
+            }
+            Op::RecvSignals { handle } => {
+                let Some(Resource::Signals(mask)) = self.handles.get(&handle) else {
+                    return Ok(Completion::Signals(Err(bad_handle())));
+                };
+                let bits = self.signals & mask;
+                if bits == 0 {
+                    return Err(Op::RecvSignals { handle });
+                }
+                self.signals &= !bits;
+                Ok(Completion::Signals(Ok(bits)))
+            }
             file => Ok(self.file_op(file)),
         }
     }
@@ -527,6 +551,16 @@ impl State {
         Completion::Bytes(Ok(buf.len()), buf)
     }
 
+    fn listened(&self) -> u32 {
+        self.handles
+            .values()
+            .filter_map(|resource| match resource {
+                Resource::Signals(mask) => Some(*mask),
+                _ => None,
+            })
+            .fold(0, |all, mask| all | mask)
+    }
+
     fn release(&mut self, handle: Handle) {
         let Some(Resource::Socket(id)) = self.handles.remove(&handle) else {
             return;
@@ -601,6 +635,7 @@ impl SimDriver {
                 disk_ops: 0,
                 halted: false,
                 uid: 0,
+                signals: 0,
             }),
         }
     }
@@ -645,6 +680,14 @@ impl SimDriver {
         let mut state = self.state.borrow_mut();
         state.net.set_reachable(ip, reachable);
         state.retry_waiting();
+    }
+
+    pub fn raise(&self, signal: Signal) {
+        let mut state = self.state.borrow_mut();
+        if state.listened() & signal.bit() != 0 {
+            state.signals |= signal.bit();
+            state.retry_waiting();
+        }
     }
 
     pub fn reset_connection(&self, local: SocketAddr) {
@@ -695,13 +738,14 @@ impl Driver for SimDriver {
         let mut state = self.state.borrow_mut();
         state.pending.remove(&id);
         state.waiting.remove(&id);
-        if let Some(
-            Completion::Handle(Ok(handle))
-            | Completion::Accepted(Ok((handle, _)))
-            | Completion::Peer(Ok((handle, _))),
-        ) = state.done.remove(&id)
-        {
-            state.release(handle);
+        match state.done.remove(&id) {
+            Some(
+                Completion::Handle(Ok(handle))
+                | Completion::Accepted(Ok((handle, _)))
+                | Completion::Peer(Ok((handle, _))),
+            ) => state.release(handle),
+            Some(Completion::Signals(Ok(bits))) => state.signals |= bits,
+            _ => {}
         }
     }
 

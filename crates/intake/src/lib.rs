@@ -6,6 +6,7 @@ mod header;
 mod listen;
 mod mailbox;
 mod owner;
+mod reload;
 mod session;
 
 pub use assemble::{Signer, Stamp, assemble, node_name};
@@ -15,5 +16,6 @@ pub use header::{Checked, Fault, HEADER_CAP, HeaderBuffer, check};
 pub use listen::{Listener, listen};
 pub use mailbox::from_domain;
 pub use owner::{Limits, Opened, Owner, OwnerStats, Prefix};
+pub use reload::{Watch, watch};
 pub use sched::{Envelope, Recipient, Required, Ret, decode_slice, encode_slice};
 pub use session::{Config, End, data_hold, message_limit, serve};

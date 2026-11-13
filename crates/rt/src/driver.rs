@@ -108,6 +108,12 @@ pub enum Op {
     ConnectUnix {
         path: PathBuf,
     },
+    ListenSignals {
+        mask: u32,
+    },
+    RecvSignals {
+        handle: Handle,
+    },
 }
 
 #[derive(Debug)]
@@ -120,6 +126,7 @@ pub enum Completion {
     From(io::Result<(usize, SocketAddr)>, Buf),
     Addr(io::Result<SocketAddr>),
     Peer(io::Result<(Handle, u32)>),
+    Signals(io::Result<u32>),
 }
 
 pub trait Unpark: Send + Sync {

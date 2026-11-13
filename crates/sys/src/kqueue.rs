@@ -54,6 +54,18 @@ impl Kqueue {
         self.change(&[read, write])
     }
 
+    pub fn watch_read(&self, fd: BorrowedFd<'_>, token: usize) -> io::Result<()> {
+        let ident = usize::try_from(fd.as_raw_fd()).map_err(|_| io::Error::other("bad fd"))?;
+        let mut read = change(ident, libc::EVFILT_READ, libc::EV_ADD | libc::EV_CLEAR, 0);
+        read.udata = ptr::without_provenance_mut(token);
+        self.change(&[read])
+    }
+
+    pub fn unwatch_read(&self, fd: BorrowedFd<'_>) -> io::Result<()> {
+        let ident = usize::try_from(fd.as_raw_fd()).map_err(|_| io::Error::other("bad fd"))?;
+        self.change(&[change(ident, libc::EVFILT_READ, libc::EV_DELETE, 0)])
+    }
+
     pub fn wake(&self) -> io::Result<()> {
         self.change(&[change(WAKE, libc::EVFILT_USER, 0, libc::NOTE_TRIGGER)])
     }

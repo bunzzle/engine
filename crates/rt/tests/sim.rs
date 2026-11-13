@@ -1,13 +1,15 @@
 use std::cell::RefCell;
+use std::future::poll_fn;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::Path;
 use std::rc::Rc;
+use std::task::Poll;
 use std::time::Duration;
 
 use rt::sim::{Config, Disk, Faults, SimDriver, check};
 use rt::{
-    Buf, File, OpenOptions, Runtime, TcpListener, TcpStream, UdpSocket, UnixListener, UnixStream,
-    now, rename, sleep, spawn, sync_dir, timeout, wall_ms,
+    Buf, File, OpenOptions, Runtime, Signal, Signals, TcpListener, TcpStream, UdpSocket,
+    UnixListener, UnixStream, now, rename, sleep, spawn, sync_dir, timeout, wall_ms,
 };
 
 const MILLION: u32 = 1_000_000;
@@ -528,4 +530,79 @@ fn a_stalled_simulation_panics() {
 #[should_panic(expected = "bad seed")]
 fn failing_seeds_are_reported() {
     check(0..5, |seed| assert!(seed % 5 != 2, "bad seed"));
+}
+
+#[test]
+fn raised_signals_reach_the_listener() {
+    check(0..20, |seed| {
+        let driver = Rc::new(SimDriver::new(seed, Config::default()));
+        let control = Rc::clone(&driver);
+        let got = run(&driver, async move {
+            let signals = Signals::listen(&[Signal::Hangup, Signal::Terminate])
+                .await
+                .expect("listen");
+            let raiser = spawn(async move {
+                sleep(Duration::from_secs(1)).await;
+                control.raise(Signal::Interrupt);
+                control.raise(Signal::Terminate);
+                control.raise(Signal::Hangup);
+                control.raise(Signal::Hangup);
+                sleep(Duration::from_secs(1)).await;
+                control.raise(Signal::Hangup);
+            });
+            let mut got = Vec::new();
+            for _ in 0..3 {
+                got.push(signals.recv().await.expect("recv"));
+            }
+            raiser.await;
+            got
+        });
+        let mut first = [got[0], got[1]];
+        first.sort();
+        assert_eq!(first, [Signal::Hangup, Signal::Terminate]);
+        assert_eq!(got[2], Signal::Hangup);
+    });
+}
+
+#[test]
+fn signals_have_one_listener_and_cancelled_receives_keep_them() {
+    check(0..20, |seed| {
+        let driver = Rc::new(SimDriver::new(seed, Config::default()));
+        let control = Rc::clone(&driver);
+        run(&driver, async move {
+            let first = Signals::listen(&[Signal::Hangup]).await.expect("listen");
+            let second = Signals::listen(&[Signal::Terminate]).await;
+            assert_eq!(
+                second.err().map(|e| e.kind()),
+                Some(std::io::ErrorKind::AlreadyExists)
+            );
+            control.raise(Signal::Hangup);
+            drop(first);
+            let signals = Signals::listen(&[Signal::Hangup]).await.expect("listen");
+            assert!(
+                timeout(Duration::from_secs(1), signals.recv())
+                    .await
+                    .is_err()
+            );
+            let mut received = Box::pin(signals.recv());
+            poll_fn(|cx| {
+                assert!(received.as_mut().poll(cx).is_pending());
+                Poll::Ready(())
+            })
+            .await;
+            sleep(Duration::from_secs(1)).await;
+            control.raise(Signal::Hangup);
+            drop(received);
+            let got = timeout(Duration::from_secs(1), signals.recv())
+                .await
+                .expect("kept")
+                .expect("recv");
+            assert_eq!(got, Signal::Hangup);
+            assert!(
+                timeout(Duration::from_secs(1), signals.recv())
+                    .await
+                    .is_err()
+            );
+        });
+    });
 }
