@@ -862,6 +862,38 @@ fn idle_sessions_close_without_a_reply() {
     });
 }
 
+#[test]
+fn close_drains_then_closes_open_sessions() {
+    check(0..2, |seed| {
+        let driver = Rc::new(SimDriver::with_disk(seed, Config::default(), created(seed)));
+        let cluster = started(&driver, 1).expect("start");
+        let nodes = cluster.nodes.clone();
+        cluster.run(async move {
+            prepare(&nodes).await;
+            let mut config = SessionConfig::new("mx1.example.net".into());
+            config.drain = Duration::from_secs(5);
+            let listening = listen_with(&nodes[0], seed, config, guard(Limits::default())).await;
+            let tls = client_config(simulated(seed + 100));
+            let mut quick = Smtp::connect(SUBMIT, &tls).await;
+            let mut idle = Smtp::connect(SUBMIT, &tls).await;
+            let leaving = spawn(async move {
+                sleep(Duration::from_secs(2)).await;
+                assert!(quick.command("QUIT").await.starts_with("221 "));
+            });
+            let started = rt::now();
+            listening.close().await;
+            let waited = rt::now().saturating_duration_since(started);
+            assert!(
+                waited >= Duration::from_secs(5) && waited <= Duration::from_secs(6),
+                "{waited:?}"
+            );
+            leaving.await;
+            assert_eq!(idle.reply().await, "");
+        });
+        cluster.stop();
+    });
+}
+
 #[derive(Default)]
 struct Load {
     accepted: BTreeSet<MessageId>,
