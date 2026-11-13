@@ -5,6 +5,7 @@ pub enum Error {
     Spool(spool::Error),
     Control(control::Error),
     Naming,
+    Node,
     Closed,
 }
 
@@ -14,6 +15,7 @@ impl fmt::Display for Error {
             Self::Spool(e) => write!(f, "{e}"),
             Self::Control(e) => write!(f, "{e}"),
             Self::Naming => write!(f, "naming key does not match this spool"),
+            Self::Node => write!(f, "node id does not match this spool"),
             Self::Closed => write!(f, "closed"),
         }
     }
