@@ -36,6 +36,11 @@ impl Machine {
         Self { sim, cores, stalls }
     }
 
+    pub fn pause(&self, core: usize, duration: Duration) {
+        let until = self.sim.now() + duration;
+        self.cores[core].paused.set(Some(until));
+    }
+
     pub fn cores(&self) -> usize {
         self.cores.len()
     }

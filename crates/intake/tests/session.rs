@@ -894,6 +894,48 @@ fn close_drains_then_closes_open_sessions() {
     });
 }
 
+#[test]
+fn close_accepts_a_message_finished_within_the_drain_and_drops_an_unfinished_one() {
+    check(0..2, |seed| {
+        let driver = Rc::new(SimDriver::with_disk(seed, Config::default(), created(seed)));
+        let cluster = started(&driver, 1).expect("start");
+        let nodes = cluster.nodes.clone();
+        cluster.run(async move {
+            let tokens = prepare(&nodes).await;
+            let mut config = SessionConfig::new("mx1.example.net".into());
+            config.drain = Duration::from_secs(5);
+            let listening = listen_with(&nodes[0], seed, config, guard(Limits::default())).await;
+            let tls = client_config(simulated(seed + 100));
+            let body = stuffed(&message("Ann <ann@example.org>", "", 20_000, seed));
+            let (head, tail) = body.split_at(body.len() / 2);
+            let mut finishing = Smtp::connect(SUBMIT, &tls).await;
+            let mut stalled = Smtp::connect(SUBMIT, &tls).await;
+            for smtp in [&mut finishing, &mut stalled] {
+                assert!(smtp.login(&tokens.first).await.starts_with("235 "));
+                let replies = smtp
+                    .transaction("bounce@example.org", &["a@example.com"])
+                    .await;
+                assert!(replies.iter().all(|r| r.starts_with("250 ")), "{replies:?}");
+                assert!(smtp.command("DATA").await.starts_with("354"));
+                smtp.send(head).await;
+            }
+            let tail = tail.to_vec();
+            let finished = spawn(async move {
+                sleep(Duration::from_secs(2)).await;
+                finishing.send(&tail).await;
+                finishing.reply().await
+            });
+            listening.close().await;
+            let reply = finished.await;
+            assert!(reply.starts_with("250 2.0.0 "), "{reply}");
+            assert_eq!(stalled.reply().await, "");
+            let accepted = opaque_id(&nodes[0], &reply);
+            assert_eq!(stored(&nodes), BTreeSet::from([accepted]));
+        });
+        cluster.stop();
+    });
+}
+
 #[derive(Default)]
 struct Load {
     accepted: BTreeSet<MessageId>,
