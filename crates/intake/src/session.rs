@@ -37,6 +37,7 @@ pub struct Config {
     pub idle: Duration,
     pub data: Duration,
     pub session: Duration,
+    pub drain: Duration,
 }
 
 impl Config {
@@ -50,6 +51,7 @@ impl Config {
             idle: Duration::from_secs(300),
             data: Duration::from_secs(180),
             session: Duration::from_secs(3600),
+            drain: Duration::from_secs(30),
         }
     }
 }
@@ -62,6 +64,7 @@ pub enum End {
     Io,
     Tls,
     Refused,
+    Closed,
 }
 
 pub fn message_limit<T: Transport + 'static>(node: &Node<T>) -> u64 {

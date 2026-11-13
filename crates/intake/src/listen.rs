@@ -1,9 +1,11 @@
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
+use std::collections::BTreeMap;
 use std::future::poll_fn;
 use std::net::IpAddr;
 use std::pin::pin;
 use std::rc::Rc;
-use std::task::Poll;
+use std::task::{Poll, Waker};
+use std::time::Duration;
 
 use rt::{Buf, JoinHandle, Notify, TcpListener, TcpStream, spawn, timeout};
 use sched::{Node, Transport};
@@ -14,7 +16,7 @@ use crate::conn::Conn;
 use crate::guard::{Guard, Refused};
 use crate::session::{Config, End, serve};
 
-const ENDS: usize = 6;
+const ENDS: usize = 7;
 const CONNECTIONS: Reply = Reply::new(421, "4.7.0", "Too many connections");
 const BUSY: Reply = Reply::new(421, "4.3.2", "System busy");
 
@@ -22,6 +24,9 @@ const BUSY: Reply = Reply::new(421, "4.3.2", "System busy");
 struct Shared {
     stop: Notify,
     idle: Notify,
+    drain: Duration,
+    closing: Cell<bool>,
+    waiting: RefCell<BTreeMap<usize, Waker>>,
     sessions: Cell<usize>,
     refused: Cell<u64>,
     ends: [Cell<u64>; ENDS],
@@ -48,9 +53,21 @@ impl Listener {
     pub async fn close(self) {
         self.shared.stop.notify();
         self.task.await;
-        while self.shared.sessions.get() > 0 {
-            self.shared.idle.wait().await;
+        let shared = self.shared;
+        if timeout(shared.drain, idle(&shared)).await.is_err() {
+            shared.closing.set(true);
+            let waiting = std::mem::take(&mut *shared.waiting.borrow_mut());
+            for waker in waiting.into_values() {
+                waker.wake();
+            }
+            idle(&shared).await;
         }
+    }
+}
+
+async fn idle(shared: &Shared) {
+    while shared.sessions.get() > 0 {
+        shared.idle.wait().await;
     }
 }
 
@@ -62,7 +79,10 @@ pub fn listen<T: Transport + 'static>(
     guard: Guard,
     implicit: bool,
 ) -> Listener {
-    let shared = Rc::new(Shared::default());
+    let shared = Rc::new(Shared {
+        drain: config.drain,
+        ..Shared::default()
+    });
     let state = Rc::clone(&shared);
     let task = spawn(async move {
         let mut count = 0usize;
@@ -88,7 +108,10 @@ pub fn listen<T: Transport + 'static>(
             );
             spawn(async move {
                 let ip = peer.ip();
-                let end = session(&node, &acceptor, io, &config, &guard, ip, implicit, count).await;
+                let work = session(&node, &acceptor, io, &config, &guard, ip, implicit, count);
+                let end = until_closed(&state, count, work)
+                    .await
+                    .unwrap_or(End::Closed);
                 drop(admitted);
                 let slot = &state.ends[index(end)];
                 slot.set(slot.get() + 1);
@@ -156,6 +179,29 @@ async fn session<T: Transport + 'static>(
     serve(node, acceptor, conn, config, guard, (ip, net), count).await
 }
 
+async fn until_closed(shared: &Shared, id: usize, work: impl Future<Output = End>) -> Option<End> {
+    let mut work = pin!(work);
+    let ended = poll_fn(|cx| {
+        if shared.closing.get() {
+            return Poll::Ready(None);
+        }
+        if let Poll::Ready(end) = work.as_mut().poll(cx) {
+            return Poll::Ready(Some(end));
+        }
+        let mut waiting = shared.waiting.borrow_mut();
+        match waiting.get_mut(&id) {
+            Some(waker) => waker.clone_from(cx.waker()),
+            None => {
+                waiting.insert(id, cx.waker().clone());
+            }
+        }
+        Poll::Pending
+    })
+    .await;
+    shared.waiting.borrow_mut().remove(&id);
+    ended
+}
+
 fn index(end: End) -> usize {
     match end {
         End::Done => 0,
@@ -164,5 +210,6 @@ fn index(end: End) -> usize {
         End::Io => 3,
         End::Tls => 4,
         End::Refused => 5,
+        End::Closed => 6,
     }
 }
