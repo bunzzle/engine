@@ -3,11 +3,17 @@ use std::io::Read;
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 
+use tls::Certs;
+
 use crate::{Config, parse};
 
 const MAX_FILE: u64 = 1 << 20;
 
 pub fn check(path: &Path) -> Result<Config, String> {
+    load(path).map(|(config, _)| config)
+}
+
+pub fn load(path: &Path) -> Result<(Config, Certs), String> {
     let euid = sys::process::euid();
     if euid == 0 {
         return Err(String::from("must not run as root"));
@@ -17,14 +23,14 @@ pub fn check(path: &Path) -> Result<Config, String> {
     let config = parse(&text).map_err(|e| format!("{}: {e}", path.display()))?;
     let key = key_file(&config.tls.key, euid)?;
     let chain = read(&config.tls.chain)?;
-    tls::Certs::new(&chain, &key).map_err(|e| {
+    let certs = Certs::new(&chain, &key).map_err(|e| {
         format!(
             "{} and {}: {e}",
             config.tls.chain.display(),
             config.tls.key.display()
         )
     })?;
-    Ok(config)
+    Ok((config, certs))
 }
 
 pub fn key_file(path: &Path, owner: u32) -> Result<Vec<u8>, String> {

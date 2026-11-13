@@ -8,7 +8,14 @@ publish.workspace = true
 
 [dependencies]
 config = { path = "../config" }
+control = { path = "../control" }
+crypto = { path = "../crypto" }
 intake = { path = "../intake" }
+keys = { path = "../keys" }
+rt = { path = "../rt" }
+sched = { path = "../sched" }
+spool = { path = "../spool" }
+store = { path = "../store" }
 sys = { path = "../sys" }
 tls = { path = "../tls" }
 

@@ -188,7 +188,14 @@ name = "node"
 version = "0.0.0"
 dependencies = [
  "config",
+ "control",
+ "crypto",
  "intake",
+ "keys",
+ "rt",
+ "sched",
+ "spool",
+ "store",
  "sys",
  "tls",
 ]
