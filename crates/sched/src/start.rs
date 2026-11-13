@@ -183,7 +183,7 @@ impl<T: Transport + 'static> Node<T> {
 
         let writer = match control {
             Some(loaded) => {
-                let writer = control_writer(loaded, changes.clone(), check).await?;
+                let writer = control_writer(loaded, changes.clone(), check, settings.node).await?;
                 Some(sweep_at_start(writer, &table, &config, cores).await?)
             }
             None => None,
@@ -608,10 +608,14 @@ async fn control_writer(
     loaded: control::Loaded,
     changes: Changes,
     check: u64,
+    node: u32,
 ) -> Result<Writer, Error> {
     let mut writer = loaded.writer(changes);
     if writer.naming_check().is_none() {
         writer.set_naming_check(check).await?;
+    }
+    if writer.node_id().is_none() {
+        writer.set_node_id(u64::from(node)).await?;
     }
     Ok(writer)
 }
@@ -623,6 +627,12 @@ fn naming(control: Option<&control::Loaded>, settings: &Settings) -> Result<u64,
         .is_some_and(|found| found != check)
     {
         return Err(Error::Naming);
+    }
+    if control
+        .and_then(control::Loaded::node_id)
+        .is_some_and(|found| found != u64::from(settings.node))
+    {
+        return Err(Error::Node);
     }
     Ok(check)
 }

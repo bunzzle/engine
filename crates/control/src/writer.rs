@@ -24,6 +24,7 @@ const NAMING_CHECK: u32 = 0;
 const DKIM_IDS: u32 = 1;
 const ACCESS_IDS: u32 = 2;
 const DOMAIN_IDS: u32 = 3;
+const NODE_ID: u32 = 4;
 
 pub fn naming_check(key: &[u8; 16]) -> u64 {
     siphash(key, b"bunzzle naming check")
@@ -60,6 +61,7 @@ pub struct Loaded {
     skipped: u64,
     waited: u64,
     naming: Option<u64>,
+    node: Option<u64>,
     dkim_next: u32,
     access_next: u32,
     domain_next: u32,
@@ -70,6 +72,10 @@ pub struct Loaded {
 impl Loaded {
     pub fn naming_check(&self) -> Option<u64> {
         self.naming
+    }
+
+    pub fn node_id(&self) -> Option<u64> {
+        self.node
     }
 
     pub fn waited(&self) -> u64 {
@@ -176,6 +182,7 @@ impl Writer {
             skipped: 0,
             waited: 0,
             naming: None,
+            node: None,
             dkim_next: 1,
             access_next: 1,
             domain_next: 1,
@@ -192,6 +199,7 @@ impl Writer {
             if kind == KIND_NODE {
                 match (id, decode_check(&item.clear)) {
                     (NAMING_CHECK, Some(check)) => loaded.naming = Some(check),
+                    (NODE_ID, Some(node)) => loaded.node = Some(node),
                     (DKIM_IDS, Some(next)) => {
                         let next = u32::try_from(next).unwrap_or(u32::MAX);
                         loaded.dkim_next = loaded.dkim_next.max(next);
@@ -280,6 +288,16 @@ impl Writer {
     pub async fn set_naming_check(&mut self, check: u64) -> Result<(), Error> {
         self.put_node(NAMING_CHECK, check).await?;
         self.loaded.naming = Some(check);
+        Ok(())
+    }
+
+    pub fn node_id(&self) -> Option<u64> {
+        self.loaded.node
+    }
+
+    pub async fn set_node_id(&mut self, node: u64) -> Result<(), Error> {
+        self.put_node(NODE_ID, node).await?;
+        self.loaded.node = Some(node);
         Ok(())
     }
 
