@@ -322,3 +322,47 @@ fn another_thread_wakes_the_runtime() {
     worker.join().expect("join");
     assert_eq!(value, Some(7));
 }
+
+#[test]
+fn signals_from_the_process_reach_the_listener() {
+    run(async {
+        let signals = rt::Signals::listen(&[rt::Signal::Hangup, rt::Signal::Terminate])
+            .await
+            .expect("listen");
+        let other = thread::spawn(|| {
+            run(async {
+                rt::Signals::listen(&[rt::Signal::Interrupt])
+                    .await
+                    .err()
+                    .map(|e| e.kind())
+            })
+        })
+        .join()
+        .expect("thread");
+        assert_eq!(other, Some(io::ErrorKind::AlreadyExists));
+        sys::signal::raise(rt::Signal::Hangup).expect("raise");
+        sys::signal::raise(rt::Signal::Terminate).expect("raise");
+        let mut got = Vec::new();
+        for _ in 0..2 {
+            let signal = timeout(Duration::from_secs(5), signals.recv())
+                .await
+                .expect("in time");
+            got.push(signal.expect("recv"));
+        }
+        assert_eq!(got, [rt::Signal::Hangup, rt::Signal::Terminate]);
+        assert!(
+            timeout(Duration::from_millis(50), signals.recv())
+                .await
+                .is_err()
+        );
+        drop(signals);
+        let signals = rt::Signals::listen(&[rt::Signal::Hangup])
+            .await
+            .expect("listen again");
+        sys::signal::raise(rt::Signal::Hangup).expect("raise");
+        let signal = timeout(Duration::from_secs(5), signals.recv())
+            .await
+            .expect("in time");
+        assert_eq!(signal.expect("recv"), rt::Signal::Hangup);
+    });
+}

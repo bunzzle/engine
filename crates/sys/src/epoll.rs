@@ -38,6 +38,24 @@ impl Epoll {
         self.add(fd, events, token as u64)
     }
 
+    pub fn watch_read(&self, fd: BorrowedFd<'_>, token: usize) -> io::Result<()> {
+        self.add(fd, libc::EPOLLIN | libc::EPOLLET, token as u64)
+    }
+
+    #[allow(unsafe_code)]
+    pub fn unwatch_read(&self, fd: BorrowedFd<'_>) -> io::Result<()> {
+        // SAFETY: both descriptors are open for the call and no event is read for a delete.
+        check(unsafe {
+            libc::epoll_ctl(
+                self.fd.as_raw_fd(),
+                libc::EPOLL_CTL_DEL,
+                fd.as_raw_fd(),
+                std::ptr::null_mut(),
+            )
+        })
+        .map(drop)
+    }
+
     pub fn wake(&self) -> io::Result<()> {
         self.wake.notify()
     }

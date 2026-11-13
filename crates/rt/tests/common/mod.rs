@@ -147,8 +147,8 @@ impl MemDriver {
                     .copied()
                     .ok_or_else(|| io::ErrorKind::NotConnected.into()),
             ),
-            Op::Accept { .. } | Op::Recv { .. } => return None,
-            Op::Connect { .. } | Op::BindUdp { .. } => {
+            Op::Accept { .. } | Op::Recv { .. } | Op::RecvSignals { .. } => return None,
+            Op::Connect { .. } | Op::BindUdp { .. } | Op::ListenSignals { .. } => {
                 Completion::Handle(Err(io::ErrorKind::Unsupported.into()))
             }
             Op::ListenUnix { .. } | Op::AcceptUnix { .. } | Op::ConnectUnix { .. } => {

@@ -8,6 +8,7 @@ mod native;
 mod net;
 mod notify;
 mod op;
+mod signal;
 pub mod sim;
 mod time;
 
@@ -20,5 +21,6 @@ pub use mesh::{Ends, Mesh, Peers};
 pub use native::Native;
 pub use net::{TcpListener, TcpStream, UdpSocket, UnixListener, UnixStream};
 pub use notify::Notify;
+pub use signal::{Signal, Signals};
 pub use sys::buf::Buf;
 pub use time::{Elapsed, Instant, Sleep, Timeout, now, sleep, sleep_until, timeout, wall_ms};

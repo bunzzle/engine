@@ -8,6 +8,7 @@ pub mod kqueue;
 pub mod mem;
 pub mod net;
 pub mod process;
+pub mod signal;
 #[cfg(target_os = "linux")]
 pub mod uring;
 

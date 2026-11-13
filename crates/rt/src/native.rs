@@ -14,6 +14,7 @@ use std::sync::Arc;
 use std::task::Waker;
 use std::time::{self, Duration, SystemTime};
 
+use sys::signal::Signals;
 #[cfg(target_os = "linux")]
 use sys::uring::{Done, Request, Ring};
 use sys::{Event, Poller};
@@ -33,12 +34,13 @@ enum Resource {
     Udp(UdpSocket),
     UnixListener(UnixListener),
     UnixStream(UnixStream),
+    Signals(Signals),
 }
 
 impl Resource {
     fn fd(&self) -> Option<BorrowedFd<'_>> {
         match self {
-            Self::File(_) => None,
+            Self::File(_) | Self::Signals(_) => None,
             Self::Listener(s) => Some(s.as_fd()),
             Self::Stream(s) => Some(s.as_fd()),
             Self::Udp(s) => Some(s.as_fd()),
@@ -149,6 +151,14 @@ fn blocked(e: &io::Error) -> bool {
     )
 }
 
+fn signals(mask: u32) -> io::Result<Signals> {
+    let wanted: Vec<_> = sys::signal::Signal::ALL
+        .into_iter()
+        .filter(|signal| mask & signal.bit() != 0)
+        .collect();
+    Signals::listen(&wanted)
+}
+
 fn open(path: &Path, options: &OpenOptions) -> io::Result<fs::File> {
     let mut open = fs::OpenOptions::new();
     open.read(options.read)
@@ -194,7 +204,9 @@ impl State {
         self.next_handle += 1;
         let handle = Handle(self.next_handle);
         let token = usize::try_from(handle.0).expect("handle fits in usize");
-        if let Some(fd) = resource.fd() {
+        if let Resource::Signals(signals) = &resource {
+            poller.watch_read(signals.as_fd(), token)?;
+        } else if let Some(fd) = resource.fd() {
             poller.watch(fd, token)?;
         }
         self.resources.insert(handle, resource);
@@ -275,6 +287,16 @@ impl State {
             | Op::Rename { .. }
             | Op::Allocate { .. }
             | Op::Stat { .. } => Ok(self.run_file(poller, op)),
+            Op::ListenSignals { mask } => Ok(Completion::Handle(
+                signals(mask).and_then(|s| self.add(poller, Resource::Signals(s))),
+            )),
+            Op::RecvSignals { handle } => match self.resources.get(&handle) {
+                Some(Resource::Signals(signals)) => match signals.take() {
+                    0 => Err(Step::Run(Op::RecvSignals { handle })),
+                    bits => Ok(Completion::Signals(Ok(bits))),
+                },
+                _ => Ok(Completion::Signals(Err(bad_handle()))),
+            },
             op => self.run_net(poller, op),
         }
     }
@@ -450,6 +472,20 @@ impl State {
         }
     }
 
+    fn remove(&mut self, poller: &Poller, handle: Handle) {
+        if let Some(Resource::Signals(signals)) = self.resources.remove(&handle) {
+            let _ = poller.unwatch_read(signals.as_fd());
+        }
+    }
+
+    fn restore_signals(&self, bits: u32) {
+        for resource in self.resources.values() {
+            if let Resource::Signals(signals) = resource {
+                signals.restore(bits);
+            }
+        }
+    }
+
     #[cfg(target_os = "linux")]
     fn ring_submit(&mut self, id: OpId, op: Op, waker: &Waker) -> Result<(), Op> {
         if self.ring.is_none() {
@@ -617,18 +653,21 @@ impl Driver for Native {
         if state.waiting.remove(&id).is_some() {
             state.backlog.retain(|(queued, _)| *queued != id.0);
         }
-        if let Some(
-            Completion::Handle(Ok(handle))
-            | Completion::Accepted(Ok((handle, _)))
-            | Completion::Peer(Ok((handle, _))),
-        ) = state.done.remove(&id)
-        {
-            state.resources.remove(&handle);
+        match state.done.remove(&id) {
+            Some(
+                Completion::Handle(Ok(handle))
+                | Completion::Accepted(Ok((handle, _)))
+                | Completion::Peer(Ok((handle, _))),
+            ) => {
+                state.remove(&self.poller, handle);
+            }
+            Some(Completion::Signals(Ok(bits))) => state.restore_signals(bits),
+            _ => {}
         }
     }
 
     fn release(&self, handle: Handle) {
-        self.state.borrow_mut().resources.remove(&handle);
+        self.state.borrow_mut().remove(&self.poller, handle);
     }
 
     fn park(&self, deadline: Option<Instant>) {
