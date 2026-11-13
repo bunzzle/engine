@@ -703,6 +703,10 @@ impl SimDriver {
         }
     }
 
+    pub fn listening(&self, addr: SocketAddr) -> usize {
+        self.state.borrow().net.listeners_at(addr).len()
+    }
+
     pub fn fail_signals(&self) {
         let mut state = self.state.borrow_mut();
         state.signals_failed = true;

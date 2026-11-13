@@ -6,8 +6,8 @@ use std::time::Duration;
 
 use keys::{Audit, Server, Settings, Vault};
 use node::{Config, Error, Plan, naming, parse, run};
-use rt::sim::{Config as SimConfig, Machine, SimDriver, Stalls};
-use rt::{Buf, JoinHandle, Signal, TcpStream, UnixListener, sleep, timeout};
+use rt::sim::{Config as SimConfig, Machine, SimDriver, Stalls, check};
+use rt::{Buf, JoinHandle, Signal, TcpStream, UnixListener, sleep, spawn, timeout};
 use sched::{Answered, Attempt, Transport};
 use store::{Committer, DataFile, Options, SLOT_SIZE, Setup, boot};
 use tls::{Certs, simulated};
@@ -48,7 +48,11 @@ fn config(id: u32) -> Config {
 }
 
 fn created(seed: u64) -> Rc<SimDriver> {
-    let driver = Rc::new(SimDriver::new(seed, SimConfig::default()));
+    created_with(seed, SimConfig::default())
+}
+
+fn created_with(seed: u64, config: SimConfig) -> Rc<SimDriver> {
+    let driver = Rc::new(SimDriver::new(seed, config));
     driver.set_uid(UID);
     let erased: Rc<dyn rt::Driver> = driver.clone();
     rt::Runtime::new(erased).block_on(async {
@@ -255,5 +259,51 @@ fn a_failed_signal_watch_stops_the_node_with_the_error() {
         }
         drop(committer.await);
         assert!(TcpStream::connect(smtp()).await.is_err());
+    });
+}
+
+#[test]
+fn a_connection_queued_during_boot_waits_for_every_core() {
+    check(0..10, |seed| {
+        let slow = SimConfig {
+            io_latency: (Duration::from_millis(1), Duration::from_millis(50)),
+            ..SimConfig::default()
+        };
+        let driver = created_with(seed, slow);
+        let probe = Rc::clone(&driver);
+        let Booted {
+            machine,
+            cores,
+            committer,
+        } = booted(&driver, config(7), CORES);
+        let machine = Rc::new(machine);
+        let threads = Rc::clone(&machine);
+        machine.block_on(0, async move {
+            while probe.listening(smtp()) == 0 {
+                sleep(Duration::from_micros(100)).await;
+            }
+            assert_eq!(probe.listening(smtp()), 1);
+            let held = rt::now();
+            threads.pause(1, Duration::from_secs(5));
+            while probe.listening(smtp()) < 2 {
+                sleep(Duration::from_micros(100)).await;
+            }
+            let mut served = Vec::new();
+            for _ in 0..8 {
+                let queued = TcpStream::connect(smtp()).await.expect("connect");
+                served.push(spawn(async move {
+                    assert!(banner(&queued).await.starts_with("220 mx1.example.net"));
+                    rt::now()
+                }));
+            }
+            for at in served {
+                assert!(at.await.saturating_duration_since(held) >= Duration::from_secs(5));
+            }
+            probe.raise(Signal::Terminate);
+            for core in cores {
+                core.await.expect("stopped");
+            }
+            drop(committer.await);
+        });
     });
 }
