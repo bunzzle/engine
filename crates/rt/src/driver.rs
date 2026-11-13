@@ -66,6 +66,7 @@ pub enum Op {
     Listen {
         addr: SocketAddr,
         backlog: u32,
+        shared: bool,
     },
     Accept {
         handle: Handle,

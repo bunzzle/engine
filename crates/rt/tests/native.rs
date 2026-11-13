@@ -366,3 +366,39 @@ fn signals_from_the_process_reach_the_listener() {
         assert_eq!(signal.expect("recv"), rt::Signal::Hangup);
     });
 }
+
+#[test]
+fn shared_listeners_bind_one_port() {
+    run(async {
+        let first = TcpListener::bind_shared(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 64)
+            .await
+            .expect("first");
+        let at = first.local_addr().await.expect("addr");
+        let second = TcpListener::bind_shared(at, 64).await.expect("second");
+        let plain = TcpListener::bind(at, 64).await;
+        assert_eq!(
+            plain.err().map(|e| e.kind()),
+            Some(io::ErrorKind::AddrInUse)
+        );
+        let (done, mut accepted) = channel::<()>();
+        for listener in [first, second] {
+            let done = done.clone();
+            drop(spawn(async move {
+                while let Ok((stream, _)) = listener.accept().await {
+                    drop(stream);
+                    let _ = done.send(());
+                }
+            }));
+        }
+        let mut clients = Vec::new();
+        for _ in 0..8 {
+            clients.push(TcpStream::connect(at).await.expect("connect"));
+        }
+        for _ in 0..8 {
+            timeout(Duration::from_secs(5), accepted.recv())
+                .await
+                .expect("in time")
+                .expect("accepted");
+        }
+    });
+}
