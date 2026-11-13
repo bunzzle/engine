@@ -606,3 +606,47 @@ fn signals_have_one_listener_and_cancelled_receives_keep_them() {
         });
     });
 }
+
+#[test]
+fn shared_listeners_split_connections() {
+    check(0..20, |seed| {
+        let driver = Rc::new(SimDriver::new(seed, Config::default()));
+        let counts = run(&driver, async {
+            let first = Rc::new(TcpListener::bind_shared(addr(25), 64).await.expect("first"));
+            let second = Rc::new(
+                TcpListener::bind_shared(addr(25), 64)
+                    .await
+                    .expect("second"),
+            );
+            let plain = TcpListener::bind(addr(25), 64).await;
+            assert_eq!(
+                plain.err().map(|e| e.kind()),
+                Some(std::io::ErrorKind::AddrInUse)
+            );
+            let alone = TcpListener::bind(addr(26), 64).await.expect("alone");
+            let joined = TcpListener::bind_shared(addr(26), 64).await;
+            assert_eq!(
+                joined.err().map(|e| e.kind()),
+                Some(std::io::ErrorKind::AddrInUse)
+            );
+            drop(alone);
+            let counts = Rc::new(RefCell::new([0u32; 2]));
+            for (index, listener) in [first, second].into_iter().enumerate() {
+                let counts = Rc::clone(&counts);
+                drop(spawn(async move {
+                    while let Ok((stream, _)) = listener.accept().await {
+                        counts.borrow_mut()[index] += 1;
+                        drop(stream);
+                    }
+                }));
+            }
+            for _ in 0..40 {
+                drop(TcpStream::connect(addr(25)).await.expect("connect"));
+            }
+            sleep(Duration::from_secs(1)).await;
+            *counts.borrow()
+        });
+        assert_eq!(counts[0] + counts[1], 40);
+        assert!(counts[0] > 0 && counts[1] > 0, "{counts:?}");
+    });
+}

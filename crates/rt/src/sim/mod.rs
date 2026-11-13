@@ -319,13 +319,14 @@ impl State {
 
     fn execute(&mut self, op: Op) -> Result<Completion, Op> {
         match op {
-            Op::Listen { addr, .. } => {
+            Op::Listen { addr, shared, .. } => {
                 let addr = self.net.bind_addr(addr);
-                if self.net.in_use(addr) {
+                if !self.net.can_listen(addr, shared) {
                     return Ok(Completion::Handle(Err(io::ErrorKind::AddrInUse.into())));
                 }
                 let id = self.net.add(Socket::Listener {
                     addr,
+                    shared,
                     backlog: std::collections::VecDeque::new(),
                 });
                 Ok(Completion::Handle(Ok(self.add(Resource::Socket(id)))))
@@ -357,18 +358,7 @@ impl State {
                     None => Err(Op::Accept { handle }),
                 }
             }
-            Op::Connect { addr } => {
-                if !self.net.reachable(addr) {
-                    return Err(Op::Connect { addr });
-                }
-                let Some(listener) = self.net.listener_at(addr) else {
-                    return Ok(Completion::Handle(Err(
-                        io::ErrorKind::ConnectionRefused.into()
-                    )));
-                };
-                let client = self.net.connect(listener, addr);
-                Ok(Completion::Handle(Ok(self.add(Resource::Socket(client)))))
-            }
+            Op::Connect { addr } => self.connect(addr),
             Op::Recv { handle, buf } => Ok(self.recv(handle, buf)?),
             Op::Send { handle, buf } => Ok(self.send(handle, buf)),
             Op::Shutdown { handle } => {
@@ -414,6 +404,24 @@ impl State {
             }
             file => Ok(self.file_op(file)),
         }
+    }
+
+    fn connect(&mut self, addr: SocketAddr) -> Result<Completion, Op> {
+        if !self.net.reachable(addr) {
+            return Err(Op::Connect { addr });
+        }
+        let listeners = self.net.listeners_at(addr);
+        let listener = match listeners.len() {
+            0 => {
+                return Ok(Completion::Handle(Err(
+                    io::ErrorKind::ConnectionRefused.into()
+                )));
+            }
+            1 => listeners[0],
+            n => listeners[self.rng.index(n)],
+        };
+        let client = self.net.connect(listener, addr);
+        Ok(Completion::Handle(Ok(self.add(Resource::Socket(client)))))
     }
 
     fn unix(&mut self, op: Op) -> Result<Completion, Op> {

@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 pub(super) enum Socket {
     Listener {
         addr: SocketAddr,
+        shared: bool,
         backlog: VecDeque<(u64, SocketAddr)>,
     },
     UnixListener {
@@ -79,11 +80,26 @@ impl Net {
         })
     }
 
-    pub(super) fn listener_at(&self, addr: SocketAddr) -> Option<u64> {
-        self.sockets.iter().find_map(|(id, socket)| match socket {
-            Socket::Listener { addr: bound, .. } if *bound == addr => Some(*id),
-            _ => None,
+    pub(super) fn can_listen(&self, addr: SocketAddr, shared: bool) -> bool {
+        self.sockets.values().all(|socket| match socket {
+            Socket::Listener {
+                addr: bound,
+                shared: other,
+                ..
+            } => *bound != addr || (shared && *other),
+            Socket::Udp { addr: bound, .. } => *bound != addr,
+            Socket::Stream { .. } | Socket::UnixListener { .. } => true,
         })
+    }
+
+    pub(super) fn listeners_at(&self, addr: SocketAddr) -> Vec<u64> {
+        self.sockets
+            .iter()
+            .filter_map(|(id, socket)| match socket {
+                Socket::Listener { addr: bound, .. } if *bound == addr => Some(*id),
+                _ => None,
+            })
+            .collect()
     }
 
     pub(super) fn udp_at(&self, addr: SocketAddr) -> Option<u64> {

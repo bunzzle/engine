@@ -353,8 +353,12 @@ impl State {
 
     fn run_net(&mut self, poller: &Poller, op: Op) -> Result<Completion, Step> {
         match op {
-            Op::Listen { addr, backlog } => Ok(Completion::Handle(
-                sys::net::listen(addr, backlog)
+            Op::Listen {
+                addr,
+                backlog,
+                shared,
+            } => Ok(Completion::Handle(
+                sys::net::listen(addr, backlog, shared)
                     .and_then(|l| self.add(poller, Resource::Listener(l))),
             )),
             Op::Accept { handle } => {

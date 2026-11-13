@@ -73,7 +73,7 @@ fn stream_socket(domain: libc::c_int) -> io::Result<OwnedFd> {
 }
 
 #[allow(unsafe_code)]
-pub fn listen(addr: SocketAddr, backlog: u32) -> io::Result<TcpListener> {
+pub fn listen(addr: SocketAddr, backlog: u32, shared: bool) -> io::Result<TcpListener> {
     let raw = Raw::new(&addr);
     let fd = stream_socket(raw.domain())?;
     let on: libc::c_int = 1;
@@ -88,6 +88,18 @@ pub fn listen(addr: SocketAddr, backlog: u32) -> io::Result<TcpListener> {
             len,
         )
     })?;
+    if shared {
+        // SAFETY: the descriptor is open, and `on` lives for the call with the given length.
+        check(unsafe {
+            libc::setsockopt(
+                fd.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_REUSEPORT,
+                std::ptr::from_ref(&on).cast(),
+                len,
+            )
+        })?;
+    }
     let (ptr, len) = raw.as_ptr();
     // SAFETY: `ptr` points to a socket address of `len` bytes owned by `raw`.
     check(unsafe { libc::bind(fd.as_raw_fd(), ptr, len) })?;

@@ -115,7 +115,20 @@ pub struct TcpListener {
 
 impl TcpListener {
     pub async fn bind(addr: SocketAddr, backlog: u32) -> io::Result<Self> {
-        let socket = Socket::create(Op::Listen { addr, backlog }).await?;
+        Self::listen(addr, backlog, false).await
+    }
+
+    pub async fn bind_shared(addr: SocketAddr, backlog: u32) -> io::Result<Self> {
+        Self::listen(addr, backlog, true).await
+    }
+
+    async fn listen(addr: SocketAddr, backlog: u32, shared: bool) -> io::Result<Self> {
+        let socket = Socket::create(Op::Listen {
+            addr,
+            backlog,
+            shared,
+        })
+        .await?;
         Ok(Self { socket })
     }
 
