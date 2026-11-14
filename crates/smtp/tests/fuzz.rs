@@ -1,8 +1,6 @@
-mod common;
-
 use std::env;
 
-use common::{Client, LIMIT, PLAIN, Rng};
+use crate::common::{Client, LIMIT, PLAIN, Rng};
 
 fn number(name: &str, default: u64) -> u64 {
     env::var(name)

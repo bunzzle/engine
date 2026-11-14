@@ -5,6 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
+autotests = false
 
 [dependencies]
 config = { path = "../config" }
@@ -20,6 +21,10 @@ spool = { path = "../spool" }
 store = { path = "../store" }
 sys = { path = "../sys" }
 tls = { path = "../tls" }
+
+[[test]]
+name = "node"
+path = "tests/main.rs"
 
 [lints]
 workspace = true

@@ -1,12 +1,10 @@
-mod common;
-
 use std::cell::RefCell;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::rc::Rc;
 use std::thread;
 use std::time::Duration;
 
-use common::MemDriver;
+use crate::common::MemDriver;
 use rt::{
     Buf, Elapsed, File, OpenOptions, Runtime, TcpListener, channel, now, sleep, spawn, timeout,
     wall_ms, yield_now,
