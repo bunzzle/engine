@@ -1,5 +1,6 @@
 mod address;
 mod body;
+pub mod client;
 mod command;
 pub mod reply;
 mod server;
