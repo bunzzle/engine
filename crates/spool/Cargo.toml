@@ -5,10 +5,15 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
+autotests = false
 
 [dependencies]
 rt = { path = "../rt" }
 store = { path = "../store" }
+
+[[test]]
+name = "spool"
+path = "tests/main.rs"
 
 [lints]
 workspace = true

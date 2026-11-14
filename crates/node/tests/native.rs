@@ -132,7 +132,7 @@ fn serve_boots_on_threads_and_stops_on_sigterm() {
 
 #[test]
 fn a_core_failing_to_start_exits_the_process_with_status_one() {
-    let name = "a_core_failing_to_start_exits_the_process_with_status_one";
+    let name = "native::a_core_failing_to_start_exits_the_process_with_status_one";
     if std::env::var_os(CHILD).is_some() {
         let dir = scratch();
         let held = std::net::TcpListener::bind("127.0.0.1:0").expect("hold");

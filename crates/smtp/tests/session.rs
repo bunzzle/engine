@@ -1,6 +1,4 @@
-mod common;
-
-use common::{Client, LIMIT, MESSAGES, PLAIN};
+use crate::common::{Client, LIMIT, MESSAGES, PLAIN};
 use smtp::{Reply, reply};
 
 fn lines(text: &str) -> Vec<&str> {

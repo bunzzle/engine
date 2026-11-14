@@ -1,11 +1,9 @@
-mod common;
-
 use std::cell::Cell;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::rc::Rc;
 use std::time::Duration;
 
-use common::{AD, NXDOMAIN, SERVFAIL, TC, mx, reply, rr, soa};
+use crate::common::{AD, NXDOMAIN, SERVFAIL, TC, mx, reply, rr, soa};
 use crypto::Secret;
 use dns::{Error, Found, Name, Record, Resolver, Settings, Type};
 use rt::sim::{Config, SimDriver, check};

@@ -5,9 +5,14 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
+autotests = false
 
 [dependencies]
 libc = "=0.2.190"
+
+[[test]]
+name = "sys"
+path = "tests/main.rs"
 
 [lints.rust]
 unsafe_code = "deny"

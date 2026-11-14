@@ -5,6 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
+autotests = false
 
 [dependencies]
 control = { path = "../control" }
@@ -20,6 +21,10 @@ tls = { path = "../tls" }
 aws-lc-rs = "=1.18.2"
 keys = { path = "../keys" }
 store = { path = "../store" }
+
+[[test]]
+name = "intake"
+path = "tests/main.rs"
 
 [lints]
 workspace = true

@@ -1,8 +1,6 @@
-mod common;
-
 use std::net::Ipv4Addr;
 
-use common::{AD, NXDOMAIN, TC, mx, reply, rr, soa, wire};
+use crate::common::{AD, NXDOMAIN, TC, mx, reply, rr, soa, wire};
 use dns::wire::{Rcode, parse, query};
 use dns::{Error, Name, Record, Type};
 
@@ -164,7 +162,7 @@ fn a_reply_must_match_the_query() {
 fn compression_pointers_must_point_backward() {
     let asked = name("example.com");
     let packet = query(1, &asked, Type::Mx, false);
-    let end = common::question_end(&packet);
+    let end = crate::common::question_end(&packet);
     let mut base = reply(&packet, 0, &[], &[]);
     base[7] = 1;
     let mut good = base.clone();
