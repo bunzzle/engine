@@ -211,6 +211,8 @@ dependencies = [
  "config",
  "control",
  "crypto",
+ "deliver",
+ "dns",
  "intake",
  "keys",
  "rt",

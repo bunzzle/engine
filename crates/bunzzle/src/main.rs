@@ -29,6 +29,17 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
+        Some((mode, [path])) if mode == "serve" => match node::deliver(Path::new(path)) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("bunzzle serve: {error}");
+                ExitCode::FAILURE
+            }
+        },
+        Some((mode, _)) if mode == "serve" => {
+            eprintln!("usage: bunzzle serve <config>");
+            ExitCode::from(2)
+        }
         Some((mode, _)) if mode == "check" => {
             eprintln!("usage: bunzzle check <config>");
             ExitCode::from(2)

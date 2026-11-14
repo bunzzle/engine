@@ -1,4 +1,4 @@
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::thread;
 use std::time::Duration;
@@ -6,6 +6,7 @@ use std::time::Duration;
 use config::{Entry, Error, Table};
 
 const MAX_COUNT: u64 = 1 << 24;
+const MAX_DEADLINE: Duration = Duration::from_secs(540);
 
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -18,6 +19,14 @@ pub struct Config {
     pub session: intake::Config,
     pub limits: intake::Limits,
     pub listen: Vec<Listen>,
+    pub dns: dns::Settings,
+    pub delivery: Delivery,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Delivery {
+    pub settings: deliver::Settings,
+    pub connections: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -38,6 +47,7 @@ pub struct Keys {
 pub struct Tls {
     pub chain: PathBuf,
     pub key: PathBuf,
+    pub roots: Option<PathBuf>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -71,6 +81,14 @@ pub fn parse(text: &str) -> Result<Config, Error> {
         guard(table, &mut limits)?;
     }
     let listen = listen(root.tables("listen"))?;
+    let dns = dns(section(&mut root, "dns")?)?;
+    let mut delivery = Delivery {
+        settings: deliver::Settings::new(name.str()?),
+        connections: 10,
+    };
+    if let Some(table) = root.table("deliver") {
+        deliver(table, &mut delivery, tls.roots.is_some())?;
+    }
     root.finish()?;
     Ok(Config {
         id,
@@ -82,6 +100,8 @@ pub fn parse(text: &str) -> Result<Config, Error> {
         session,
         limits,
         listen,
+        dns,
+        delivery,
     })
 }
 
@@ -110,9 +130,88 @@ fn tls(mut table: Table) -> Result<Tls, Error> {
     let tls = Tls {
         chain: path(&table.require("chain")?)?,
         key: path(&table.require("key")?)?,
+        roots: table.take("roots").map(|entry| path(&entry)).transpose()?,
     };
     table.finish()?;
     Ok(tls)
+}
+
+fn dns(mut table: Table) -> Result<dns::Settings, Error> {
+    let entry = table.require("servers")?;
+    let mut servers: Vec<SocketAddr> = Vec::new();
+    for text in entry.strs()? {
+        let server = text
+            .parse()
+            .or_else(|_| text.parse::<IpAddr>().map(|ip| SocketAddr::new(ip, 53)))
+            .map_err(|_| {
+                entry.error("must list addresses such as \"127.0.0.1\" or \"[::1]:53\"")
+            })?;
+        if !servers.contains(&server) {
+            servers.push(server);
+        }
+    }
+    if servers.is_empty() {
+        return Err(entry.error("must list at least one server"));
+    }
+    let mut settings = dns::Settings::new(servers);
+    if let Some(entry) = table.take("dnssec") {
+        settings.dnssec = entry.bool()?;
+        if settings.dnssec && !settings.servers.iter().all(|s| s.ip().is_loopback()) {
+            return Err(entry.error("needs every server on loopback"));
+        }
+    }
+    settings.timeout = duration(&mut table, "timeout", settings.timeout)?;
+    settings.tries = number(&mut table, "tries", 1, 10, settings.tries)?;
+    settings.cache = number(&mut table, "cache", 0, MAX_COUNT, settings.cache)?;
+    table.finish()?;
+    Ok(settings)
+}
+
+fn deliver(mut table: Table, delivery: &mut Delivery, roots: bool) -> Result<(), Error> {
+    let settings = &mut delivery.settings;
+    if let Some(entry) = table.take("ehlo") {
+        let name = entry.str()?;
+        if !intake::node_name(name) {
+            return Err(entry.error("must be a host name"));
+        }
+        name.clone_into(&mut settings.ehlo);
+    }
+    delivery.connections = number(&mut table, "connections", 1, 100_000, delivery.connections)?;
+    if let Some(entry) = table.take("deadline") {
+        let value = entry.duration()?;
+        if value.is_zero() || value > MAX_DEADLINE {
+            return Err(entry.error("must be more than zero and at most 9m"));
+        }
+        settings.deadline = value;
+    }
+    settings.wait = duration(&mut table, "wait", settings.wait)?;
+    settings.idle = duration(&mut table, "idle", settings.idle)?;
+    settings.reuse = number(&mut table, "reuse", 1, 1_000_000, settings.reuse)?;
+    settings.pooled = number(&mut table, "pooled", 0, 1_000_000, settings.pooled)?;
+    settings.dead = duration(&mut table, "dead", settings.dead)?;
+    if let Some(entry) = table.take("mta_sts") {
+        settings.mta_sts = entry.bool()?;
+        if settings.mta_sts && !roots {
+            return Err(entry.error("needs `roots` in [tls]"));
+        }
+    }
+    if let Some(entry) = table.take("eight_bit") {
+        settings.eight_bit = match entry.str()? {
+            "send" => deliver::EightBit::Send,
+            "fail" => deliver::EightBit::Fail,
+            _ => return Err(entry.error("must be \"send\" or \"fail\"")),
+        };
+    }
+    let t = &mut settings.timeouts;
+    t.connect = duration(&mut table, "connect_timeout", t.connect)?;
+    t.banner = duration(&mut table, "banner_timeout", t.banner)?;
+    t.ehlo = duration(&mut table, "ehlo_timeout", t.ehlo)?;
+    t.starttls = duration(&mut table, "starttls_timeout", t.starttls)?;
+    t.rset = duration(&mut table, "rset_timeout", t.rset)?;
+    t.command = duration(&mut table, "command_timeout", t.command)?;
+    t.body = duration(&mut table, "body_timeout", t.body)?;
+    t.final_reply = duration(&mut table, "final_timeout", t.final_reply)?;
+    table.finish()
 }
 
 fn intake(mut table: Table, session: &mut intake::Config) -> Result<(), Error> {

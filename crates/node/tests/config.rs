@@ -3,7 +3,9 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use node::{Listen, check, key_file, parse};
+use std::net::SocketAddr;
+
+use node::{Delivery, Listen, check, key_file, parse};
 
 const CHAIN: &[u8] = include_bytes!("data/a.pem");
 const KEY: &[u8] = include_bytes!("data/a.key");
@@ -22,6 +24,9 @@ socket = "/run/bunzzle/keys.sock"
 [tls]
 chain = "/etc/bunzzle/chain.pem"
 key = "/etc/bunzzle/key.pem"
+
+[dns]
+servers = ["127.0.0.1"]
 
 [[listen]]
 address = "0.0.0.0:25"
@@ -70,6 +75,18 @@ fn minimal_config_takes_defaults() {
             implicit: false,
         }]
     );
+    assert_eq!(
+        config.dns,
+        dns::Settings::new(vec!["127.0.0.1:53".parse().expect("server")])
+    );
+    assert_eq!(config.tls.roots, None);
+    assert_eq!(
+        config.delivery,
+        Delivery {
+            settings: deliver::Settings::new("mx.example.org"),
+            connections: 10,
+        }
+    );
 }
 
 #[test]
@@ -100,6 +117,7 @@ leak = "30s"
 entries = 1_000
 budget = "16MiB"
 ask = "2s"
+
 "#
     )
     .replace("id = 7", "id = 7\ncores = 3\nboot_deadline = \"90s\"")
@@ -153,6 +171,90 @@ ask = "2s"
 }
 
 #[test]
+fn delivery_settings_are_read() {
+    let text = format!(
+        r#"{MINIMAL}[deliver]
+ehlo = "out.example.org"
+connections = 4
+deadline = "5m"
+wait = "2s"
+idle = "10s"
+reuse = 20
+pooled = 50
+dead = "2m"
+mta_sts = true
+eight_bit = "fail"
+connect_timeout = "10s"
+banner_timeout = "1m"
+ehlo_timeout = "2m"
+starttls_timeout = "3m"
+rset_timeout = "4s"
+command_timeout = "4m"
+body_timeout = "5m"
+final_timeout = "6m"
+"#
+    )
+    .replace(
+        "servers = [\"127.0.0.1\"]",
+        r#"servers = ["::1", "127.0.0.1:5353", "::1"]
+dnssec = true
+timeout = "3s"
+tries = 2
+cache = 500"#,
+    )
+    .replace(
+        "key = \"/etc/bunzzle/key.pem\"",
+        "key = \"/etc/bunzzle/key.pem\"\nroots = \"/etc/ssl/roots.pem\"",
+    );
+    let config = parse(&text).expect("config");
+    let dns = &config.dns;
+    assert_eq!(
+        dns.servers,
+        ["[::1]:53", "127.0.0.1:5353"].map(|s| s.parse::<SocketAddr>().expect("server"))
+    );
+    assert_eq!(
+        (dns.dnssec, dns.timeout, dns.tries, dns.cache),
+        (true, Duration::from_secs(3), 2, 500)
+    );
+    assert_eq!(
+        config.tls.roots.as_deref(),
+        Some(Path::new("/etc/ssl/roots.pem"))
+    );
+    let delivery = &config.delivery;
+    let settings = &delivery.settings;
+    assert_eq!(
+        (settings.ehlo.as_str(), delivery.connections),
+        ("out.example.org", 4)
+    );
+    assert_eq!(
+        [
+            settings.deadline,
+            settings.wait,
+            settings.idle,
+            settings.dead
+        ],
+        [300, 2, 10, 120].map(Duration::from_secs)
+    );
+    assert_eq!((settings.reuse, settings.pooled), (20, 50));
+    assert!(settings.mta_sts);
+    assert_eq!(settings.eight_bit, deliver::EightBit::Fail);
+    let t = settings.timeouts;
+    assert_eq!(
+        [
+            t.connect,
+            t.banner,
+            t.ehlo,
+            t.starttls,
+            t.rset,
+            t.command,
+            t.body,
+            t.final_reply
+        ],
+        [10, 60, 120, 180, 4, 240, 300, 360].map(Duration::from_secs)
+    );
+}
+
+#[test]
 fn mistakes_are_refused_with_their_place() {
     assert_eq!(
         error(&MINIMAL.replace("id = 7", "id = 7\nport = 25")),
@@ -176,23 +278,23 @@ fn mistakes_are_refused_with_their_place() {
     );
     assert_eq!(
         error(&format!("{MINIMAL}[intake]\ndrain = \"0s\"\n")),
-        "line 19, column 1: `drain` must be more than zero"
+        "line 22, column 1: `drain` must be more than zero"
     );
     assert_eq!(
         error(&format!("{MINIMAL}[guard]\nbudget = \"4KiB\"\n")),
-        "line 19, column 1: `budget` must be between 1048576 and 1099511627776 bytes"
+        "line 22, column 1: `budget` must be between 1048576 and 1099511627776 bytes"
     );
     assert_eq!(
         error(&format!("{MINIMAL}[[listen]]\naddress = \"0.0.0.0:25\"\n")),
-        "line 19, column 1: `address` is listed twice"
+        "line 22, column 1: `address` is listed twice"
     );
     assert_eq!(
         error(&format!("{MINIMAL}mode = \"tls\"\n")),
-        "line 18, column 1: `mode` must be \"starttls\" or \"implicit\""
+        "line 21, column 1: `mode` must be \"starttls\" or \"implicit\""
     );
     assert_eq!(
         error(&MINIMAL.replace("0.0.0.0:25", "localhost:25")),
-        "line 17, column 1: `address` must be an address such as \"0.0.0.0:25\" or \"[::]:25\""
+        "line 20, column 1: `address` must be an address such as \"0.0.0.0:25\" or \"[::]:25\""
     );
     assert_eq!(
         error(&MINIMAL.replace("key = \"/etc/bunzzle/key.pem\"", "")),
@@ -207,6 +309,53 @@ fn mistakes_are_refused_with_their_place() {
         error(&MINIMAL.replace("[store]", "[stores]")),
         "line 1, column 1: missing [store]"
     );
+    assert_eq!(
+        error(&MINIMAL.replace("[dns]", "[resolver]")),
+        "line 1, column 1: missing [dns]"
+    );
+    let dns = [
+        (
+            "servers = []",
+            "line 17, column 1: `servers` must list at least one server",
+        ),
+        (
+            "servers = [\"localhost\"]",
+            "line 17, column 1: `servers` must list addresses such as \"127.0.0.1\" or \"[::1]:53\"",
+        ),
+        (
+            "servers = [\"10.0.0.1\"]\ndnssec = true",
+            "line 18, column 1: `dnssec` needs every server on loopback",
+        ),
+    ];
+    for (from, want) in dns {
+        assert_eq!(
+            error(&MINIMAL.replace("servers = [\"127.0.0.1\"]", from)),
+            want
+        );
+    }
+    let deliver = [
+        ("ehlo = \"a..b\"", "`ehlo` must be a host name"),
+        (
+            "connections = 0",
+            "`connections` must be between 1 and 100000",
+        ),
+        (
+            "deadline = \"10m\"",
+            "`deadline` must be more than zero and at most 9m",
+        ),
+        ("mta_sts = true", "`mta_sts` needs `roots` in [tls]"),
+        (
+            "eight_bit = \"drop\"",
+            "`eight_bit` must be \"send\" or \"fail\"",
+        ),
+        ("retries = 3", "`retries` is not a known setting"),
+    ];
+    for (line, want) in deliver {
+        assert_eq!(
+            error(&format!("{MINIMAL}[deliver]\n{line}\n")),
+            format!("line 22, column 1: {want}")
+        );
+    }
 }
 
 #[test]
@@ -250,6 +399,22 @@ fn check_reads_the_config_and_the_certificate_pair() {
     write(&file, text.as_bytes(), 0o644);
     let config = check(&file).expect("check");
     assert_eq!(config.tls.key, key);
+
+    let roots = dir.join("roots.pem");
+    let with_roots = text.replace(
+        "key = \"",
+        &format!("roots = \"{}\"\nkey = \"", roots.display()),
+    );
+    write(&file, with_roots.as_bytes(), 0o644);
+    write(&roots, CHAIN, 0o644);
+    assert_eq!(check(&file).expect("roots").tls.roots, Some(roots.clone()));
+    write(&roots, b"", 0o644);
+    let error = check(&file).expect_err("no roots");
+    assert!(
+        error.starts_with(&format!("{}: ", roots.display())),
+        "{error}"
+    );
+    write(&file, text.as_bytes(), 0o644);
 
     write(&key, KEY, 0o644);
     let error = check(&file).expect_err("mode");
