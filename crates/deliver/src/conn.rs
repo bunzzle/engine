@@ -100,6 +100,7 @@ impl Conn {
         self,
         connector: &Connector,
         name: &str,
+        verify: Verify,
         limit: Duration,
     ) -> Result<Self, Lost> {
         if self.responses.pending() {
@@ -108,12 +109,7 @@ impl Conn {
         let Io::Plain(io) = self.io else {
             return Err(Lost::Tls);
         };
-        match timeout(
-            left(self.end, limit),
-            connector.connect(io, name, Verify::Any),
-        )
-        .await
-        {
+        match timeout(left(self.end, limit), connector.connect(io, name, verify)).await {
             Ok(Ok(stream)) => Ok(Self {
                 io: Io::Tls(Box::new(stream)),
                 responses: Responses::default(),

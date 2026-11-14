@@ -45,6 +45,7 @@ pub struct Settings {
     pub reuse: u32,
     pub pooled: usize,
     pub dead: Duration,
+    pub mta_sts: bool,
 }
 
 impl Settings {
@@ -60,6 +61,7 @@ impl Settings {
             reuse: 100,
             pooled: 1000,
             dead: Duration::from_secs(60),
+            mta_sts: false,
         }
     }
 }

@@ -5,7 +5,7 @@ use std::net::{IpAddr, Ipv4Addr};
 use std::rc::Rc;
 use std::time::Duration;
 
-use common::{Script, Seen, Zone, serve};
+use common::{Script, Seen, Zone, policy, serve, serve_policy};
 use control::Leases;
 use deliver::{Deliver, EightBit, Message, Outcome, Remote, Settings, limits};
 use dns::{Found, Name, Record, Type};
@@ -18,8 +18,15 @@ const EGRESS: IpAddr = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
 const EGRESS2: IpAddr = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2));
 const MX1: IpAddr = IpAddr::V4(Ipv4Addr::new(10, 0, 1, 1));
 const MX2: IpAddr = IpAddr::V4(Ipv4Addr::new(10, 0, 1, 2));
+const WEB: IpAddr = IpAddr::V4(Ipv4Addr::new(10, 0, 2, 1));
+const ROOTS: &[u8] = include_bytes!("data/ca.pem");
+const LEAF: &str = "b144595e51e3ade2a723db0ddb2b560ba510fd1da2d9246d45b4618481d8bb01";
+const ROOT: &str = "86ee2f95596152cea98375f669a6e13a72a7de0671efcc61dcde8b5d501e8bc1";
+const ENFORCE: &str = "version: STSv1\nmode: enforce\nmx: mx2.example.com\nmax_age: 86400\n";
 const HEADER: &[u8] = b"Received: from a\r\nSubject: hi\r\n";
 const TEMPORARY: Answer = Answer::Deferred(Kind::Temporary);
+
+type Records = &'static [(u8, u8, u8, &'static str)];
 
 fn run<T: 'static>(future: impl Future<Output = T> + 'static) -> T {
     let driver = Rc::new(SimDriver::new(7, Config::default()));
@@ -68,6 +75,59 @@ fn deliverer(zone: Zone, settings: Settings) -> Deliver<Zone> {
 fn limited(zone: Zone, settings: Settings, leases: Option<Leases<Remote>>) -> Deliver<Zone> {
     let connector = Connector::new(simulated(2), None).expect("connector");
     Deliver::new(zone, connector, settings, leases, 9).expect("deliver")
+}
+
+fn verifying(zone: Zone, settings: Settings) -> Deliver<Zone> {
+    let connector = Connector::new(simulated(2), Some(ROOTS)).expect("connector");
+    Deliver::new(zone, connector, settings, None, 9).expect("deliver")
+}
+
+fn signed(only: bool) -> Zone {
+    let zone = zone();
+    if only {
+        zone.set("example.com", Type::Mx, mx(&[(10, "mx1.example.com")]));
+    }
+    zone.sign("example.com", Type::Mx);
+    zone.sign("mx1.example.com", Type::A);
+    zone.sign("mx2.example.com", Type::A);
+    zone
+}
+
+fn tlsa(zone: &Zone, host: &str, records: &[(u8, u8, u8, &str)]) {
+    let name = format!("_25._tcp.{host}");
+    let records = records
+        .iter()
+        .map(|(usage, selector, matching, data)| Record::Tlsa {
+            usage: *usage,
+            selector: *selector,
+            matching: *matching,
+            data: (0..data.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&data[i..i + 2], 16).expect("hex"))
+                .collect(),
+        })
+        .collect();
+    zone.set(&name, Type::Tlsa, Found::Records(records));
+    zone.sign(&name, Type::Tlsa);
+}
+
+fn sts(zone: &Zone, id: &str) {
+    zone.set(
+        "_mta-sts.example.com",
+        Type::Txt,
+        Found::Records(vec![Record::Txt(format!("v=STSv1; id={id}").into_bytes())]),
+    );
+    zone.set("mta-sts.example.com", Type::A, a(&[WEB]));
+}
+
+fn strict() -> Settings {
+    let mut settings = settings();
+    settings.mta_sts = true;
+    settings
+}
+
+fn mailed(seen: &Rc<RefCell<Seen>>) -> bool {
+    commands(seen).iter().any(|c| c.starts_with("MAIL"))
 }
 
 fn settings() -> Settings {
@@ -765,4 +825,348 @@ fn closes_after_421() {
         seen
     });
     assert_eq!(seen.borrow().connections, 2);
+}
+
+#[test]
+fn dane_checks_the_server_certificate() {
+    let cases: [(Records, Answer); 5] = [
+        (&[(3, 1, 1, LEAF)], Answer::Delivered),
+        (&[(2, 0, 1, ROOT)], Answer::Delivered),
+        (&[(3, 1, 1, ROOT), (3, 1, 1, LEAF)], Answer::Delivered),
+        (&[(3, 1, 1, ROOT)], TEMPORARY),
+        (&[(2, 0, 1, LEAF)], TEMPORARY),
+    ];
+    for (records, want) in cases {
+        let (outcomes, seen) = run(async move {
+            let seen = serve(MX1, Script::new(&["STARTTLS"]));
+            let zone = signed(true);
+            tlsa(&zone, "mx1.example.com", records);
+            let deliver = deliverer(zone, settings());
+            (simple(&deliver, "example.com").await, seen)
+        });
+        assert_eq!(answers(&outcomes), [want], "{records:?}");
+        assert_eq!(mailed(&seen), want == Answer::Delivered, "{records:?}");
+        if want == TEMPORARY {
+            assert_eq!(reply(&outcomes[0]), "451 4.7.5 TLS negotiation failed");
+        }
+    }
+}
+
+#[test]
+fn dane_never_falls_back_to_plaintext() {
+    let cases: [(Records, &[&str], Answer); 4] = [
+        (&[(3, 1, 1, LEAF)], &[], TEMPORARY),
+        (&[(1, 1, 1, LEAF)], &[], TEMPORARY),
+        (&[(1, 1, 1, ROOT)], &["STARTTLS"], Answer::Delivered),
+        (&[(3, 9, 1, ROOT)], &["STARTTLS"], Answer::Delivered),
+    ];
+    for (records, extensions, want) in cases {
+        let (outcomes, seen) = run(async move {
+            let seen = serve(MX1, Script::new(extensions));
+            let zone = signed(true);
+            tlsa(&zone, "mx1.example.com", records);
+            let deliver = deliverer(zone, settings());
+            (simple(&deliver, "example.com").await, seen)
+        });
+        assert_eq!(answers(&outcomes), [want], "{records:?}");
+        assert_eq!(seen.borrow().tls, want == Answer::Delivered, "{records:?}");
+        if want == TEMPORARY {
+            assert!(!mailed(&seen));
+            assert!(reply(&outcomes[0]).starts_with("451 4.7.4"));
+        }
+    }
+}
+
+#[test]
+fn dane_needs_signed_answers() {
+    for (mx, host, records) in [
+        (false, true, true),
+        (true, false, true),
+        (true, true, false),
+    ] {
+        let (outcomes, asked) = run(async move {
+            drop(serve(MX1, Script::new(&["STARTTLS"])));
+            let zone = zone();
+            zone.set("example.com", Type::Mx, mx_one());
+            if mx {
+                zone.sign("example.com", Type::Mx);
+            }
+            if host {
+                zone.sign("mx1.example.com", Type::A);
+            }
+            tlsa(&zone, "mx1.example.com", &[(3, 1, 1, ROOT)]);
+            if !records {
+                zone.unsign("_25._tcp.mx1.example.com", Type::Tlsa);
+            }
+            let asked = Rc::clone(&zone.asked);
+            let deliver = deliverer(zone, settings());
+            (simple(&deliver, "example.com").await, asked)
+        });
+        assert_eq!(answers(&outcomes), [Answer::Delivered]);
+        let tlsa = asked.borrow().iter().any(|(_, kind)| *kind == Type::Tlsa);
+        assert_eq!(tlsa, !records);
+    }
+}
+
+fn mx_one() -> Found {
+    mx(&[(10, "mx1.example.com")])
+}
+
+#[test]
+fn tlsa_failure_tries_the_next_host() {
+    let (outcomes, first, second) = run(async {
+        let first = serve(MX1, Script::new(&["STARTTLS"]));
+        let second = serve(MX2, Script::new(&["STARTTLS"]));
+        let zone = signed(false);
+        zone.fail("_25._tcp.mx1.example.com", Type::Tlsa);
+        let deliver = deliverer(zone, settings());
+        (simple(&deliver, "example.com").await, first, second)
+    });
+    assert_eq!(answers(&outcomes), [Answer::Delivered]);
+    assert_eq!(first.borrow().connections, 0);
+    assert_eq!(second.borrow().connections, 1);
+}
+
+#[test]
+fn dane_follows_a_signed_alias() {
+    let (outcomes, asked) = run(async {
+        drop(serve(MX1, Script::new(&["STARTTLS"])));
+        let zone = signed(true);
+        zone.alias("mx1.example.com", "mx.hosting.example");
+        tlsa(&zone, "mx.hosting.example", &[(2, 0, 1, ROOT)]);
+        tlsa(&zone, "mx1.example.com", &[(3, 1, 1, ROOT)]);
+        let asked = Rc::clone(&zone.asked);
+        let deliver = deliverer(zone, settings());
+        (simple(&deliver, "example.com").await, asked)
+    });
+    assert_eq!(answers(&outcomes), [Answer::Delivered]);
+    let tlsa: Vec<String> = asked
+        .borrow()
+        .iter()
+        .filter(|(_, kind)| *kind == Type::Tlsa)
+        .map(|(name, _)| name.clone())
+        .collect();
+    assert_eq!(tlsa, ["_25._tcp.mx.hosting.example"]);
+}
+
+#[test]
+fn pooled_connections_keep_their_tls_level() {
+    let (outcomes, seen) = run(async {
+        let seen = serve(MX1, Script::new(&["STARTTLS"]));
+        let zone = signed(true);
+        let deliver = deliverer(zone.clone(), settings());
+        let first = simple(&deliver, "example.com").await;
+        assert_eq!(answers(&first), [Answer::Delivered]);
+        assert_eq!(deliver.pooled(), 1);
+        tlsa(&zone, "mx1.example.com", &[(3, 1, 1, ROOT)]);
+        (simple(&deliver, "example.com").await, seen)
+    });
+    assert_eq!(answers(&outcomes), [TEMPORARY]);
+    assert_eq!(seen.borrow().connections, 2);
+}
+
+#[test]
+fn mta_sts_enforce_limits_hosts() {
+    let (outcomes, first, second, requests, policies) = run(async {
+        let first = serve(MX1, Script::new(&["STARTTLS"]));
+        let second = serve(MX2, Script::new(&["STARTTLS"]));
+        let requests = serve_policy(WEB, Rc::new(RefCell::new(policy(ENFORCE))));
+        let zone = zone();
+        sts(&zone, "1");
+        let deliver = verifying(zone, strict());
+        let mut outcomes = simple(&deliver, "example.com").await;
+        outcomes.extend(simple(&deliver, "example.com").await);
+        (outcomes, first, second, requests, deliver.policies())
+    });
+    assert_eq!(answers(&outcomes), [Answer::Delivered, Answer::Delivered]);
+    assert_eq!(first.borrow().connections, 0);
+    assert!(second.borrow().tls);
+    assert_eq!(policies, 1);
+    let requests = requests.borrow();
+    assert_eq!(requests.len(), 1);
+    assert!(
+        requests[0]
+            .starts_with("GET /.well-known/mta-sts.txt HTTP/1.1\r\nHost: mta-sts.example.com\r\n")
+    );
+}
+
+#[test]
+fn mta_sts_enforce_needs_verified_tls() {
+    let cases = [
+        ("mx2.example.com", &[][..], "451 4.7.4"),
+        ("mx3.example.com", &["STARTTLS"][..], "451 4.7.5"),
+    ];
+    for (host, extensions, text) in cases {
+        let (outcomes, seen) = run(async move {
+            let seen = serve(MX2, Script::new(extensions));
+            let text = format!("version: STSv1\nmode: enforce\nmx: {host}\nmax_age: 86400\n");
+            drop(serve_policy(WEB, Rc::new(RefCell::new(policy(&text)))));
+            let zone = zone();
+            zone.set("example.com", Type::Mx, mx(&[(10, host)]));
+            zone.set("mx3.example.com", Type::A, a(&[MX2]));
+            sts(&zone, "1");
+            let deliver = verifying(zone, strict());
+            (simple(&deliver, "example.com").await, seen)
+        });
+        assert_eq!(answers(&outcomes), [TEMPORARY], "{host}");
+        assert!(reply(&outcomes[0]).starts_with(text), "{host}");
+        assert!(!mailed(&seen), "{host}");
+    }
+}
+
+#[test]
+fn mta_sts_without_enforce_does_not_block() {
+    let testing = "version: STSv1\nmode: testing\nmx: mx2.example.com\nmax_age: 86400\n";
+    let wrong = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\n\r\n{ENFORCE}",
+        ENFORCE.len()
+    );
+    let cases = [
+        (Some(policy(testing)), true),
+        (Some(wrong), true),
+        (None, true),
+        (Some(policy(ENFORCE)), false),
+    ];
+    for (served, first) in cases {
+        let (outcomes, seen) = run(async move {
+            let seen = serve(MX1, Script::new(&[]));
+            drop(serve(MX2, Script::new(&["STARTTLS"])));
+            if let Some(served) = served {
+                drop(serve_policy(WEB, Rc::new(RefCell::new(served))));
+            }
+            let zone = zone();
+            sts(&zone, "1");
+            let deliver = verifying(zone, strict());
+            (simple(&deliver, "example.com").await, seen)
+        });
+        assert_eq!(answers(&outcomes), [Answer::Delivered]);
+        assert_eq!(seen.borrow().connections == 1, first);
+    }
+}
+
+#[test]
+fn cached_policy_outlives_a_failed_fetch() {
+    let (outcomes, first, requests) = run(async {
+        let first = serve(MX1, Script::new(&["STARTTLS"]));
+        drop(serve(MX2, Script::new(&["STARTTLS"])));
+        let response = Rc::new(RefCell::new(policy(ENFORCE)));
+        let requests = serve_policy(WEB, Rc::clone(&response));
+        let zone = zone();
+        sts(&zone, "1");
+        let deliver = verifying(zone.clone(), strict());
+        let mut outcomes = simple(&deliver, "example.com").await;
+        *response.borrow_mut() = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n".to_owned();
+        sts(&zone, "2");
+        outcomes.extend(simple(&deliver, "example.com").await);
+        zone.fail("_mta-sts.example.com", Type::Txt);
+        outcomes.extend(simple(&deliver, "example.com").await);
+        (outcomes, first, requests)
+    });
+    assert_eq!(answers(&outcomes), [Answer::Delivered; 3]);
+    assert_eq!(first.borrow().connections, 0);
+    assert_eq!(requests.borrow().len(), 2);
+}
+
+#[test]
+fn requiretls_needs_verified_tls() {
+    let tls = Envelope {
+        required: Required {
+            smtputf8: false,
+            requiretls: true,
+        },
+        ..envelope()
+    };
+    let cases: [(bool, Records, &[&str], Answer, bool); 4] = [
+        (
+            true,
+            &[(3, 1, 1, LEAF)],
+            &["STARTTLS", "REQUIRETLS"],
+            Answer::Delivered,
+            true,
+        ),
+        (
+            true,
+            &[(3, 1, 1, LEAF)],
+            &["STARTTLS"],
+            Answer::Failed,
+            true,
+        ),
+        (
+            true,
+            &[],
+            &["STARTTLS", "REQUIRETLS"],
+            Answer::Failed,
+            false,
+        ),
+        (
+            false,
+            &[],
+            &["STARTTLS", "REQUIRETLS"],
+            Answer::Delivered,
+            true,
+        ),
+    ];
+    for (dane, records, extensions, want, connects) in cases {
+        let tls = tls.clone();
+        let (outcomes, seen) = run(async move {
+            let seen = serve(MX2, Script::new(extensions));
+            drop(serve_policy(WEB, Rc::new(RefCell::new(policy(ENFORCE)))));
+            let zone = if dane { signed(false) } else { zone() };
+            zone.set("example.com", Type::Mx, mx(&[(10, "mx2.example.com")]));
+            if !records.is_empty() {
+                tlsa(&zone, "mx2.example.com", records);
+            }
+            let settings = if dane { settings() } else { strict() };
+            if !dane {
+                sts(&zone, "1");
+            }
+            let deliver = verifying(zone, settings);
+            let outcomes = send(
+                &deliver,
+                &tls,
+                &destination("example.com"),
+                &["a@example.com"],
+                b"hello\r\n",
+            )
+            .await;
+            (outcomes, seen)
+        });
+        assert_eq!(answers(&outcomes), [want], "{records:?} {extensions:?}");
+        assert_eq!(seen.borrow().connections > 0, connects, "{extensions:?}");
+        if want == Answer::Failed {
+            assert!(reply(&outcomes[0]).starts_with("550 5.7.30"));
+            assert!(!mailed(&seen));
+        } else {
+            assert!(
+                commands(&seen)
+                    .iter()
+                    .any(|c| c.starts_with("MAIL") && c.ends_with(" REQUIRETLS"))
+            );
+        }
+    }
+}
+
+#[test]
+fn requiretls_defers_when_the_host_is_down() {
+    let tls = Envelope {
+        required: Required {
+            smtputf8: false,
+            requiretls: true,
+        },
+        ..envelope()
+    };
+    let outcomes = run(async move {
+        let zone = signed(false);
+        tlsa(&zone, "mx1.example.com", &[(3, 1, 1, LEAF)]);
+        let deliver = deliverer(zone, settings());
+        send(
+            &deliver,
+            &tls,
+            &destination("example.com"),
+            &["a@example.com"],
+            b"hello\r\n",
+        )
+        .await
+    });
+    assert_eq!(answers(&outcomes), [TEMPORARY]);
 }

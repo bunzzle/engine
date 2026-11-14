@@ -17,7 +17,7 @@ impl Dns for Resolver {
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Hosts {
-    Found(Vec<Name>),
+    Found(Vec<Name>, bool),
     NullMx,
     NoDomain,
     Failed,
@@ -33,7 +33,7 @@ pub(crate) async fn hosts<D: Dns>(
     };
     let records = match &lookup.found {
         Found::NxDomain => return Hosts::NoDomain,
-        Found::NoData => return Hosts::Found(vec![domain.clone()]),
+        Found::NoData => return Hosts::Found(vec![domain.clone()], lookup.secure),
         Found::Records(records) => records,
     };
     let mut mx: Vec<(u16, &Name)> = records
@@ -69,7 +69,7 @@ pub(crate) async fn hosts<D: Dns>(
             names.push(name.clone());
         }
     }
-    Hosts::Found(names)
+    Hosts::Found(names, lookup.secure)
 }
 
 fn literal(name: &Name) -> bool {
@@ -80,7 +80,11 @@ fn literal(name: &Name) -> bool {
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Addresses {
-    Found(Vec<IpAddr>),
+    Found {
+        ips: Vec<IpAddr>,
+        secure: bool,
+        target: Name,
+    },
     Failed,
 }
 
@@ -90,9 +94,13 @@ pub(crate) async fn addresses<D: Dns>(dns: &D, host: &Name, v6: bool) -> Address
         return Addresses::Failed;
     };
     let Found::Records(records) = &lookup.found else {
-        return Addresses::Found(Vec::new());
+        return Addresses::Found {
+            ips: Vec::new(),
+            secure: lookup.secure,
+            target: lookup.name.clone(),
+        };
     };
-    let found = records
+    let ips = records
         .iter()
         .filter_map(|record| match record {
             Record::A(ip) if !v6 => Some(IpAddr::V4(*ip)),
@@ -103,5 +111,9 @@ pub(crate) async fn addresses<D: Dns>(dns: &D, host: &Name, v6: bool) -> Address
         .filter(|ip| !matches!(ip, IpAddr::V4(v4) if v4.is_broadcast()))
         .take(PER_HOST)
         .collect();
-    Addresses::Found(found)
+    Addresses::Found {
+        ips,
+        secure: lookup.secure,
+        target: lookup.name.clone(),
+    }
 }

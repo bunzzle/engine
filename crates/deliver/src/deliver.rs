@@ -13,13 +13,15 @@ use sched::{
 use smtp::client::{
     self, Answer as Reply, Capabilities, Dots, Mail, Rcpt, Refused, Response, Step, Transaction,
 };
-use tls::Connector;
+use tls::{Connector, Tlsa, Verify};
 
 use crate::classify;
 use crate::conn::{Conn, Lost, left};
+use crate::dane::{self, Dane};
 use crate::mx::{self, Addresses, Dns, Hosts};
-use crate::pool::{Key, Link, Pool, Remote, Slot};
+use crate::pool::{Key, Level, Link, Pool, Remote, Slot};
 use crate::settings::{EightBit, Settings};
+use crate::sts::{Got, Mode, Sts};
 
 const ADDRESSES: usize = 10;
 const CHUNK: usize = 64 * 1024;
@@ -36,6 +38,10 @@ const NO_HOST: &[u8] = b"451 4.4.4 No mail server address";
 const DEAD: &[u8] = b"451 4.4.1 Mail server recently unreachable";
 const BUSY: &[u8] = b"451 4.4.5 Connection limit reached";
 const REQUIRETLS: &[u8] = b"550 5.7.30 REQUIRETLS not possible";
+const NO_STARTTLS: &[u8] = b"451 4.7.4 Mail server does not offer STARTTLS";
+const TLSA_FAILED: &[u8] = b"451 4.4.3 TLSA lookup failed";
+const STS_BUSY: &[u8] = b"451 4.4.5 Too many MTA-STS policy fetches";
+const STS_NO_MX: &[u8] = b"451 4.4.4 No mail server matches the MTA-STS policy";
 const SMTPUTF8: &[u8] = b"553 5.6.7 Receiving server does not support SMTPUTF8";
 const EIGHT_BIT: &[u8] = b"554 5.6.3 Receiving server does not support 8BITMIME";
 const TOO_BIG: &[u8] = b"552 5.3.4 Message too big for the receiving server";
@@ -62,11 +68,47 @@ pub struct Deliver<D> {
     settings: Settings,
     leases: Option<Leases<Remote>>,
     pool: Pool,
+    sts: Sts,
     dead: RefCell<BTreeMap<(IpAddr, IpAddr), Instant>>,
     ehlo: Vec<u8>,
     helo: Vec<u8>,
     random: Cell<u64>,
     turn: Cell<u64>,
+}
+
+enum Need {
+    Any,
+    Encrypt,
+    Sts,
+    Dane {
+        names: Vec<String>,
+        records: Vec<Tlsa>,
+    },
+}
+
+impl Need {
+    fn level(&self) -> Level {
+        match self {
+            Self::Any => Level::Any,
+            Self::Encrypt => Level::Encrypt,
+            Self::Sts => Level::Sts,
+            Self::Dane { .. } => Level::Dane,
+        }
+    }
+
+    fn verify(&self, host: &Name) -> (String, Verify) {
+        match self {
+            Self::Any | Self::Encrypt => (host.to_string(), Verify::Any),
+            Self::Sts => (host.to_string(), Verify::WebPki),
+            Self::Dane { names, records } => (
+                names.first().cloned().unwrap_or_else(|| host.to_string()),
+                Verify::Dane {
+                    names: names.clone(),
+                    records: records.clone(),
+                },
+            ),
+        }
+    }
 }
 
 enum Tried {
@@ -92,6 +134,7 @@ impl<D: Dns> Deliver<D> {
             settings,
             leases,
             pool,
+            sts: Sts::default(),
             dead: RefCell::new(BTreeMap::new()),
             ehlo,
             helo,
@@ -106,6 +149,10 @@ impl<D: Dns> Deliver<D> {
 
     pub fn dead_hosts(&self) -> usize {
         self.dead.borrow().len()
+    }
+
+    pub fn policies(&self) -> usize {
+        self.sts.len()
     }
 
     pub async fn deliver(
@@ -124,36 +171,61 @@ impl<D: Dns> Deliver<D> {
         let Some(egress) = egress else {
             return every(TEMPORARY, NO_EGRESS);
         };
-        if message.envelope.required.requiretls {
-            return every(Answer::Failed, REQUIRETLS);
-        }
+        let requiretls = message.envelope.required.requiretls;
         let Ok(domain) = Name::parse(&destination.domain) else {
             return every(Answer::Failed, BAD_DOMAIN);
         };
         let mut pick = |n| self.pick(n);
-        let hosts = match timeout(deadline, mx::hosts(&self.dns, &domain, &mut pick)).await {
-            Ok(Hosts::Found(hosts)) => hosts,
-            Ok(Hosts::NullMx) => return every(Answer::Failed, NULL_MX),
-            Ok(Hosts::NoDomain) => return every(Answer::Failed, NO_DOMAIN),
-            Ok(Hosts::Failed) => return every(TEMPORARY, MX_FAILED),
-            Err(_) => return every(TEMPORARY, Lost::Timeout.text()),
+        let (mut hosts, secure) =
+            match timeout(deadline, mx::hosts(&self.dns, &domain, &mut pick)).await {
+                Ok(Hosts::Found(hosts, secure)) => (hosts, secure),
+                Ok(Hosts::NullMx) => return every(Answer::Failed, NULL_MX),
+                Ok(Hosts::NoDomain) => return every(Answer::Failed, NO_DOMAIN),
+                Ok(Hosts::Failed) => return every(TEMPORARY, MX_FAILED),
+                Err(_) => return every(TEMPORARY, Lost::Timeout.text()),
+            };
+        let sts = match self.enforce(egress, &domain, &mut hosts, end).await {
+            Ok(sts) => sts,
+            Err((answer, reply)) => return every(answer, reply),
         };
+        if requiretls && !secure && !sts {
+            return every(Answer::Failed, REQUIRETLS);
+        }
         let remote: Remote = (egress, destination.domain.clone());
         let mut slot = None;
         let mut last = NO_HOST.to_vec();
         let mut tried = 0;
+        let mut others = false;
         'hosts: for host in &hosts {
             let lookup = mx::addresses(&self.dns, host, egress.is_ipv6());
-            let found = match timeout(left(end, deadline), lookup).await {
-                Ok(Addresses::Found(found)) => found,
+            let (found, target, dnssec) = match timeout(left(end, deadline), lookup).await {
+                Ok(Addresses::Found {
+                    ips,
+                    secure: dnssec,
+                    target,
+                }) => (ips, target, dnssec),
                 Ok(Addresses::Failed) => {
                     if tried == 0 {
                         last = HOST_FAILED.to_vec();
                     }
+                    others = true;
                     continue;
                 }
-                Err(_) => break,
+                Err(_) => {
+                    others = true;
+                    break;
+                }
             };
+            let dane = secure && dnssec && !found.is_empty();
+            let Some(need) = self.need(end, host, &target, dane, sts).await else {
+                last = TLSA_FAILED.to_vec();
+                others = true;
+                continue;
+            };
+            if requiretls && matches!(need, Need::Any | Need::Encrypt) {
+                last = REQUIRETLS.to_vec();
+                continue;
+            }
             for ip in found {
                 if tried == ADDRESSES || now() >= end {
                     break 'hosts;
@@ -164,30 +236,90 @@ impl<D: Dns> Deliver<D> {
                     domain: destination.domain.clone(),
                     host: host.clone(),
                     remote: ip,
+                    level: need.level(),
                 };
                 match self
-                    .session(end, &key, &remote, &mut slot, &mut message)
+                    .session(end, &key, &need, &remote, &mut slot, &mut message)
                     .await
                 {
                     Tried::Done(outcomes) => return outcomes,
-                    Tried::Busy => {
-                        let wait = u64::try_from(self.settings.wait.as_millis()).unwrap_or(0);
-                        return every(Answer::Later(wait), BUSY);
+                    Tried::Busy => return every(Answer::Later(self.wait()), BUSY),
+                    Tried::Next(reply) => {
+                        others |= reply != REQUIRETLS;
+                        last = reply;
                     }
-                    Tried::Next(reply) => last = reply,
                 }
             }
         }
         if now() >= end {
             last = Lost::Timeout.text().to_vec();
+        } else if requiretls && !others && last == REQUIRETLS {
+            return every(Answer::Failed, REQUIRETLS);
         }
         every(TEMPORARY, &last)
+    }
+
+    async fn enforce(
+        &self,
+        egress: IpAddr,
+        domain: &Name,
+        hosts: &mut Vec<Name>,
+        end: Instant,
+    ) -> Result<bool, (Answer, &'static [u8])> {
+        if !self.settings.mta_sts {
+            return Ok(false);
+        }
+        let got = self
+            .sts
+            .policy(&self.dns, &self.tls, egress, domain, end)
+            .await;
+        match got {
+            Got::Busy => Err((Answer::Later(self.wait()), STS_BUSY)),
+            Got::Policy(policy) if policy.mode == Mode::Enforce => {
+                hosts.retain(|host| policy.allows(host));
+                if hosts.is_empty() {
+                    return Err((TEMPORARY, STS_NO_MX));
+                }
+                Ok(true)
+            }
+            Got::Policy(_) | Got::None => Ok(false),
+        }
+    }
+
+    async fn need(
+        &self,
+        end: Instant,
+        host: &Name,
+        target: &Name,
+        dane: bool,
+        sts: bool,
+    ) -> Option<Need> {
+        let found = if dane {
+            let lookup = dane::lookup(&self.dns, self.settings.port, host, target);
+            timeout(left(end, self.settings.deadline), lookup)
+                .await
+                .unwrap_or(Dane::Failed)
+        } else {
+            Dane::None
+        };
+        match found {
+            Dane::Failed => None,
+            Dane::Verify { names, records } => Some(Need::Dane { names, records }),
+            _ if sts => Some(Need::Sts),
+            Dane::Encrypt => Some(Need::Encrypt),
+            Dane::None => Some(Need::Any),
+        }
+    }
+
+    fn wait(&self) -> u64 {
+        u64::try_from(self.settings.wait.as_millis()).unwrap_or(0)
     }
 
     async fn session(
         &self,
         end: Instant,
         key: &Key,
+        need: &Need,
         remote: &Remote,
         slot: &mut Option<Slot>,
         message: &mut Message<'_>,
@@ -205,7 +337,7 @@ impl<D: Dns> Deliver<D> {
                     Err(()) => return Tried::Busy,
                 }
             }
-            match self.open(end, key).await {
+            match self.open(end, key, need).await {
                 Ok((conn, caps)) => Link {
                     conn,
                     caps,
@@ -217,6 +349,10 @@ impl<D: Dns> Deliver<D> {
         };
         let caps = link.caps;
         let envelope = message.envelope;
+        if envelope.required.requiretls && !caps.requiretls {
+            self.pool.park(key.clone(), link).await;
+            return Tried::Next(REQUIRETLS.to_vec());
+        }
         let refusal = if envelope.required.smtputf8 && !caps.smtputf8 {
             Some(SMTPUTF8)
         } else if envelope.eight_bit && !caps.eight_bit && self.settings.eight_bit == EightBit::Fail
@@ -312,7 +448,12 @@ impl<D: Dns> Deliver<D> {
         }
     }
 
-    async fn open(&self, end: Instant, key: &Key) -> Result<(Conn, Capabilities), Vec<u8>> {
+    async fn open(
+        &self,
+        end: Instant,
+        key: &Key,
+        need: &Need,
+    ) -> Result<(Conn, Capabilities), Vec<u8>> {
         let t = &self.settings.timeouts;
         let to = SocketAddr::new(key.remote, self.settings.port);
         let mut conn = match Conn::open(key.egress, to, end, t.connect).await {
@@ -330,21 +471,29 @@ impl<D: Dns> Deliver<D> {
             Ok(caps) => caps,
             Err(failed) => return Err(next(conn, failed).await),
         };
-        if caps.starttls {
-            match command(&mut conn, client::STARTTLS, t.starttls).await {
-                Ok(reply) if reply.code == 220 => {
-                    conn = conn
-                        .starttls(&self.tls, &key.host.to_string(), t.starttls)
-                        .await
-                        .map_err(|lost| lost.text().to_vec())?;
-                    caps = match self.hello(&mut conn).await {
-                        Ok(caps) => caps,
-                        Err(failed) => return Err(next(conn, failed).await),
-                    };
-                }
-                Ok(_) => {}
-                Err(lost) => return Err(lost.text().to_vec()),
+        let required = key.level != Level::Any;
+        if !caps.starttls {
+            if required {
+                conn.quit().await;
+                return Err(NO_STARTTLS.to_vec());
             }
+            return Ok((conn, caps));
+        }
+        match command(&mut conn, client::STARTTLS, t.starttls).await {
+            Ok(reply) if reply.code == 220 => {
+                let (name, verify) = need.verify(&key.host);
+                conn = conn
+                    .starttls(&self.tls, &name, verify, t.starttls)
+                    .await
+                    .map_err(|lost| lost.text().to_vec())?;
+                caps = match self.hello(&mut conn).await {
+                    Ok(caps) => caps,
+                    Err(failed) => return Err(next(conn, failed).await),
+                };
+            }
+            Ok(reply) if required => return Err(next(conn, Ok(reply)).await),
+            Ok(_) => {}
+            Err(lost) => return Err(lost.text().to_vec()),
         }
         Ok((conn, caps))
     }

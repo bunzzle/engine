@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 
 use std::cell::{Cell, RefCell};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::future::ready;
 use std::net::{IpAddr, SocketAddr};
 use std::rc::Rc;
@@ -21,6 +21,8 @@ type Answers = BTreeMap<(String, Type), Option<Found>>;
 #[derive(Clone, Default)]
 pub struct Zone {
     answers: Rc<RefCell<Answers>>,
+    signed: Rc<RefCell<BTreeSet<(String, Type)>>>,
+    aliases: Rc<RefCell<BTreeMap<String, String>>>,
     pub asked: Rc<RefCell<Vec<(String, Type)>>>,
 }
 
@@ -36,6 +38,20 @@ impl Zone {
             .borrow_mut()
             .insert((name.to_owned(), kind), None);
     }
+
+    pub fn sign(&self, name: &str, kind: Type) {
+        self.signed.borrow_mut().insert((name.to_owned(), kind));
+    }
+
+    pub fn unsign(&self, name: &str, kind: Type) {
+        self.signed.borrow_mut().remove(&(name.to_owned(), kind));
+    }
+
+    pub fn alias(&self, name: &str, target: &str) {
+        self.aliases
+            .borrow_mut()
+            .insert(name.to_owned(), target.to_owned());
+    }
 }
 
 impl Dns for Zone {
@@ -47,11 +63,17 @@ impl Dns for Zone {
             Some(None) => Err(Error::ServFail),
             None => Ok(Found::NxDomain),
         };
+        let secure = self.signed.borrow().contains(&key);
+        let target = self
+            .aliases
+            .borrow()
+            .get(&key.0)
+            .map_or_else(|| name.clone(), |t| Name::parse(t).expect("alias"));
         ready(found.map(|found| {
             Rc::new(Lookup {
-                name: name.clone(),
+                name: target,
                 found,
-                secure: false,
+                secure,
                 expires: now() + Duration::from_secs(3600),
             })
         }))
@@ -150,6 +172,50 @@ pub fn serve(ip: IpAddr, script: Script) -> Rc<RefCell<Seen>> {
         }
     }));
     seen
+}
+
+pub fn policy(text: &str) -> String {
+    format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n{text}",
+        text.len()
+    )
+}
+
+pub fn serve_policy(ip: IpAddr, response: Rc<RefCell<String>>) -> Rc<RefCell<Vec<String>>> {
+    let requests = Rc::new(RefCell::new(Vec::new()));
+    let shared = Rc::clone(&requests);
+    let certs = Arc::new(Certs::new(CERT, &key()).expect("certs"));
+    let acceptor = Rc::new(Acceptor::new(simulated(3), certs).expect("acceptor"));
+    drop(spawn(async move {
+        let listener = TcpListener::bind(SocketAddr::new(ip, 443), 16)
+            .await
+            .expect("bind");
+        while let Ok((io, _)) = listener.accept().await {
+            let acceptor = Rc::clone(&acceptor);
+            let response = response.borrow().clone();
+            let shared = Rc::clone(&shared);
+            drop(spawn(async move {
+                let Ok(mut stream) = acceptor.accept(io).await else {
+                    return;
+                };
+                let mut buf = Vec::new();
+                let mut chunk = [0; 4096];
+                while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                    let n = stream.read(&mut chunk).await.unwrap_or(0);
+                    if n == 0 {
+                        return;
+                    }
+                    buf.extend_from_slice(&chunk[..n]);
+                }
+                shared
+                    .borrow_mut()
+                    .push(String::from_utf8_lossy(&buf).into_owned());
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.shutdown().await;
+            }));
+        }
+    }));
+    requests
 }
 
 fn line(buf: &mut Vec<u8>) -> Option<String> {
