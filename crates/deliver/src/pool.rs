@@ -59,12 +59,21 @@ impl Drop for Slot {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum Level {
+    Any,
+    Encrypt,
+    Sts,
+    Dane,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct Key {
     pub(crate) egress: IpAddr,
     pub(crate) domain: Box<str>,
     pub(crate) host: Name,
     pub(crate) remote: IpAddr,
+    pub(crate) level: Level,
 }
 
 pub(crate) struct Link {
