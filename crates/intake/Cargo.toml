@@ -17,7 +17,7 @@ spool = { path = "../spool" }
 tls = { path = "../tls" }
 
 [dev-dependencies]
-aws-lc-rs = "=1.18.2"
+aws-lc-rs = "=1.19.0"
 keys = { path = "../keys" }
 store = { path = "../store" }
 

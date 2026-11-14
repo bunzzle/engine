@@ -7,7 +7,7 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
-libc = "=0.2.190"
+libc = "=0.2.191"
 
 [lints.rust]
 unsafe_code = "deny"
