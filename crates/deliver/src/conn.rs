@@ -62,6 +62,10 @@ impl Conn {
         }
     }
 
+    pub(crate) fn renew(&mut self, end: Instant) {
+        self.end = end;
+    }
+
     pub(crate) async fn response(&mut self, limit: Duration) -> Result<Response, Lost> {
         let (io, responses) = (&mut self.io, &mut self.responses);
         let read = async move {

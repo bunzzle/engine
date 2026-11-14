@@ -1,8 +1,10 @@
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
+use std::collections::BTreeMap;
 use std::mem;
 use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 
+use control::Leases;
 use dns::Name;
 use rt::{Instant, now, timeout};
 use sched::{
@@ -16,10 +18,12 @@ use tls::Connector;
 use crate::classify;
 use crate::conn::{Conn, Lost, left};
 use crate::mx::{self, Addresses, Dns, Hosts};
+use crate::pool::{Key, Link, Pool, Remote, Slot};
 use crate::settings::{EightBit, Settings};
 
 const ADDRESSES: usize = 10;
 const CHUNK: usize = 64 * 1024;
+const DEAD_MOST: usize = 10_000;
 const TEMPORARY: Answer = Answer::Deferred(Kind::Temporary);
 
 const NO_EGRESS: &[u8] = b"451 4.3.0 No egress address";
@@ -29,6 +33,8 @@ const NULL_MX: &[u8] = b"556 5.1.10 Recipient domain does not accept mail";
 const MX_FAILED: &[u8] = b"451 4.4.3 MX lookup failed";
 const HOST_FAILED: &[u8] = b"451 4.4.3 Mail server address lookup failed";
 const NO_HOST: &[u8] = b"451 4.4.4 No mail server address";
+const DEAD: &[u8] = b"451 4.4.1 Mail server recently unreachable";
+const BUSY: &[u8] = b"451 4.4.5 Connection limit reached";
 const REQUIRETLS: &[u8] = b"550 5.7.30 REQUIRETLS not possible";
 const SMTPUTF8: &[u8] = b"553 5.6.7 Receiving server does not support SMTPUTF8";
 const EIGHT_BIT: &[u8] = b"554 5.6.3 Receiving server does not support 8BITMIME";
@@ -54,6 +60,9 @@ pub struct Deliver<D> {
     dns: D,
     tls: Connector,
     settings: Settings,
+    leases: Option<Leases<Remote>>,
+    pool: Pool,
+    dead: RefCell<BTreeMap<(IpAddr, IpAddr), Instant>>,
     ehlo: Vec<u8>,
     helo: Vec<u8>,
     random: Cell<u64>,
@@ -62,22 +71,41 @@ pub struct Deliver<D> {
 
 enum Tried {
     Next(Vec<u8>),
+    Busy,
     Done(Vec<Outcome>),
 }
 
 impl<D: Dns> Deliver<D> {
-    pub fn new(dns: D, tls: Connector, settings: Settings, seed: u64) -> Result<Self, Refused> {
+    pub fn new(
+        dns: D,
+        tls: Connector,
+        settings: Settings,
+        leases: Option<Leases<Remote>>,
+        seed: u64,
+    ) -> Result<Self, Refused> {
         let ehlo = client::ehlo(&settings.ehlo)?;
         let helo = client::helo(&settings.ehlo)?;
+        let pool = Pool::new(settings.idle, settings.pooled);
         Ok(Self {
             dns,
             tls,
             settings,
+            leases,
+            pool,
+            dead: RefCell::new(BTreeMap::new()),
             ehlo,
             helo,
             random: Cell::new(seed | 1),
             turn: Cell::new(0),
         })
+    }
+
+    pub fn pooled(&self) -> usize {
+        self.pool.len()
+    }
+
+    pub fn dead_hosts(&self) -> usize {
+        self.dead.borrow().len()
     }
 
     pub async fn deliver(
@@ -89,7 +117,11 @@ impl<D: Dns> Deliver<D> {
         let end = now() + deadline;
         let recipients = message.recipients;
         let every = |answer, reply: &[u8]| all(recipients, answer, reply);
-        let Some(egress) = self.egress(&destination.egress) else {
+        let egress = self
+            .pool
+            .egress(&destination.domain, &destination.egress)
+            .or_else(|| self.egress(&destination.egress));
+        let Some(egress) = egress else {
             return every(TEMPORARY, NO_EGRESS);
         };
         if message.envelope.required.requiretls {
@@ -106,6 +138,8 @@ impl<D: Dns> Deliver<D> {
             Ok(Hosts::Failed) => return every(TEMPORARY, MX_FAILED),
             Err(_) => return every(TEMPORARY, Lost::Timeout.text()),
         };
+        let remote: Remote = (egress, destination.domain.clone());
+        let mut slot = None;
         let mut last = NO_HOST.to_vec();
         let mut tried = 0;
         'hosts: for host in &hosts {
@@ -125,8 +159,21 @@ impl<D: Dns> Deliver<D> {
                     break 'hosts;
                 }
                 tried += 1;
-                match self.session(end, egress, ip, host, &mut message).await {
+                let key = Key {
+                    egress,
+                    domain: destination.domain.clone(),
+                    host: host.clone(),
+                    remote: ip,
+                };
+                match self
+                    .session(end, &key, &remote, &mut slot, &mut message)
+                    .await
+                {
                     Tried::Done(outcomes) => return outcomes,
+                    Tried::Busy => {
+                        let wait = u64::try_from(self.settings.wait.as_millis()).unwrap_or(0);
+                        return every(Answer::Later(wait), BUSY);
+                    }
                     Tried::Next(reply) => last = reply,
                 }
             }
@@ -140,44 +187,35 @@ impl<D: Dns> Deliver<D> {
     async fn session(
         &self,
         end: Instant,
-        egress: IpAddr,
-        ip: IpAddr,
-        host: &Name,
+        key: &Key,
+        remote: &Remote,
+        slot: &mut Option<Slot>,
         message: &mut Message<'_>,
     ) -> Tried {
-        let t = &self.settings.timeouts;
-        let to = SocketAddr::new(ip, self.settings.port);
-        let mut conn = match Conn::open(egress, to, end, t.connect).await {
-            Ok(conn) => conn,
-            Err(lost) => return Tried::Next(lost.text().to_vec()),
-        };
-        match conn.response(t.banner).await {
-            Ok(banner) if banner.code == 220 => {}
-            failed => return next(conn, failed).await,
-        }
-        let mut caps = match self.hello(&mut conn).await {
-            Ok(caps) => caps,
-            Err(failed) => return next(conn, failed).await,
-        };
-        if caps.starttls {
-            match command(&mut conn, client::STARTTLS, t.starttls).await {
-                Ok(reply) if reply.code == 220 => {
-                    conn = match conn
-                        .starttls(&self.tls, &host.to_string(), t.starttls)
-                        .await
-                    {
-                        Ok(conn) => conn,
-                        Err(lost) => return Tried::Next(lost.text().to_vec()),
-                    };
-                    caps = match self.hello(&mut conn).await {
-                        Ok(caps) => caps,
-                        Err(failed) => return next(conn, failed).await,
-                    };
-                }
-                Ok(_) => {}
-                Err(lost) => return Tried::Next(lost.text().to_vec()),
+        let mut link = if let Some(link) = self.reuse(key, end).await {
+            drop(slot.take());
+            link
+        } else {
+            if self.is_dead(key.egress, key.remote) {
+                return Tried::Next(DEAD.to_vec());
             }
-        }
+            if slot.is_none() {
+                match self.slot(remote, end).await {
+                    Ok(taken) => *slot = taken,
+                    Err(()) => return Tried::Busy,
+                }
+            }
+            match self.open(end, key).await {
+                Ok((conn, caps)) => Link {
+                    conn,
+                    caps,
+                    used: 0,
+                    _slot: slot.take(),
+                },
+                Err(reply) => return Tried::Next(reply),
+            }
+        };
+        let caps = link.caps;
         let envelope = message.envelope;
         let refusal = if envelope.required.smtputf8 && !caps.smtputf8 {
             Some(SMTPUTF8)
@@ -197,16 +235,22 @@ impl<D: Dns> Deliver<D> {
         let mut transaction = match transaction {
             Ok(transaction) => transaction,
             Err(text) => {
-                conn.quit().await;
+                self.pool.park(key.clone(), link).await;
                 return Tried::Done(all(message.recipients, Answer::Failed, text));
             }
         };
-        let run = self.transact(&mut conn, &mut transaction, message).await;
+        let run = self
+            .transact(&mut link.conn, &mut transaction, message)
+            .await;
         let finished = run.is_ok();
         let answers = transaction.answers();
         let delivered = finished && answers.iter().any(|a| a == &Some(Reply::Accepted));
+        let mut closing = false;
         let (done, lost) = match &run {
-            Ok(last) => (last.as_ref().map(Response::text), Lost::Closed),
+            Ok(last) => {
+                closing = last.as_ref().is_some_and(|r| r.code == 421);
+                (last.as_ref().map(Response::text), Lost::Closed)
+            }
             Err(lost) => (None, *lost),
         };
         let outcomes = message
@@ -219,7 +263,10 @@ impl<D: Dns> Deliver<D> {
                         Answer::Delivered,
                         done.clone().unwrap_or_default().into_bytes(),
                     ),
-                    Some(Reply::Refused(r)) => (classify::answer(&r), r.text().into_bytes()),
+                    Some(Reply::Refused(r)) => {
+                        closing |= r.code == 421;
+                        (classify::answer(&r), r.text().into_bytes())
+                    }
                     Some(Reply::Again(r)) if delivered => (Answer::Later(0), r.text().into_bytes()),
                     Some(Reply::Again(r)) => (TEMPORARY, r.text().into_bytes()),
                     _ => (TEMPORARY, lost.text().to_vec()),
@@ -231,10 +278,98 @@ impl<D: Dns> Deliver<D> {
                 }
             })
             .collect();
-        if finished && transaction.reusable() {
-            conn.quit().await;
+        link.used += 1;
+        if finished && transaction.reusable() && !closing && link.used < self.settings.reuse {
+            self.pool.park(key.clone(), link).await;
+        } else if finished && !closing {
+            link.conn.quit().await;
         }
         Tried::Done(outcomes)
+    }
+
+    async fn reuse(&self, key: &Key, end: Instant) -> Option<Link> {
+        loop {
+            let mut link = self.pool.take(key)?;
+            link.conn.renew(end);
+            let rset = command(&mut link.conn, client::RSET, self.settings.timeouts.rset).await;
+            if rset.is_ok_and(|r| r.code / 100 == 2) {
+                return Some(link);
+            }
+        }
+    }
+
+    async fn slot(&self, remote: &Remote, end: Instant) -> Result<Option<Slot>, ()> {
+        let Some(leases) = &self.leases else {
+            return Ok(None);
+        };
+        match leases
+            .take_within(remote, left(end, self.settings.wait))
+            .await
+        {
+            Ok(taken) if taken.slot => Ok(Some(Slot::new(leases.clone(), remote.clone()))),
+            Ok(_) | Err(control::Error::Invalid(_)) => Ok(None),
+            Err(_) => Err(()),
+        }
+    }
+
+    async fn open(&self, end: Instant, key: &Key) -> Result<(Conn, Capabilities), Vec<u8>> {
+        let t = &self.settings.timeouts;
+        let to = SocketAddr::new(key.remote, self.settings.port);
+        let mut conn = match Conn::open(key.egress, to, end, t.connect).await {
+            Ok(conn) => conn,
+            Err(lost) => {
+                self.mark_dead(key.egress, key.remote);
+                return Err(lost.text().to_vec());
+            }
+        };
+        match conn.response(t.banner).await {
+            Ok(banner) if banner.code == 220 => {}
+            failed => return Err(next(conn, failed).await),
+        }
+        let mut caps = match self.hello(&mut conn).await {
+            Ok(caps) => caps,
+            Err(failed) => return Err(next(conn, failed).await),
+        };
+        if caps.starttls {
+            match command(&mut conn, client::STARTTLS, t.starttls).await {
+                Ok(reply) if reply.code == 220 => {
+                    conn = conn
+                        .starttls(&self.tls, &key.host.to_string(), t.starttls)
+                        .await
+                        .map_err(|lost| lost.text().to_vec())?;
+                    caps = match self.hello(&mut conn).await {
+                        Ok(caps) => caps,
+                        Err(failed) => return Err(next(conn, failed).await),
+                    };
+                }
+                Ok(_) => {}
+                Err(lost) => return Err(lost.text().to_vec()),
+            }
+        }
+        Ok((conn, caps))
+    }
+
+    fn is_dead(&self, egress: IpAddr, remote: IpAddr) -> bool {
+        let mut dead = self.dead.borrow_mut();
+        match dead.get(&(egress, remote)) {
+            Some(until) if *until > now() => true,
+            Some(_) => {
+                dead.remove(&(egress, remote));
+                false
+            }
+            None => false,
+        }
+    }
+
+    fn mark_dead(&self, egress: IpAddr, remote: IpAddr) {
+        let now = now();
+        let mut dead = self.dead.borrow_mut();
+        if dead.len() >= DEAD_MOST {
+            dead.retain(|_, until| *until > now);
+        }
+        if dead.len() < DEAD_MOST {
+            dead.insert((egress, remote), now + self.settings.dead);
+        }
     }
 
     async fn hello(&self, conn: &mut Conn) -> Result<Capabilities, Result<Response, Lost>> {
@@ -401,13 +536,13 @@ fn rcpts(message: &Message<'_>) -> Vec<Rcpt> {
         .collect()
 }
 
-async fn next(conn: Conn, failed: Result<Response, Lost>) -> Tried {
+async fn next(conn: Conn, failed: Result<Response, Lost>) -> Vec<u8> {
     match failed {
         Ok(reply) => {
             conn.quit().await;
-            Tried::Next(reply.text().into_bytes())
+            reply.text().into_bytes()
         }
-        Err(lost) => Tried::Next(lost.text().to_vec()),
+        Err(lost) => lost.text().to_vec(),
     }
 }
 

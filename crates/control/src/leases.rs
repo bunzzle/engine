@@ -265,8 +265,12 @@ impl<K: Ord + Clone + Send + 'static> Leases<K> {
     }
 
     pub async fn take(&self, key: &K) -> Result<Taken, Error> {
+        self.take_within(key, WAIT).await
+    }
+
+    pub async fn take_within(&self, key: &K, wait: Duration) -> Result<Taken, Error> {
         let limits = (self.inner.limits)(key).ok_or(Error::Invalid("key"))?;
-        let deadline = rt::now() + WAIT;
+        let deadline = rt::now() + wait;
         loop {
             let now = rt::now();
             if let Some(taken) = self.try_take(key, limits, now) {
