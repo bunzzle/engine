@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::task::Poll;
 use std::time::Duration;
 
-use control::{Created, KeyError, KeySource, Ready, Tenancy};
+use control::{Created, KeyError, KeySource, Name, Ready, Tenancy};
 use crypto::{TenantKeys, Wrap};
 use rt::sim::{Config, Disk, Faults, Machine, SimDriver, Stalls, check};
 use rt::{JoinHandle, Mesh, Runtime, sleep, spawn, timeout};
@@ -50,6 +50,7 @@ struct World {
     submitted: BTreeSet<Key>,
     queues: BTreeMap<Key, u32>,
     misrouted: u64,
+    unrouted: u64,
     in_attempt: BTreeSet<Key>,
     finals: BTreeMap<Key, u32>,
     durable: BTreeSet<Key>,
@@ -71,12 +72,34 @@ fn key(id: MessageId, r: u32) -> Key {
     (id.shard, id.key, r)
 }
 
-struct Tens;
+struct Tens {
+    world: Shared,
+    named: RefCell<BTreeSet<u32>>,
+}
 
 impl Tenancy for Tens {
     fn holder(&self, queue: u32) -> Option<(u32, u32)> {
         Some((queue / 10, 1))
     }
+
+    fn name(&self, queue: u32) -> Option<Name> {
+        let (mut tenant, mut domain) = (queue / 10, domain(queue));
+        if self.named.borrow_mut().insert(queue) {
+            self.world.borrow_mut().unrouted += 1;
+            tenant += 1;
+            domain = "other.example".into();
+        }
+        Some(Name {
+            tenant,
+            domain: domain.into(),
+            generation: 1,
+            pool: queue % 3,
+        })
+    }
+}
+
+fn domain(queue: u32) -> String {
+    format!("q{queue}.example")
 }
 
 struct Shredded;
@@ -126,6 +149,36 @@ impl Simulated {
         self.driver.random() % n
     }
 
+    fn record(&self, attempt: &Attempt) {
+        let now = self.clock.now();
+        let mut world = self.world.borrow_mut();
+        world.attempts += 1;
+        let destination = &attempt.destination;
+        if *destination.domain != domain(attempt.queue) || destination.pool != attempt.queue % 3 {
+            world.misrouted += 1;
+        }
+        let owner = usize::from(attempt.message.shard % CORES);
+        let spool = world.spools[owner].clone();
+        for c in &attempt.recipients {
+            let k = key(attempt.message, c.recipient);
+            let state = spool
+                .recipient(attempt.message, c.recipient)
+                .expect("claimed recipient");
+            if state.due > now + SLACK {
+                world.early += 1;
+            }
+            if world.queues.get(&k) != Some(&attempt.queue) {
+                world.misrouted += 1;
+            }
+            if world.durable.contains(&k) {
+                world.again += 1;
+            }
+            if !world.in_attempt.insert(k) {
+                world.overlaps += 1;
+            }
+        }
+    }
+
     fn answer(&self) -> Answer {
         match self.below(20) {
             0..=9 => Answer::Delivered,
@@ -141,31 +194,7 @@ impl Simulated {
 
 impl Transport for Simulated {
     async fn send(&self, attempt: Attempt) -> Vec<Answered> {
-        let now = self.clock.now();
-        {
-            let mut world = self.world.borrow_mut();
-            world.attempts += 1;
-            let owner = usize::from(attempt.message.shard % CORES);
-            let spool = world.spools[owner].clone();
-            for c in &attempt.recipients {
-                let k = key(attempt.message, c.recipient);
-                let state = spool
-                    .recipient(attempt.message, c.recipient)
-                    .expect("claimed recipient");
-                if state.due > now + SLACK {
-                    world.early += 1;
-                }
-                if world.queues.get(&k) != Some(&attempt.queue) {
-                    world.misrouted += 1;
-                }
-                if world.durable.contains(&k) {
-                    world.again += 1;
-                }
-                if !world.in_attempt.insert(k) {
-                    world.overlaps += 1;
-                }
-            }
-        }
+        self.record(&attempt);
         sleep(Duration::from_millis(1 + self.below(2_000))).await;
         let (fault, mixed, generation) = match self.below(40) {
             0 => (Some(Unsealable::Unavailable), false, 1),
@@ -483,8 +512,12 @@ fn start_cores(
                 driver: transport_driver,
                 clock,
             };
+            let tens = Tens {
+                world: Rc::clone(&transport.world),
+                named: RefCell::default(),
+            };
             let (sched, done) =
-                Sched::start(ends, opened, transport, Rc::new(Tens), clock, config());
+                Sched::start(ends, opened, transport, Rc::new(tens), clock, config());
             sched.use_keys(Rc::new(Shredded));
             sched.restore(pending, |_| Some(1));
             (sched, done)
@@ -616,6 +649,7 @@ fn verify(seed: u64, world: &World) {
         );
     }
     assert!(world.attempts > 0);
+    assert!(world.unrouted > 0);
 }
 
 fn one_session(seed: u64) {

@@ -5,7 +5,8 @@ use store::{
 use crate::bodies::{KIND_BODY_CHUNK, decode_chunk};
 use crate::error::Error;
 use crate::intake::{MessageId, Spool};
-use crate::items::{BODY_ITEM, HeadClear, WRAP, head_parts};
+use crate::items::{BODY_ITEM, HeadClear, WRAP, head_parts, slice_item, slice_parts};
+use crate::limits::SLICE;
 use crate::pending::Fixed;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -21,12 +22,14 @@ pub struct Stored {
     pub clear: HeadClear,
     pub head: Location,
     pub body: StoredBody,
+    pub slices: Box<[(u32, Location)]>,
 }
 
 pub struct Opened {
     pub wrap: [u8; WRAP],
     pub head: Vec<u8>,
     pub body: Source,
+    pub slices: Vec<(u32, Vec<u8>)>,
     pub pins: Pinned,
 }
 
@@ -59,8 +62,12 @@ fn damaged(range: &Range) -> Error {
 }
 
 impl Spool {
-    pub async fn stored(&self, id: MessageId) -> Result<Stored, Error> {
-        let keys = vec![Key::new(id.key, HEAD_ITEM), Key::new(id.key, BODY_ITEM)];
+    pub async fn stored(&self, id: MessageId, recipients: &[u32]) -> Result<Stored, Error> {
+        let mut slices: Vec<u32> = recipients.iter().map(|r| r / SLICE).collect();
+        slices.sort_unstable();
+        slices.dedup();
+        let mut keys = vec![Key::new(id.key, HEAD_ITEM), Key::new(id.key, BODY_ITEM)];
+        keys.extend(slices.iter().map(|&n| Key::new(id.key, slice_item(n))));
         let mut items = self.inner.changes.items(id.shard, keys).await?.into_iter();
         let (Some(Some(head)), Some(Some(body))) = (items.next(), items.next()) else {
             return Err(Error::State("message"));
@@ -69,6 +76,14 @@ impl Spool {
         if body.tenant != head.tenant {
             return Err(Error::State("body"));
         }
+        let slices = slices
+            .into_iter()
+            .zip(items)
+            .map(|(n, item)| match item {
+                Some(item) if item.tenant == head.tenant => Ok((n, item.location)),
+                _ => Err(Error::State("slice")),
+            })
+            .collect::<Result<_, _>>()?;
         let body = if body.bodies.is_empty() {
             StoredBody::Inline(body.location)
         } else {
@@ -80,6 +95,7 @@ impl Spool {
             clear,
             head: head.location,
             body,
+            slices,
         })
     }
 
@@ -90,6 +106,7 @@ impl Spool {
             StoredBody::Inline(at) => pinned.push(pins.pin(at.region)),
             StoredBody::Chain(ranges) => pinned.extend(ranges.iter().map(|r| pins.pin(r.region))),
         }
+        pinned.extend(stored.slices.iter().map(|(_, at)| pins.pin(at.region)));
         let region = self.sealed(stored.head, stored.tenant).await?;
         let (wrap, head) = head_parts(&region).ok_or(Error::State("head"))?;
         let (wrap, head) = (*wrap, head.to_vec());
@@ -107,10 +124,17 @@ impl Spool {
                 next: 0,
             }),
         };
+        let mut slices = Vec::with_capacity(stored.slices.len());
+        for &(n, at) in &stored.slices {
+            let payload = self.sealed(at, stored.tenant).await?;
+            let (_, sealed) = slice_parts(&payload).ok_or(Error::State("slice"))?;
+            slices.push((n, sealed.to_vec()));
+        }
         Ok(Opened {
             wrap,
             head,
             body,
+            slices,
             pins: Pinned { _pins: pinned },
         })
     }

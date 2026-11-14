@@ -57,6 +57,7 @@ struct Seen {
     publics: RefCell<BTreeMap<String, Vec<u8>>>,
     verified: RefCell<BTreeMap<MessageId, usize>>,
     delivered: RefCell<BTreeSet<MessageId>>,
+    routed: RefCell<BTreeSet<String>>,
     faults: RefCell<Vec<&'static str>>,
     deliver: Cell<bool>,
     hold: Cell<bool>,
@@ -79,10 +80,22 @@ impl Transport for Idle {
                     Fault::Keys => "keys",
                     Fault::Signer(_) => "signer",
                     Fault::Format(_) => "format",
+                    Fault::Recipients(_) => "recipients",
                 });
                 return fault.answers(&claimed);
             }
         };
+        let indexes: Vec<u32> = prepared.recipients.iter().map(|(r, _)| *r).collect();
+        let claimed_indexes: Vec<u32> = claimed.iter().map(|c| c.recipient).collect();
+        assert_eq!(indexes, claimed_indexes);
+        let destination = &attempt.destination;
+        assert_eq!(destination.pool, 1);
+        assert_eq!(destination.egress, [(IpAddr::from([192, 0, 2, 1]), 1)]);
+        for (_, recipient) in &prepared.recipients {
+            let domain = recipient.address.rsplit_once('@').map(|(_, d)| d);
+            assert_eq!(domain, Some(&*destination.domain));
+            seen.routed.borrow_mut().insert(recipient.address.clone());
+        }
         let mut hash = BodyHash::new();
         match &mut prepared.body {
             Body::Inline(body) => hash.update(body),
@@ -769,6 +782,7 @@ fn attempts_carry_verified_signatures_and_wait_for_keys() {
                 sent.iter().all(|id| verified.get(id) == Some(&2)) && stored(&nodes).is_empty()
             })
             .await;
+            assert!(to.iter().all(|a| seen.routed.borrow().contains(*a)));
 
             seen.hold.set(true);
             smtp.transaction("bounce@example.org", &to).await;

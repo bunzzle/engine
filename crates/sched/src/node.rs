@@ -17,12 +17,13 @@ use crate::lanes::{Entry, Lanes, Limits, QueueId, Take, ranges};
 use crate::policy::{Answer, BACKOFF, Kind, clamp, delay, report_retry};
 use crate::sealing::{Keys, Unsealable};
 use crate::sign::{Outgoing, Signing};
-use crate::transport::{Answered, Attempt, Claimed, Transport};
+use crate::transport::{Answered, Attempt, Claimed, Destination, Transport};
 use crate::unopened::{Action, Breaker, UnopenedStats, action};
 
 const HOLD: u64 = 3_600_000;
 const QUARANTINE: u64 = u64::MAX / 2;
 const UNREADABLE: u64 = 30_000;
+const UNROUTED: u64 = 30_000;
 const DAMAGED_TRIES: u8 = 3;
 const DAMAGED_KEPT: usize = 4096;
 
@@ -163,8 +164,10 @@ struct Inner<T> {
     report_streak: Cell<u32>,
     refused: Cell<u64>,
     unreadable: Cell<u64>,
+    unrouted: Cell<u64>,
     damaged: RefCell<BTreeMap<MessageId, u8>>,
     signing: OnceCell<Rc<Signing>>,
+    table: OnceCell<Rc<RefCell<Table>>>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -236,8 +239,10 @@ impl<T: Transport + 'static> Sched<T> {
             report_streak: Cell::new(0),
             refused: Cell::new(0),
             unreadable: Cell::new(0),
+            unrouted: Cell::new(0),
             damaged: RefCell::new(BTreeMap::new()),
             signing: OnceCell::new(),
+            table: OnceCell::new(),
         });
         let sched = Self { inner };
         let handler = sched.clone();
@@ -290,6 +295,10 @@ impl<T: Transport + 'static> Sched<T> {
         self.inner.unreadable.get()
     }
 
+    pub fn unrouted(&self) -> u64 {
+        self.inner.unrouted.get()
+    }
+
     pub fn unsigned(&self) -> u64 {
         self.inner.signing.get().map_or(0, |s| s.unsigned())
     }
@@ -299,6 +308,7 @@ impl<T: Transport + 'static> Sched<T> {
     }
 
     pub fn use_table(&self, table: Rc<RefCell<Table>>) {
+        let _ = self.inner.table.set(Rc::clone(&table));
         if let Some(keys) = self.inner.keys.get() {
             let _ = self
                 .inner
@@ -531,7 +541,12 @@ impl<T: Transport + 'static> Sched<T> {
         let sched = self.clone();
         drop(spawn(async move {
             let spool = &sched.inner.spool;
-            let stored = spool.stored(id).await.ok();
+            let wanted: Vec<u32> = answers
+                .iter()
+                .filter(|(_, a)| matches!(a, Claim::Claimed { .. }))
+                .map(|(r, _)| *r)
+                .collect();
+            let stored = spool.stored(id, &wanted).await.ok();
             if stored.is_none() {
                 let due = sched.inner.clock.now() + UNREADABLE;
                 for (r, answer) in &mut answers {
@@ -598,32 +613,13 @@ impl<T: Transport + 'static> Sched<T> {
     }
 
     async fn attempt(&self, route: Route, mut claimed: Vec<Claimed>, stored: Stored) {
-        let opened = if stored.tenant == route.tenant && stored.id == route.message {
-            self.inner.spool.open_stored(&stored).await
-        } else {
-            Err(Error::State("tenant"))
-        };
-        let opened = match opened {
-            Ok(opened) => {
-                self.inner.damaged.borrow_mut().remove(&route.message);
-                opened
-            }
-            Err(error) => {
-                self.skip(route, &claimed, &error);
-                return;
-            }
+        let Some(attempt) = self.prepare(route, &claimed, stored).await else {
+            return;
         };
         let id = self.inner.next_attempt.get();
         self.inner.next_attempt.set(id + 1);
         let started = self.inner.clock.now();
         self.inner.attempts.borrow_mut().insert(id, started);
-        let attempt = Attempt {
-            queue: route.queue,
-            tenant: route.tenant,
-            message: route.message,
-            recipients: claimed.clone(),
-            outgoing: Outgoing::new(stored, opened, self.inner.signing.get().cloned()),
-        };
         let answers = self.inner.transport.send(attempt).await;
         self.inner.attempts.borrow_mut().remove(&id);
         let now = self.inner.clock.now();
@@ -726,6 +722,71 @@ impl<T: Transport + 'static> Sched<T> {
             Note::Released { route, recipients },
         );
         (!open.is_empty()).then_some(open)
+    }
+
+    async fn prepare(&self, route: Route, claimed: &[Claimed], stored: Stored) -> Option<Attempt> {
+        let Some(destination) = self.destination(route) else {
+            self.unroute(route, claimed);
+            return None;
+        };
+        let opened = if stored.tenant == route.tenant && stored.id == route.message {
+            self.inner.spool.open_stored(&stored).await
+        } else {
+            Err(Error::State("tenant"))
+        };
+        let opened = match opened {
+            Ok(opened) => {
+                self.inner.damaged.borrow_mut().remove(&route.message);
+                opened
+            }
+            Err(error) => {
+                self.skip(route, claimed, &error);
+                return None;
+            }
+        };
+        Some(Attempt {
+            queue: route.queue,
+            tenant: route.tenant,
+            message: route.message,
+            destination,
+            recipients: claimed.to_vec(),
+            outgoing: Outgoing::new(
+                stored,
+                opened,
+                self.inner.signing.get().cloned(),
+                claimed.iter().map(|c| c.recipient).collect(),
+            ),
+        })
+    }
+
+    fn destination(&self, route: Route) -> Option<Destination> {
+        let name = self.inner.tenancy.name(route.queue)?;
+        if name.tenant != route.tenant {
+            return None;
+        }
+        let egress = self
+            .inner
+            .table
+            .get()
+            .and_then(|t| t.borrow().pool(name.pool).map(|p| p.addresses.clone()))
+            .unwrap_or_default();
+        Some(Destination {
+            domain: name.domain,
+            pool: name.pool,
+            egress,
+        })
+    }
+
+    fn unroute(&self, route: Route, claimed: &[Claimed]) {
+        self.inner.unrouted.set(self.inner.unrouted.get() + 1);
+        let due = self.inner.clock.now() + UNROUTED;
+        self.send(
+            self.owner(route.message),
+            Note::Released {
+                route,
+                recipients: claimed.iter().map(|c| (c.recipient, due)).collect(),
+            },
+        );
     }
 
     fn skip(&self, route: Route, claimed: &[Claimed], error: &Error) {

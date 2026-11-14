@@ -171,6 +171,7 @@ pub async fn tenant_keys(
 
 pub trait Tenancy {
     fn holder(&self, queue: u32) -> Option<(u32, u32)>;
+    fn name(&self, queue: u32) -> Option<Name>;
 }
 
 pub fn mix(mut x: u32) -> u32 {
