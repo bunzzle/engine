@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 use std::future::ready;
 use std::net::{IpAddr, SocketAddr};
@@ -67,6 +67,7 @@ pub struct Script {
     pub mail: &'static str,
     pub rcpt: Rc<dyn Fn(&str) -> String>,
     pub done: &'static str,
+    pub stalls: Rc<Cell<u32>>,
 }
 
 impl Script {
@@ -85,6 +86,7 @@ impl Script {
             mail: "250 2.1.0 ok",
             rcpt: Rc::new(|_| "250 2.1.5 ok".to_owned()),
             done: "250 2.0.0 queued",
+            stalls: Rc::default(),
         }
     }
 }
@@ -228,7 +230,8 @@ async fn session(io: TcpStream, script: Script, seen: Rc<RefCell<Seen>>, accepto
                     }
                 };
                 seen.borrow_mut().bodies.push(body);
-                if script.done.is_empty() {
+                if script.done.is_empty() || script.stalls.get() > 0 {
+                    script.stalls.set(script.stalls.get().saturating_sub(1));
                     sleep(Duration::from_secs(100_000)).await;
                     return;
                 }

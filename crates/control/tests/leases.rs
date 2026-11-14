@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use control::{Ask, Error, Gcra, LIFETIME, Leases, Limits, limit_core};
 use rt::sim::{Config, Machine, SimDriver, Stalls, check};
-use rt::{Instant, JoinHandle, Mesh, sleep};
+use rt::{Instant, JoinHandle, Mesh, Runtime, sleep, spawn};
 
 const CORES: u16 = 4;
 const SHARDS: u32 = 8;
@@ -426,4 +426,36 @@ fn gcra_gives_the_whole_burst_after_idle() {
     let mut gcra = Gcra::default();
     assert_eq!(gcra.grant(wide, 1_000, start).count, RATE / 10);
     assert_eq!(gcra.grant(wide, 1_000, start).count, RATE / 10);
+}
+
+#[test]
+fn waits_as_long_as_asked() {
+    let sim = Rc::new(SimDriver::new(3, Config::default()));
+    Runtime::new(sim).block_on(async {
+        let mesh = Mesh::<Ask<u32>>::new(1);
+        let ends = mesh.take(0).expect("ends");
+        let (leases, done) = Leases::start(ends, |_| 0, |t| limits(*t));
+        let mut held = Vec::new();
+        for _ in 0..LIMIT {
+            held.push(leases.take(&QUEUED).await.expect("slot"));
+        }
+        assert!(matches!(leases.take(&QUEUED).await, Err(Error::Busy)));
+        let freer = leases.clone();
+        let freeing = spawn(async move {
+            sleep(Duration::from_secs(1)).await;
+            freer.free(&QUEUED, 1);
+        });
+        let start = rt::now();
+        let taken = leases
+            .take_within(&QUEUED, Duration::from_secs(2))
+            .await
+            .expect("slot after the wait");
+        assert!(taken.slot);
+        let waited = rt::now().saturating_duration_since(start);
+        assert!(waited >= Duration::from_secs(1), "{waited:?}");
+        assert!(waited < Duration::from_secs(2), "{waited:?}");
+        freeing.await;
+        leases.close();
+        done.await;
+    });
 }

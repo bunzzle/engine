@@ -1,0 +1,170 @@
+use std::cell::RefCell;
+use std::collections::BTreeMap;
+use std::net::IpAddr;
+use std::rc::Rc;
+use std::time::Duration;
+
+use control::{Ask, Leases, Limits, siphash};
+use dns::Name;
+use rt::{Ends, JoinHandle, sleep, spawn};
+use smtp::client::Capabilities;
+
+use crate::conn::Conn;
+
+pub type Remote = (IpAddr, Box<str>);
+
+pub fn limits(
+    ends: Ends<Ask<Remote>>,
+    connections: u32,
+    key: [u8; 16],
+) -> (Leases<Remote>, JoinHandle<()>) {
+    let cores = ends.cores();
+    Leases::start(
+        ends,
+        move |remote| owner(&key, remote, cores),
+        move |_| {
+            Some(Limits {
+                rate: 0,
+                burst: 0,
+                connections,
+                queued: u64::from(connections),
+            })
+        },
+    )
+}
+
+fn owner(key: &[u8; 16], (ip, domain): &Remote, cores: u16) -> u16 {
+    let mut data = match ip {
+        IpAddr::V4(v4) => v4.octets().to_vec(),
+        IpAddr::V6(v6) => v6.octets().to_vec(),
+    };
+    data.extend_from_slice(domain.as_bytes());
+    u16::try_from(siphash(key, &data) % u64::from(cores.max(1))).unwrap_or(0)
+}
+
+pub(crate) struct Slot {
+    leases: Leases<Remote>,
+    remote: Remote,
+}
+
+impl Slot {
+    pub(crate) fn new(leases: Leases<Remote>, remote: Remote) -> Self {
+        Self { leases, remote }
+    }
+}
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        self.leases.free(&self.remote, 1);
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct Key {
+    pub(crate) egress: IpAddr,
+    pub(crate) domain: Box<str>,
+    pub(crate) host: Name,
+    pub(crate) remote: IpAddr,
+}
+
+pub(crate) struct Link {
+    pub(crate) conn: Conn,
+    pub(crate) caps: Capabilities,
+    pub(crate) used: u32,
+    pub(crate) _slot: Option<Slot>,
+}
+
+#[derive(Default)]
+struct Parked {
+    links: BTreeMap<Key, Vec<(u64, Link)>>,
+    count: usize,
+    next: u64,
+}
+
+impl Parked {
+    fn remove(&mut self, key: &Key, id: u64) -> Option<Link> {
+        let list = self.links.get_mut(key)?;
+        let at = list.iter().position(|(n, _)| *n == id)?;
+        let (_, link) = list.remove(at);
+        if list.is_empty() {
+            self.links.remove(key);
+        }
+        self.count -= 1;
+        Some(link)
+    }
+}
+
+pub(crate) struct Pool {
+    parked: Rc<RefCell<Parked>>,
+    idle: Duration,
+    most: usize,
+}
+
+impl Pool {
+    pub(crate) fn new(idle: Duration, most: usize) -> Self {
+        Self {
+            parked: Rc::default(),
+            idle,
+            most,
+        }
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.parked.borrow().count
+    }
+
+    pub(crate) fn take(&self, key: &Key) -> Option<Link> {
+        let mut parked = self.parked.borrow_mut();
+        let id = parked.links.get(key)?.last()?.0;
+        parked.remove(key, id)
+    }
+
+    pub(crate) fn egress(&self, domain: &str, allowed: &[(IpAddr, u16)]) -> Option<IpAddr> {
+        self.parked
+            .borrow()
+            .links
+            .keys()
+            .find(|key| {
+                &*key.domain == domain
+                    && allowed
+                        .iter()
+                        .any(|(ip, weight)| *weight > 0 && *ip == key.egress)
+            })
+            .map(|key| key.egress)
+    }
+
+    pub(crate) async fn park(&self, key: Key, link: Link) {
+        let id = {
+            let mut parked = self.parked.borrow_mut();
+            if parked.count >= self.most {
+                None
+            } else {
+                let id = parked.next;
+                parked.next += 1;
+                parked.count += 1;
+                Some(id)
+            }
+        };
+        let Some(id) = id else {
+            link.conn.quit().await;
+            return;
+        };
+        self.parked
+            .borrow_mut()
+            .links
+            .entry(key.clone())
+            .or_default()
+            .push((id, link));
+        let parked = Rc::downgrade(&self.parked);
+        let idle = self.idle;
+        drop(spawn(async move {
+            sleep(idle).await;
+            let link = parked
+                .upgrade()
+                .and_then(|parked| parked.borrow_mut().remove(&key, id));
+            if let Some(link) = link {
+                link.conn.quit().await;
+            }
+        }));
+    }
+}

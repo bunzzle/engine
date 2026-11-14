@@ -6,14 +6,16 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use common::{Script, Seen, Zone, serve};
-use deliver::{Deliver, EightBit, Message, Outcome, Settings};
+use control::Leases;
+use deliver::{Deliver, EightBit, Message, Outcome, Remote, Settings, limits};
 use dns::{Found, Name, Record, Type};
 use rt::sim::{Config, SimDriver};
-use rt::{Runtime, now};
+use rt::{Mesh, Runtime, now, sleep, spawn};
 use sched::{Answer, Body, Destination, Envelope, Kind, Recipient, Required};
 use tls::{Connector, simulated};
 
 const EGRESS: IpAddr = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+const EGRESS2: IpAddr = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2));
 const MX1: IpAddr = IpAddr::V4(Ipv4Addr::new(10, 0, 1, 1));
 const MX2: IpAddr = IpAddr::V4(Ipv4Addr::new(10, 0, 1, 2));
 const HEADER: &[u8] = b"Received: from a\r\nSubject: hi\r\n";
@@ -60,8 +62,12 @@ fn zone() -> Zone {
 }
 
 fn deliverer(zone: Zone, settings: Settings) -> Deliver<Zone> {
+    limited(zone, settings, None)
+}
+
+fn limited(zone: Zone, settings: Settings, leases: Option<Leases<Remote>>) -> Deliver<Zone> {
     let connector = Connector::new(simulated(2), None).expect("connector");
-    Deliver::new(zone, connector, settings, 9).expect("deliver")
+    Deliver::new(zone, connector, settings, leases, 9).expect("deliver")
 }
 
 fn settings() -> Settings {
@@ -167,7 +173,6 @@ fn delivers_with_pipelining() {
             "RCPT TO:<a@example.com>",
             "RCPT TO:<b@example.com>",
             "DATA",
-            "QUIT",
         ]
     );
     assert_eq!(
@@ -609,4 +614,155 @@ fn no_egress_defers_without_lookups() {
     });
     assert_eq!(answers(&outcomes), [TEMPORARY]);
     assert!(asked.borrow().is_empty());
+}
+
+#[test]
+fn reuses_an_idle_connection() {
+    let (seen, pooled) = run(async {
+        let seen = serve(MX1, Script::new(&["PIPELINING"]));
+        let deliver = deliverer(zone(), settings());
+        for _ in 0..2 {
+            let outcomes = simple(&deliver, "example.com").await;
+            assert_eq!(answers(&outcomes), [Answer::Delivered]);
+        }
+        assert_eq!(deliver.pooled(), 1);
+        sleep(Duration::from_secs(6)).await;
+        (seen, deliver.pooled())
+    });
+    assert_eq!(pooled, 0);
+    assert_eq!(seen.borrow().connections, 1);
+    let commands = commands(&seen);
+    assert_eq!(commands.iter().filter(|c| *c == "RSET").count(), 1);
+    assert_eq!(commands.last().map(String::as_str), Some("QUIT"));
+}
+
+#[test]
+fn retires_a_connection_after_its_transactions() {
+    let seen = run(async {
+        let seen = serve(MX1, Script::new(&[]));
+        let mut settings = settings();
+        settings.reuse = 2;
+        let deliver = deliverer(zone(), settings);
+        for _ in 0..3 {
+            let outcomes = simple(&deliver, "example.com").await;
+            assert_eq!(answers(&outcomes), [Answer::Delivered]);
+        }
+        seen
+    });
+    assert_eq!(seen.borrow().connections, 2);
+}
+
+#[test]
+fn skips_a_dead_host_for_a_while() {
+    let (skipped, later, second) = run(async {
+        let second = serve(MX2, Script::new(&[]));
+        let mut settings = settings();
+        settings.pooled = 0;
+        let deliver = deliverer(zone(), settings);
+        let outcomes = simple(&deliver, "example.com").await;
+        assert_eq!(answers(&outcomes), [Answer::Delivered]);
+        assert_eq!(deliver.dead_hosts(), 1);
+        let first = serve(MX1, Script::new(&[]));
+        let outcomes = simple(&deliver, "example.com").await;
+        assert_eq!(answers(&outcomes), [Answer::Delivered]);
+        let skipped = first.borrow().connections;
+        sleep(Duration::from_secs(61)).await;
+        let outcomes = simple(&deliver, "example.com").await;
+        assert_eq!(answers(&outcomes), [Answer::Delivered]);
+        let later = first.borrow().connections;
+        (skipped, later, second.borrow().connections)
+    });
+    assert_eq!((skipped, later, second), (0, 1, 2));
+}
+
+#[test]
+fn waits_for_a_free_connection() {
+    let (busy, waited, freed) = run(async {
+        let script = Script::new(&["PIPELINING"]);
+        script.stalls.set(1);
+        serve(MX1, script);
+        let mesh = Mesh::new(1);
+        let (leases, _done) = limits(mesh.take(0).expect("ends"), 1, [7; 16]);
+        let mut settings = settings();
+        settings.deadline = Duration::from_secs(20);
+        settings.wait = Duration::from_secs(1);
+        let deliver = Rc::new(limited(zone(), settings, Some(leases)));
+        let stuck = Rc::clone(&deliver);
+        let first = spawn(async move { simple(&stuck, "example.com").await });
+        sleep(Duration::from_millis(100)).await;
+        let start = now();
+        let busy = simple(&deliver, "example.com").await;
+        let waited = now().saturating_duration_since(start);
+        assert_eq!(answers(&first.await), [TEMPORARY]);
+        let freed = simple(&deliver, "example.com").await;
+        (busy, waited, freed)
+    });
+    assert_eq!(answers(&busy), [Answer::Later(1000)]);
+    assert_eq!(reply(&busy[0]), "451 4.4.5 Connection limit reached");
+    assert!(waited >= Duration::from_secs(1), "{waited:?}");
+    assert!(waited < Duration::from_secs(2), "{waited:?}");
+    assert_eq!(answers(&freed), [Answer::Delivered]);
+}
+
+#[test]
+fn keeps_the_egress_of_a_pooled_connection() {
+    let seen = run(async {
+        let seen = serve(MX1, Script::new(&[]));
+        let deliver = deliverer(zone(), settings());
+        let mut destination = destination("example.com");
+        destination.egress.push((EGRESS2, 1));
+        for _ in 0..3 {
+            let outcomes = send(
+                &deliver,
+                &envelope(),
+                &destination,
+                &["a@example.com"],
+                b"hello\r\n",
+            )
+            .await;
+            assert_eq!(answers(&outcomes), [Answer::Delivered]);
+        }
+        seen
+    });
+    assert_eq!(seen.borrow().connections, 1);
+}
+
+#[test]
+fn closes_after_421() {
+    let seen = run(async {
+        let mut script = Script::new(&[]);
+        script.rcpt = Rc::new(|address| {
+            if address.starts_with("busy@") {
+                "421 4.7.0 too busy".to_owned()
+            } else {
+                "250 2.1.5 ok".to_owned()
+            }
+        });
+        let seen = serve(MX1, script);
+        let deliver = deliverer(zone(), settings());
+        let outcomes = send(
+            &deliver,
+            &envelope(),
+            &destination("example.com"),
+            &["busy@example.com"],
+            b"hello\r\n",
+        )
+        .await;
+        assert_eq!(answers(&outcomes), [Answer::Deferred(Kind::Throttled)]);
+        let outcomes = send(
+            &deliver,
+            &envelope(),
+            &destination("example.com"),
+            &["busy@example.com", "ok@example.com"],
+            b"hello\r\n",
+        )
+        .await;
+        assert_eq!(
+            answers(&outcomes),
+            [Answer::Deferred(Kind::Throttled), Answer::Delivered]
+        );
+        assert_eq!(deliver.pooled(), 0);
+        seen
+    });
+    assert_eq!(seen.borrow().connections, 2);
 }

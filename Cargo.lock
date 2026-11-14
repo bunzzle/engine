@@ -89,6 +89,7 @@ dependencies = [
 name = "deliver"
 version = "0.0.0"
 dependencies = [
+ "control",
  "dkim",
  "dns",
  "rt",
