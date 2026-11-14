@@ -1,6 +1,6 @@
 #![cfg(any(target_os = "macos", target_os = "linux"))]
 
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::Duration;
@@ -212,6 +212,47 @@ fn tcp_echo() {
         server.await;
         assert_eq!(echoed, message);
     });
+}
+
+#[test]
+fn a_connect_from_a_local_address_uses_it_as_source() {
+    let source = if cfg!(target_os = "linux") {
+        IpAddr::from([127, 0, 0, 2])
+    } else {
+        IpAddr::from(Ipv4Addr::LOCALHOST)
+    };
+    let (seen, local) = run(async move {
+        let listener = TcpListener::bind(local(), 16).await.expect("bind");
+        let addr = listener.local_addr().await.expect("addr");
+        let server = spawn(async move { listener.accept().await.expect("accept").1 });
+        let client = TcpStream::connect_from(source, addr)
+            .await
+            .expect("connect");
+        let local = client.local_addr().await.expect("local");
+        (server.await, local)
+    });
+    assert_eq!(seen.ip(), source);
+    assert_eq!(local.ip(), source);
+    assert_ne!(local.port(), 0);
+}
+
+#[test]
+fn a_connect_from_a_foreign_or_mismatched_address_fails() {
+    let (foreign, mismatched) = run(async {
+        let listener = TcpListener::bind(local(), 16).await.expect("bind");
+        let addr = listener.local_addr().await.expect("addr");
+        let foreign = TcpStream::connect_from(IpAddr::from([192, 0, 2, 1]), addr).await;
+        let mismatched = TcpStream::connect_from(IpAddr::from(Ipv6Addr::LOCALHOST), addr).await;
+        (foreign.map(drop), mismatched.map(drop))
+    });
+    assert_eq!(
+        foreign.expect_err("foreign").kind(),
+        io::ErrorKind::AddrNotAvailable
+    );
+    assert_eq!(
+        mismatched.expect_err("mismatched").kind(),
+        io::ErrorKind::InvalidInput
+    );
 }
 
 #[test]

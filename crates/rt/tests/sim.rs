@@ -351,6 +351,29 @@ fn tcp_echo_between_tasks() {
 }
 
 #[test]
+fn a_connect_from_a_local_address_uses_it_as_source() {
+    let source = IpAddr::from([10, 0, 0, 9]);
+    let driver = Rc::new(SimDriver::new(3, Config::default()));
+    let (seen, local, mismatched) = run(&driver, async move {
+        let listener = TcpListener::bind(addr(25), 16).await.expect("bind");
+        let server = spawn(async move { listener.accept().await.expect("accept").1 });
+        let client = TcpStream::connect_from(source, addr(25))
+            .await
+            .expect("connect");
+        let local = client.local_addr().await.expect("local");
+        let v6 = IpAddr::from([0xfd00, 0, 0, 0, 0, 0, 0, 9]);
+        let mismatched = TcpStream::connect_from(v6, addr(25)).await.map(drop);
+        (server.await, local, mismatched)
+    });
+    assert_eq!(seen.ip(), source);
+    assert_eq!(local, seen);
+    assert_eq!(
+        mismatched.expect_err("mismatched").kind(),
+        std::io::ErrorKind::InvalidInput
+    );
+}
+
+#[test]
 fn closed_streams_read_end_of_file() {
     let driver = Rc::new(SimDriver::new(12, Config::default()));
     let n = run(&driver, async {

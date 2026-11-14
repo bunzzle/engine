@@ -377,9 +377,11 @@ impl State {
                     )),
                 }
             }
-            Op::Connect { addr } => {
-                self.connect(poller, sys::net::connect(addr).map(Resource::Stream), false)
-            }
+            Op::Connect { addr, from } => self.connect(
+                poller,
+                sys::net::connect(addr, from).map(Resource::Stream),
+                false,
+            ),
             Op::Recv { handle, mut buf } => {
                 buf.clear();
                 let result = self.stream(handle).and_then(|s| s.read(buf.spare_mut()));

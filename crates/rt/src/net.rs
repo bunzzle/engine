@@ -1,5 +1,5 @@
 use std::io;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
 use std::rc::Rc;
 
@@ -159,7 +159,16 @@ pub struct TcpStream {
 
 impl TcpStream {
     pub async fn connect(addr: SocketAddr) -> io::Result<Self> {
-        let socket = Socket::create(Op::Connect { addr }).await?;
+        let socket = Socket::create(Op::Connect { addr, from: None }).await?;
+        Ok(Self { socket })
+    }
+
+    pub async fn connect_from(from: IpAddr, addr: SocketAddr) -> io::Result<Self> {
+        if from.is_ipv4() != addr.is_ipv4() {
+            return Err(io::ErrorKind::InvalidInput.into());
+        }
+        let from = Some(from);
+        let socket = Socket::create(Op::Connect { addr, from }).await?;
         Ok(Self { socket })
     }
 

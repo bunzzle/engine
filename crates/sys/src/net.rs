@@ -1,6 +1,6 @@
 use std::io;
 use std::mem::{offset_of, size_of};
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
 use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::net::UnixStream;
@@ -112,10 +112,13 @@ pub fn listen(addr: SocketAddr, backlog: u32, shared: bool) -> io::Result<TcpLis
 }
 
 #[allow(unsafe_code)]
-pub fn connect(addr: SocketAddr) -> io::Result<TcpStream> {
+pub fn connect(addr: SocketAddr, from: Option<IpAddr>) -> io::Result<TcpStream> {
     let raw = Raw::new(&addr);
     let stream = TcpStream::from(stream_socket(raw.domain())?);
     stream.set_nonblocking(true)?;
+    if let Some(ip) = from {
+        bind_local(&stream, ip)?;
+    }
     let (ptr, len) = raw.as_ptr();
     // SAFETY: `ptr` points to a socket address of `len` bytes owned by `raw`.
     match check(unsafe { libc::connect(stream.as_raw_fd(), ptr, len) }) {
@@ -123,6 +126,30 @@ pub fn connect(addr: SocketAddr) -> io::Result<TcpStream> {
         Err(e) if e.raw_os_error() == Some(libc::EINPROGRESS) => Ok(stream),
         Err(e) => Err(e),
     }
+}
+
+#[allow(unsafe_code)]
+fn bind_local(stream: &TcpStream, ip: IpAddr) -> io::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        let on: libc::c_int = 1;
+        let len = libc::socklen_t::try_from(size_of::<libc::c_int>()).expect("fits");
+        // SAFETY: the descriptor is open, and `on` lives for the call with the given length.
+        check(unsafe {
+            libc::setsockopt(
+                stream.as_raw_fd(),
+                libc::IPPROTO_IP,
+                libc::IP_BIND_ADDRESS_NO_PORT,
+                std::ptr::from_ref(&on).cast(),
+                len,
+            )
+        })?;
+    }
+    let local = Raw::new(&SocketAddr::new(ip, 0));
+    let (ptr, len) = local.as_ptr();
+    // SAFETY: `ptr` points to a socket address of `len` bytes owned by `local`.
+    check(unsafe { libc::bind(stream.as_raw_fd(), ptr, len) })?;
+    Ok(())
 }
 
 pub fn transient(error: &io::Error) -> bool {

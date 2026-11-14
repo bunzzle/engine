@@ -359,7 +359,7 @@ impl State {
                     None => Err(Op::Accept { handle }),
                 }
             }
-            Op::Connect { addr } => self.connect(addr),
+            Op::Connect { addr, from } => self.connect(addr, from),
             Op::Recv { handle, buf } => Ok(self.recv(handle, buf)?),
             Op::Send { handle, buf } => Ok(self.send(handle, buf)),
             Op::Shutdown { handle } => {
@@ -410,9 +410,9 @@ impl State {
         }
     }
 
-    fn connect(&mut self, addr: SocketAddr) -> Result<Completion, Op> {
+    fn connect(&mut self, addr: SocketAddr, from: Option<IpAddr>) -> Result<Completion, Op> {
         if !self.net.reachable(addr) {
-            return Err(Op::Connect { addr });
+            return Err(Op::Connect { addr, from });
         }
         let listeners = self.net.listeners_at(addr);
         let listener = match listeners.len() {
@@ -424,7 +424,7 @@ impl State {
             1 => listeners[0],
             n => listeners[self.rng.index(n)],
         };
-        let client = self.net.connect(listener, addr);
+        let client = self.net.connect(listener, addr, from);
         Ok(Completion::Handle(Ok(self.add(Resource::Socket(client)))))
     }
 

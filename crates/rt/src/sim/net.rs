@@ -66,10 +66,8 @@ impl Net {
 
     pub(super) fn in_use(&self, addr: SocketAddr) -> bool {
         self.sockets.values().any(|socket| match socket {
-            Socket::Listener { addr: bound, .. } | Socket::Udp { addr: bound, .. } => {
-                *bound == addr
-            }
-            Socket::Stream { .. } | Socket::UnixListener { .. } => false,
+            Socket::Udp { addr: bound, .. } => *bound == addr,
+            Socket::Listener { .. } | Socket::Stream { .. } | Socket::UnixListener { .. } => false,
         })
     }
 
@@ -87,8 +85,7 @@ impl Net {
                 shared: other,
                 ..
             } => *bound != addr || (shared && *other),
-            Socket::Udp { addr: bound, .. } => *bound != addr,
-            Socket::Stream { .. } | Socket::UnixListener { .. } => true,
+            Socket::Udp { .. } | Socket::Stream { .. } | Socket::UnixListener { .. } => true,
         })
     }
 
@@ -145,8 +142,8 @@ impl Net {
         (client, server)
     }
 
-    pub(super) fn connect(&mut self, listener: u64, addr: SocketAddr) -> u64 {
-        let client_addr = self.bind_addr(SocketAddr::new(addr.ip(), 0));
+    pub(super) fn connect(&mut self, listener: u64, addr: SocketAddr, from: Option<IpAddr>) -> u64 {
+        let client_addr = self.bind_addr(SocketAddr::new(from.unwrap_or(addr.ip()), 0));
         let (client, server) = self.pair(Some(client_addr), Some(addr));
         if let Some(Socket::Listener { backlog, .. }) = self.sockets.get_mut(&listener) {
             backlog.push_back((server, client_addr));
