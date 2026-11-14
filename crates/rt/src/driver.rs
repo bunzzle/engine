@@ -1,5 +1,5 @@
 use std::io;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::task::Waker;
@@ -73,6 +73,7 @@ pub enum Op {
     },
     Connect {
         addr: SocketAddr,
+        from: Option<IpAddr>,
     },
     Recv {
         handle: Handle,
