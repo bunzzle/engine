@@ -42,6 +42,7 @@ fn config(id: u32) -> Config {
          [keys]\nsocket = \"{SOCKET}\"\nserver = {UID}\n\
          [tls]\nchain = \"/etc/a.pem\"\nkey = \"/etc/a.key\"\n\
          [intake]\ndrain = \"2s\"\n\
+         [dns]\nservers = [\"127.0.0.1\"]\n\
          [[listen]]\naddress = \"{SMTP}\"\n"
     );
     parse(&text).expect("config")

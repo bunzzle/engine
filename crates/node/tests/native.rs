@@ -91,6 +91,7 @@ fn node_config(dir: &Path, address: SocketAddr) -> PathBuf {
          [keys]\nsocket = \"{}\"\nserver = {uid}\n\
          [tls]\nchain = \"{}\"\nkey = \"{}\"\n\
          [intake]\ndrain = \"1s\"\n\
+         [dns]\nservers = [\"127.0.0.1\"]\n\
          [[listen]]\naddress = \"{address}\"\n",
         store.display(),
         socket.display(),
@@ -122,7 +123,7 @@ fn serve_boots_on_threads_and_stops_on_sigterm() {
         raise(Signal::Terminate).expect("raise");
         banner
     });
-    node::serve(&config, |_| Idle).expect("serve");
+    node::deliver(&config).expect("serve");
     let banner = client.join().expect("client");
     assert!(banner.starts_with("220 mx1.example.net"), "{banner}");
     assert!(TcpStream::connect(address).is_err());
@@ -136,7 +137,7 @@ fn a_core_failing_to_start_exits_the_process_with_status_one() {
         let dir = scratch();
         let held = std::net::TcpListener::bind("127.0.0.1:0").expect("hold");
         let config = node_config(&dir, held.local_addr().expect("address"));
-        let ended = node::serve(&config, |_| Idle);
+        let ended = node::serve(&config, |_| Ok(Idle));
         panic!("serve returned {ended:?}");
     }
     let child = Command::new(std::env::current_exe().expect("test binary"))
