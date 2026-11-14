@@ -50,9 +50,9 @@ impl Resource {
     }
 
     fn connected(&self) -> io::Result<bool> {
-        let (error, peer) = match self {
-            Self::Stream(s) => (s.take_error(), s.peer_addr().map(drop)),
-            Self::UnixStream(s) => (s.take_error(), s.peer_addr().map(drop)),
+        let (peer, error) = match self {
+            Self::Stream(s) => (s.peer_addr().map(drop), s.take_error()),
+            Self::UnixStream(s) => (s.peer_addr().map(drop), s.take_error()),
             _ => return Err(bad_handle()),
         };
         if let Some(e) = error? {
