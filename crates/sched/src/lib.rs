@@ -45,5 +45,5 @@ pub use suppress::{
     Ask, Hash, Inputs, KIND_SUPPRESS, Listed, Page, Reason, SEAL_SUPPRESS, SHAPE, Suppression,
     Suppressions, keyed_hash, retain,
 };
-pub use transport::{Answered, Attempt, Claimed, Transport};
+pub use transport::{Answered, Attempt, Claimed, Destination, Transport};
 pub use unopened::{Action, DROPS_PER_MINUTE, UnopenedStats, action};

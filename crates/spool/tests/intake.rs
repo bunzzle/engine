@@ -184,7 +184,12 @@ async fn draft(intake: &Spool, shard: u16, step: u64) -> Result<(Message, Accept
 }
 
 async fn read_back(intake: &Spool, expected: &Accepted, model: &Shared) -> bool {
-    let Ok(stored) = intake.stored(expected.id).await else {
+    let total = expected.head.clear.recipients;
+    let wanted: Vec<u32> = (0..total)
+        .step_by(911)
+        .chain(total.checked_sub(1))
+        .collect();
+    let Ok(stored) = intake.stored(expected.id, &wanted).await else {
         return false;
     };
     assert_eq!(stored.tenant, expected.tenant);
@@ -199,6 +204,16 @@ async fn read_back(intake: &Spool, expected: &Accepted, model: &Shared) -> bool 
     };
     assert_eq!(opened.wrap, expected.head.wrap);
     assert_eq!(opened.head, expected.head.sealed);
+    let mut numbers: Vec<u32> = wanted.iter().map(|r| r / SLICE).collect();
+    numbers.dedup();
+    let slices: Vec<(u32, Vec<u8>)> = numbers
+        .into_iter()
+        .map(|n| {
+            let slice = &expected.slices[usize::try_from(n).expect("fits")];
+            (n, slice.sealed.clone())
+        })
+        .collect();
+    assert_eq!(opened.slices, slices);
     let found = match opened.body {
         Source::Inline(sealed) => Expected::Inline(sealed),
         Source::Chain(mut chunks) => {

@@ -1,3 +1,5 @@
+use std::net::IpAddr;
+
 use spool::{MessageId, Stamp};
 
 use crate::lanes::QueueId;
@@ -13,10 +15,18 @@ pub struct Claimed {
     pub stamp: Stamp,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Destination {
+    pub domain: Box<str>,
+    pub pool: u32,
+    pub egress: Vec<(IpAddr, u16)>,
+}
+
 pub struct Attempt {
     pub queue: QueueId,
     pub tenant: u32,
     pub message: MessageId,
+    pub destination: Destination,
     pub recipients: Vec<Claimed>,
     pub outgoing: Outgoing,
 }

@@ -907,6 +907,11 @@ impl Tenancy for Queues {
         let queue = owned.queues.get(&queue)?;
         Some((queue.name.tenant, queue.name.generation))
     }
+
+    fn name(&self, queue: u32) -> Option<Name> {
+        let owned = self.inner.owned.borrow();
+        owned.queues.get(&queue).map(|q| q.name.clone())
+    }
 }
 
 fn open(clear: &[u8], hidden: &[u8], keys: &TenantKeys) -> Option<Queue> {

@@ -4,10 +4,10 @@ use std::rc::Rc;
 
 use control::Table;
 use crypto::{Opener as ChunkOpener, Wrap};
-use spool::{Chunks, MessageId, Opened, Pinned, Source, Stored};
+use spool::{Chunks, MessageId, Opened, Pinned, SLICE, Source, Stored};
 
 use crate::dkim::{sign, signer};
-use crate::envelope::Envelope;
+use crate::envelope::{Envelope, Recipient, decode_slice};
 use crate::error::Refusal;
 use crate::policy::Answer;
 use crate::sealing::{Keys, Opener, Unsealable, opener};
@@ -17,6 +17,7 @@ pub const SIGNED_KEPT: usize = 65_536;
 pub const KEYS_WAIT: u64 = 30_000;
 const SIGNER_GONE: &[u8] = b"550 5.7.1 Signing key removed";
 const UNSIGNABLE: &[u8] = b"554 5.3.0 Stored message cannot be signed";
+const UNREADABLE: &[u8] = b"554 5.3.0 Stored recipients cannot be read";
 
 pub enum Body {
     Inline(Vec<u8>),
@@ -54,6 +55,7 @@ impl Plain {
 
 pub struct Prepared {
     pub envelope: Envelope,
+    pub recipients: Vec<(u32, Recipient)>,
     header: Vec<u8>,
     pub body: Body,
     pub opener: Opener,
@@ -75,6 +77,7 @@ pub enum Fault {
     Keys,
     Signer(Opener),
     Format(Opener),
+    Recipients(Opener),
 }
 
 impl Fault {
@@ -95,6 +98,7 @@ impl Fault {
             Self::Keys => (Answer::Later(KEYS_WAIT), None),
             Self::Signer(opener) => (Answer::Failed, Some((opener, SIGNER_GONE))),
             Self::Format(opener) => (Answer::Failed, Some((opener, UNSIGNABLE))),
+            Self::Recipients(opener) => (Answer::Failed, Some((opener, UNREADABLE))),
         };
         claimed
             .iter()
@@ -139,14 +143,21 @@ pub struct Outgoing {
     pub stored: Stored,
     opened: Opened,
     signing: Option<Rc<Signing>>,
+    wanted: Vec<u32>,
 }
 
 impl Outgoing {
-    pub(crate) fn new(stored: Stored, opened: Opened, signing: Option<Rc<Signing>>) -> Self {
+    pub(crate) fn new(
+        stored: Stored,
+        opened: Opened,
+        signing: Option<Rc<Signing>>,
+        wanted: Vec<u32>,
+    ) -> Self {
         Self {
             stored,
             opened,
             signing,
+            wanted,
         }
     }
 
@@ -154,7 +165,7 @@ impl Outgoing {
         let Some(signing) = self.signing else {
             return Err(Fault::Keys);
         };
-        let prepared = prepare(&signing, &self.stored, self.opened).await;
+        let prepared = prepare(&signing, &self.stored, self.opened, &self.wanted).await;
         if matches!(prepared, Err(Fault::Format(_))) {
             signing.unsigned.set(signing.unsigned.get() + 1);
         }
@@ -190,7 +201,12 @@ impl Cache {
     }
 }
 
-async fn prepare(signing: &Signing, stored: &Stored, read: Opened) -> Result<Prepared, Fault> {
+async fn prepare(
+    signing: &Signing,
+    stored: &Stored,
+    read: Opened,
+    wanted: &[u32],
+) -> Result<Prepared, Fault> {
     let (keys, table, cache) = (&*signing.keys, &*signing.table, &signing.cache);
     let unopened = |fault, generation| Fault::Unopened {
         fault,
@@ -215,6 +231,11 @@ async fn prepare(signing: &Signing, stored: &Stored, read: Opened) -> Result<Pre
         .map_err(|fault| unopened(fault, generation))?;
     let Some((envelope, fields)) = check(&envelope, &section) else {
         return Err(Fault::Format(opener));
+    };
+    let recipients = match open_recipients(&opener, &read.slices, stored.clear.recipients, wanted) {
+        Ok(recipients) => recipients,
+        Err(Some(fault)) => return Err(unopened(fault, generation)),
+        Err(None) => return Err(Fault::Recipients(opener)),
     };
     let count = envelope.signatures.len();
     let cached = cache.borrow().get(stored.id);
@@ -270,11 +291,40 @@ async fn prepare(signing: &Signing, stored: &Stored, read: Opened) -> Result<Pre
     };
     Ok(Prepared {
         envelope,
+        recipients,
         header,
         body,
         opener,
         _pins: read.pins,
     })
+}
+
+fn open_recipients(
+    opener: &Opener,
+    sealed: &[(u32, Vec<u8>)],
+    total: u32,
+    wanted: &[u32],
+) -> Result<Vec<(u32, Recipient)>, Option<Unsealable>> {
+    let mut slices = BTreeMap::new();
+    for (n, sealed) in sealed {
+        let plain = opener.slice(*n, sealed).map_err(Some)?;
+        let size = total.saturating_sub(n.saturating_mul(SLICE)).min(SLICE);
+        let list = decode_slice(&plain).ok_or(None)?;
+        if list.len() != usize::try_from(size).map_err(|_| None)? {
+            return Err(None);
+        }
+        slices.insert(*n, list);
+    }
+    wanted
+        .iter()
+        .map(|&r| {
+            let list = slices.get(&(r / SLICE)).ok_or(None)?;
+            let at = usize::try_from(r % SLICE).map_err(|_| None)?;
+            list.get(at)
+                .map(|recipient| (r, recipient.clone()))
+                .ok_or(None)
+        })
+        .collect()
 }
 
 fn check<'a>(envelope: &[u8], section: &'a [u8]) -> Option<(Envelope, Vec<dkim::Field<'a>>)> {

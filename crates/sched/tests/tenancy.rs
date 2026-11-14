@@ -1,7 +1,7 @@
 use std::rc::Rc;
 use std::sync::Arc;
 
-use control::Tenancy;
+use control::{Name, Tenancy};
 use rt::sim::{Config, SimDriver};
 use rt::{Mesh, Runtime, spawn, yield_now};
 use sched::{Answered, Arrival, Attempt, Clock, Note, Sched, Transport};
@@ -29,6 +29,15 @@ struct Held;
 impl Tenancy for Held {
     fn holder(&self, queue: u32) -> Option<(u32, u32)> {
         (queue == 10).then_some((1, 4))
+    }
+
+    fn name(&self, queue: u32) -> Option<Name> {
+        (queue == 10).then(|| Name {
+            tenant: 1,
+            domain: "example.org".into(),
+            generation: 4,
+            pool: 0,
+        })
     }
 }
 
