@@ -19,8 +19,16 @@ pub struct Config {
     pub session: intake::Config,
     pub limits: intake::Limits,
     pub listen: Vec<Listen>,
+    pub api: Option<Api>,
     pub dns: dns::Settings,
     pub delivery: Delivery,
+}
+
+#[derive(Clone, Debug)]
+pub struct Api {
+    pub settings: api::Config,
+    pub listen: Vec<SocketAddr>,
+    pub plain: Vec<SocketAddr>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -81,6 +89,10 @@ pub fn parse(text: &str) -> Result<Config, Error> {
         guard(table, &mut limits)?;
     }
     let listen = listen(root.tables("listen"))?;
+    let api = match root.table("api") {
+        Some(table) => Some(http(table, name.str()?, session.lifetime, &listen)?),
+        None => None,
+    };
     let dns = dns(section(&mut root, "dns")?)?;
     let mut delivery = Delivery {
         settings: deliver::Settings::new(name.str()?),
@@ -100,6 +112,7 @@ pub fn parse(text: &str) -> Result<Config, Error> {
         session,
         limits,
         listen,
+        api,
         dns,
         delivery,
     })
@@ -274,6 +287,64 @@ fn listen(tables: Vec<Table>) -> Result<Vec<Listen>, Error> {
         listen.push(Listen { address, implicit });
     }
     Ok(listen)
+}
+
+fn http(mut table: Table, name: &str, lifetime: u64, smtp: &[Listen]) -> Result<Api, Error> {
+    let mut settings = api::Config::new(name.to_owned());
+    settings.lifetime = lifetime;
+    let mut taken: Vec<SocketAddr> = smtp.iter().map(|l| l.address).collect();
+    let listen = addresses(&mut table, "listen", &mut taken, false)?;
+    let plain = addresses(&mut table, "plain", &mut taken, true)?;
+    if listen.is_empty() && plain.is_empty() {
+        return Err(Error::at(1, 1, "[api] needs `listen` or `plain`"));
+    }
+    if let Some(entry) = table.take("max_body") {
+        let value = entry.size()?;
+        if !(1024..=1 << 34).contains(&value) {
+            return Err(entry.error("must be between 1024 and 17179869184 bytes"));
+        }
+        settings.max_body = Some(value);
+    }
+    let limits = &mut settings.limits;
+    limits.requests = number(&mut table, "requests", 1, 1_000_000, limits.requests)?;
+    let t = &mut settings.timeouts;
+    t.handshake = duration(&mut table, "handshake", t.handshake)?;
+    t.head = duration(&mut table, "head", t.head)?;
+    t.body = duration(&mut table, "body", t.body)?;
+    t.idle = duration(&mut table, "idle", t.idle)?;
+    settings.drain = duration(&mut table, "drain", settings.drain)?;
+    table.finish()?;
+    Ok(Api {
+        settings,
+        listen,
+        plain,
+    })
+}
+
+fn addresses(
+    table: &mut Table,
+    key: &str,
+    taken: &mut Vec<SocketAddr>,
+    loopback: bool,
+) -> Result<Vec<SocketAddr>, Error> {
+    let Some(entry) = table.take(key) else {
+        return Ok(Vec::new());
+    };
+    let mut out = Vec::new();
+    for text in entry.strs()? {
+        let address: SocketAddr = text
+            .parse()
+            .map_err(|_| entry.error("must list addresses such as \"0.0.0.0:443\""))?;
+        if taken.contains(&address) {
+            return Err(entry.error("lists an address twice"));
+        }
+        if loopback && !address.ip().is_loopback() {
+            return Err(entry.error("must list loopback addresses only"));
+        }
+        taken.push(address);
+        out.push(address);
+    }
+    Ok(out)
 }
 
 fn section(root: &mut Table, name: &str) -> Result<Table, Error> {

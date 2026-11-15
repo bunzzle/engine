@@ -438,3 +438,61 @@ fn check_reads_the_config_and_the_certificate_pair() {
     );
     let _ = fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn api_settings_are_read() {
+    assert!(parse(MINIMAL).expect("config").api.is_none());
+    let text = format!(
+        "{MINIMAL}[api]\nlisten = [\"0.0.0.0:443\"]\nplain = [\"127.0.0.1:8080\"]\n\
+         max_body = \"2MiB\"\nrequests = 50\nhandshake = \"5s\"\nhead = \"4s\"\nbody = \"20s\"\n\
+         idle = \"30s\"\ndrain = \"10s\"\n"
+    );
+    let api = parse(&text).expect("config").api.expect("api");
+    assert_eq!(
+        api.listen,
+        ["0.0.0.0:443".parse::<SocketAddr>().expect("address")]
+    );
+    assert_eq!(
+        api.plain,
+        ["127.0.0.1:8080".parse::<SocketAddr>().expect("address")]
+    );
+    let settings = api.settings;
+    assert_eq!(settings.name, "mx.example.org");
+    assert_eq!(settings.max_body, Some(2 << 20));
+    assert_eq!(settings.limits.requests, 50);
+    assert_eq!(
+        (
+            settings.timeouts.handshake,
+            settings.timeouts.head,
+            settings.timeouts.body,
+            settings.timeouts.idle,
+            settings.drain
+        ),
+        (
+            Duration::from_secs(5),
+            Duration::from_secs(4),
+            Duration::from_secs(20),
+            Duration::from_secs(30),
+            Duration::from_secs(10)
+        )
+    );
+
+    assert_eq!(
+        error(&format!("{MINIMAL}[api]\nplain = [\"0.0.0.0:8080\"]\n")),
+        "line 22, column 1: `plain` must list loopback addresses only"
+    );
+    assert_eq!(
+        error(&format!("{MINIMAL}[api]\nlisten = [\"0.0.0.0:25\"]\n")),
+        "line 22, column 1: `listen` lists an address twice"
+    );
+    assert_eq!(
+        error(&format!("{MINIMAL}[api]\nmax_body = \"1KiB\"\n")),
+        "line 1, column 1: [api] needs `listen` or `plain`"
+    );
+    assert_eq!(
+        error(&format!(
+            "{MINIMAL}[api]\nlisten = [\"0.0.0.0:443\"]\nmax_body = \"10B\"\n"
+        )),
+        "line 23, column 1: `max_body` must be between 1024 and 17179869184 bytes"
+    );
+}

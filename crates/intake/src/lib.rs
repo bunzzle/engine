@@ -8,6 +8,7 @@ mod mailbox;
 mod owner;
 mod reload;
 mod session;
+mod submit;
 
 pub use assemble::{Signer, Stamp, assemble, node_name};
 pub use conn::Conn;
@@ -19,3 +20,4 @@ pub use owner::{Limits, Opened, Owner, OwnerStats, Prefix};
 pub use reload::{Watch, watch};
 pub use sched::{Envelope, Recipient, Required, Ret, decode_slice, encode_slice};
 pub use session::{Config, End, data_hold, message_limit, serve};
+pub use submit::{Failure, Origin, Submission};

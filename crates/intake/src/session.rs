@@ -2,19 +2,16 @@ use std::net::IpAddr;
 use std::time::Duration;
 
 use control::{Grant, Scope};
-use crypto::{DkimAlg, Ids, Sealer, TAG};
-use dkim::BodyHash;
+use crypto::TAG;
 use rt::{Instant, now, timeout};
-use sched::{Draft, Node, Refusal, Sealing, Transport, domain_of};
+use sched::{Draft, Envelope, Node, Refusal, Transport, domain_of};
 use smtp::{BodyType, Event, Reply, Server, reply};
-use spool::{Body, BodyWriter, HeadClear, Message, SLICE};
 use tls::Acceptor;
 
-use crate::assemble::{Signer, Stamp, assemble};
 use crate::conn::Conn;
 use crate::guard::{Guard, Refused, Reserved, Slot};
-use crate::header::{Checked, Fault, HEADER_CAP, HeaderBuffer, check};
-use sched::{Envelope, Recipient, encode_slice};
+use crate::header::{Fault, HEADER_CAP};
+use crate::submit::{Failure, Origin, Submission};
 
 const SENDER_DOMAIN: Reply = Reply::new(550, "5.7.1", "Sender domain not verified");
 const FROM_DOMAIN: Reply = Reply::new(550, "5.7.1", "From domain not verified");
@@ -144,29 +141,9 @@ struct Tx {
 }
 
 struct Data {
-    sealing: Sealing,
-    id: String,
-    header: HeaderBuffer,
-    ready: Option<Ready>,
-    hash: BodyHash,
-    eight_bit: bool,
-    size: u64,
-    pending: Vec<u8>,
-    stream: Option<(Sealer, BodyWriter)>,
+    submission: Submission,
     refused: Option<Reply>,
     _hold: Reserved,
-}
-
-struct Ready {
-    checked: Checked,
-    keys: Vec<Key>,
-}
-
-struct Key {
-    id: u32,
-    alg: DkimAlg,
-    domain: String,
-    selector: String,
 }
 
 impl<T: Transport + 'static> Session<'_, T> {
@@ -375,23 +352,11 @@ impl<T: Transport + 'static> Session<'_, T> {
             .get(self.shard % shards.len().max(1))
             .ok_or(reply::TEMPORARY)?;
         self.shard = self.shard.wrapping_add(1);
-        let sealing = self
-            .node
-            .sealing(&mut tx.draft, shard)
+        let submission = Submission::open(self.node, &mut tx.draft, shard)
             .await
-            .map_err(refusal)?;
-        let ids = self.node.ids().ok_or(reply::TEMPORARY)?;
-        let ids = Ids::new(&ids).map_err(|_| reply::TEMPORARY)?;
+            .map_err(failure)?;
         tx.data = Some(Data {
-            id: ids.encode(&sealing.id().bytes()),
-            sealing,
-            header: HeaderBuffer::default(),
-            ready: None,
-            hash: BodyHash::new(),
-            eight_bit: false,
-            size: 0,
-            pending: Vec::new(),
-            stream: None,
+            submission,
             refused: None,
             _hold: hold,
         });
@@ -400,8 +365,7 @@ impl<T: Transport + 'static> Session<'_, T> {
 
     fn refuse(&mut self, reply: Reply) {
         if let Some(data) = self.tx.as_mut().and_then(|tx| tx.data.as_mut()) {
-            data.stream = None;
-            data.pending = Vec::new();
+            data.submission.discard();
             data.refused = Some(reply.clone());
         }
         self.server.refuse(reply);
@@ -409,165 +373,49 @@ impl<T: Transport + 'static> Session<'_, T> {
 
     async fn body(&mut self, bytes: &[u8]) -> Result<(), Reply> {
         let grant = self.grant.ok_or(reply::SEQUENCE)?;
-        let node = self.node;
         let Some(data) = self.tx.as_mut().and_then(|tx| tx.data.as_mut()) else {
             return Ok(());
         };
         if data.refused.is_some() {
             return Ok(());
         }
-        let rest = data.header.push(bytes).map_err(fault)?;
-        if data.header.done() && data.ready.is_none() {
-            data.ready = Some(ready(node, grant, data.header.section())?);
-        }
-        if rest.is_empty() {
-            return Ok(());
-        }
-        data.eight_bit |= rest.iter().any(|&b| b >= 0x80);
-        data.hash.update(rest);
-        data.size += rest.len() as u64;
-        data.pending.extend_from_slice(rest);
-        let spool = node.spool();
-        let inline = spool.limits().inline.saturating_sub(TAG);
-        if data.stream.is_none() && data.pending.len() > inline {
-            let sealer = data.sealing.body_chunks().map_err(refusal)?;
-            let writer = spool.body_stream(data.sealing.id(), grant.tenant);
-            data.stream = Some((sealer, writer));
-        }
-        let plain = spool.stream_chunk() - TAG;
-        if let Some((sealer, writer)) = data.stream.as_mut() {
-            while data.pending.len() > plain {
-                let mut chunk: Vec<u8> = data.pending.drain(..plain).collect();
-                sealer.seal(&mut chunk).map_err(|_| reply::TEMPORARY)?;
-                writer.push(&chunk).await.map_err(|e| spool_error(&e))?;
-            }
-        }
-        Ok(())
+        data.submission
+            .push(self.node, grant, bytes)
+            .await
+            .map_err(failure)
     }
 
     async fn finish(&mut self) -> Result<Reply, Reply> {
         let grant = self.grant.ok_or(reply::TEMPORARY)?;
-        let node = self.node;
         let mut tx = self.tx.take().ok_or(reply::TEMPORARY)?;
-        let mut data = tx.data.take().ok_or(reply::TEMPORARY)?;
+        let data = tx.data.take().ok_or(reply::TEMPORARY)?;
         if let Some(reply) = data.refused {
             return Err(reply);
         }
-        let ready = match data.ready.take() {
-            Some(ready) => ready,
-            None => ready(node, grant, data.header.section())?,
-        };
-        let body = match data.stream.take() {
-            None => data.sealing.inline_body(&data.pending).map_err(refusal)?,
-            Some((sealer, mut writer)) => {
-                let mut last = std::mem::take(&mut data.pending);
-                sealer.seal_last(&mut last);
-                writer.push(&last).await.map_err(|e| spool_error(&e))?;
-                Body::Chain(writer.finish().map_err(|e| spool_error(&e))?)
-            }
-        };
-        let accepted = node.sched().clock().now();
-        let signers: Vec<Signer> = ready
-            .keys
-            .iter()
-            .map(|key| Signer {
-                key: key.id,
-                alg: key.alg,
-                domain: &key.domain,
-                selector: &key.selector,
-            })
-            .collect();
-        let stamp = Stamp {
+        let origin = Origin {
             node: &self.config.name,
-            id: &data.id,
-            now: accepted,
+            with: "ESMTPSA",
             lifetime: self.config.lifetime,
         };
-        let section = assemble(
-            data.header.section(),
-            &ready.checked,
-            &stamp,
-            &signers,
-            &data.hash.finish(),
-        )
-        .map_err(fault)?;
         let envelope = Envelope {
             sender: tx.sender,
-            eight_bit: data.eight_bit,
             declared: tx.declared,
-            signatures: ready.keys.iter().map(|key| (key.id, key.alg)).collect(),
             ..Envelope::default()
-        }
-        .encode()
-        .ok_or(reply::TEMPORARY)?;
-        let count = u32::try_from(tx.recipients.len()).map_err(|_| reply::TEMPORARY)?;
-        let clear = HeadClear {
-            recipients: count,
-            body_size: data.size,
-            accepted,
-            ..HeadClear::default()
         };
-        let head = data
-            .sealing
-            .head(clear, accepted + self.config.lifetime, &envelope, &section)
-            .map_err(refusal)?;
-        let mut slices = Vec::new();
-        let groups = tx.draft.queues().chunks(SLICE as usize);
-        for (n, (queues, addresses)) in
-            (0u32..).zip(groups.zip(tx.recipients.chunks(SLICE as usize)))
-        {
-            let recipients: Vec<Recipient> = addresses
-                .iter()
-                .map(|address| Recipient {
-                    address: address.clone(),
-                    ..Recipient::default()
-                })
-                .collect();
-            let plain = encode_slice(&recipients).ok_or(reply::TEMPORARY)?;
-            slices.push(
-                data.sealing
-                    .slice(n, queues.to_vec(), &plain)
-                    .map_err(refusal)?,
-            );
-        }
-        let message = Message {
-            id: data.sealing.id(),
-            tenant: tx.draft.tenant(),
-            head,
-            body,
-            slices,
-        };
-        node.accept(tx.draft, message).await.map_err(refusal)?;
-        Ok(Reply::owned(250, "2.0.0", data.id))
+        let id = data
+            .submission
+            .finish(
+                self.node,
+                grant,
+                &origin,
+                tx.draft,
+                envelope,
+                &tx.recipients,
+            )
+            .await
+            .map_err(failure)?;
+        Ok(Reply::owned(250, "2.0.0", id))
     }
-}
-
-fn ready<T: Transport + 'static>(
-    node: &Node<T>,
-    grant: Grant,
-    section: &[u8],
-) -> Result<Ready, Reply> {
-    let checked = check(section).map_err(fault)?;
-    let table = node.table();
-    let domain = table
-        .sender(grant.tenant, &checked.from)
-        .ok_or(FROM_DOMAIN)?;
-    let keys: Vec<Key> = [domain.rsa, domain.ed25519]
-        .into_iter()
-        .filter(|&id| id != 0)
-        .filter_map(|id| table.dkim(grant.tenant, id))
-        .filter(|dkim| dkim.generation == grant.generation)
-        .map(|dkim| Key {
-            id: dkim.id,
-            alg: dkim.alg,
-            domain: dkim.domain.to_string(),
-            selector: dkim.selector.to_string(),
-        })
-        .collect();
-    if keys.is_empty() {
-        return Err(NO_KEY);
-    }
-    Ok(Ready { checked, keys })
 }
 
 fn fault(fault: Fault) -> Reply {
@@ -590,9 +438,13 @@ fn refusal(refusal: Refusal) -> Reply {
     }
 }
 
-fn spool_error(error: &spool::Error) -> Reply {
-    match error {
-        spool::Error::Limit("body" | "chunk" | "inline body") => reply::TOO_BIG,
-        _ => reply::TEMPORARY,
+fn failure(failure: Failure) -> Reply {
+    match failure {
+        Failure::Header(f) => fault(f),
+        Failure::FromDomain => FROM_DOMAIN,
+        Failure::NoKey => NO_KEY,
+        Failure::Refused(r) => refusal(r),
+        Failure::TooBig => reply::TOO_BIG,
+        Failure::Temporary => reply::TEMPORARY,
     }
 }

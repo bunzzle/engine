@@ -122,6 +122,7 @@ struct Up<T> {
     guarding: JoinHandle<()>,
     acceptor: Rc<Acceptor>,
     sockets: Vec<(TcpListener, bool)>,
+    apis: Vec<(TcpListener, bool, bool)>,
 }
 
 pub async fn run<T: Transport + 'static>(
@@ -180,6 +181,26 @@ pub async fn run<T: Transport + 'static>(
             )
         })
         .collect();
+    let apis: Vec<api::Api> = match &plan.config.api {
+        None => Vec::new(),
+        Some(settings) => {
+            let config = Rc::new(settings.settings.clone());
+            up.apis
+                .into_iter()
+                .map(|(socket, secure, loopback)| {
+                    let acceptor = secure.then(|| Rc::clone(&up.acceptor));
+                    api::listen(
+                        up.node.clone(),
+                        socket,
+                        acceptor,
+                        Rc::clone(&config),
+                        up.guard.clone(),
+                        loopback,
+                    )
+                })
+                .collect()
+        }
+    };
     let stopped = if let Some(watched) = watched {
         let requested = watched.stop_requested().await;
         watched.close().await;
@@ -191,10 +212,11 @@ pub async fn run<T: Transport + 'static>(
         orders.until(|o| o.stop.get()).await;
         Ok(())
     };
-    let closing: Vec<_> = listeners
+    let mut closing: Vec<_> = listeners
         .into_iter()
         .map(|listener| spawn(listener.close()))
         .collect();
+    closing.extend(apis.into_iter().map(|api| spawn(api.close())));
     for closed in closing {
         closed.await;
     }
@@ -247,6 +269,17 @@ async fn start<T: Transport + 'static>(
             .map_err(|e| Error::Bind(listen.address, e))?;
         sockets.push((socket, listen.implicit));
     }
+    let mut apis = Vec::new();
+    if let Some(api) = &config.api {
+        let tls = api.listen.iter().map(|a| (*a, true));
+        let clear = api.plain.iter().map(|a| (*a, false));
+        for (address, secure) in tls.chain(clear) {
+            let socket = TcpListener::bind_shared(address, BACKLOG)
+                .await
+                .map_err(|e| Error::Bind(address, e))?;
+            apis.push((socket, secure, address.ip().is_loopback()));
+        }
+    }
     Ok(Up {
         node,
         running,
@@ -254,5 +287,6 @@ async fn start<T: Transport + 'static>(
         guarding,
         acceptor: Rc::new(acceptor),
         sockets,
+        apis,
     })
 }

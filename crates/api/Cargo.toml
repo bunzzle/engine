@@ -8,7 +8,20 @@ publish.workspace = true
 autotests = false
 
 [dependencies]
+control = { path = "../control" }
+crypto = { path = "../crypto" }
 dkim = { path = "../dkim" }
+http = { path = "../http" }
+intake = { path = "../intake" }
+rt = { path = "../rt" }
+sched = { path = "../sched" }
+tls = { path = "../tls" }
+
+[dev-dependencies]
+aws-lc-rs = "=1.18.2"
+keys = { path = "../keys" }
+spool = { path = "../spool" }
+store = { path = "../store" }
 
 [[test]]
 name = "api"
