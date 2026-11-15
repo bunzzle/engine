@@ -3,11 +3,13 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, ThreadId};
+use std::time::Duration;
 use std::{fs, process};
 
-use rt::{Native, Runtime, spawn};
+use rt::{Native, Runtime, sleep, spawn};
 use store::{
     Change, Claim, Core, DataFile, Delivery, Error, Event, Index, KIND_STATE, Key, Location,
     Options, Owner, SLOT_SIZE, Setup, Submission, Write, launch,
@@ -66,7 +68,7 @@ fn put(key: u64) -> Index {
     }
 }
 
-async fn fill(mut core: Core) {
+async fn fill(mut core: Core, cores: u16, done: Arc<AtomicU16>) {
     let mut sent = BTreeMap::new();
     for (tag, &shard) in (0u64..).zip(&core.shards) {
         let index = put(u64::from(shard) * 100 + u64::from(core.index));
@@ -105,6 +107,10 @@ async fn fill(mut core: Core) {
     for location in written {
         let buf = reader.read(location, 5, &Nobody).await.expect("read");
         assert_eq!(buf.len(), location.size as usize);
+    }
+    done.fetch_add(1, Ordering::SeqCst);
+    while core.index == 0 && done.load(Ordering::SeqCst) < cores {
+        sleep(Duration::from_millis(1)).await;
     }
     let checkpoint = (core.index == 0).then(|| {
         let client = core.session.client().clone();
@@ -153,9 +159,10 @@ fn cores_run_on_their_own_threads_and_rebuild_their_shards() {
     let path = scratch("threads");
     let first = Arc::new(Mutex::new(Seen::default()));
     let seen = Arc::clone(&first);
+    let done = Arc::new(AtomicU16::new(0));
     let committer = launch(&path, SETUP, move |core| {
         record(&seen, &core);
-        fill(core)
+        fill(core, SETUP.cores, Arc::clone(&done))
     })
     .expect("launch");
     assert!(!committer.is_failed());
