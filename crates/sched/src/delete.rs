@@ -73,6 +73,7 @@ impl<T: Transport + 'static> Node<T> {
         let spool = self.spool();
         for id in spool.messages_of(tenant) {
             if spool.cancel(id).await.is_ok() {
+                self.inner.sched.forget_signed(id);
                 self.inner.dropped.set(self.inner.dropped.get() + 1);
             }
         }

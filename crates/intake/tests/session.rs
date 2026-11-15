@@ -840,6 +840,8 @@ fn attempts_carry_verified_signatures_and_wait_for_keys() {
             assert!(seen.faults.borrow().contains(&"signer"), "seed {seed}");
             assert!(!seen.delivered.borrow().contains(&orphan), "seed {seed}");
             assert!(nodes.iter().all(|n| n.sched().unsigned() == 0));
+            let cached: usize = nodes.iter().map(|n| n.sched().signed_cached()).sum();
+            assert!(cached <= sent.len() + 2, "seed {seed}: {cached}");
             assert!(smtp.command("QUIT").await.starts_with("221 "));
             listening.close().await;
         });
