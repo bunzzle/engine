@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use api::json::{self, Value};
-use api::{Api, Config as ApiConfig, Route, listen};
+use api::{Api, Config as ApiConfig, Forward, Route, Socket, start};
 use aws_lc_rs::digest::{Digest, SHA256};
 use aws_lc_rs::signature::{ED25519, RSA_PKCS1_2048_8192_SHA256, UnparsedPublicKey};
 use control::{Domain, Object, Pool, Scopes, State, Tenant, Verification};
@@ -19,7 +19,7 @@ use keys::{
     Settings as KeySettings, Vault,
 };
 use rt::sim::{Config, Disk, Machine, SimDriver, Stalls, check};
-use rt::{JoinHandle, Mesh, Runtime, TcpListener, TcpStream, sleep, timeout};
+use rt::{Ends, JoinHandle, Mesh, Notify, Runtime, TcpListener, TcpStream, sleep, timeout};
 use sched::{
     Answered, Attempt, Body, Clock, Keyring, Keys, Meshes, Node, Parts, Reason, Running, Settings,
     Transport,
@@ -409,42 +409,51 @@ fn guard() -> Guard {
     Guard::start(ends, [7; 16], Limits::default()).0
 }
 
-struct Ports(Vec<Api>);
+struct Ports(Api);
 
 impl Ports {
     fn count(&self, route: Route, status: u16) -> u64 {
-        self.0.iter().map(|api| api.count(route, status)).sum()
+        self.0.count(route, status)
     }
 
     fn ended(&self, end: End) -> u64 {
-        self.0.iter().map(|api| api.ended(end)).sum()
+        self.0.ended(end)
     }
 
     async fn close(self) {
-        for api in self.0 {
-            api.close().await;
-        }
+        self.0.close().await;
     }
 }
 
 async fn serve(node: &Node<Idle>, seed: u64, config: ApiConfig) -> Ports {
-    let config = Rc::new(config);
-    let guard = guard();
+    let forwards = Mesh::new(2);
+    serve_with(node, seed, config, forwards.take(0).expect("ends")).await
+}
+
+async fn serve_with(node: &Node<Idle>, seed: u64, config: ApiConfig, ends: Ends<Forward>) -> Ports {
     let secure = TcpListener::bind(SocketAddr::from((HOST, HTTPS)), 64)
         .await
         .expect("bind");
     let plain = TcpListener::bind(LOOPBACK, 64).await.expect("bind");
-    Ports(vec![
-        listen(
-            node.clone(),
-            secure,
-            Some(acceptor(seed)),
-            Rc::clone(&config),
-            guard.clone(),
-            false,
-        ),
-        listen(node.clone(), plain, None, config, guard, true),
-    ])
+    let sockets = vec![
+        Socket {
+            socket: secure,
+            acceptor: Some(acceptor(seed)),
+            loopback: false,
+        },
+        Socket {
+            socket: plain,
+            acceptor: None,
+            loopback: true,
+        },
+    ];
+    Ports(start(
+        node.clone(),
+        sockets,
+        Rc::new(config),
+        &guard(),
+        ends,
+    ))
 }
 
 #[derive(Debug)]
@@ -1024,4 +1033,121 @@ async fn raw_refusals(tokens: &Tokens, tls: &Arc<ClientConfig>, seed: u64) {
         (reply.status, reply.code().as_str()),
         (415, "unsupported_media_type")
     );
+}
+
+fn keyed(token: &str, key: &str, body: &str) -> Vec<u8> {
+    format!(
+        "POST /v1/messages HTTP/1.1\r\nHost: api.test\r\nAuthorization: Bearer {token}\r\n\
+         Idempotency-Key: {key}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    )
+    .into_bytes()
+}
+
+#[test]
+fn keyed_requests_run_on_the_owner_core() {
+    check(0..2, |seed| {
+        let cluster = started(seed, 2);
+        let nodes = cluster.nodes.clone();
+        let seen = Rc::clone(&cluster.seen);
+        let forwards = Mesh::new(2);
+        let owner: Rc<RefCell<Option<Api>>> = Rc::default();
+        let stop = Rc::new(Notify::default());
+        let held = {
+            let node = nodes[1].clone();
+            let ends = forwards.take(1).expect("ends");
+            let (owner, stop) = (Rc::clone(&owner), Rc::clone(&stop));
+            cluster.machine.spawn_on(2, async move {
+                let config = Rc::new(ApiConfig::new("mx1.example.net".into()));
+                owner.replace(Some(start(node, Vec::new(), config, &guard(), ends)));
+                stop.wait().await;
+                let api = owner.borrow_mut().take().expect("owner api");
+                api.close().await;
+            })
+        };
+        let ends = forwards.take(0).expect("ends");
+        let watched = Rc::clone(&owner);
+        cluster.run(async move {
+            let owner = watched;
+            let tokens = prepare(&nodes).await;
+            seen.publics.replace(tokens.publics.clone());
+            let config = ApiConfig::new("mx1.example.net".into());
+            let ports = serve_with(&nodes[0], seed, config, ends).await;
+            let first = tokens.first.as_str();
+            let body = r#"{"from":"ann@example.org","to":"d@example.com","text":"x"}"#;
+            let mut http = Http::plain().await;
+            let mut ids = BTreeSet::new();
+            let mut cores = [0u64; 2];
+            let mut spare = Vec::new();
+            for n in 0..256 {
+                let key = format!("k{seed}-{n}");
+                let requests = nodes[0].requests();
+                let shard = requests.shard(1, key.as_bytes()).await.expect("shard");
+                let core = usize::from(shard % 2);
+                if cores[core] == 3 {
+                    if core == 1 && spare.len() < 3 {
+                        spare.push(key);
+                    }
+                    if spare.len() == 3 && cores[0] == 3 {
+                        break;
+                    }
+                    continue;
+                }
+                http.send(&keyed(first, &key, body)).await;
+                let id = opaque(&nodes[0], &http.reply().await.expect("reply").id());
+                assert_eq!(id.shard, shard);
+                ids.insert(id);
+                cores[core] += 1;
+            }
+            assert_eq!(cores, [3, 3]);
+            assert_eq!(spare.len(), 3);
+
+            let tls = client_config(simulated(seed + 100));
+            let mut secure = Http::tls(&tls).await;
+            let big = message("Ann <ann@example.org>", "", 300_000, seed);
+            let envelope = "Envelope-From: bounce@example.org\r\nEnvelope-To: a@example.com\r\n";
+            let fields = format!("Idempotency-Key: {}\r\n{envelope}", spare[0]);
+            secure.send(&raw(first, &fields, &big)).await;
+            let streamed = opaque(&nodes[0], &secure.reply().await.expect("reply").id());
+            ids.insert(streamed);
+
+            let small = message("Ann <ann@example.org>", "", 300, seed);
+            let fields = format!(
+                "Idempotency-Key: {}\r\nEnvelope-From: a@unknown.test\r\nEnvelope-To: a@example.com\r\n",
+                spare[1]
+            );
+            http.send(&raw(first, &fields, &small)).await;
+            let reply = http.reply().await.expect("reply");
+            assert_eq!((reply.status, reply.code().as_str()), (403, "sender_not_allowed"));
+            assert!(http.closed().await);
+
+            let mut http = Http::plain().await;
+            http.send(&keyed(first, &"x".repeat(256), body)).await;
+            let reply = http.reply().await.expect("reply");
+            assert_eq!((reply.status, reply.code().as_str()), (400, "bad_request"));
+
+            let mut http = Http::plain().await;
+            let fields = format!("Idempotency-Key: {}\r\n{envelope}", spare[2]);
+            let partial = raw(first, &fields, &big);
+            http.send(&partial[..partial.len() / 2]).await;
+            let serving = |n| {
+                let owner = Rc::clone(&owner);
+                move || owner.borrow().as_ref().is_some_and(|api| api.serving() == n)
+            };
+            until("forwarded body", serving(1)).await;
+            drop(http);
+            until("owner released", serving(0)).await;
+
+            assert_eq!(stored(&nodes), ids);
+            until("attempted", || seen.headers.borrow().len() == ids.len()).await;
+            let header = seen.headers.borrow()[&streamed].0.clone();
+            assert!(String::from_utf8_lossy(&header).contains("with HTTPS id"));
+            assert_eq!(ports.0.forwarded(), 6);
+            assert_eq!(owner.borrow().as_ref().map(Api::served), Some(6));
+            stop.notify();
+            ports.close().await;
+        });
+        cluster.machine.block_on(0, held);
+        cluster.stop();
+    });
 }

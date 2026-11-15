@@ -1,0 +1,425 @@
+use std::cell::{Cell, OnceCell, RefCell};
+use std::collections::{BTreeMap, VecDeque};
+use std::future::poll_fn;
+use std::rc::Rc;
+use std::task::{Poll, Waker};
+
+use control::Grant;
+use http::{Request, Response};
+use intake::End;
+use rt::{Ends, JoinHandle, Notify, Peers};
+
+use crate::handler::Source;
+use crate::server::{Route, Stop};
+
+pub struct Forward(Message);
+
+enum Message {
+    Open { ticket: u64, open: Box<Open> },
+    Ahead { ticket: u64, ahead: Ahead },
+    Back { ticket: u64, back: Back },
+}
+
+pub(crate) struct Open {
+    pub(crate) route: Route,
+    pub(crate) request: Request,
+    pub(crate) grant: Grant,
+    pub(crate) id: String,
+    pub(crate) secure: bool,
+    pub(crate) shard: u16,
+}
+
+pub(crate) enum Ahead {
+    Chunk(Vec<u8>),
+    End,
+    Abort,
+}
+
+pub(crate) enum Back {
+    Start(u64),
+    Credit,
+    Reply(Box<Response>),
+}
+
+pub(crate) struct Pipe<M> {
+    queue: RefCell<VecDeque<M>>,
+    notify: Notify,
+    closed: Cell<bool>,
+}
+
+impl<M> Pipe<M> {
+    fn new() -> Rc<Self> {
+        Rc::new(Self {
+            queue: RefCell::new(VecDeque::new()),
+            notify: Notify::default(),
+            closed: Cell::new(false),
+        })
+    }
+
+    fn put(&self, message: M) {
+        self.queue.borrow_mut().push_back(message);
+        self.notify.notify();
+    }
+
+    fn close(&self) {
+        self.closed.set(true);
+        self.notify.notify();
+    }
+
+    pub(crate) fn try_take(&self) -> Option<M> {
+        self.queue.borrow_mut().pop_front()
+    }
+
+    pub(crate) async fn take(&self) -> Option<M> {
+        loop {
+            if let Some(message) = self.try_take() {
+                return Some(message);
+            }
+            if self.closed.get() {
+                return None;
+            }
+            self.notify.wait().await;
+        }
+    }
+}
+
+type Inbounds = BTreeMap<(u16, u64), Rc<Pipe<Ahead>>>;
+
+pub(crate) type Serve = Box<dyn Fn(Rc<Inbound>, Box<Open>) -> JoinHandle<()>>;
+
+pub(crate) struct Forwarder {
+    cores: u16,
+    peers: OnceCell<Peers<Forward>>,
+    tickets: Cell<u64>,
+    outbound: RefCell<BTreeMap<u64, Rc<Pipe<Back>>>>,
+    inbound: RefCell<Inbounds>,
+    serve: RefCell<Option<Serve>>,
+    closing: Cell<bool>,
+    serving: Cell<usize>,
+    idle: Notify,
+    waiting: RefCell<BTreeMap<(u16, u64), Waker>>,
+    stopped: Cell<bool>,
+    forwarded: Cell<u64>,
+    served: Cell<u64>,
+}
+
+impl Forwarder {
+    pub(crate) fn start(ends: Ends<Forward>) -> (Rc<Self>, JoinHandle<()>) {
+        let forwarder = Rc::new(Self {
+            cores: ends.cores(),
+            peers: OnceCell::new(),
+            tickets: Cell::new(0),
+            outbound: RefCell::new(BTreeMap::new()),
+            inbound: RefCell::new(BTreeMap::new()),
+            serve: RefCell::new(None),
+            closing: Cell::new(false),
+            serving: Cell::new(0),
+            idle: Notify::default(),
+            waiting: RefCell::new(BTreeMap::new()),
+            stopped: Cell::new(false),
+            forwarded: Cell::new(0),
+            served: Cell::new(0),
+        });
+        let handler = Rc::clone(&forwarder);
+        let (peers, done) = ends.start(move |from, Forward(message)| handler.handle(from, message));
+        let _ = forwarder.peers.set(peers);
+        (forwarder, done)
+    }
+
+    pub(crate) fn serve_with(&self, serve: Serve) {
+        self.serve.replace(Some(serve));
+    }
+
+    pub(crate) fn index(&self) -> u16 {
+        self.peers.get().map_or(0, Peers::index)
+    }
+
+    pub(crate) fn owner(&self, shard: u16) -> u16 {
+        shard % self.cores.max(1)
+    }
+
+    pub(crate) fn forwarded(&self) -> u64 {
+        self.forwarded.get()
+    }
+
+    pub(crate) fn served(&self) -> u64 {
+        self.served.get()
+    }
+
+    pub(crate) fn serving(&self) -> usize {
+        self.serving.get()
+    }
+
+    pub(crate) fn open(self: &Rc<Self>, owner: u16, open: Open) -> Link {
+        let ticket = self.tickets.get().wrapping_add(1);
+        self.tickets.set(ticket);
+        let pipe = Pipe::new();
+        if self.closing.get() {
+            pipe.close();
+        } else {
+            self.outbound.borrow_mut().insert(ticket, Rc::clone(&pipe));
+            self.forwarded.set(self.forwarded.get() + 1);
+            self.send(
+                owner,
+                Message::Open {
+                    ticket,
+                    open: Box::new(open),
+                },
+            );
+        }
+        Link {
+            forwarder: Rc::clone(self),
+            owner,
+            ticket,
+            pipe,
+            done: false,
+        }
+    }
+
+    fn send(&self, to: u16, message: Message) {
+        if let Some(peers) = self.peers.get() {
+            peers.send(to, Forward(message));
+        }
+    }
+
+    fn handle(self: &Rc<Self>, from: u16, message: Message) {
+        match message {
+            Message::Open { ticket, open } => self.accept(from, ticket, open),
+            Message::Ahead { ticket, ahead } => {
+                if let Some(pipe) = self.inbound.borrow().get(&(from, ticket)) {
+                    pipe.put(ahead);
+                }
+            }
+            Message::Back { ticket, back } => {
+                if let Some(pipe) = self.outbound.borrow().get(&ticket) {
+                    pipe.put(back);
+                }
+            }
+        }
+    }
+
+    fn accept(self: &Rc<Self>, from: u16, ticket: u64, open: Box<Open>) {
+        let serve = self.serve.borrow();
+        let Some(serve) = serve.as_ref().filter(|_| !self.closing.get()) else {
+            self.send(
+                from,
+                Message::Back {
+                    ticket,
+                    back: Back::Reply(Box::new(unavailable(&open.id))),
+                },
+            );
+            return;
+        };
+        let pipe = Pipe::new();
+        self.inbound
+            .borrow_mut()
+            .insert((from, ticket), Rc::clone(&pipe));
+        self.serving.set(self.serving.get() + 1);
+        self.served.set(self.served.get() + 1);
+        let inbound = Rc::new(Inbound {
+            forwarder: Rc::clone(self),
+            from,
+            ticket,
+            pipe,
+            secure: open.secure,
+            id: open.id.clone(),
+            replied: Cell::new(false),
+        });
+        drop(serve(inbound, open));
+    }
+
+    pub(crate) async fn until_stopped<F: Future<Output = ()>>(&self, key: (u16, u64), work: F) {
+        let mut work = std::pin::pin!(work);
+        poll_fn(|cx| {
+            if self.stopped.get() {
+                return Poll::Ready(());
+            }
+            if work.as_mut().poll(cx).is_ready() {
+                return Poll::Ready(());
+            }
+            self.waiting.borrow_mut().insert(key, cx.waker().clone());
+            Poll::Pending
+        })
+        .await;
+        self.waiting.borrow_mut().remove(&key);
+    }
+
+    pub(crate) async fn close(&self, drain: std::time::Duration) {
+        self.closing.set(true);
+        self.serve.replace(None);
+        if rt::timeout(drain, self.idle()).await.is_err() {
+            self.stopped.set(true);
+            for waker in std::mem::take(&mut *self.waiting.borrow_mut()).into_values() {
+                waker.wake();
+            }
+            self.idle().await;
+        }
+        for pipe in std::mem::take(&mut *self.outbound.borrow_mut()).into_values() {
+            pipe.close();
+        }
+        if let Some(peers) = self.peers.get() {
+            peers.close();
+        }
+    }
+
+    async fn idle(&self) {
+        while self.serving.get() > 0 {
+            self.idle.wait().await;
+        }
+    }
+}
+
+fn unavailable(id: &str) -> Response {
+    crate::problem::Problem::unavailable().response(id)
+}
+
+pub(crate) struct Link {
+    forwarder: Rc<Forwarder>,
+    owner: u16,
+    ticket: u64,
+    pipe: Rc<Pipe<Back>>,
+    done: bool,
+}
+
+impl Link {
+    pub(crate) fn send(&self, ahead: Ahead) {
+        self.forwarder.send(
+            self.owner,
+            Message::Ahead {
+                ticket: self.ticket,
+                ahead,
+            },
+        );
+    }
+
+    pub(crate) fn pipe(&self) -> &Pipe<Back> {
+        &self.pipe
+    }
+
+    pub(crate) fn replied(&self) -> bool {
+        self.pipe.closed.get()
+            || self
+                .pipe
+                .queue
+                .borrow()
+                .iter()
+                .any(|back| matches!(back, Back::Reply(_)))
+    }
+
+    pub(crate) async fn reply(&self) {
+        while !self.replied() {
+            self.pipe.notify.wait().await;
+        }
+    }
+
+    pub(crate) fn done(&mut self) {
+        self.done = true;
+    }
+}
+
+impl Drop for Link {
+    fn drop(&mut self) {
+        self.forwarder.outbound.borrow_mut().remove(&self.ticket);
+        if !self.done && !self.pipe.closed.get() {
+            self.send(Ahead::Abort);
+        }
+    }
+}
+
+pub(crate) struct Inbound {
+    forwarder: Rc<Forwarder>,
+    from: u16,
+    ticket: u64,
+    pipe: Rc<Pipe<Ahead>>,
+    secure: bool,
+    id: String,
+    replied: Cell<bool>,
+}
+
+impl Inbound {
+    pub(crate) fn key(&self) -> (u16, u64) {
+        (self.from, self.ticket)
+    }
+
+    pub(crate) fn secure(&self) -> bool {
+        self.secure
+    }
+
+    pub(crate) fn pipe(&self) -> &Pipe<Ahead> {
+        &self.pipe
+    }
+
+    pub(crate) fn reply(&self, response: Response) {
+        self.replied.set(true);
+        self.send(Back::Reply(Box::new(response)));
+    }
+
+    pub(crate) fn send(&self, back: Back) {
+        self.forwarder.send(
+            self.from,
+            Message::Back {
+                ticket: self.ticket,
+                back,
+            },
+        );
+    }
+}
+
+impl Drop for Inbound {
+    fn drop(&mut self) {
+        if !self.replied.get() {
+            self.reply(unavailable(&self.id));
+        }
+        let forwarder = &self.forwarder;
+        forwarder
+            .inbound
+            .borrow_mut()
+            .remove(&(self.from, self.ticket));
+        forwarder.serving.set(forwarder.serving.get() - 1);
+        if forwarder.serving.get() == 0 {
+            forwarder.idle.notify();
+        }
+    }
+}
+
+pub(crate) struct Remote {
+    inbound: Rc<Inbound>,
+    owed: bool,
+    wait: std::time::Duration,
+}
+
+impl Remote {
+    pub(crate) fn new(inbound: Rc<Inbound>, wait: std::time::Duration) -> Self {
+        Self {
+            inbound,
+            owed: false,
+            wait,
+        }
+    }
+}
+
+impl Source for Remote {
+    fn start(&mut self, _request: &Request, max: u64) -> Result<(), Stop> {
+        self.inbound.send(Back::Start(max));
+        Ok(())
+    }
+
+    async fn next(&mut self) -> Result<Option<Vec<u8>>, Stop> {
+        if std::mem::take(&mut self.owed) {
+            self.inbound.send(Back::Credit);
+        }
+        match rt::timeout(self.wait, self.inbound.pipe().take()).await {
+            Ok(Some(Ahead::Chunk(bytes))) => {
+                self.owed = true;
+                Ok(Some(bytes))
+            }
+            Ok(Some(Ahead::End)) => Ok(None),
+            Ok(Some(Ahead::Abort) | None) => Err(Stop::End(End::Dropped)),
+            Err(_) => Err(Stop::End(End::Timeout)),
+        }
+    }
+
+    fn secure(&self) -> bool {
+        self.inbound.secure()
+    }
+}
