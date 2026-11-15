@@ -1,9 +1,12 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
+use std::future::poll_fn;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::Path;
+use std::pin::pin;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::task::Poll;
 use std::time::Duration;
 
 use api::json::{self, Value};
@@ -19,7 +22,7 @@ use keys::{
     Settings as KeySettings, Vault,
 };
 use rt::sim::{Config, Disk, Machine, SimDriver, Stalls, check};
-use rt::{Ends, JoinHandle, Mesh, Notify, Runtime, TcpListener, TcpStream, sleep, timeout};
+use rt::{Ends, JoinHandle, Mesh, Notify, Runtime, TcpListener, TcpStream, sleep, spawn, timeout};
 use sched::{
     Answered, Attempt, Body, Clock, Keyring, Keys, Meshes, Node, Parts, Reason, Running, Settings,
     Transport,
@@ -208,7 +211,11 @@ fn keyring() -> Rc<dyn Keys> {
 
 fn started(run: u64, cores: u16) -> Cluster {
     let driver = Rc::new(SimDriver::with_disk(run, Config::default(), created(run)));
-    let machine = Machine::new(driver, usize::from(cores) + 1, Stalls::default());
+    started_on(&driver, cores).expect("start")
+}
+
+fn started_on(driver: &Rc<SimDriver>, cores: u16) -> Option<Cluster> {
+    let machine = Machine::new(Rc::clone(driver), usize::from(cores) + 1, Stalls::default());
     let setup = Setup {
         cores,
         credits: 4,
@@ -219,8 +226,8 @@ fn started(run: u64, cores: u16) -> Cluster {
         .block_on(0, async move {
             timeout(Duration::from_secs(60), boot(PATH, setup)).await
         })
-        .expect("boot in time")
-        .expect("boot");
+        .ok()?
+        .ok()?;
     let committer = machine.spawn_on(0, booted.committer.run());
     keys_up(&machine);
     let seen = Rc::new(Seen::default());
@@ -231,15 +238,17 @@ fn started(run: u64, cores: u16) -> Cluster {
         let links = meshes.take(index).expect("links");
         let transport = Idle(Rc::clone(&seen));
         tasks.push(machine.spawn_on(usize::from(index) + 1, async move {
-            let core = start.open().await.expect("open");
+            let core = timeout(Duration::from_secs(60), start.open())
+                .await
+                .ok()?
+                .ok()?;
             let parts = Parts {
                 keys: keyring(),
                 transport,
                 clock: Clock::at(rt::wall_ms(), rt::now()),
             };
-            Node::start(core, links, settings(), parts)
-                .await
-                .expect("start")
+            let started = Node::start(core, links, settings(), parts);
+            timeout(Duration::from_secs(60), started).await.ok()?.ok()
         }));
     }
     let started = machine.block_on(0, async move {
@@ -249,15 +258,19 @@ fn started(run: u64, cores: u16) -> Cluster {
         }
         started
     });
-    let (nodes, runnings) = started.into_iter().unzip();
-    Cluster {
+    let (nodes, runnings) = started
+        .into_iter()
+        .collect::<Option<Vec<_>>>()?
+        .into_iter()
+        .unzip();
+    Some(Cluster {
         seen,
         machine,
         nodes,
         runnings,
         client: booted.client,
         committer,
-    }
+    })
 }
 
 async fn until(name: &str, what: impl Fn() -> bool) {
@@ -275,7 +288,21 @@ struct Tokens {
     first: String,
     second: String,
     smtp: String,
+    third: String,
     publics: BTreeMap<String, Vec<u8>>,
+}
+
+async fn verify_domain(control: &Node<Idle>, tenant: u32, name: &str, rsa: u32, ed25519: u32) {
+    let domain = control.domain_new(tenant, name).await.expect("domain");
+    control
+        .domain_write(Domain {
+            state: Verification::Verified,
+            rsa,
+            ed25519,
+            ..domain
+        })
+        .await
+        .expect("verify");
 }
 
 async fn prepare(nodes: &[Node<Idle>]) -> Tokens {
@@ -293,12 +320,13 @@ async fn prepare(nodes: &[Node<Idle>]) -> Tokens {
         }),
         tenant(1),
         tenant(2),
+        tenant(3),
     ];
     for object in objects {
         control.write(object).await.expect("write");
     }
     until("tenants", || {
-        nodes.iter().all(|n| n.table().tenant(2).is_some())
+        nodes.iter().all(|n| n.table().tenant(3).is_some())
     })
     .await;
     let ed = control
@@ -309,24 +337,13 @@ async fn prepare(nodes: &[Node<Idle>]) -> Tokens {
         .dkim_new(1, DkimAlg::RsaSha256, "example.org", "r1")
         .await
         .expect("rsa");
-    let domain = control.domain_new(1, "example.org").await.expect("domain");
-    control
-        .domain_write(Domain {
-            state: Verification::Verified,
-            rsa: rsa.id,
-            ed25519: ed.id,
-            ..domain
-        })
+    verify_domain(control, 1, "example.org", rsa.id, ed.id).await;
+    verify_domain(control, 2, "example.net", 0, 0).await;
+    let info = control
+        .dkim_new(3, DkimAlg::Ed25519Sha256, "example.info", "e3")
         .await
-        .expect("verify");
-    let other = control.domain_new(2, "example.net").await.expect("domain");
-    control
-        .domain_write(Domain {
-            state: Verification::Verified,
-            ..other
-        })
-        .await
-        .expect("verify");
+        .expect("ed25519");
+    verify_domain(control, 3, "example.info", 0, info.id).await;
     let api = Scopes {
         smtp: false,
         api: true,
@@ -338,15 +355,20 @@ async fn prepare(nodes: &[Node<Idle>]) -> Tokens {
     let (first, first_token) = control.access_new(1, api, 0).await.expect("access");
     let (second, second_token) = control.access_new(2, api, 0).await.expect("access");
     let (third, smtp_token) = control.access_new(1, smtp, 0).await.expect("access");
+    let (fourth, third_token) = control.access_new(3, api, 0).await.expect("access");
     until("records", || {
         nodes.iter().all(|n| {
             let table = n.table();
-            [first.id, second.id, third.id]
+            [first.id, second.id, third.id, fourth.id]
                 .iter()
                 .all(|id| table.access(*id).is_some())
                 && table.sender(1, "example.org").is_some_and(|d| d.rsa != 0)
                 && table.dkim(1, rsa.id).is_some()
                 && table.sender(2, "example.net").is_some()
+                && table
+                    .sender(3, "example.info")
+                    .is_some_and(|d| d.ed25519 != 0)
+                && table.dkim(3, info.id).is_some()
         })
     })
     .await;
@@ -355,7 +377,13 @@ async fn prepare(nodes: &[Node<Idle>]) -> Tokens {
         first: text(&first_token),
         second: text(&second_token),
         smtp: text(&smtp_token),
-        publics: [("e1".into(), ed.public), ("r1".into(), rsa.public)].into(),
+        third: text(&third_token),
+        publics: [
+            ("e1".into(), ed.public),
+            ("r1".into(), rsa.public),
+            ("e3".into(), info.public),
+        ]
+        .into(),
     }
 }
 
@@ -583,6 +611,10 @@ impl Http {
         })
     }
 
+    async fn try_send(&mut self, data: &[u8]) -> bool {
+        self.conn.write_all(data).await.is_ok()
+    }
+
     async fn send_reply(&mut self, request: &[u8]) -> Reply {
         self.send(request).await;
         self.reply().await.expect("reply")
@@ -615,7 +647,7 @@ fn opaque(node: &Node<Idle>, id: &str) -> MessageId {
 fn stored(nodes: &[Node<Idle>]) -> BTreeSet<MessageId> {
     nodes
         .iter()
-        .flat_map(|n| [1, 2].into_iter().flat_map(|t| n.spool().messages_of(t)))
+        .flat_map(|n| [1, 2, 3].into_iter().flat_map(|t| n.spool().messages_of(t)))
         .collect()
 }
 
@@ -1040,24 +1072,64 @@ async fn raw_refusals(tokens: &Tokens, tls: &Arc<ClientConfig>, seed: u64) {
     );
 }
 
-type Owner = (Rc<RefCell<Option<Api>>>, Rc<Notify>, JoinHandle<()>);
+struct Owners {
+    apis: Vec<Rc<RefCell<Option<Api>>>>,
+    stops: Vec<Rc<Notify>>,
+    held: RefCell<Vec<JoinHandle<()>>>,
+}
 
-fn owner_core(cluster: &Cluster, forwards: &Mesh<Forward>) -> Owner {
-    let owner: Rc<RefCell<Option<Api>>> = Rc::default();
-    let stop = Rc::new(Notify::default());
-    let node = cluster.nodes[1].clone();
-    let ends = forwards.take(1).expect("ends");
-    let held = {
-        let (owner, stop) = (Rc::clone(&owner), Rc::clone(&stop));
-        cluster.machine.spawn_on(2, async move {
-            let config = Rc::new(ApiConfig::new("mx1.example.net".into()));
-            owner.replace(Some(start(node, Vec::new(), config, &guard(), ends)));
-            stop.wait().await;
-            let api = owner.borrow_mut().take().expect("owner api");
-            api.close().await;
-        })
+impl Owners {
+    fn sum(&self, of: impl Fn(&Api) -> u64) -> u64 {
+        self.apis
+            .iter()
+            .filter_map(|api| api.borrow().as_ref().map(&of))
+            .sum()
+    }
+
+    fn served(&self) -> u64 {
+        self.sum(Api::served)
+    }
+
+    fn serving(&self) -> u64 {
+        self.sum(|api| api.serving() as u64)
+    }
+
+    fn stop(&self) {
+        for stop in &self.stops {
+            stop.notify();
+        }
+    }
+
+    fn join(&self, machine: &Machine) {
+        for held in self.held.take() {
+            machine.block_on(0, held);
+        }
+    }
+}
+
+fn owners(cluster: &Cluster, forwards: &Mesh<Forward>) -> Rc<Owners> {
+    let mut owners = Owners {
+        apis: Vec::new(),
+        stops: Vec::new(),
+        held: RefCell::new(Vec::new()),
     };
-    (owner, stop, held)
+    for (core, node) in (1u16..).zip(&cluster.nodes[1..]) {
+        let api: Rc<RefCell<Option<Api>>> = Rc::default();
+        let stop = Rc::new(Notify::default());
+        let ends = forwards.take(core).expect("ends");
+        let (node, slot, wait) = (node.clone(), Rc::clone(&api), Rc::clone(&stop));
+        let held = cluster.machine.spawn_on(usize::from(core) + 1, async move {
+            let config = Rc::new(ApiConfig::new("mx1.example.net".into()));
+            slot.replace(Some(start(node, Vec::new(), config, &guard(), ends)));
+            wait.wait().await;
+            let api = slot.borrow_mut().take().expect("owner api");
+            api.close().await;
+        });
+        owners.apis.push(api);
+        owners.stops.push(stop);
+        owners.held.get_mut().push(held);
+    }
+    Rc::new(owners)
 }
 
 async fn owned_key(node: &Node<Idle>, name: &str, core: u16) -> String {
@@ -1091,11 +1163,11 @@ fn keyed_requests_run_on_the_owner_core() {
         let nodes = cluster.nodes.clone();
         let seen = Rc::clone(&cluster.seen);
         let forwards = Mesh::new(2);
-        let (owner, stop, held) = owner_core(&cluster, &forwards);
+        let owners = owners(&cluster, &forwards);
         let ends = forwards.take(0).expect("ends");
-        let watched = Rc::clone(&owner);
+        let watched = Rc::clone(&owners);
         cluster.run(async move {
-            let owner = watched;
+            let owners = watched;
             let tokens = prepare(&nodes).await;
             seen.publics.replace(tokens.publics.clone());
             let config = ApiConfig::new("mx1.example.net".into());
@@ -1158,8 +1230,8 @@ fn keyed_requests_run_on_the_owner_core() {
             let partial = raw(first, &fields, &big);
             http.send(&partial[..partial.len() / 2]).await;
             let serving = |n| {
-                let owner = Rc::clone(&owner);
-                move || owner.borrow().as_ref().is_some_and(|api| api.serving() == n)
+                let owners = Rc::clone(&owners);
+                move || owners.serving() == n
             };
             until("forwarded body", serving(1)).await;
             drop(http);
@@ -1170,11 +1242,11 @@ fn keyed_requests_run_on_the_owner_core() {
             let header = seen.headers.borrow()[&streamed].0.clone();
             assert!(String::from_utf8_lossy(&header).contains("with HTTPS id"));
             assert_eq!(ports.0.forwarded(), 6);
-            assert_eq!(owner.borrow().as_ref().map(Api::served), Some(6));
-            stop.notify();
+            assert_eq!(owners.served(), 6);
+            owners.stop();
             ports.close().await;
         });
-        cluster.machine.block_on(0, held);
+        owners.join(&cluster.machine);
         cluster.stop();
     });
 }
@@ -1185,9 +1257,11 @@ fn idempotency_keys_replay_and_refuse_conflicts() {
         let cluster = started(seed, 2);
         let nodes = cluster.nodes.clone();
         let forwards = Mesh::new(2);
-        let (owner, stop, held) = owner_core(&cluster, &forwards);
+        let owners = owners(&cluster, &forwards);
         let ends = forwards.take(0).expect("ends");
+        let watched = Rc::clone(&owners);
         cluster.run(async move {
+            let owners = watched;
             let tokens = prepare(&nodes).await;
             let config = ApiConfig::new("mx1.example.net".into());
             let ports = serve_with(&nodes[0], seed, config, ends).await;
@@ -1246,11 +1320,339 @@ fn idempotency_keys_replay_and_refuse_conflicts() {
                 ids.insert(opaque(&nodes[0], &one.id()));
             }
             assert_eq!(stored(&nodes), ids);
-            assert_eq!(owner.borrow().as_ref().map(Api::serving), Some(0));
-            stop.notify();
+            assert_eq!(owners.serving(), 0);
+            owners.stop();
             ports.close().await;
         });
-        cluster.machine.block_on(0, held);
+        owners.join(&cluster.machine);
+        cluster.stop();
+    });
+}
+
+fn json(token: &str, fields: &str, body: &str) -> Vec<u8> {
+    format!(
+        "POST /v1/messages HTTP/1.1\r\nHost: api.test\r\nAuthorization: Bearer {token}\r\n\
+         {fields}Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    )
+    .into_bytes()
+}
+
+fn mixed(token: &str, from: &str, key: Option<&str>, n: u64, m: u64) -> Vec<u8> {
+    let fields = key
+        .map(|key| format!("Idempotency-Key: {key}\r\n"))
+        .unwrap_or_default();
+    if (n + m).is_multiple_of(2) {
+        let body = format!(
+            r#"{{"from":"{from}","to":["a@example.com","b@example.net"],"text":"m{n}-{m}"}}"#
+        );
+        json(token, &fields, &body)
+    } else {
+        let size = [300, 3000, 90_000, 200_000][usize::try_from((n + m) % 4).expect("small")];
+        let envelope = format!("{fields}Envelope-From: {from}\r\nEnvelope-To: a@example.com\r\n");
+        raw(token, &envelope, &message(from, "", size, n * 100 + m))
+    }
+}
+
+#[derive(Default)]
+struct Calls {
+    keyed: BTreeMap<String, (Vec<u8>, Option<MessageId>)>,
+    unkeyed: BTreeSet<MessageId>,
+    sent: usize,
+}
+
+async fn api_client(
+    node: Node<Idle>,
+    tokens: Rc<(String, String)>,
+    tls: Arc<ClientConfig>,
+    n: u64,
+    calls: Rc<RefCell<Calls>>,
+) {
+    let mut http = if n.is_multiple_of(2) {
+        Http::plain().await
+    } else {
+        Http::tls(&tls).await
+    };
+    for m in 0..6u64 {
+        let keyed = !(n + m).is_multiple_of(3);
+        let (token, from) = if keyed {
+            (&tokens.0, "ann@example.org")
+        } else {
+            (&tokens.1, "ann@example.info")
+        };
+        let key = keyed.then(|| format!("c{n}-{m}"));
+        let request = mixed(token, from, key.as_deref(), n, m);
+        if let Some(key) = &key {
+            let entry = (request.clone(), None);
+            calls.borrow_mut().keyed.insert(key.clone(), entry);
+        }
+        if !http.try_send(&request).await {
+            return;
+        }
+        if !keyed {
+            calls.borrow_mut().sent += 1;
+        }
+        let Some(reply) = http.reply().await else {
+            return;
+        };
+        if reply.status != 200 {
+            return;
+        }
+        let id = opaque(&node, &reply.id());
+        let Some(key) = key else {
+            calls.borrow_mut().unkeyed.insert(id);
+            continue;
+        };
+        if let Some(entry) = calls.borrow_mut().keyed.get_mut(&key) {
+            entry.1 = Some(id);
+        }
+        if m.is_multiple_of(2) {
+            if !http.try_send(&request).await {
+                return;
+            }
+            let Some(again) = http.reply().await else {
+                return;
+            };
+            if again.status == 200 {
+                assert_eq!(opaque(&node, &again.id()), id, "retry of {key}");
+                assert_eq!(again.header("idempotent-replayed"), Some("true"));
+            }
+        }
+    }
+}
+
+async fn halted(driver: Rc<SimDriver>) {
+    while !driver.is_halted() {
+        sleep(Duration::from_millis(50)).await;
+    }
+}
+
+async fn until_accepted(request: &[u8]) -> Reply {
+    for _ in 0..50 {
+        let mut http = Http::plain().await;
+        if http.try_send(request).await
+            && let Some(reply) = http.reply().await
+            && reply.status == 200
+        {
+            return reply;
+        }
+        sleep(Duration::from_millis(200)).await;
+    }
+    panic!("request never accepted");
+}
+
+fn load_until_halt(cluster: &Cluster, driver: &Rc<SimDriver>, seed: u64, tokens: &Tokens) -> Calls {
+    let calls: Rc<RefCell<Calls>> = Rc::default();
+    let forwards = Mesh::new(u16::try_from(cluster.nodes.len()).expect("cores"));
+    let _owners = owners(cluster, &forwards);
+    let ends = forwards.take(0).expect("ends");
+    let nodes = cluster.nodes.clone();
+    let tokens = Rc::new((tokens.first.clone(), tokens.third.clone()));
+    let (shared, power) = (Rc::clone(&calls), Rc::clone(driver));
+    cluster.run(async move {
+        let config = ApiConfig::new("mx1.example.net".into());
+        let _ports = serve_with(&nodes[0], seed, config, ends).await;
+        let tls = client_config(simulated(seed + 100));
+        let clients: Vec<_> = (0..4)
+            .map(|n| {
+                let tokens = Rc::clone(&tokens);
+                spawn(api_client(
+                    nodes[0].clone(),
+                    tokens,
+                    Arc::clone(&tls),
+                    n,
+                    Rc::clone(&shared),
+                ))
+            })
+            .collect();
+        let mut all = pin!(async move {
+            for task in clients {
+                task.await;
+            }
+        });
+        let mut halt = pin!(halted(power));
+        let race = poll_fn(|cx| {
+            if all.as_mut().poll(cx).is_ready() || halt.as_mut().poll(cx).is_ready() {
+                Poll::Ready(())
+            } else {
+                Poll::Pending
+            }
+        });
+        let _ = timeout(Duration::from_secs(3600), race).await;
+    });
+    std::mem::take(&mut *calls.borrow_mut())
+}
+
+fn api_crash(seed: u64, cores: u16, crashed: &Cell<u32>) {
+    let driver = Rc::new(SimDriver::with_disk(seed, Config::default(), created(seed)));
+    let cluster = started_on(&driver, cores).expect("start");
+    let nodes = cluster.nodes.clone();
+    let tokens = cluster.run(async move { prepare(&nodes).await });
+    cluster.stop();
+
+    let config = Config {
+        halt_after: Some(80 + seed * 53 % 400),
+        ..Config::default()
+    };
+    let driver = Rc::new(SimDriver::with_disk(seed + 1, config, driver.crash()));
+    let calls = match started_on(&driver, cores) {
+        Some(cluster) => load_until_halt(&cluster, &driver, seed, &tokens),
+        None => Calls::default(),
+    };
+    let answered = calls.keyed.values().any(|(_, id)| id.is_some()) || !calls.unkeyed.is_empty();
+    if driver.is_halted() && answered {
+        crashed.set(crashed.get() + 1);
+    }
+
+    let driver = Rc::new(SimDriver::with_disk(
+        seed + 2,
+        Config::default(),
+        driver.crash(),
+    ));
+    let restarted = started_on(&driver, cores).expect("restart");
+    let forwards = Mesh::new(cores);
+    let owners = owners(&restarted, &forwards);
+    let ends = forwards.take(0).expect("ends");
+    let nodes = restarted.nodes.clone();
+    let watched = Rc::clone(&owners);
+    let first = tokens.first.clone();
+    restarted.run(async move {
+        let owners = watched;
+        let config = ApiConfig::new("mx1.example.net".into());
+        let ports = serve_with(&nodes[0], seed, config, ends).await;
+        let mut ids = BTreeSet::new();
+        for (key, (request, answered)) in &calls.keyed {
+            let reply = until_accepted(request).await;
+            let id = opaque(&nodes[0], &reply.id());
+            if let Some(answered) = answered {
+                assert_eq!(
+                    id, *answered,
+                    "seed {seed}: {key} answered again with another id"
+                );
+                assert_eq!(reply.header("idempotent-replayed"), Some("true"));
+            }
+            ids.insert(id);
+        }
+        let of = |tenant| -> BTreeSet<MessageId> {
+            nodes
+                .iter()
+                .flat_map(|n| n.spool().messages_of(tenant))
+                .collect()
+        };
+        assert_eq!(
+            of(1),
+            ids,
+            "seed {seed}: keyed messages differ from the answers"
+        );
+        let unkeyed = of(3);
+        assert!(
+            calls.unkeyed.is_subset(&unkeyed),
+            "seed {seed}: answered message lost"
+        );
+        assert!(
+            unkeyed.len() <= calls.sent,
+            "seed {seed}: unkeyed stored twice"
+        );
+        if let Some(key) = calls.keyed.keys().next() {
+            let mut http = Http::plain().await;
+            let other = r#"{"from":"ann@example.org","to":"z@example.com","text":"other"}"#;
+            let fields = format!("Idempotency-Key: {key}\r\n");
+            let refused = http.send_reply(&json(&first, &fields, other)).await;
+            assert_eq!(
+                (refused.status, refused.code().as_str()),
+                (422, "idempotency_conflict")
+            );
+        }
+        assert_eq!(owners.serving(), 0);
+        owners.stop();
+        ports.close().await;
+    });
+    owners.join(&restarted.machine);
+    restarted.stop();
+}
+
+#[test]
+fn keyed_requests_survive_crashes_on_two_cores() {
+    let crashed = Rc::new(Cell::new(0));
+    let counted = Rc::clone(&crashed);
+    check(0..6, move |seed| api_crash(seed, 2, &counted));
+    assert!(crashed.get() > 0, "no crash after an answered request");
+}
+
+#[test]
+fn keyed_requests_survive_crashes_on_four_cores() {
+    let crashed = Rc::new(Cell::new(0));
+    let counted = Rc::clone(&crashed);
+    check(0..4, move |seed| api_crash(seed, 4, &counted));
+    assert!(crashed.get() > 0, "no crash after an answered request");
+}
+
+#[test]
+fn tenants_never_share_keys_or_senders() {
+    check(0..2, |seed| {
+        let cluster = started(seed, 2);
+        let nodes = cluster.nodes.clone();
+        let forwards = Mesh::new(2);
+        let owners = owners(&cluster, &forwards);
+        let ends = forwards.take(0).expect("ends");
+        let watched = Rc::clone(&owners);
+        cluster.run(async move {
+            let owners = watched;
+            let tokens = prepare(&nodes).await;
+            let config = ApiConfig::new("mx1.example.net".into());
+            let ports = serve_with(&nodes[0], seed, config, ends).await;
+            let (first, third) = (tokens.first.as_str(), tokens.third.as_str());
+            let mut http = Http::plain().await;
+            let mut ours = BTreeSet::new();
+            let mut theirs = BTreeSet::new();
+            for core in [0, 1] {
+                let key = owned_key(&nodes[0], &format!("shared{seed}"), core).await;
+                let fields = format!("Idempotency-Key: {key}\r\n");
+                let body = r#"{"from":"ann@example.org","to":"a@example.com","text":"x"}"#;
+                let one = http.send_reply(&json(first, &fields, body)).await;
+                ours.insert(opaque(&nodes[0], &one.id()));
+                let mut other = Http::plain().await;
+                let refused = other.send_reply(&json(third, &fields, body)).await;
+                assert_eq!((refused.status, refused.code().as_str()), (403, "sender_not_allowed"));
+                let own = r#"{"from":"ann@example.info","to":"a@example.com","text":"x"}"#;
+                let three = http.send_reply(&json(third, &fields, own)).await;
+                assert_eq!(three.header("idempotent-replayed"), None);
+                assert_ne!(three.id(), one.id());
+                theirs.insert(opaque(&nodes[0], &three.id()));
+
+                let key = owned_key(&nodes[0], &format!("raw{seed}"), core).await;
+                let small = message("Ann <ann@example.org>", "", 500, seed);
+                let envelope = format!(
+                    "Idempotency-Key: {key}\r\nEnvelope-From: ann@example.org\r\nEnvelope-To: a@example.com\r\n"
+                );
+                let one = http.send_reply(&raw(first, &envelope, &small)).await;
+                ours.insert(opaque(&nodes[0], &one.id()));
+                let mut other = Http::plain().await;
+                let refused = other.send_reply(&raw(third, &envelope, &small)).await;
+                assert_eq!((refused.status, refused.code().as_str()), (403, "sender_not_allowed"));
+                let mine = message("Ann <ann@example.info>", "", 500, seed);
+                let envelope = format!(
+                    "Idempotency-Key: {key}\r\nEnvelope-From: ann@example.info\r\nEnvelope-To: a@example.com\r\n"
+                );
+                let three = http.send_reply(&raw(third, &envelope, &mine)).await;
+                assert_eq!(three.header("idempotent-replayed"), None);
+                theirs.insert(opaque(&nodes[0], &three.id()));
+            }
+            let of = |tenant| -> BTreeSet<MessageId> {
+                nodes.iter().flat_map(|n| n.spool().messages_of(tenant)).collect()
+            };
+            assert_eq!(of(1), ours);
+            assert_eq!(of(3), theirs);
+            let mut plain = Http::plain().await;
+            let health = format!(
+                "GET /healthz HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {third}\r\n\r\n"
+            );
+            let reply = plain.send_reply(health.as_bytes()).await;
+            assert_eq!(reply.body, b"{\"status\":\"ok\"}");
+            owners.stop();
+            ports.close().await;
+        });
+        owners.join(&cluster.machine);
         cluster.stop();
     });
 }
