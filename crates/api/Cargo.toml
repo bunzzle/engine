@@ -7,6 +7,9 @@ license.workspace = true
 publish.workspace = true
 autotests = false
 
+[dependencies]
+dkim = { path = "../dkim" }
+
 [[test]]
 name = "api"
 path = "tests/main.rs"

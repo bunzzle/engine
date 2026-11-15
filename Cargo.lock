@@ -5,6 +5,9 @@ version = 4
 [[package]]
 name = "api"
 version = "0.0.0"
+dependencies = [
+ "dkim",
+]
 
 [[package]]
 name = "aws-lc-rs"
