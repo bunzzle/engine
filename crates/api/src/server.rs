@@ -1,28 +1,26 @@
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
+use std::future::poll_fn;
 use std::net::IpAddr;
+use std::pin::pin;
 use std::rc::Rc;
+use std::task::Poll;
 use std::time::Duration;
 
 use control::{Grant, Scope};
 use crypto::Secret;
 use http::{Event, Framing, Limits, Phase, Request, Response, Server, Status, Timeouts};
-use intake::{
-    Conn, End, Envelope, Failure, Fault, Guard, Origin, Refused, Required, Slot, Submission,
-    data_hold, message_limit,
-};
+use intake::{Conn, End, Guard, Refused, Slot};
 use rt::{Instant, TcpStream, now, timeout};
-use sched::{Draft, Node, Refusal, Transport, domain_of};
-use smtp::{Decoder, Fault as LineFault};
+use sched::{Node, Transport};
 use tls::Acceptor;
 
-use crate::json;
-use crate::mime;
+use crate::forward::{Ahead, Back, Forwarder, Inbound, Link, Open, Remote};
+use crate::handler::{Handler, Source, chunk, ok, refusal};
 use crate::problem::Problem;
-use crate::send;
 
-const SLACK: u64 = 64 * 1024;
+const KEY: usize = 255;
 
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -63,14 +61,18 @@ pub(crate) struct Stats {
 
 pub(crate) struct Context<T> {
     pub(crate) node: Node<T>,
-    pub(crate) acceptor: Option<Rc<Acceptor>>,
     pub(crate) config: Rc<Config>,
     pub(crate) guard: Guard,
-    pub(crate) loopback: bool,
     pub(crate) stats: Rc<Stats>,
+    pub(crate) forward: Rc<Forwarder>,
 }
 
-enum Stop {
+pub(crate) struct Port {
+    pub(crate) acceptor: Option<Rc<Acceptor>>,
+    pub(crate) loopback: bool,
+}
+
+pub(crate) enum Stop {
     Problem(Problem),
     End(End),
 }
@@ -83,6 +85,7 @@ impl From<Problem> for Stop {
 
 pub(crate) async fn connection<T: Transport + 'static>(
     context: Rc<Context<T>>,
+    port: Rc<Port>,
     io: TcpStream,
     ip: IpAddr,
     shard: usize,
@@ -92,7 +95,7 @@ pub(crate) async fn connection<T: Transport + 'static>(
         return End::Refused;
     };
     let handshake = context.config.timeouts.handshake;
-    let conn = match &context.acceptor {
+    let conn = match &port.acceptor {
         Some(acceptor) => match timeout(handshake, acceptor.accept(io)).await {
             Ok(Ok(stream)) => Conn::tls(stream),
             _ => return End::Tls,
@@ -102,6 +105,7 @@ pub(crate) async fn connection<T: Transport + 'static>(
     let mut session = Session {
         server: Server::new(context.config.limits),
         context: &context,
+        loopback: port.loopback,
         ip,
         net: Some(net),
         tenant: None,
@@ -118,8 +122,41 @@ pub(crate) async fn connection<T: Transport + 'static>(
     end
 }
 
+pub(crate) async fn serve<T: Transport + 'static>(
+    context: Rc<Context<T>>,
+    inbound: Rc<Inbound>,
+    open: Box<Open>,
+) {
+    let key = inbound.key();
+    let work = async {
+        let Open {
+            route,
+            request,
+            grant,
+            id,
+            secure: _,
+            shard,
+        } = *open;
+        let mut source = Remote::new(Rc::clone(&inbound), context.config.timeouts.body);
+        let mut handler = Handler {
+            context: &context,
+            source: &mut source,
+            grant,
+            shard,
+        };
+        let response = match handler.run(route, &request, &id).await {
+            Ok(response) => response,
+            Err(Stop::Problem(problem)) => problem.response(&id),
+            Err(Stop::End(_)) => return,
+        };
+        inbound.reply(response);
+    };
+    context.forward.until_stopped(key, work).await;
+}
+
 struct Session<'a, T> {
     context: &'a Context<T>,
+    loopback: bool,
     ip: IpAddr,
     net: Option<Slot>,
     tenant: Option<(u32, Option<Slot>)>,
@@ -129,6 +166,12 @@ struct Session<'a, T> {
     head: Instant,
     last: Instant,
     body: Option<(Instant, u64)>,
+}
+
+enum Piece {
+    Body(Vec<u8>),
+    End,
+    Replied,
 }
 
 impl<T: Transport + 'static> Session<'_, T> {
@@ -234,12 +277,13 @@ impl<T: Transport + 'static> Session<'_, T> {
         let id = id();
         let (route, answer) = match request.path.as_str() {
             "/healthz" => (Route::Health, self.health(request, &id)),
-            "/v1/messages" if request.method == "POST" => {
-                (Route::Messages, self.send(request, &id).await)
-            }
+            "/v1/messages" if request.method == "POST" => (
+                Route::Messages,
+                self.post(Route::Messages, request, &id).await,
+            ),
             "/v1/messages" => (Route::Messages, Err(Problem::method("POST").into())),
             "/v1/messages/raw" if request.method == "POST" => {
-                (Route::Raw, self.raw(request, &id).await)
+                (Route::Raw, self.post(Route::Raw, request, &id).await)
             }
             "/v1/messages/raw" => (Route::Raw, Err(Problem::method("POST").into())),
             _ => (Route::Other, Err(Problem::not_found().into())),
@@ -252,7 +296,7 @@ impl<T: Transport + 'static> Session<'_, T> {
     }
 
     fn health(&self, request: &Request, id: &str) -> Result<Response, Stop> {
-        if !self.context.loopback {
+        if !self.loopback {
             return Err(Problem::not_found().into());
         }
         if request.method != "GET" && request.method != "HEAD" {
@@ -264,35 +308,133 @@ impl<T: Transport + 'static> Session<'_, T> {
         Ok(ok(id, "{\"status\":\"ok\"}".into()))
     }
 
-    async fn send(&mut self, request: &Request, id: &str) -> Result<Response, Stop> {
+    async fn post(&mut self, route: Route, request: &Request, id: &str) -> Result<Response, Stop> {
         let grant = self.auth(request).await?;
-        let json = request
-            .headers
-            .get("content-type")
-            .is_some_and(|value| media(value) == "application/json");
-        if !json {
-            return Err(Problem::media_type().into());
-        }
-        let node = &self.context.node;
-        let limit = message_limit(node);
-        let max = self
-            .context
-            .config
-            .max_body
-            .unwrap_or(limit / 3 * 4 + SLACK);
-        let spool = node.spool();
-        let chunk = spool.stream_chunk().max(spool.limits().inline) as u64;
-        let hold = max + 2 * limit + 2 * chunk;
-        let hold = usize::try_from(hold).unwrap_or(usize::MAX);
-        let Some(_hold) = self.context.guard.reserve(hold) else {
+        let context = self.context;
+        let shard = match key(request)? {
+            None => self.next_shard()?,
+            Some(key) => {
+                let requests = context.node.requests();
+                let shard = requests.shard(grant.tenant, key).await.map_err(refusal)?;
+                let owner = context.forward.owner(shard);
+                if owner != context.forward.index() {
+                    let open = Open {
+                        route,
+                        request: request.clone(),
+                        grant,
+                        id: id.to_owned(),
+                        secure: self.secure(),
+                        shard,
+                    };
+                    return self.forward(owner, open).await;
+                }
+                shard
+            }
+        };
+        let mut handler = Handler {
+            context,
+            source: self,
+            grant,
+            shard,
+        };
+        handler.run(route, request, id).await
+    }
+
+    fn next_shard(&mut self) -> Result<u16, Problem> {
+        let shards = self.context.node.spool().shards();
+        let shard = *shards
+            .get(self.shard % shards.len().max(1))
+            .ok_or_else(Problem::unavailable)?;
+        self.shard = self.shard.wrapping_add(1);
+        Ok(shard)
+    }
+
+    async fn forward(&mut self, owner: u16, open: Open) -> Result<Response, Stop> {
+        let context = self.context;
+        let size = usize::try_from(chunk(&context.node)).unwrap_or(usize::MAX);
+        let Some(_hold) = context.guard.reserve(size.saturating_mul(2)) else {
             return Err(Problem::unavailable().close().into());
         };
-        let body = self.body(request, max).await?;
-        let recipients = spool.limits().recipients as usize;
-        let send = send::parse(&body, recipients, limit)?;
-        drop(body);
-        let message = self.submit(grant, send, limit).await?;
-        Ok(accepted(id, &message))
+        let request = open.request.clone();
+        let wait = context.guard.limits().ask;
+        let mut link = context.forward.open(owner, open);
+        let mut credits = 0u32;
+        let mut started = false;
+        let mut ended = false;
+        let mut pending = Vec::new();
+        loop {
+            let back = if let Some(back) = link.pipe().try_take() {
+                Some(back)
+            } else if started && !ended && credits > 0 {
+                if !pending.is_empty() {
+                    let end = pending.len().min(size.max(1));
+                    let rest = pending.split_off(end);
+                    link.send(Ahead::Chunk(std::mem::replace(&mut pending, rest)));
+                    credits -= 1;
+                    continue;
+                }
+                match self.next_or(&link).await? {
+                    Piece::Body(bytes) => {
+                        pending = bytes;
+                        continue;
+                    }
+                    Piece::End => {
+                        link.send(Ahead::End);
+                        ended = true;
+                        continue;
+                    }
+                    Piece::Replied => link.pipe().take().await,
+                }
+            } else if ended {
+                link.pipe().take().await
+            } else {
+                timeout(wait, link.pipe().take())
+                    .await
+                    .map_err(|_| Problem::unavailable().close())?
+            };
+            match back {
+                None => return Err(Problem::unavailable().close().into()),
+                Some(Back::Start(max)) => {
+                    self.start(&request, max)?;
+                    started = true;
+                    credits = 2;
+                }
+                Some(Back::Credit) => credits += 1,
+                Some(Back::Reply(response)) => {
+                    link.done();
+                    return Ok(*response);
+                }
+            }
+        }
+    }
+
+    async fn next_or(&mut self, link: &Link) -> Result<Piece, Stop> {
+        loop {
+            match self.server.event() {
+                Some(Event::Body(bytes)) => return Ok(Piece::Body(bytes)),
+                Some(Event::End) => return Ok(Piece::End),
+                Some(Event::Fault(status)) => return Err(Problem::framing(status).into()),
+                Some(Event::Request(_)) => {
+                    return Err(Problem::framing(Status::BAD_REQUEST).into());
+                }
+                None => {
+                    self.flush().await.map_err(Stop::End)?;
+                    let mut read = pin!(self.read());
+                    let mut replied = pin!(link.reply());
+                    let raced = poll_fn(|cx| {
+                        if replied.as_mut().poll(cx).is_ready() {
+                            return Poll::Ready(None);
+                        }
+                        read.as_mut().poll(cx).map(Some)
+                    })
+                    .await;
+                    match raced {
+                        None => return Ok(Piece::Replied),
+                        Some(read) => read.map_err(Stop::End)?,
+                    }
+                }
+            }
+        }
     }
 
     async fn auth(&mut self, request: &Request) -> Result<Grant, Stop> {
@@ -331,8 +473,10 @@ impl<T: Transport + 'static> Session<'_, T> {
         self.net = None;
         Ok(grant)
     }
+}
 
-    fn start(&mut self, request: &Request, max: u64) -> Result<(), Problem> {
+impl<T: Transport + 'static> Source for Session<'_, T> {
+    fn start(&mut self, request: &Request, max: u64) -> Result<(), Stop> {
         self.server.accept_body(max).map_err(Problem::framing)?;
         let expected = match request.body {
             Framing::Length(n) => n,
@@ -360,174 +504,25 @@ impl<T: Transport + 'static> Session<'_, T> {
         }
     }
 
-    async fn body(&mut self, request: &Request, max: u64) -> Result<Vec<u8>, Stop> {
-        self.start(request, max)?;
-        let mut body = Vec::new();
-        while let Some(bytes) = self.next().await? {
-            body.extend_from_slice(&bytes);
-        }
-        Ok(body)
+    fn secure(&self) -> bool {
+        self.conn.as_ref().is_some_and(Conn::secure)
     }
+}
 
-    async fn submit(&mut self, grant: Grant, send: send::Send, limit: u64) -> Result<String, Stop> {
-        let node = &self.context.node;
-        let mut draft = self.draft(grant, &send.sender, &send.recipients).await?;
-        let mut submission = self.open(&mut draft).await?;
-        let boundary = format!("=_{}", submission.id());
-        let built = mime::build(&send.message, &boundary).map_err(mime_fault)?;
-        if built.len() as u64 > limit {
-            return Err(Problem::too_large().into());
-        }
-        submission
-            .push(node, grant, &built)
-            .await
-            .map_err(failure)?;
-        drop(built);
-        let envelope = (send.sender, send.recipients, send.require_tls);
-        self.seal(grant, submission, draft, envelope).await
-    }
-
-    async fn raw(&mut self, request: &Request, id: &str) -> Result<Response, Stop> {
-        let grant = self.auth(request).await?;
-        let rfc822 = request
-            .headers
-            .get("content-type")
-            .is_some_and(|value| media(value) == "message/rfc822");
-        if !rfc822 {
-            return Err(Problem::media_type().into());
-        }
-        let node = &self.context.node;
-        let limit = message_limit(node);
-        let recipients = node.spool().limits().recipients as usize;
-        let raw = send::envelope(&request.headers, recipients)?;
-        let mut draft = self.draft(grant, &raw.sender, &raw.recipients).await?;
-        let Some(_hold) = self.context.guard.reserve(data_hold(node)) else {
-            return Err(Problem::unavailable().close().into());
-        };
-        let mut submission = self.open(&mut draft).await?;
-        self.start(request, limit)?;
-        let mut lines = Decoder::chunks(limit);
-        let mut out = Vec::new();
-        while let Some(bytes) = self.next().await? {
-            lines.feed(&bytes, &mut out);
-            line_fault(&lines)?;
-            submission
-                .push(&self.context.node, grant, &out)
-                .await
-                .map_err(failure)?;
-            out.clear();
-        }
-        lines.finish(&mut out);
-        line_fault(&lines)?;
-        submission
-            .push(&self.context.node, grant, &out)
-            .await
-            .map_err(failure)?;
-        let envelope = (raw.sender, raw.recipients, raw.require_tls);
-        let message = self.seal(grant, submission, draft, envelope).await?;
-        Ok(accepted(id, &message))
-    }
-
-    async fn draft(
-        &mut self,
-        grant: Grant,
-        sender: &str,
-        recipients: &[String],
-    ) -> Result<Draft, Stop> {
-        let node = &self.context.node;
-        let domain = domain_of(sender).ok_or_else(|| Problem::bad_address("envelope_from"))?;
-        if node.table().sender(grant.tenant, &domain).is_none() {
-            return Err(Problem::sender().into());
-        }
-        let mut draft = node
-            .draft(grant.tenant, Some(grant.pool))
-            .map_err(refusal)?;
-        if draft.generation() != grant.generation {
-            return Err(Problem::suspended().into());
-        }
-        let addresses: Vec<&str> = recipients.iter().map(String::as_str).collect();
-        let results = node.recipients(&mut draft, &addresses).await;
-        let mut refused = Vec::new();
-        for (address, result) in addresses.iter().zip(results) {
-            match result {
-                Ok(_) => {}
-                Err(Refusal::Address) => refused.push(((*address).to_owned(), "bad_address")),
-                Err(Refusal::Suppressed) => refused.push(((*address).to_owned(), "suppressed")),
-                Err(other) => return Err(refusal(other).into()),
+fn key(request: &Request) -> Result<Option<&[u8]>, Problem> {
+    let bad = || Problem::bad_request("`Idempotency-Key` must be 1 to 255 printable ASCII octets");
+    match request.headers.count("idempotency-key") {
+        0 => Ok(None),
+        1 => {
+            let key = request.headers.get("idempotency-key").ok_or_else(bad)?;
+            let printable = key.iter().all(|&b| (0x20..0x7f).contains(&b));
+            if key.is_empty() || key.len() > KEY || !printable {
+                return Err(bad());
             }
+            Ok(Some(key))
         }
-        if !refused.is_empty() {
-            return Err(Problem::refused(refused).into());
-        }
-        Ok(draft)
+        _ => Err(bad()),
     }
-
-    async fn open(&mut self, draft: &mut Draft) -> Result<Submission, Stop> {
-        let node = &self.context.node;
-        let shards = node.spool().shards();
-        let shard = *shards
-            .get(self.shard % shards.len().max(1))
-            .ok_or_else(Problem::unavailable)?;
-        self.shard = self.shard.wrapping_add(1);
-        Ok(Submission::open(node, draft, shard)
-            .await
-            .map_err(failure)?)
-    }
-
-    async fn seal(
-        &mut self,
-        grant: Grant,
-        submission: Submission,
-        draft: Draft,
-        (sender, recipients, require_tls): (String, Vec<String>, bool),
-    ) -> Result<String, Stop> {
-        let with = match self.conn.as_ref() {
-            Some(conn) if conn.secure() => "HTTPS",
-            _ => "HTTP",
-        };
-        let origin = Origin {
-            node: &self.context.config.name,
-            with,
-            lifetime: self.context.config.lifetime,
-        };
-        let envelope = Envelope {
-            sender,
-            required: Required {
-                requiretls: require_tls,
-                ..Required::default()
-            },
-            ..Envelope::default()
-        };
-        let node = &self.context.node;
-        Ok(submission
-            .finish(node, grant, &origin, draft, envelope, &recipients)
-            .await
-            .map_err(failure)?)
-    }
-}
-
-fn accepted(request: &str, message: &str) -> Response {
-    let mut out = String::from("{\"id\":");
-    json::string(message, &mut out);
-    out.push('}');
-    ok(request, out)
-}
-
-fn line_fault(lines: &Decoder) -> Result<(), Problem> {
-    match lines.fault() {
-        None => Ok(()),
-        Some(LineFault::Size) => Err(Problem::too_large()),
-        Some(LineFault::Cr(_)) => Err(Problem::bad_message("bare CR in the message")),
-        Some(LineFault::Nul(_)) => Err(Problem::bad_message("NUL in the message")),
-        Some(LineFault::Long(_)) => Err(Problem::bad_message("line longer than 998 octets")),
-    }
-}
-
-fn ok(request: &str, body: String) -> Response {
-    Response::new(Status::OK)
-        .header("Request-Id", request)
-        .and_then(|r| r.body("application/json", body.into_bytes()))
-        .unwrap_or_else(|_| Response::new(Status::INTERNAL))
 }
 
 fn id() -> String {
@@ -547,46 +542,4 @@ fn bearer(value: &[u8]) -> Option<&[u8]> {
     }
     let token = token.trim_ascii();
     (!token.is_empty()).then_some(token)
-}
-
-fn media(value: &[u8]) -> String {
-    let end = value.iter().position(|&b| b == b';').unwrap_or(value.len());
-    String::from_utf8_lossy(value[..end].trim_ascii()).to_ascii_lowercase()
-}
-
-fn refusal(refusal: Refusal) -> Problem {
-    match refusal {
-        Refusal::Tenant => Problem::suspended(),
-        Refusal::Pool => Problem::pool(),
-        Refusal::Recipients => Problem::too_many_recipients(),
-        Refusal::Address => Problem::bad_address("to"),
-        Refusal::Suppressed => Problem::refused(Vec::new()),
-        Refusal::Busy => Problem::rate_limited(),
-        Refusal::Conflict
-        | Refusal::Message
-        | Refusal::Keys
-        | Refusal::Signer
-        | Refusal::Failed => Problem::unavailable(),
-    }
-}
-
-fn failure(failure: Failure) -> Problem {
-    match failure {
-        Failure::Header(Fault::TooLarge) | Failure::TooBig => Problem::too_large(),
-        Failure::Header(Fault::Signer) | Failure::Temporary => Problem::unavailable(),
-        Failure::Header(_) => Problem::bad_header(),
-        Failure::FromDomain | Failure::NoKey => Problem::sender(),
-        Failure::Refused(r) => refusal(r),
-    }
-}
-
-fn mime_fault(fault: mime::Fault) -> Problem {
-    match fault {
-        mime::Fault::Address => Problem::bad_address("from"),
-        mime::Fault::Header => Problem::bad_header(),
-        mime::Fault::ContentType => Problem::bad_message("`attachments.content_type` not accepted"),
-        mime::Fault::ContentId => Problem::bad_message("`attachments.content_id` not accepted"),
-        mime::Fault::Filename => Problem::bad_message("`attachments.filename` not accepted"),
-        mime::Fault::Body => Problem::bad_message("message body not accepted"),
-    }
 }

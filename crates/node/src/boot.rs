@@ -2,6 +2,7 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::Arc;
 
+use api::Forward;
 use control::Naming;
 use intake::{Ask, Guard, Listener, listen, watch};
 use keys::{BatchSettings, Client, Connect, Ring, RingSettings};
@@ -33,6 +34,7 @@ pub struct Plan {
     meshes: Meshes,
     guards: Mesh<Ask>,
     orders: Mesh<Order>,
+    forwards: Mesh<Forward>,
 }
 
 impl Plan {
@@ -53,6 +55,7 @@ impl Plan {
             meshes: Meshes::new(cores),
             guards: Mesh::new(cores),
             orders: Mesh::new(cores),
+            forwards: Mesh::new(cores),
         }
     }
 
@@ -181,26 +184,25 @@ pub async fn run<T: Transport + 'static>(
             )
         })
         .collect();
-    let apis: Vec<api::Api> = match &plan.config.api {
-        None => Vec::new(),
-        Some(settings) => {
-            let config = Rc::new(settings.settings.clone());
-            up.apis
-                .into_iter()
-                .map(|(socket, secure, loopback)| {
-                    let acceptor = secure.then(|| Rc::clone(&up.acceptor));
-                    api::listen(
-                        up.node.clone(),
-                        socket,
-                        acceptor,
-                        Rc::clone(&config),
-                        up.guard.clone(),
-                        loopback,
-                    )
-                })
-                .collect()
-        }
-    };
+    let apis: Option<api::Api> = plan.config.api.as_ref().map(|settings| {
+        let sockets = up
+            .apis
+            .into_iter()
+            .map(|(socket, secure, loopback)| api::Socket {
+                socket,
+                acceptor: secure.then(|| Rc::clone(&up.acceptor)),
+                loopback,
+            })
+            .collect();
+        let ends = plan.forwards.take(index).expect("forwards of each core");
+        api::start(
+            up.node.clone(),
+            sockets,
+            Rc::new(settings.settings.clone()),
+            &up.guard,
+            ends,
+        )
+    });
     let stopped = if let Some(watched) = watched {
         let requested = watched.stop_requested().await;
         watched.close().await;

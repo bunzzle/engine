@@ -1,15 +1,24 @@
 use std::rc::Rc;
 
 use intake::{End, Guard, Listener};
-use rt::TcpListener;
+use rt::{Ends, TcpListener, spawn};
 use sched::{Node, Transport};
 use tls::Acceptor;
 
-use crate::server::{Config, Context, Route, Stats, connection};
+use crate::forward::{Forward, Forwarder};
+use crate::server::{Config, Context, Port, Route, Stats, connection, serve};
+
+pub struct Socket {
+    pub socket: TcpListener,
+    pub acceptor: Option<Rc<Acceptor>>,
+    pub loopback: bool,
+}
 
 pub struct Api {
-    listener: Listener,
+    listeners: Vec<Listener>,
     stats: Rc<Stats>,
+    forward: Rc<Forwarder>,
+    drain: std::time::Duration,
 }
 
 impl Api {
@@ -23,43 +32,81 @@ impl Api {
     }
 
     pub fn sessions(&self) -> usize {
-        self.listener.sessions()
+        self.listeners.iter().map(Listener::sessions).sum()
     }
 
     pub fn refused(&self) -> u64 {
-        self.listener.refused()
+        self.listeners.iter().map(Listener::refused).sum()
     }
 
     pub fn ended(&self, end: End) -> u64 {
-        self.listener.ended(end)
+        self.listeners.iter().map(|l| l.ended(end)).sum()
+    }
+
+    pub fn forwarded(&self) -> u64 {
+        self.forward.forwarded()
+    }
+
+    pub fn served(&self) -> u64 {
+        self.forward.served()
+    }
+
+    pub fn serving(&self) -> usize {
+        self.forward.serving()
     }
 
     pub async fn close(self) {
         self.stats.closing.set(true);
-        self.listener.close().await;
+        let closing: Vec<_> = self
+            .listeners
+            .into_iter()
+            .map(|listener| spawn(listener.close()))
+            .collect();
+        for closed in closing {
+            closed.await;
+        }
+        self.forward.close(self.drain).await;
     }
 }
 
-pub fn listen<T: Transport + 'static>(
+pub fn start<T: Transport + 'static>(
     node: Node<T>,
-    socket: TcpListener,
-    acceptor: Option<Rc<Acceptor>>,
+    sockets: Vec<Socket>,
     config: Rc<Config>,
-    guard: Guard,
-    loopback: bool,
+    guard: &Guard,
+    ends: Ends<Forward>,
 ) -> Api {
     let stats = Rc::new(Stats::default());
     let drain = config.drain;
+    let (forward, _) = Forwarder::start(ends);
     let context = Rc::new(Context {
         node,
-        acceptor,
         config,
         guard: guard.clone(),
-        loopback,
         stats: Rc::clone(&stats),
+        forward: Rc::clone(&forward),
     });
-    let listener = Listener::start(socket, guard, drain, move |io, ip, count| {
-        connection(Rc::clone(&context), io, ip, count)
-    });
-    Api { listener, stats }
+    let owner = Rc::clone(&context);
+    forward.serve_with(Box::new(move |inbound, open| {
+        spawn(serve(Rc::clone(&owner), inbound, open))
+    }));
+    let listeners = sockets
+        .into_iter()
+        .map(|socket| {
+            let port = Rc::new(Port {
+                acceptor: socket.acceptor,
+                loopback: socket.loopback,
+            });
+            let context = Rc::clone(&context);
+            Listener::start(socket.socket, guard.clone(), drain, move |io, ip, count| {
+                connection(Rc::clone(&context), Rc::clone(&port), io, ip, count)
+            })
+        })
+        .collect();
+    Api {
+        listeners,
+        stats,
+        forward,
+        drain,
+    }
 }
