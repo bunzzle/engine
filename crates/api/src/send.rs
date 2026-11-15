@@ -1,4 +1,5 @@
 use dkim::base64;
+use http::Headers;
 
 use crate::json::{self, Value};
 use crate::mime::{self, Attachment, Mailbox, Message};
@@ -26,6 +27,53 @@ pub struct Send {
     pub sender: String,
     pub recipients: Vec<String>,
     pub require_tls: bool,
+}
+
+#[derive(Debug)]
+pub struct Raw {
+    pub sender: String,
+    pub recipients: Vec<String>,
+    pub require_tls: bool,
+}
+
+pub fn envelope(headers: &Headers, recipients: usize) -> Result<Raw, Problem> {
+    if headers.count("envelope-from") != 1 {
+        return Err(Problem::bad_request("`Envelope-From` must be sent once"));
+    }
+    let sender = headers.get("envelope-from").unwrap_or_default();
+    let sender = std::str::from_utf8(sender)
+        .ok()
+        .map(str::trim)
+        .filter(|s| mime::address_ok(s))
+        .ok_or_else(|| Problem::bad_address("Envelope-From"))?;
+    let mut all: Vec<String> = Vec::new();
+    for value in headers.all("envelope-to") {
+        let text = std::str::from_utf8(value).map_err(|_| Problem::bad_address("Envelope-To"))?;
+        for address in text.split(',').map(str::trim) {
+            if !mime::address_ok(address) {
+                return Err(Problem::bad_address("Envelope-To"));
+            }
+            if !all.iter().any(|a| a.eq_ignore_ascii_case(address)) {
+                all.push(address.to_owned());
+            }
+        }
+    }
+    if all.is_empty() {
+        return Err(Problem::no_recipients());
+    }
+    if all.len() > recipients {
+        return Err(Problem::too_many_recipients());
+    }
+    let require_tls = match (headers.count("require-tls"), headers.get("require-tls")) {
+        (0, _) => false,
+        (1, Some(b"1")) => true,
+        _ => return Err(Problem::bad_request("`Require-TLS` must be 1")),
+    };
+    Ok(Raw {
+        sender: sender.to_owned(),
+        recipients: all,
+        require_tls,
+    })
 }
 
 pub fn parse(body: &[u8], recipients: usize, message: u64) -> Result<Send, Problem> {

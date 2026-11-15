@@ -2,10 +2,10 @@ use std::mem;
 
 use crate::reply::{self, Reply};
 
-pub(crate) const TEXT_LINE: usize = 998;
+pub const TEXT_LINE: usize = 998;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Fault {
+pub enum Fault {
     Cr(u64),
     Long(u64),
     Nul(u64),
@@ -35,7 +35,7 @@ enum At {
 }
 
 #[derive(Debug)]
-pub(crate) struct Decoder {
+pub struct Decoder {
     dots: bool,
     at: At,
     cr: bool,
@@ -54,7 +54,7 @@ impl Decoder {
         Self::new(limit, true, crlf)
     }
 
-    pub(crate) fn chunks(limit: u64) -> Self {
+    pub fn chunks(limit: u64) -> Self {
         Self::new(limit, false, true)
     }
 
@@ -74,7 +74,7 @@ impl Decoder {
         }
     }
 
-    pub(crate) fn fault(&self) -> Option<Fault> {
+    pub fn fault(&self) -> Option<Fault> {
         self.fault
     }
 
@@ -94,7 +94,7 @@ impl Decoder {
         self.halted = true;
     }
 
-    pub(crate) fn feed(&mut self, input: &[u8], out: &mut Vec<u8>) -> (usize, bool) {
+    pub fn feed(&mut self, input: &[u8], out: &mut Vec<u8>) -> (usize, bool) {
         for (i, &b) in input.iter().enumerate() {
             if self.halted {
                 self.discarded += 1;
@@ -121,7 +121,7 @@ impl Decoder {
         (input.len(), false)
     }
 
-    pub(crate) fn finish(&mut self, out: &mut Vec<u8>) {
+    pub fn finish(&mut self, out: &mut Vec<u8>) {
         if mem::take(&mut self.cr) {
             self.fail(Fault::Cr(self.line));
         }

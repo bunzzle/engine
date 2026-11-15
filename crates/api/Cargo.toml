@@ -15,6 +15,7 @@ http = { path = "../http" }
 intake = { path = "../intake" }
 rt = { path = "../rt" }
 sched = { path = "../sched" }
+smtp = { path = "../smtp" }
 tls = { path = "../tls" }
 
 [dev-dependencies]

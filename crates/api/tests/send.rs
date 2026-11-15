@@ -839,3 +839,189 @@ fn slow_and_idle_connections_time_out() {
     });
     cluster.stop();
 }
+
+fn raw(token: &str, envelope: &str, body: &[u8]) -> Vec<u8> {
+    let mut out = format!(
+        "POST /v1/messages/raw HTTP/1.1\r\nHost: api.test\r\nAuthorization: Bearer {token}\r\n\
+         Content-Type: message/rfc822\r\n{envelope}Content-Length: {}\r\n\r\n",
+        body.len()
+    )
+    .into_bytes();
+    out.extend_from_slice(body);
+    out
+}
+
+fn message(from: &str, extra: &str, size: usize, seed: u64) -> Vec<u8> {
+    let mut out = format!("From: {from}\r\nTo: a@example.com\r\nSubject: s{seed}\r\n{extra}\r\n")
+        .into_bytes();
+    let mut state = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
+    while out.len() < size {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        let width = 1 + usize::try_from(state % 76).expect("small");
+        let line: Vec<u8> = (0..width)
+            .map(|i| {
+                b"abcdefghij.KLMNOP 0123456789"
+                    [usize::try_from((state >> (i % 50)) % 28).expect("fits")]
+            })
+            .collect();
+        out.extend_from_slice(&line);
+        out.extend_from_slice(if state.is_multiple_of(3) {
+            b"\n"
+        } else {
+            b"\r\n"
+        });
+    }
+    out
+}
+
+#[test]
+fn raw_messages_stream_under_the_smtp_line_rules() {
+    check(0..2, |seed| {
+        let cluster = started(seed, 2);
+        let nodes = cluster.nodes.clone();
+        let seen = Rc::clone(&cluster.seen);
+        cluster.run(async move {
+            let tokens = prepare(&nodes).await;
+            seen.publics.replace(tokens.publics.clone());
+            let ports = serve(&nodes[0], seed, ApiConfig::new("mx1.example.net".into())).await;
+            let tls = client_config(simulated(seed + 100));
+            let first = tokens.first.as_str();
+            let envelope = "Envelope-From: bounce@example.org\r\n\
+                            Envelope-To: a@example.com, b@example.net\r\n\
+                            Envelope-To: c@example.com\r\nRequire-TLS: 1\r\n";
+            let mut http = Http::tls(&tls).await;
+            let mut ids = BTreeSet::new();
+            for (n, size) in [300, 5000, 300_000].into_iter().enumerate() {
+                let body = message("Ann <ann@example.org>", "", size, seed * 10 + n as u64);
+                http.send(&raw(first, envelope, &body)).await;
+                let reply = http.reply().await.expect("reply");
+                ids.insert(opaque(&nodes[0], &reply.id()));
+            }
+            let body = message("ann@example.org", "", 2000, seed);
+            let head = format!(
+                "POST /v1/messages/raw HTTP/1.1\r\nHost: a\r\nAuthorization: Bearer {first}\r\n\
+                 Content-Type: message/rfc822\r\nEnvelope-From: ann@example.org\r\n\
+                 Envelope-To: d@example.com\r\nTransfer-Encoding: chunked\r\n\r\n"
+            );
+            http.send(head.as_bytes()).await;
+            for part in body.chunks(700) {
+                http.send(format!("{:x}\r\n", part.len()).as_bytes()).await;
+                http.send(part).await;
+                http.send(b"\r\n").await;
+            }
+            http.send(b"0\r\n\r\n").await;
+            ids.insert(opaque(&nodes[0], &http.reply().await.expect("reply").id()));
+
+            raw_refusals(&tokens, &tls, seed).await;
+
+            assert_eq!(stored(&nodes), ids);
+            until("attempted", || seen.headers.borrow().len() == ids.len()).await;
+            let headers = seen.headers.borrow().clone();
+            for id in &ids {
+                let (header, signatures) = &headers[id];
+                assert_eq!(*signatures, 2);
+                assert!(String::from_utf8_lossy(header).contains("with HTTPS id"));
+            }
+            let routed = seen.routed.borrow().clone();
+            let want: BTreeSet<String> = [
+                "a@example.com",
+                "b@example.net",
+                "c@example.com",
+                "d@example.com",
+            ]
+            .map(String::from)
+            .into();
+            assert_eq!(routed, want);
+            assert_eq!(ports.count(Route::Raw, 200), 4);
+            ports.close().await;
+        });
+        cluster.stop();
+    });
+}
+
+async fn raw_refusals(tokens: &Tokens, tls: &Arc<ClientConfig>, seed: u64) {
+    let first = tokens.first.as_str();
+    let ok = "Envelope-From: ann@example.org\r\nEnvelope-To: a@example.com\r\n";
+    let plain = message("ann@example.org", "", 500, seed);
+    let envelopes = [
+        ("Envelope-To: a@example.com\r\n", 400, "bad_request"),
+        (
+            "Envelope-From: a@example.org\r\nEnvelope-From: b@example.org\r\n",
+            400,
+            "bad_request",
+        ),
+        (
+            "Envelope-From: ann@example.org\r\nEnvelope-To: a@example.com, bad\r\n",
+            400,
+            "bad_address",
+        ),
+        ("Envelope-From: ann@example.org\r\n", 422, "no_recipients"),
+        (
+            "Envelope-From: ann@example.org\r\nEnvelope-To: a@example.com\r\nRequire-TLS: yes\r\n",
+            400,
+            "bad_request",
+        ),
+        (
+            "Envelope-From: ann@example.com\r\nEnvelope-To: a@example.com\r\n",
+            403,
+            "sender_not_allowed",
+        ),
+    ];
+    let mut long = plain.clone();
+    long.extend_from_slice(&[b'x'; 1000]);
+    long.extend_from_slice(b"\r\n");
+    let bodies = [
+        (
+            message("ann@example.com", "", 500, seed),
+            403,
+            "sender_not_allowed",
+        ),
+        (
+            message("ann@example.org", "Bcc: x@example.com\r\n", 500, seed),
+            400,
+            "bad_header",
+        ),
+        (
+            b"From: ann@example.org\r\n\r\na\rb\r\n".to_vec(),
+            400,
+            "bad_message",
+        ),
+        (
+            b"From: ann@example.org\r\n\r\na\0b\r\n".to_vec(),
+            400,
+            "bad_message",
+        ),
+        (long, 400, "bad_message"),
+    ];
+    let requests = envelopes
+        .into_iter()
+        .map(|(envelope, status, code)| (raw(first, envelope, &plain), status, code))
+        .chain(
+            bodies
+                .into_iter()
+                .map(|(body, status, code)| (raw(first, ok, &body), status, code)),
+        )
+        .chain([
+            (raw(&tokens.second, ok, &plain), 403, "sender_not_allowed"),
+            (raw("nobody", ok, &plain), 401, "unauthorized"),
+        ]);
+    for (request, status, code) in requests {
+        let mut http = Http::tls(tls).await;
+        http.send(&request).await;
+        let reply = http.reply().await.expect("reply");
+        assert_eq!((reply.status, reply.code().as_str()), (status, code));
+    }
+    let mut http = Http::tls(tls).await;
+    let json = format!(
+        "POST /v1/messages/raw HTTP/1.1\r\nHost: a\r\nAuthorization: Bearer {first}\r\n\
+         Content-Type: application/json\r\n{ok}Content-Length: 2\r\n\r\n{{}}"
+    );
+    http.send(json.as_bytes()).await;
+    let reply = http.reply().await.expect("reply");
+    assert_eq!(
+        (reply.status, reply.code().as_str()),
+        (415, "unsupported_media_type")
+    );
+}
