@@ -18,6 +18,7 @@ const SOCKET: &str = "/run/keys.sock";
 const UID: u32 = 1000;
 const CORES: u16 = 2;
 const SMTP: &str = "10.0.0.1:587";
+const API: &str = "127.0.0.1:8080";
 const OPTIONS: Options = Options {
     journal_size: 8 * SLOT_SIZE,
     region_size: 8 * SLOT_SIZE,
@@ -42,6 +43,7 @@ fn config(id: u32) -> Config {
          [keys]\nsocket = \"{SOCKET}\"\nserver = {UID}\n\
          [tls]\nchain = \"/etc/a.pem\"\nkey = \"/etc/a.key\"\n\
          [intake]\ndrain = \"2s\"\n\
+         [api]\nplain = [\"{API}\"]\ndrain = \"2s\"\n\
          [dns]\nservers = [\"127.0.0.1\"]\n\
          [[listen]]\naddress = \"{SMTP}\"\n"
     );
@@ -133,6 +135,21 @@ fn smtp() -> SocketAddr {
     SMTP.parse().expect("address")
 }
 
+async fn health() -> String {
+    let stream = TcpStream::connect(API.parse().expect("address"))
+        .await
+        .expect("connect");
+    let request = b"GET /healthz HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    stream
+        .write_all(Buf::from_slice(request))
+        .await
+        .0
+        .expect("write");
+    let (read, buf) = stream.read(Buf::new(512)).await;
+    let n = read.expect("read");
+    String::from_utf8_lossy(&buf[..n]).into_owned()
+}
+
 async fn serving() -> TcpStream {
     for _ in 0..600 {
         if let Ok(stream) = TcpStream::connect(smtp()).await {
@@ -174,6 +191,7 @@ fn a_node_boots_serves_and_drains_on_sigterm() {
         let first = serving().await;
         assert!(banner(&first).await.starts_with("220 mx1.example.net"));
         drop(first);
+        assert!(health().await.starts_with("HTTP/1.1 200 OK\r\n"));
         let open = TcpStream::connect(smtp()).await.expect("connect");
         assert!(banner(&open).await.starts_with("220 "));
         let asked = rt::now();
@@ -190,6 +208,11 @@ fn a_node_boots_serves_and_drains_on_sigterm() {
         }
         drop(committer.await);
         assert!(TcpStream::connect(smtp()).await.is_err());
+        assert!(
+            TcpStream::connect(API.parse().expect("address"))
+                .await
+                .is_err()
+        );
     });
 }
 
@@ -260,6 +283,11 @@ fn a_failed_signal_watch_stops_the_node_with_the_error() {
         }
         drop(committer.await);
         assert!(TcpStream::connect(smtp()).await.is_err());
+        assert!(
+            TcpStream::connect(API.parse().expect("address"))
+                .await
+                .is_err()
+        );
     });
 }
 

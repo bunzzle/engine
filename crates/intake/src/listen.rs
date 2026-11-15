@@ -79,50 +79,62 @@ pub fn listen<T: Transport + 'static>(
     guard: Guard,
     implicit: bool,
 ) -> Listener {
-    let shared = Rc::new(Shared {
-        drain: config.drain,
-        ..Shared::default()
-    });
-    let state = Rc::clone(&shared);
-    let task = spawn(async move {
-        let mut count = 0usize;
-        loop {
-            let Some(accepted) = accept_or_stop(&socket, &state.stop).await else {
-                return;
-            };
-            let Ok((io, peer)) = accepted else {
-                continue;
-            };
-            let Some(admitted) = guard.admit() else {
-                state.refused.set(state.refused.get() + 1);
-                continue;
-            };
-            count = count.wrapping_add(1);
-            state.sessions.set(state.sessions.get() + 1);
-            let (node, acceptor, config, guard, state) = (
-                node.clone(),
-                Rc::clone(&acceptor),
-                Rc::clone(&config),
-                guard.clone(),
-                Rc::clone(&state),
-            );
-            spawn(async move {
-                let ip = peer.ip();
-                let work = session(&node, &acceptor, io, &config, &guard, ip, implicit, count);
-                let end = until_closed(&state, count, work)
-                    .await
-                    .unwrap_or(End::Closed);
-                drop(admitted);
-                let slot = &state.ends[index(end)];
-                slot.set(slot.get() + 1);
-                state.sessions.set(state.sessions.get() - 1);
-                if state.sessions.get() == 0 {
-                    state.idle.notify();
-                }
-            });
-        }
-    });
-    Listener { shared, task }
+    let (drain, gate) = (config.drain, guard.clone());
+    Listener::start(socket, gate, drain, move |io, ip, count| {
+        let (node, acceptor, config, guard) = (
+            node.clone(),
+            Rc::clone(&acceptor),
+            Rc::clone(&config),
+            guard.clone(),
+        );
+        async move { session(&node, &acceptor, io, &config, &guard, ip, implicit, count).await }
+    })
+}
+
+impl Listener {
+    pub fn start<F, W>(socket: TcpListener, guard: Guard, drain: Duration, handler: F) -> Self
+    where
+        F: Fn(TcpStream, IpAddr, usize) -> W + 'static,
+        W: Future<Output = End> + 'static,
+    {
+        let shared = Rc::new(Shared {
+            drain,
+            ..Shared::default()
+        });
+        let state = Rc::clone(&shared);
+        let task = spawn(async move {
+            let mut count = 0usize;
+            loop {
+                let Some(accepted) = accept_or_stop(&socket, &state.stop).await else {
+                    return;
+                };
+                let Ok((io, peer)) = accepted else {
+                    continue;
+                };
+                let Some(admitted) = guard.admit() else {
+                    state.refused.set(state.refused.get() + 1);
+                    continue;
+                };
+                count = count.wrapping_add(1);
+                state.sessions.set(state.sessions.get() + 1);
+                let work = handler(io, peer.ip(), count);
+                let state = Rc::clone(&state);
+                spawn(async move {
+                    let end = until_closed(&state, count, work)
+                        .await
+                        .unwrap_or(End::Closed);
+                    drop(admitted);
+                    let slot = &state.ends[index(end)];
+                    slot.set(slot.get() + 1);
+                    state.sessions.set(state.sessions.get() - 1);
+                    if state.sessions.get() == 0 {
+                        state.idle.notify();
+                    }
+                });
+            }
+        });
+        Self { shared, task }
+    }
 }
 
 async fn accept_or_stop(

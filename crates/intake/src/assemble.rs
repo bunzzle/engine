@@ -18,6 +18,7 @@ pub struct Signer<'a> {
 
 pub struct Stamp<'a> {
     pub node: &'a str,
+    pub with: &'a str,
     pub id: &'a str,
     pub now: u64,
     pub lifetime: u64,
@@ -47,8 +48,8 @@ pub fn assemble(
     let time = stamp.now / 1000;
     let expiry = time + (stamp.lifetime / 1000 + DAY).max(SIGNATURE_FLOOR);
     let mut out = fold(&format!(
-        "Received: by {} with ESMTPSA id {};",
-        stamp.node, stamp.id
+        "Received: by {} with {} id {};",
+        stamp.node, stamp.with, stamp.id
     ));
     out.extend_from_slice(format!(" {date}\r\n").as_bytes());
     for signer in signers {
@@ -103,6 +104,7 @@ mod tests {
     fn stamp() -> Stamp<'static> {
         Stamp {
             node: "mx1.example.net",
+            with: "ESMTPSA",
             id: "ABCDEFGHIJKLMNOPQRSTUVWXYZ",
             now: NOW,
             lifetime: 10 * DAY * 1000,
