@@ -125,6 +125,14 @@ impl Problem {
         )
     }
 
+    pub fn idempotency_conflict() -> Self {
+        Self::new(
+            Status::UNPROCESSABLE,
+            "idempotency_conflict",
+            "key used with another request",
+        )
+    }
+
     pub fn refused(refused: Vec<(String, &'static str)>) -> Self {
         Self {
             refused,

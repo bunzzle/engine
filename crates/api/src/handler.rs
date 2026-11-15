@@ -1,7 +1,8 @@
 use control::Grant;
+use crypto::{Ids, Sha256};
 use http::{Request, Response, Status};
 use intake::{Envelope, Failure, Fault, Origin, Required, Submission, data_hold, message_limit};
-use sched::{Draft, Node, Refusal, Transport, domain_of};
+use sched::{Begun, Draft, Node, Refusal, Ticket, Transport, domain_of};
 use smtp::{Decoder, Fault as LineFault};
 
 use crate::json;
@@ -11,6 +12,12 @@ use crate::send;
 use crate::server::{Context, Route, Stop};
 
 const SLACK: u64 = 64 * 1024;
+const KEY: usize = 255;
+
+pub(crate) enum Answer {
+    Accepted(String),
+    Replayed(String),
+}
 
 pub(crate) trait Source {
     fn start(&mut self, request: &Request, max: u64) -> Result<(), Stop>;
@@ -32,15 +39,46 @@ impl<T: Transport + 'static, S: Source> Handler<'_, T, S> {
         request: &Request,
         id: &str,
     ) -> Result<Response, Stop> {
-        let message = match route {
+        let answer = match route {
             Route::Messages => self.send(request).await?,
             Route::Raw => self.raw(request).await?,
             Route::Health | Route::Other => return Err(Problem::not_found().into()),
         };
-        Ok(accepted(id, &message))
+        Ok(match answer {
+            Answer::Accepted(message) => accepted(id, &message),
+            Answer::Replayed(message) => {
+                let response = accepted(id, &message);
+                let fallback = response.clone();
+                response
+                    .header("Idempotent-Replayed", "true")
+                    .unwrap_or(fallback)
+            }
+        })
     }
 
-    async fn send(&mut self, request: &Request) -> Result<String, Stop> {
+    async fn begin(&self, request: &Request, fields: &[&[u8]]) -> Result<Begin, Stop> {
+        let Some(key) = key(request)? else {
+            return Ok(Begin::Fresh(None));
+        };
+        let node = &self.context.node;
+        let tenant = self.grant.tenant;
+        let digest = node
+            .requests()
+            .digest(tenant, &canonical(fields))
+            .await
+            .map_err(refusal)?;
+        match node.begin(tenant, key, digest).await {
+            Ok(Begun::Fresh(ticket)) => Ok(Begin::Fresh(Some(ticket))),
+            Ok(Begun::Replay(ids)) => {
+                let id = ids.first().ok_or_else(Problem::unavailable)?;
+                Ok(Begin::Replay(opaque(node, &id.bytes())?))
+            }
+            Err(Refusal::Conflict) => Err(Problem::idempotency_conflict().into()),
+            Err(other) => Err(refusal(other).into()),
+        }
+    }
+
+    async fn send(&mut self, request: &Request) -> Result<Answer, Stop> {
         let json = request
             .headers
             .get("content-type")
@@ -68,14 +106,28 @@ impl<T: Transport + 'static, S: Source> Handler<'_, T, S> {
         }
         let recipients = spool.limits().recipients as usize;
         let send = send::parse(&body, recipients, limit)?;
+        let hash = crypto::sha256(&body);
         drop(body);
-        self.submit(send, limit).await
+        let fields: [&[u8]; 3] = [b"POST /v1/messages", b"application/json", &hash];
+        let ticket = match self.begin(request, &fields).await? {
+            Begin::Replay(id) => return Ok(Answer::Replayed(id)),
+            Begin::Fresh(ticket) => ticket,
+        };
+        self.submit(send, limit, ticket).await.map(Answer::Accepted)
     }
 
-    async fn submit(&mut self, send: send::Send, limit: u64) -> Result<String, Stop> {
+    async fn submit(
+        &mut self,
+        send: send::Send,
+        limit: u64,
+        ticket: Option<Ticket>,
+    ) -> Result<String, Stop> {
         let node = &self.context.node;
         let mut draft = self.draft(&send.sender, &send.recipients).await?;
         let mut submission = self.open(&mut draft).await?;
+        if let Some(ticket) = ticket {
+            submission.once(ticket);
+        }
         let boundary = format!("=_{}", submission.id());
         let built = mime::build(&send.message, &boundary).map_err(mime_fault)?;
         if built.len() as u64 > limit {
@@ -90,7 +142,7 @@ impl<T: Transport + 'static, S: Source> Handler<'_, T, S> {
         self.seal(submission, draft, envelope).await
     }
 
-    async fn raw(&mut self, request: &Request) -> Result<String, Stop> {
+    async fn raw(&mut self, request: &Request) -> Result<Answer, Stop> {
         let rfc822 = request
             .headers
             .get("content-type")
@@ -110,7 +162,9 @@ impl<T: Transport + 'static, S: Source> Handler<'_, T, S> {
         self.source.start(request, limit)?;
         let mut lines = Decoder::chunks(limit);
         let mut out = Vec::new();
+        let mut hash = Sha256::new();
         while let Some(bytes) = self.source.next().await? {
+            hash.update(&bytes);
             lines.feed(&bytes, &mut out);
             line_fault(&lines)?;
             submission
@@ -125,8 +179,26 @@ impl<T: Transport + 'static, S: Source> Handler<'_, T, S> {
             .push(&self.context.node, self.grant, &out)
             .await
             .map_err(failure)?;
+        let hash = hash.finish();
+        let joined = raw.recipients.join(",");
+        let tls: &[u8] = if raw.require_tls { b"1" } else { b"0" };
+        let fields: [&[u8]; 6] = [
+            b"POST /v1/messages/raw",
+            b"message/rfc822",
+            raw.sender.as_bytes(),
+            joined.as_bytes(),
+            tls,
+            &hash,
+        ];
+        match self.begin(request, &fields).await? {
+            Begin::Replay(id) => return Ok(Answer::Replayed(id)),
+            Begin::Fresh(Some(ticket)) => submission.once(ticket),
+            Begin::Fresh(None) => {}
+        }
         let envelope = (raw.sender, raw.recipients, raw.require_tls);
-        self.seal(submission, draft, envelope).await
+        self.seal(submission, draft, envelope)
+            .await
+            .map(Answer::Accepted)
     }
 
     async fn draft(&mut self, sender: &str, recipients: &[String]) -> Result<Draft, Stop> {
@@ -196,6 +268,43 @@ impl<T: Transport + 'static, S: Source> Handler<'_, T, S> {
             .await
             .map_err(failure)?)
     }
+}
+
+enum Begin {
+    Fresh(Option<Ticket>),
+    Replay(String),
+}
+
+pub(crate) fn key(request: &Request) -> Result<Option<&[u8]>, Problem> {
+    let bad = || Problem::bad_request("`Idempotency-Key` must be 1 to 255 printable ASCII octets");
+    match request.headers.count("idempotency-key") {
+        0 => Ok(None),
+        1 => {
+            let key = request.headers.get("idempotency-key").ok_or_else(bad)?;
+            let printable = key.iter().all(|&b| (0x20..0x7f).contains(&b));
+            if key.is_empty() || key.len() > KEY || !printable {
+                return Err(bad());
+            }
+            Ok(Some(key))
+        }
+        _ => Err(bad()),
+    }
+}
+
+fn canonical(fields: &[&[u8]]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for field in fields {
+        let length = u32::try_from(field.len()).unwrap_or(u32::MAX);
+        out.extend_from_slice(&length.to_le_bytes());
+        out.extend_from_slice(field);
+    }
+    out
+}
+
+fn opaque<T: Transport + 'static>(node: &Node<T>, id: &[u8; 16]) -> Result<String, Problem> {
+    let ids = node.ids().ok_or_else(Problem::unavailable)?;
+    let ids = Ids::new(&ids).map_err(|_| Problem::unavailable())?;
+    Ok(ids.encode(id))
 }
 
 pub(crate) fn chunk<T: Transport + 'static>(node: &Node<T>) -> u64 {

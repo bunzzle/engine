@@ -1,7 +1,7 @@
 use control::Grant;
 use crypto::{DkimAlg, Ids, Sealer, TAG};
 use dkim::BodyHash;
-use sched::{Draft, Envelope, Node, Recipient, Refusal, Sealing, Transport, encode_slice};
+use sched::{Draft, Envelope, Node, Recipient, Refusal, Sealing, Ticket, Transport, encode_slice};
 use spool::{Body, BodyWriter, HeadClear, Message, SLICE};
 
 use crate::assemble::{Signer, Stamp, assemble};
@@ -33,6 +33,7 @@ pub struct Submission {
     size: u64,
     pending: Vec<u8>,
     stream: Option<(Sealer, BodyWriter)>,
+    ticket: Option<Ticket>,
 }
 
 struct Ready {
@@ -66,11 +67,16 @@ impl Submission {
             size: 0,
             pending: Vec::new(),
             stream: None,
+            ticket: None,
         })
     }
 
     pub fn id(&self) -> &str {
         &self.id
+    }
+
+    pub fn once(&mut self, ticket: Ticket) {
+        self.ticket = Some(ticket);
     }
 
     pub fn discard(&mut self) {
@@ -207,9 +213,11 @@ impl Submission {
             body,
             slices,
         };
-        node.accept(draft, message)
-            .await
-            .map_err(Failure::Refused)?;
+        let accepted = match self.ticket.take() {
+            Some(ticket) => node.accept_once(ticket, draft, message).await,
+            None => node.accept(draft, message).await,
+        };
+        accepted.map_err(Failure::Refused)?;
         Ok(self.id)
     }
 }
