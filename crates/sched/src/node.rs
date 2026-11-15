@@ -307,6 +307,12 @@ impl<T: Transport + 'static> Sched<T> {
         self.inner.signing.get().map_or(0, |s| s.cached())
     }
 
+    pub(crate) fn forget_signed(&self, id: MessageId) {
+        if let Some(signing) = self.inner.signing.get() {
+            signing.forget(id);
+        }
+    }
+
     pub fn use_table(&self, table: Rc<RefCell<Table>>) {
         let _ = self.inner.table.set(Rc::clone(&table));
         if let Some(keys) = self.inner.keys.get() {
@@ -889,7 +895,10 @@ impl<T: Transport + 'static> Sched<T> {
                 .iter()
                 .filter_map(|(r, due)| due.map(|due| (*r, due)))
                 .collect(),
-            Some(Done::Dropped) => Vec::new(),
+            Some(Done::Dropped) => {
+                self.forget_signed(route.message);
+                Vec::new()
+            }
             None => reports
                 .iter()
                 .map(|(r, due)| (*r, due.unwrap_or(0).max(now + wait)))
@@ -1060,6 +1069,7 @@ impl<T: Transport + 'static> Sched<T> {
                 drop(spawn(async move {
                     let inner = &sched.inner;
                     if inner.spool.expire(id, now).await.is_ok() {
+                        sched.forget_signed(id);
                         inner.expired.set(inner.expired.get() + 1);
                     } else {
                         rt::sleep(std::time::Duration::from_millis(inner.config.ending)).await;

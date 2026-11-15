@@ -1,5 +1,5 @@
 use std::cell::{Cell, RefCell};
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::BTreeMap;
 use std::rc::Rc;
 
 use control::Table;
@@ -13,7 +13,7 @@ use crate::policy::Answer;
 use crate::sealing::{Keys, Opener, Unsealable, opener};
 use crate::transport::{Answered, Claimed};
 
-pub const SIGNED_KEPT: usize = 65_536;
+pub const SIGNED_BYTES: usize = 16 << 20;
 pub const KEYS_WAIT: u64 = 30_000;
 const SIGNER_GONE: &[u8] = b"550 5.7.1 Signing key removed";
 const UNSIGNABLE: &[u8] = b"554 5.3.0 Stored message cannot be signed";
@@ -137,6 +137,10 @@ impl Signing {
     pub(crate) fn cached(&self) -> usize {
         self.cache.borrow().len()
     }
+
+    pub(crate) fn forget(&self, id: MessageId) {
+        self.cache.borrow_mut().forget(id);
+    }
 }
 
 pub struct Outgoing {
@@ -173,26 +177,50 @@ impl Outgoing {
     }
 }
 
+type Fields = Rc<[Vec<u8>]>;
+
 #[derive(Default)]
 pub(crate) struct Cache {
-    signed: BTreeMap<MessageId, Rc<[Vec<u8>]>>,
-    order: VecDeque<MessageId>,
+    signed: BTreeMap<MessageId, (u64, Fields)>,
+    order: BTreeMap<u64, MessageId>,
+    next: u64,
+    bytes: usize,
+}
+
+fn size(fields: &[Vec<u8>]) -> usize {
+    fields.iter().map(Vec::len).sum()
 }
 
 impl Cache {
-    fn get(&self, id: MessageId) -> Option<Rc<[Vec<u8>]>> {
-        self.signed.get(&id).cloned()
+    fn get(&mut self, id: MessageId) -> Option<Fields> {
+        let entry = self.signed.get_mut(&id)?;
+        self.order.remove(&entry.0);
+        entry.0 = self.next;
+        self.order.insert(self.next, id);
+        self.next += 1;
+        Some(Rc::clone(&entry.1))
     }
 
-    fn put(&mut self, id: MessageId, fields: Rc<[Vec<u8>]>) {
-        if self.signed.insert(id, fields).is_some() {
-            return;
-        }
-        self.order.push_back(id);
-        while self.order.len() > SIGNED_KEPT {
-            if let Some(old) = self.order.pop_front() {
-                self.signed.remove(&old);
+    fn put(&mut self, id: MessageId, fields: Fields) {
+        self.forget(id);
+        self.bytes += size(&fields);
+        self.signed.insert(id, (self.next, fields));
+        self.order.insert(self.next, id);
+        self.next += 1;
+        while self.bytes > SIGNED_BYTES {
+            let Some((_, old)) = self.order.pop_first() else {
+                break;
+            };
+            if let Some((_, fields)) = self.signed.remove(&old) {
+                self.bytes -= size(&fields);
             }
+        }
+    }
+
+    fn forget(&mut self, id: MessageId) {
+        if let Some((sequence, fields)) = self.signed.remove(&id) {
+            self.order.remove(&sequence);
+            self.bytes -= size(&fields);
         }
     }
 
@@ -238,7 +266,7 @@ async fn prepare(
         Err(None) => return Err(Fault::Recipients(opener)),
     };
     let count = envelope.signatures.len();
-    let cached = cache.borrow().get(stored.id);
+    let cached = cache.borrow_mut().get(stored.id);
     let signed = if let Some(signed) = cached {
         signed
     } else {
@@ -347,4 +375,70 @@ fn check<'a>(envelope: &[u8], section: &'a [u8]) -> Option<(Envelope, Vec<dkim::
         }
     }
     Some((envelope, fields))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn id(key: u64) -> MessageId {
+        MessageId {
+            node: 1,
+            shard: 0,
+            key,
+        }
+    }
+
+    fn fields(len: usize) -> Fields {
+        vec![vec![0u8; len]].into()
+    }
+
+    #[test]
+    fn the_cache_keeps_its_byte_limit() {
+        let mut cache = Cache::default();
+        let len = SIGNED_BYTES / 4;
+        for key in 0..8 {
+            cache.put(id(key), fields(len));
+            assert!(cache.bytes <= SIGNED_BYTES);
+        }
+        assert_eq!(cache.len(), 4);
+        assert!(cache.get(id(3)).is_none());
+        assert!(cache.get(id(4)).is_some());
+    }
+
+    #[test]
+    fn a_hit_moves_the_entry_last() {
+        let mut cache = Cache::default();
+        let len = SIGNED_BYTES / 4;
+        for key in 0..4 {
+            cache.put(id(key), fields(len));
+        }
+        assert!(cache.get(id(0)).is_some());
+        cache.put(id(4), fields(len));
+        assert!(cache.get(id(0)).is_some());
+        assert!(cache.get(id(1)).is_none());
+    }
+
+    #[test]
+    fn forget_and_replace_keep_the_byte_count() {
+        let mut cache = Cache::default();
+        cache.put(id(0), fields(100));
+        cache.put(id(1), fields(50));
+        cache.put(id(0), fields(30));
+        assert_eq!(cache.bytes, 80);
+        cache.forget(id(1));
+        cache.forget(id(7));
+        assert_eq!((cache.bytes, cache.len()), (30, 1));
+        assert_eq!(cache.order.len(), 1);
+        cache.forget(id(0));
+        assert_eq!((cache.bytes, cache.len(), cache.order.len()), (0, 0, 0));
+    }
+
+    #[test]
+    fn an_entry_over_the_limit_is_not_kept() {
+        let mut cache = Cache::default();
+        cache.put(id(0), fields(10));
+        cache.put(id(1), fields(SIGNED_BYTES + 1));
+        assert_eq!((cache.bytes, cache.len()), (0, 0));
+    }
 }
