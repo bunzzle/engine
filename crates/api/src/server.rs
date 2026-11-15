@@ -17,10 +17,8 @@ use sched::{Node, Transport};
 use tls::Acceptor;
 
 use crate::forward::{Ahead, Back, Forwarder, Inbound, Link, Open, Remote};
-use crate::handler::{Handler, Source, chunk, ok, refusal};
+use crate::handler::{Handler, Source, chunk, key, ok, refusal};
 use crate::problem::Problem;
-
-const KEY: usize = 255;
 
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -506,22 +504,6 @@ impl<T: Transport + 'static> Source for Session<'_, T> {
 
     fn secure(&self) -> bool {
         self.conn.as_ref().is_some_and(Conn::secure)
-    }
-}
-
-fn key(request: &Request) -> Result<Option<&[u8]>, Problem> {
-    let bad = || Problem::bad_request("`Idempotency-Key` must be 1 to 255 printable ASCII octets");
-    match request.headers.count("idempotency-key") {
-        0 => Ok(None),
-        1 => {
-            let key = request.headers.get("idempotency-key").ok_or_else(bad)?;
-            let printable = key.iter().all(|&b| (0x20..0x7f).contains(&b));
-            if key.is_empty() || key.len() > KEY || !printable {
-                return Err(bad());
-            }
-            Ok(Some(key))
-        }
-        _ => Err(bad()),
     }
 }
 

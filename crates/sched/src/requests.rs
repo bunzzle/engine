@@ -19,6 +19,7 @@ pub const KIND_REQUEST: u8 = 2;
 pub const DAY: u64 = 86_400_000;
 pub const REQUEST_SHAPE: Shape = Shape { value: 61 };
 pub const INLINE_IDS: usize = 2;
+const DIGEST: &[u8] = b"request digest\0";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Value {
@@ -185,6 +186,15 @@ impl Requests {
         let generation = self.generation(tenant)?;
         let hash = self.hash(tenant, generation, key).await?;
         Ok(owner_shard(&self.inner.parts.naming, tenant, &hash))
+    }
+
+    pub async fn digest(&self, tenant: u32, request: &[u8]) -> Result<Hash, Refusal> {
+        let generation = self.generation(tenant)?;
+        let keys = keys_of(self.inner.parts.keys.as_ref(), tenant, generation).await?;
+        let mut data = Vec::with_capacity(DIGEST.len() + request.len());
+        data.extend_from_slice(DIGEST);
+        data.extend_from_slice(request);
+        Ok(keyed_hash(&keys, &data))
     }
 
     async fn hash(&self, tenant: u32, generation: u32, key: &[u8]) -> Result<Hash, Refusal> {

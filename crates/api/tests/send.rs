@@ -583,6 +583,11 @@ impl Http {
         })
     }
 
+    async fn send_reply(&mut self, request: &[u8]) -> Reply {
+        self.send(request).await;
+        self.reply().await.expect("reply")
+    }
+
     async fn post(&mut self, token: &str, body: &str) -> Reply {
         self.send(&post(token, body)).await;
         self.reply().await.expect("reply")
@@ -1035,6 +1040,41 @@ async fn raw_refusals(tokens: &Tokens, tls: &Arc<ClientConfig>, seed: u64) {
     );
 }
 
+type Owner = (Rc<RefCell<Option<Api>>>, Rc<Notify>, JoinHandle<()>);
+
+fn owner_core(cluster: &Cluster, forwards: &Mesh<Forward>) -> Owner {
+    let owner: Rc<RefCell<Option<Api>>> = Rc::default();
+    let stop = Rc::new(Notify::default());
+    let node = cluster.nodes[1].clone();
+    let ends = forwards.take(1).expect("ends");
+    let held = {
+        let (owner, stop) = (Rc::clone(&owner), Rc::clone(&stop));
+        cluster.machine.spawn_on(2, async move {
+            let config = Rc::new(ApiConfig::new("mx1.example.net".into()));
+            owner.replace(Some(start(node, Vec::new(), config, &guard(), ends)));
+            stop.wait().await;
+            let api = owner.borrow_mut().take().expect("owner api");
+            api.close().await;
+        })
+    };
+    (owner, stop, held)
+}
+
+async fn owned_key(node: &Node<Idle>, name: &str, core: u16) -> String {
+    for n in 0.. {
+        let key = format!("{name}-{n}");
+        let shard = node
+            .requests()
+            .shard(1, key.as_bytes())
+            .await
+            .expect("shard");
+        if shard % 2 == core {
+            return key;
+        }
+    }
+    unreachable!()
+}
+
 fn keyed(token: &str, key: &str, body: &str) -> Vec<u8> {
     format!(
         "POST /v1/messages HTTP/1.1\r\nHost: api.test\r\nAuthorization: Bearer {token}\r\n\
@@ -1051,20 +1091,7 @@ fn keyed_requests_run_on_the_owner_core() {
         let nodes = cluster.nodes.clone();
         let seen = Rc::clone(&cluster.seen);
         let forwards = Mesh::new(2);
-        let owner: Rc<RefCell<Option<Api>>> = Rc::default();
-        let stop = Rc::new(Notify::default());
-        let held = {
-            let node = nodes[1].clone();
-            let ends = forwards.take(1).expect("ends");
-            let (owner, stop) = (Rc::clone(&owner), Rc::clone(&stop));
-            cluster.machine.spawn_on(2, async move {
-                let config = Rc::new(ApiConfig::new("mx1.example.net".into()));
-                owner.replace(Some(start(node, Vec::new(), config, &guard(), ends)));
-                stop.wait().await;
-                let api = owner.borrow_mut().take().expect("owner api");
-                api.close().await;
-            })
-        };
+        let (owner, stop, held) = owner_core(&cluster, &forwards);
         let ends = forwards.take(0).expect("ends");
         let watched = Rc::clone(&owner);
         cluster.run(async move {
@@ -1144,6 +1171,82 @@ fn keyed_requests_run_on_the_owner_core() {
             assert!(String::from_utf8_lossy(&header).contains("with HTTPS id"));
             assert_eq!(ports.0.forwarded(), 6);
             assert_eq!(owner.borrow().as_ref().map(Api::served), Some(6));
+            stop.notify();
+            ports.close().await;
+        });
+        cluster.machine.block_on(0, held);
+        cluster.stop();
+    });
+}
+
+#[test]
+fn idempotency_keys_replay_and_refuse_conflicts() {
+    check(0..2, |seed| {
+        let cluster = started(seed, 2);
+        let nodes = cluster.nodes.clone();
+        let forwards = Mesh::new(2);
+        let (owner, stop, held) = owner_core(&cluster, &forwards);
+        let ends = forwards.take(0).expect("ends");
+        cluster.run(async move {
+            let tokens = prepare(&nodes).await;
+            let config = ApiConfig::new("mx1.example.net".into());
+            let ports = serve_with(&nodes[0], seed, config, ends).await;
+            let first = tokens.first.as_str();
+            let body = r#"{"from":"ann@example.org","to":"d@example.com","text":"x"}"#;
+            let other = r#"{"from":"ann@example.org","to":"e@example.com","text":"x"}"#;
+            let small = message("Ann <ann@example.org>", "", 3000, seed);
+            let to_a = "Envelope-From: ann@example.org\r\nEnvelope-To: a@example.com\r\n";
+            let to_b = "Envelope-From: ann@example.org\r\nEnvelope-To: b@example.com\r\n";
+            let mut ids = BTreeSet::new();
+            for core in [0, 1] {
+                let key = owned_key(&nodes[0], &format!("json{seed}"), core).await;
+                let mut http = Http::plain().await;
+                let reply = http.send_reply(&keyed(first, &key, body)).await;
+                assert_eq!(reply.header("idempotent-replayed"), None);
+                let id = reply.id();
+                let again = http.send_reply(&keyed(first, &key, body)).await;
+                assert_eq!(again.header("idempotent-replayed"), Some("true"));
+                assert_eq!(again.id(), id);
+                let refused = http.send_reply(&keyed(first, &key, other)).await;
+                assert_eq!(
+                    (refused.status, refused.code().as_str()),
+                    (422, "idempotency_conflict")
+                );
+                ids.insert(opaque(&nodes[0], &id));
+
+                let key = owned_key(&nodes[0], &format!("raw{seed}"), core).await;
+                let fields = |envelope: &str| format!("Idempotency-Key: {key}\r\n{envelope}");
+                let reply = http.send_reply(&raw(first, &fields(to_a), &small)).await;
+                let id = reply.id();
+                let again = http.send_reply(&raw(first, &fields(to_a), &small)).await;
+                assert_eq!(again.header("idempotent-replayed"), Some("true"));
+                assert_eq!(again.id(), id);
+                let refused = http.send_reply(&raw(first, &fields(to_b), &small)).await;
+                assert_eq!(
+                    (refused.status, refused.code().as_str()),
+                    (422, "idempotency_conflict")
+                );
+                ids.insert(opaque(&nodes[0], &id));
+
+                let key = owned_key(&nodes[0], &format!("race{seed}"), core).await;
+                let mut one = Http::plain().await;
+                let mut two = Http::plain().await;
+                one.send(&keyed(first, &key, body)).await;
+                two.send(&keyed(first, &key, body)).await;
+                let (one, two) = (
+                    one.reply().await.expect("one"),
+                    two.reply().await.expect("two"),
+                );
+                assert_eq!(one.id(), two.id());
+                let replayed = [&one, &two]
+                    .iter()
+                    .filter(|r| r.header("idempotent-replayed").is_some())
+                    .count();
+                assert_eq!(replayed, 1);
+                ids.insert(opaque(&nodes[0], &one.id()));
+            }
+            assert_eq!(stored(&nodes), ids);
+            assert_eq!(owner.borrow().as_ref().map(Api::serving), Some(0));
             stop.notify();
             ports.close().await;
         });
