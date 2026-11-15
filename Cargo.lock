@@ -15,6 +15,7 @@ dependencies = [
  "keys",
  "rt",
  "sched",
+ "smtp",
  "spool",
  "store",
  "tls",

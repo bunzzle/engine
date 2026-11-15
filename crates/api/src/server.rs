@@ -10,10 +10,11 @@ use crypto::Secret;
 use http::{Event, Framing, Limits, Phase, Request, Response, Server, Status, Timeouts};
 use intake::{
     Conn, End, Envelope, Failure, Fault, Guard, Origin, Refused, Required, Slot, Submission,
-    message_limit,
+    data_hold, message_limit,
 };
 use rt::{Instant, TcpStream, now, timeout};
-use sched::{Node, Refusal, Transport, domain_of};
+use sched::{Draft, Node, Refusal, Transport, domain_of};
+use smtp::{Decoder, Fault as LineFault};
 use tls::Acceptor;
 
 use crate::json;
@@ -49,6 +50,7 @@ impl Config {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Route {
     Messages,
+    Raw,
     Health,
     Other,
 }
@@ -236,6 +238,10 @@ impl<T: Transport + 'static> Session<'_, T> {
                 (Route::Messages, self.send(request, &id).await)
             }
             "/v1/messages" => (Route::Messages, Err(Problem::method("POST").into())),
+            "/v1/messages/raw" if request.method == "POST" => {
+                (Route::Raw, self.raw(request, &id).await)
+            }
+            "/v1/messages/raw" => (Route::Raw, Err(Problem::method("POST").into())),
             _ => (Route::Other, Err(Problem::not_found().into())),
         };
         match answer {
@@ -286,10 +292,7 @@ impl<T: Transport + 'static> Session<'_, T> {
         let send = send::parse(&body, recipients, limit)?;
         drop(body);
         let message = self.submit(grant, send, limit).await?;
-        let mut out = String::from("{\"id\":");
-        json::string(&message, &mut out);
-        out.push('}');
-        Ok(ok(id, out))
+        Ok(accepted(id, &message))
     }
 
     async fn auth(&mut self, request: &Request) -> Result<Grant, Stop> {
@@ -329,7 +332,7 @@ impl<T: Transport + 'static> Session<'_, T> {
         Ok(grant)
     }
 
-    async fn body(&mut self, request: &Request, max: u64) -> Result<Vec<u8>, Stop> {
+    fn start(&mut self, request: &Request, max: u64) -> Result<(), Problem> {
         self.server.accept_body(max).map_err(Problem::framing)?;
         let expected = match request.body {
             Framing::Length(n) => n,
@@ -337,11 +340,14 @@ impl<T: Transport + 'static> Session<'_, T> {
             Framing::Chunked => max,
         };
         self.body = Some((now(), expected));
-        let mut body = Vec::new();
+        Ok(())
+    }
+
+    async fn next(&mut self) -> Result<Option<Vec<u8>>, Stop> {
         loop {
             match self.server.event() {
-                Some(Event::Body(bytes)) => body.extend_from_slice(&bytes),
-                Some(Event::End) => return Ok(body),
+                Some(Event::Body(bytes)) => return Ok(Some(bytes)),
+                Some(Event::End) => return Ok(None),
                 Some(Event::Fault(status)) => return Err(Problem::framing(status).into()),
                 Some(Event::Request(_)) => {
                     return Err(Problem::framing(Status::BAD_REQUEST).into());
@@ -354,10 +360,82 @@ impl<T: Transport + 'static> Session<'_, T> {
         }
     }
 
+    async fn body(&mut self, request: &Request, max: u64) -> Result<Vec<u8>, Stop> {
+        self.start(request, max)?;
+        let mut body = Vec::new();
+        while let Some(bytes) = self.next().await? {
+            body.extend_from_slice(&bytes);
+        }
+        Ok(body)
+    }
+
     async fn submit(&mut self, grant: Grant, send: send::Send, limit: u64) -> Result<String, Stop> {
         let node = &self.context.node;
-        let domain =
-            domain_of(&send.sender).ok_or_else(|| Problem::bad_address("envelope_from"))?;
+        let mut draft = self.draft(grant, &send.sender, &send.recipients).await?;
+        let mut submission = self.open(&mut draft).await?;
+        let boundary = format!("=_{}", submission.id());
+        let built = mime::build(&send.message, &boundary).map_err(mime_fault)?;
+        if built.len() as u64 > limit {
+            return Err(Problem::too_large().into());
+        }
+        submission
+            .push(node, grant, &built)
+            .await
+            .map_err(failure)?;
+        drop(built);
+        let envelope = (send.sender, send.recipients, send.require_tls);
+        self.seal(grant, submission, draft, envelope).await
+    }
+
+    async fn raw(&mut self, request: &Request, id: &str) -> Result<Response, Stop> {
+        let grant = self.auth(request).await?;
+        let rfc822 = request
+            .headers
+            .get("content-type")
+            .is_some_and(|value| media(value) == "message/rfc822");
+        if !rfc822 {
+            return Err(Problem::media_type().into());
+        }
+        let node = &self.context.node;
+        let limit = message_limit(node);
+        let recipients = node.spool().limits().recipients as usize;
+        let raw = send::envelope(&request.headers, recipients)?;
+        let mut draft = self.draft(grant, &raw.sender, &raw.recipients).await?;
+        let Some(_hold) = self.context.guard.reserve(data_hold(node)) else {
+            return Err(Problem::unavailable().close().into());
+        };
+        let mut submission = self.open(&mut draft).await?;
+        self.start(request, limit)?;
+        let mut lines = Decoder::chunks(limit);
+        let mut out = Vec::new();
+        while let Some(bytes) = self.next().await? {
+            lines.feed(&bytes, &mut out);
+            line_fault(&lines)?;
+            submission
+                .push(&self.context.node, grant, &out)
+                .await
+                .map_err(failure)?;
+            out.clear();
+        }
+        lines.finish(&mut out);
+        line_fault(&lines)?;
+        submission
+            .push(&self.context.node, grant, &out)
+            .await
+            .map_err(failure)?;
+        let envelope = (raw.sender, raw.recipients, raw.require_tls);
+        let message = self.seal(grant, submission, draft, envelope).await?;
+        Ok(accepted(id, &message))
+    }
+
+    async fn draft(
+        &mut self,
+        grant: Grant,
+        sender: &str,
+        recipients: &[String],
+    ) -> Result<Draft, Stop> {
+        let node = &self.context.node;
+        let domain = domain_of(sender).ok_or_else(|| Problem::bad_address("envelope_from"))?;
         if node.table().sender(grant.tenant, &domain).is_none() {
             return Err(Problem::sender().into());
         }
@@ -367,7 +445,7 @@ impl<T: Transport + 'static> Session<'_, T> {
         if draft.generation() != grant.generation {
             return Err(Problem::suspended().into());
         }
-        let addresses: Vec<&str> = send.recipients.iter().map(String::as_str).collect();
+        let addresses: Vec<&str> = recipients.iter().map(String::as_str).collect();
         let results = node.recipients(&mut draft, &addresses).await;
         let mut refused = Vec::new();
         for (address, result) in addresses.iter().zip(results) {
@@ -381,24 +459,28 @@ impl<T: Transport + 'static> Session<'_, T> {
         if !refused.is_empty() {
             return Err(Problem::refused(refused).into());
         }
+        Ok(draft)
+    }
+
+    async fn open(&mut self, draft: &mut Draft) -> Result<Submission, Stop> {
+        let node = &self.context.node;
         let shards = node.spool().shards();
         let shard = *shards
             .get(self.shard % shards.len().max(1))
             .ok_or_else(Problem::unavailable)?;
         self.shard = self.shard.wrapping_add(1);
-        let mut submission = Submission::open(node, &mut draft, shard)
+        Ok(Submission::open(node, draft, shard)
             .await
-            .map_err(failure)?;
-        let boundary = format!("=_{}", submission.id());
-        let built = mime::build(&send.message, &boundary).map_err(mime_fault)?;
-        if built.len() as u64 > limit {
-            return Err(Problem::too_large().into());
-        }
-        submission
-            .push(node, grant, &built)
-            .await
-            .map_err(failure)?;
-        drop(built);
+            .map_err(failure)?)
+    }
+
+    async fn seal(
+        &mut self,
+        grant: Grant,
+        submission: Submission,
+        draft: Draft,
+        (sender, recipients, require_tls): (String, Vec<String>, bool),
+    ) -> Result<String, Stop> {
         let with = match self.conn.as_ref() {
             Some(conn) if conn.secure() => "HTTPS",
             _ => "HTTP",
@@ -409,18 +491,35 @@ impl<T: Transport + 'static> Session<'_, T> {
             lifetime: self.context.config.lifetime,
         };
         let envelope = Envelope {
-            sender: send.sender,
+            sender,
             required: Required {
-                requiretls: send.require_tls,
+                requiretls: require_tls,
                 ..Required::default()
             },
             ..Envelope::default()
         };
-        let accepted = submission
-            .finish(node, grant, &origin, draft, envelope, &send.recipients)
+        let node = &self.context.node;
+        Ok(submission
+            .finish(node, grant, &origin, draft, envelope, &recipients)
             .await
-            .map_err(failure)?;
-        Ok(accepted)
+            .map_err(failure)?)
+    }
+}
+
+fn accepted(request: &str, message: &str) -> Response {
+    let mut out = String::from("{\"id\":");
+    json::string(message, &mut out);
+    out.push('}');
+    ok(request, out)
+}
+
+fn line_fault(lines: &Decoder) -> Result<(), Problem> {
+    match lines.fault() {
+        None => Ok(()),
+        Some(LineFault::Size) => Err(Problem::too_large()),
+        Some(LineFault::Cr(_)) => Err(Problem::bad_message("bare CR in the message")),
+        Some(LineFault::Nul(_)) => Err(Problem::bad_message("NUL in the message")),
+        Some(LineFault::Long(_)) => Err(Problem::bad_message("line longer than 998 octets")),
     }
 }
 
