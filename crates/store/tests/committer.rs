@@ -263,7 +263,7 @@ fn intake_is_refused_at_the_reserve() {
             .await
             .expect("internal claim");
         drop(client);
-        assert_eq!(committer.await.regions().free(), 6);
+        assert_eq!(committer.await.regions().free(), 5);
     });
 }
 

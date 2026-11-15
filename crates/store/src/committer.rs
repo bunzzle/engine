@@ -346,7 +346,7 @@ impl Committer {
             while let Some(next) = self.try_next_request() {
                 self.handle(next, &mut batch);
             }
-            if !batch.is_empty() {
+            if !batch.is_empty() || self.sealed_allocation() {
                 self.commit(batch).await;
             }
             self.settle().await;
@@ -446,6 +446,13 @@ impl Committer {
         if matches!(claim, Claim::State | Claim::Flush | Claim::Index) {
             return Err(Error::Invalid("claim"));
         }
+        if !journal::fits(0, self.allocations.len() + 1, 0, 0) {
+            return Err(if claim == Claim::Intake {
+                Error::Reserve
+            } else {
+                Error::Full
+            });
+        }
         let region = self.regions.acquire(claim)?;
         assert!(
             self.usage.is_empty(region),
@@ -459,6 +466,15 @@ impl Committer {
             epoch: *epoch,
         });
         Ok((region, *epoch))
+    }
+
+    fn sealed_allocation(&self) -> bool {
+        !self.failed
+            && self.queues.parked.is_none()
+            && self
+                .allocations
+                .iter()
+                .any(|a| !self.open[a.region as usize])
     }
 
     async fn commit(&mut self, batch: Vec<(Submission, Reply)>) {
@@ -504,7 +520,7 @@ impl Committer {
         for stream in self.streams.iter_mut().flatten() {
             stream.offset = stream.offset.next_multiple_of(sector);
         }
-        if accepted.is_empty() {
+        if accepted.is_empty() && !self.sealed_allocation() {
             return;
         }
         let mut commit = Commit {
@@ -515,6 +531,38 @@ impl Committer {
             live: live.into_values().collect(),
             dead,
         };
+        let buffers = self.buffers(segments, &mut commit);
+        commit.ranges.extend(ranges);
+        self.busy = commit.ranges.iter().map(|r| r.region).collect();
+        let mut reserved = self.journal.reserve(&commit);
+        if matches!(reserved, Err(Error::JournalFull)) {
+            if !self.checkpoint_in_flight() {
+                self.begin_checkpoint(None);
+                self.settle_flight().await;
+            }
+            if self.checkpoint_in_flight() {
+                self.busy.clear();
+                if accepted.is_empty() {
+                    return;
+                }
+                self.queues.parked = Some(Parked {
+                    commit,
+                    buffers,
+                    accepted,
+                });
+                return;
+            }
+            reserved = self.journal.reserve(&commit);
+        }
+        self.busy.clear();
+        if let Err(e) = reserved {
+            self.refuse(accepted, &e);
+            return;
+        }
+        self.finish_commit(commit, buffers, accepted).await;
+    }
+
+    fn buffers(&self, segments: Vec<Segment>, commit: &mut Commit) -> Vec<(u64, Buf)> {
         let align = self.data.sector_size() as usize;
         let mut buffers = Vec::with_capacity(segments.len());
         for segment in segments {
@@ -534,31 +582,7 @@ impl Committer {
                 buf,
             ));
         }
-        commit.ranges.extend(ranges);
-        self.busy = commit.ranges.iter().map(|r| r.region).collect();
-        let mut reserved = self.journal.reserve(&commit);
-        if matches!(reserved, Err(Error::JournalFull)) {
-            if !self.checkpoint_in_flight() {
-                self.begin_checkpoint(None);
-                self.settle_flight().await;
-            }
-            if self.checkpoint_in_flight() {
-                self.busy.clear();
-                self.queues.parked = Some(Parked {
-                    commit,
-                    buffers,
-                    accepted,
-                });
-                return;
-            }
-            reserved = self.journal.reserve(&commit);
-        }
-        self.busy.clear();
-        if let Err(e) = reserved {
-            self.refuse(accepted, &e);
-            return;
-        }
-        self.finish_commit(commit, buffers, accepted).await;
+        buffers
     }
 
     fn defer(&mut self, rest: impl DoubleEndedIterator<Item = (Submission, Reply)>) {

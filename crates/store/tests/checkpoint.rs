@@ -6,8 +6,8 @@ use std::time::Duration;
 use rt::sim::{Config, Faults, SimDriver, check};
 use rt::{Buf, File, JoinHandle, OpenOptions, Runtime, sleep, spawn};
 use store::{
-    Body, CHECKPOINT_RESERVE, Claim, Client, Committer, DataFile, Durable, Error, Location,
-    Options, Range, Record, Recovered, SLOT_SIZE, Submission, Write, checksum, load, recover,
+    Body, Claim, Client, Committer, DataFile, Durable, Error, Location, Options, Range, Record,
+    Recovered, SLOT_SIZE, Submission, Write, checksum, load, recover,
 };
 
 const MILLION: u32 = 1_000_000;
@@ -274,17 +274,78 @@ fn allocations_not_yet_committed_stay_out_of_the_checkpoint() {
 }
 
 #[test]
+fn a_sealed_region_without_a_commit_is_freed() {
+    let driver = created(6);
+    run(&driver, async {
+        let (client, committer) = start().await;
+        let lease = client.allocate(Claim::Intake).await.expect("allocate");
+        let (region, epoch) = (lease.region(), lease.epoch());
+        drop(lease);
+        client.checkpoint().await.expect("checkpoint");
+        drop(client);
+        committer.await;
+        let (_, recovered) = reopen().await;
+        let recovered = recovered.expect("recover");
+        assert!(!recovered.state.regions.is_used(region));
+        assert_eq!(recovered.state.epochs[region as usize], epoch);
+    });
+}
+
+#[test]
+fn an_allocation_only_commit_is_replayed_after_a_crash() {
+    let driver = created(8);
+    run(&driver, async {
+        let (client, committer) = start().await;
+        let lease = client.allocate(Claim::Intake).await.expect("allocate");
+        let (region, epoch) = (lease.region(), lease.epoch());
+        drop(lease);
+        let next = client.allocate(Claim::Intake).await.expect("allocate");
+        drop((next, client));
+        committer.await;
+        let (_, recovered) = reopen().await;
+        let recovered = recovered.expect("recover");
+        assert!(recovered.state.regions.is_used(region));
+        assert_eq!(recovered.state.epochs[region as usize], epoch);
+        let (client, committer) = start().await;
+        client.checkpoint().await.expect("checkpoint");
+        drop(client);
+        committer.await;
+        let (_, recovered) = reopen().await;
+        assert!(!recovered.expect("recover").state.regions.is_used(region));
+    });
+}
+
+#[test]
+fn refused_leases_never_exhaust_the_store() {
+    let driver = created(7);
+    run(&driver, async {
+        let (client, committer) = start().await;
+        for round in 0..4 * OPTIONS.region_count {
+            let lease = client.allocate(Claim::Intake).await;
+            assert!(lease.is_ok(), "round {round}: {:?}", lease.err());
+        }
+        drop(client);
+        committer.await;
+        let (_, recovered) = reopen().await;
+        let recovered = recovered.expect("recover");
+        assert!(used(&recovered).len() < OPTIONS.region_count as usize);
+    });
+}
+
+#[test]
 fn a_full_store_can_still_checkpoint() {
     let driver = created(5);
     run(&driver, async {
         let (client, committer) = start().await;
-        while client.allocate(Claim::Internal).await.is_ok() {}
-        let free = client.allocate(Claim::Checkpoint).await;
-        assert!(free.is_ok(), "the checkpoint reserve is kept");
-        drop(free);
-        drop(client);
-        let committer = committer.await;
-        assert_eq!(committer.regions().free(), CHECKPOINT_RESERVE - 1);
+        client.checkpoint().await.expect("checkpoint");
+        let mut leases = Vec::new();
+        while let Ok(lease) = client.allocate(Claim::Internal).await {
+            leases.push(lease);
+        }
+        client.checkpoint().await.expect("checkpoint");
+        client.checkpoint().await.expect("checkpoint");
+        drop((leases, client));
+        committer.await;
     });
 }
 
