@@ -12,7 +12,7 @@ use spool::{
     Spool, StoredBody, decode_chunk, slice_item, slice_parts,
 };
 use store::{
-    CoreFile, DataFile, HEAD_ITEM, Index, Keeper, Location, Options, Owner, Range, Record,
+    CoreFile, DataFile, HEAD_ITEM, Index, Keeper, Location, Options, Owner, Pins, Range, Record,
     SLOT_SIZE, Setup, boot, split_key,
 };
 
@@ -183,7 +183,7 @@ async fn draft(intake: &Spool, shard: u16, step: u64) -> Result<(Message, Accept
     Ok((message, accepted))
 }
 
-async fn read_back(intake: &Spool, expected: &Accepted, model: &Shared) -> bool {
+async fn read_back(intake: &Spool, pins: &Pins, expected: &Accepted, model: &Shared) -> bool {
     let total = expected.head.clear.recipients;
     let wanted: Vec<u32> = (0..total)
         .step_by(911)
@@ -193,6 +193,14 @@ async fn read_back(intake: &Spool, expected: &Accepted, model: &Shared) -> bool 
         return false;
     };
     assert_eq!(stored.tenant, expected.tenant);
+    assert!(pins.is_pinned(stored.head.region));
+    for (_, at) in &stored.slices {
+        assert!(pins.is_pinned(at.region));
+    }
+    match &stored.body {
+        StoredBody::Inline(at) => assert!(pins.is_pinned(at.region)),
+        StoredBody::Chain(ranges) => assert!(ranges.iter().all(|r| pins.is_pinned(r.region))),
+    }
     assert_eq!(stored.clear, expected.head.clear);
     if let StoredBody::Chain(ranges) = &stored.body
         && ranges.iter().any(|r| r.length > LIMITS.read)
@@ -236,7 +244,7 @@ async fn read_back(intake: &Spool, expected: &Accepted, model: &Shared) -> bool 
     true
 }
 
-async fn work(intake: Spool, shards: Vec<u16>, steps: u64, model: Shared) -> bool {
+async fn work(intake: Spool, pins: Pins, shards: Vec<u16>, steps: u64, model: Shared) -> bool {
     let mut step = 0;
     let mut group = 0;
     while step < steps {
@@ -264,7 +272,7 @@ async fn work(intake: Spool, shards: Vec<u16>, steps: u64, model: Shared) -> boo
         match intake.accept(messages).await {
             Ok(()) => {
                 for expected in &accepted {
-                    if !read_back(&intake, expected, &model).await {
+                    if !read_back(&intake, &pins, expected, &model).await {
                         return false;
                     }
                 }
@@ -340,11 +348,18 @@ fn workload(seed: u64, steps: u64, halt_after: Option<u64>, disk: Disk, model: &
             };
         };
         let shards = opened.shards.clone();
+        let pins = opened.file.reader().pins().clone();
         let (intake, owner) = Spool::new(opened, NODE, LIMITS).expect("limits");
         owners.push(machine.spawn_on(core, owner.run()));
         closers.push(intake.changes().clone());
         for _ in 0..2 {
-            let work = work(intake.clone(), shards.clone(), steps / 2, Rc::clone(model));
+            let work = work(
+                intake.clone(),
+                pins.clone(),
+                shards.clone(),
+                steps / 2,
+                Rc::clone(model),
+            );
             workers.push(machine.spawn_on(core, work));
         }
     }
@@ -516,7 +531,7 @@ fn after(driver: &SimDriver, seed: u64, model: Shared) {
 #[test]
 fn accepted_messages_come_back_whole() {
     let model = Shared::default();
-    let outcome = workload(1, 120, None, created(1), &model);
+    let outcome = workload(5, 120, None, created(5), &model);
     assert!(outcome.finished, "workload finished");
     let shared = Rc::clone(&model);
     let model = model.borrow();

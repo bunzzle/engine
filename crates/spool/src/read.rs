@@ -1,5 +1,6 @@
 use store::{
-    Crc32c, HEAD_ITEM, Index, Key, Location, Pin, RECORD_HEADER_SIZE, Range, Record, peek,
+    Crc32c, HEAD_ITEM, Index, Key, Location, Pin, READ_ATTEMPTS, RECORD_HEADER_SIZE, Range, Record,
+    peek,
 };
 
 use crate::bodies::{KIND_BODY_CHUNK, decode_chunk};
@@ -15,7 +16,6 @@ pub enum StoredBody {
     Chain(Box<[Range]>),
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Stored {
     pub id: MessageId,
     pub tenant: u32,
@@ -23,6 +23,17 @@ pub struct Stored {
     pub head: Location,
     pub body: StoredBody,
     pub slices: Box<[(u32, Location)]>,
+    pins: Pinned,
+}
+
+impl Stored {
+    fn same(&self, other: &Self) -> bool {
+        self.tenant == other.tenant
+            && self.clear == other.clear
+            && self.head == other.head
+            && self.body == other.body
+            && self.slices == other.slices
+    }
 }
 
 pub struct Opened {
@@ -66,6 +77,19 @@ impl Spool {
         let mut slices: Vec<u32> = recipients.iter().map(|r| r / SLICE).collect();
         slices.sort_unstable();
         slices.dedup();
+        let mut found = self.lookup(id, &slices).await?;
+        for _ in 0..READ_ATTEMPTS {
+            found.pins = self.pin(&found);
+            let again = self.lookup(id, &slices).await?;
+            if again.same(&found) {
+                return Ok(found);
+            }
+            found = again;
+        }
+        Err(Error::State("moved"))
+    }
+
+    async fn lookup(&self, id: MessageId, slices: &[u32]) -> Result<Stored, Error> {
         let mut keys = vec![Key::new(id.key, HEAD_ITEM), Key::new(id.key, BODY_ITEM)];
         keys.extend(slices.iter().map(|&n| Key::new(id.key, slice_item(n))));
         let mut items = self.inner.changes.items(id.shard, keys).await?.into_iter();
@@ -77,7 +101,8 @@ impl Spool {
             return Err(Error::State("body"));
         }
         let slices = slices
-            .into_iter()
+            .iter()
+            .copied()
             .zip(items)
             .map(|(n, item)| match item {
                 Some(item) if item.tenant == head.tenant => Ok((n, item.location)),
@@ -96,10 +121,11 @@ impl Spool {
             head: head.location,
             body,
             slices,
+            pins: Pinned { _pins: Vec::new() },
         })
     }
 
-    pub async fn open_stored(&self, stored: &Stored) -> Result<Opened, Error> {
+    fn pin(&self, stored: &Stored) -> Pinned {
         let pins = self.inner.reader.pins();
         let mut pinned = vec![pins.pin(stored.head.region)];
         match &stored.body {
@@ -107,6 +133,11 @@ impl Spool {
             StoredBody::Chain(ranges) => pinned.extend(ranges.iter().map(|r| pins.pin(r.region))),
         }
         pinned.extend(stored.slices.iter().map(|(_, at)| pins.pin(at.region)));
+        Pinned { _pins: pinned }
+    }
+
+    pub async fn open_stored(&self, stored: &Stored) -> Result<Opened, Error> {
+        let pins = self.pin(stored);
         let region = self.sealed(stored.head, stored.tenant).await?;
         let (wrap, head) = head_parts(&region).ok_or(Error::State("head"))?;
         let (wrap, head) = (*wrap, head.to_vec());
@@ -135,7 +166,7 @@ impl Spool {
             head,
             body,
             slices,
-            pins: Pinned { _pins: pinned },
+            pins,
         })
     }
 
