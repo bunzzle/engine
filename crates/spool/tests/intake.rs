@@ -155,7 +155,11 @@ async fn draft(intake: &Spool, shard: u16, step: u64) -> Result<(Message, Accept
         let sealed = bytes(seed + 1, 100 + usize::try_from(seed % 1900).expect("fits"));
         (Body::Inline(sealed.clone()), Expected::Inline(sealed))
     } else if step % 3 == 1 {
-        let chunks = chunks(seed, intake.chunk());
+        let chunks = if step % 9 == 1 {
+            (0..3).map(|n| bytes(seed ^ n, 24_000)).collect()
+        } else {
+            chunks(seed, intake.chunk())
+        };
         let written = intake.body(id, 7, &chunks).await?;
         (Body::Chain(written), Expected::Chain(chunks))
     } else {
