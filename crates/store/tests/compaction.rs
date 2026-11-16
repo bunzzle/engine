@@ -10,8 +10,8 @@ use rt::{JoinHandle, Runtime, sleep, spawn, timeout};
 use store::{
     Batch, Change, Changes, Claim, Client, Committer, CoreFile, DataFile, Delivery, Error,
     HEAD_ITEM, Header, INDEX_SIZE, Index, Item, Keeper, Key, Lease, Location, Op, Options, Owner,
-    Range, Record, SLOT_SIZE, Setup, Shards, Usage, boot, checksum, encode, load, record_size,
-    recover,
+    Pin, Pins, Range, Record, SLOT_SIZE, Setup, Shards, Usage, boot, checksum, encode, load,
+    record_size, recover,
 };
 
 const PATH: &str = "/data/store";
@@ -303,12 +303,31 @@ fn merge(keepers: Vec<Keeper>) -> Keeper {
     all
 }
 
+async fn tick(client: Client, running: Rc<RefCell<bool>>) -> bool {
+    while *running.borrow() {
+        sleep(Duration::from_millis(2)).await;
+        if client.checkpoint().await.is_err() {
+            return false;
+        }
+    }
+    true
+}
+
+async fn hold(pins: Pins, running: Rc<RefCell<bool>>) {
+    let mut held: Vec<Pin> = Vec::new();
+    while *running.borrow() {
+        held = (0..OPTIONS.region_count).map(|r| pins.pin(r)).collect();
+        sleep(Duration::from_millis(1)).await;
+    }
+    drop(held);
+}
+
 struct Outcome {
     driver: Rc<SimDriver>,
     finished: Option<(Committer, Keeper)>,
 }
 
-fn workload(seed: u64, steps: u64, halt_after: Option<u64>, disk: Disk) -> Outcome {
+fn workload(seed: u64, steps: u64, halt_after: Option<u64>, disk: Disk, pinned: bool) -> Outcome {
     let config = Config {
         halt_after,
         faults: Faults {
@@ -338,6 +357,7 @@ fn workload(seed: u64, steps: u64, halt_after: Option<u64>, disk: Disk) -> Outco
     else {
         return none(driver);
     };
+    let pins = booted.committer.reader().pins().clone();
     let committer = machine.spawn_on(0, booted.committer.run());
     let mut owners: Vec<JoinHandle<Keeper>> = Vec::new();
     let mut workers: Vec<JoinHandle<bool>> = Vec::new();
@@ -367,24 +387,16 @@ fn workload(seed: u64, steps: u64, halt_after: Option<u64>, disk: Disk) -> Outco
         let done = async move {
             let mut ok = true;
             let running = Rc::new(RefCell::new(true));
-            let ticking = Rc::clone(&running);
-            let ticker = {
-                let client = client.clone();
-                spawn(async move {
-                    while *ticking.borrow() {
-                        sleep(Duration::from_millis(2)).await;
-                        if client.checkpoint().await.is_err() {
-                            return false;
-                        }
-                    }
-                    true
-                })
-            };
+            let ticker = spawn(tick(client.clone(), Rc::clone(&running)));
+            let holder = pinned.then(|| spawn(hold(pins, Rc::clone(&running))));
             for worker in workers {
                 ok &= worker.await;
             }
             *running.borrow_mut() = false;
             ok &= ticker.await;
+            if let Some(holder) = holder {
+                holder.await;
+            }
             for _ in 0..6 {
                 ok &= client.checkpoint().await.is_ok();
                 sleep(Duration::from_millis(5)).await;
@@ -427,7 +439,7 @@ async fn reopen() -> (Usage, Keeper, CoreFile) {
 
 #[test]
 fn compaction_moves_live_records_and_frees_their_regions() {
-    let outcome = workload(1, 600, None, created(1));
+    let outcome = workload(1, 600, None, created(1), false);
     let (committer, keeper) = outcome.finished.expect("workload finished");
     let stats = committer.compaction();
     assert!(stats.emptied > 0, "{stats:?}");
@@ -464,8 +476,18 @@ fn compaction_moves_live_records_and_frees_their_regions() {
     });
 }
 
+#[test]
+fn compaction_moves_records_out_of_pinned_regions() {
+    let outcome = workload(3, 600, None, created(3), true);
+    let (committer, keeper) = outcome.finished.expect("workload finished");
+    let stats = committer.compaction();
+    assert!(stats.emptied > 0, "{stats:?}");
+    assert_eq!(committer.space().releasable, 0);
+    audit(committer.usage(), &keeper);
+}
+
 fn crash_at(seed: u64, steps: u64, point: u64) {
-    let outcome = workload(seed, steps, Some(point), created(seed));
+    let outcome = workload(seed, steps, Some(point), created(seed), false);
     assert!(
         outcome.driver.is_halted(),
         "crash point {point} not reached"
@@ -489,7 +511,7 @@ fn moves_survive_a_crash_at_every_disk_operation() {
         .and_then(|s| s.parse::<u64>().ok());
     let steps = 240;
     check(0..1, |seed| {
-        let outcome = workload(seed, steps, None, created(seed));
+        let outcome = workload(seed, steps, None, created(seed), false);
         let (committer, _) = outcome.finished.as_ref().expect("workload ran");
         assert!(
             committer.compaction().emptied > 0,
