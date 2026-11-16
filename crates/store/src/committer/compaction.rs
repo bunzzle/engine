@@ -194,7 +194,6 @@ impl Committer {
         self.regions.is_used(region)
             && self.epochs[region as usize] == epoch
             && !self.open[region as usize]
-            && !self.pins.is_pinned(region)
             && !self.usage.is_quarantined(region)
             && !self.checkpoint.contains(&region)
             && !self.is_state(region)
