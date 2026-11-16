@@ -132,6 +132,7 @@ impl Vault {
         let state = State {
             day,
             naming: Secret::random()?,
+            system: Secret::random()?,
             tenants: BTreeMap::new(),
         };
         let last = file::seal(&master, 1, &state.encode())?;
@@ -264,6 +265,11 @@ impl Vault {
 
     pub fn naming(&self) -> &Secret<16> {
         &self.state.naming
+    }
+
+    pub fn system(&self) -> (Secret<32>, Secret<16>) {
+        let root = Tenant::new(&self.state.system);
+        (root.data_secret(0, VERSION), root.hash_key(0))
     }
 
     pub fn is_dirty(&self) -> bool {

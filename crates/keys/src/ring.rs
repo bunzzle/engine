@@ -13,6 +13,7 @@ use crate::{Client, Error};
 
 pub type Connecting = Pin<Box<dyn Future<Output = Result<Client, Error>>>>;
 pub type Connect = Rc<dyn Fn() -> Connecting>;
+const SYSTEM: u32 = 0;
 const REFRESH: Duration = Duration::from_secs(600);
 const DAY_MS: u64 = 86_400_000;
 
@@ -118,7 +119,7 @@ struct Inner {
     connect: Connect,
     link: RefCell<Link>,
     joining: RefCell<Vec<Sender<()>>>,
-    naming: RefCell<Option<(Secret<16>, Secret<16>)>>,
+    naming: RefCell<Option<(Secret<16>, Secret<16>, TenantKeys)>>,
     day: Cell<u32>,
     failed: Cell<bool>,
     tenants: RefCell<Cache<(u32, u32), Working>>,
@@ -195,7 +196,15 @@ impl Ring {
             .naming
             .borrow()
             .as_ref()
-            .map(|(key, _)| *key.expose())
+            .map(|(key, _, _)| *key.expose())
+    }
+
+    pub fn system(&self) -> Option<TenantKeys> {
+        self.inner
+            .naming
+            .borrow()
+            .as_ref()
+            .map(|(_, _, system)| system.clone())
     }
 
     pub fn ids(&self) -> Option<Secret<16>> {
@@ -203,7 +212,7 @@ impl Ring {
             .naming
             .borrow()
             .as_ref()
-            .map(|(_, ids)| ids.copy())
+            .map(|(_, ids, _)| ids.copy())
     }
 
     pub fn stats(&self) -> RingStats {
@@ -718,16 +727,25 @@ impl Ring {
             node: settings.node,
         };
         let answer = client.call_within(&hello, settings.deadline).await;
-        let Ok(Answer::Hello { day, naming, ids }) = answer else {
+        let Ok(Answer::Hello {
+            day,
+            naming,
+            ids,
+            version,
+            system,
+            system_hash,
+        }) = answer
+        else {
             client.close();
             return Err(answer.err().unwrap_or(Error::Bad));
         };
         let changed = {
             let mut known = self.inner.naming.borrow_mut();
-            if let Some((key, known_ids)) = known.as_ref() {
+            if let Some((key, known_ids, _)) = known.as_ref() {
                 !(*key == naming && *known_ids == ids)
             } else {
-                *known = Some((naming, ids));
+                let system = TenantKeys::new(SYSTEM, 0, &system, version, system_hash);
+                *known = Some((naming, ids, system));
                 false
             }
         };

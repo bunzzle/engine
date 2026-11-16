@@ -66,6 +66,8 @@ fn state_survives_a_restart() {
             keys.today,
             keys.tomorrow,
             *vault.naming().expose(),
+            *vault.system().0.expose(),
+            *vault.system().1.expose(),
         )
     });
     let driver = Rc::new(SimDriver::with_disk(2, quiet(), driver.crash()));
@@ -77,6 +79,13 @@ fn state_survives_a_restart() {
         assert_eq!(*keys.hash.expose(), before.1);
         assert_eq!((keys.today, keys.tomorrow), (before.2, before.3));
         assert_eq!(*vault.naming().expose(), before.4);
+        let (system, system_hash) = vault.system();
+        assert_eq!(
+            (*system.expose(), *system_hash.expose()),
+            (before.5, before.6)
+        );
+        assert_ne!(*system.expose(), *keys.data.expose());
+        assert_ne!(*system_hash.expose(), *keys.hash.expose());
         assert_ne!(keys.today, keys.tomorrow);
         assert!(vault.keys(2, 1).is_ok());
         let listed: Vec<(u32, u32, u16, u32)> = vault
