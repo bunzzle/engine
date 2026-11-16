@@ -4,8 +4,8 @@ use crypto::{Plain, Secret};
 
 use crate::Error;
 
-const FORMAT: u8 = 1;
-const FIXED: usize = 1 + 4 + 16 + 4;
+const FORMAT: u8 = 2;
+const FIXED: usize = 1 + 4 + 16 + 32 + 4;
 const ENTRY: usize = 4 + 4 + 2 + 4 + 32 + 32;
 
 pub struct Entry {
@@ -19,6 +19,7 @@ pub struct Entry {
 pub struct State {
     pub day: u32,
     pub naming: Secret<16>,
+    pub system: Secret<32>,
     pub tenants: BTreeMap<u32, Entry>,
 }
 
@@ -28,6 +29,7 @@ impl State {
         out.push(FORMAT);
         out.extend_from_slice(&self.day.to_le_bytes());
         out.extend_from_slice(self.naming.expose());
+        out.extend_from_slice(self.system.expose());
         let count = u32::try_from(self.tenants.len()).expect("tenant count fits in u32");
         out.extend_from_slice(&count.to_le_bytes());
         for (tenant, entry) in &self.tenants {
@@ -46,7 +48,7 @@ impl State {
             return Err(Error::Corrupt("state format"));
         }
         let u32_at = |at: usize| u32::from_le_bytes(bytes[at..at + 4].try_into().expect("4 bytes"));
-        let count = u32_at(21) as usize;
+        let count = u32_at(53) as usize;
         if bytes.len() != FIXED + ENTRY * count {
             return Err(Error::Corrupt("state length"));
         }
@@ -71,6 +73,7 @@ impl State {
         Ok(Self {
             day: u32_at(1),
             naming: Secret::from_slice(&bytes[5..21])?,
+            system: Secret::from_slice(&bytes[21..53])?,
             tenants,
         })
     }
@@ -102,6 +105,7 @@ mod tests {
         State {
             day: 120,
             naming: Secret::new([5; 16]),
+            system: Secret::new([6; 32]),
             tenants,
         }
     }
@@ -112,6 +116,7 @@ mod tests {
         let back = State::decode(&bytes).expect("decodes");
         assert_eq!(back.day, 120);
         assert!(back.naming == Secret::new([5; 16]));
+        assert!(back.system == Secret::new([6; 32]));
         assert_eq!(back.tenants.keys().copied().collect::<Vec<_>>(), [1, 3, 9]);
         let entry = &back.tenants[&9];
         assert_eq!(
@@ -130,13 +135,13 @@ mod tests {
             Some(Error::Corrupt("state length"))
         );
         let mut bad = bytes.to_vec();
-        bad[0] = 2;
+        bad[0] = 1;
         assert_eq!(
             State::decode(&bad).err(),
             Some(Error::Corrupt("state format"))
         );
         let mut swapped = bytes.to_vec();
-        swapped[25..29].copy_from_slice(&5u32.to_le_bytes());
+        swapped[57..61].copy_from_slice(&5u32.to_le_bytes());
         assert_eq!(
             State::decode(&swapped).err(),
             Some(Error::Corrupt("state order"))

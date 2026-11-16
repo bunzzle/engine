@@ -124,6 +124,9 @@ async fn fake(host: u8, keys: (Secret<16>, Secret<16>), mode: Fake) -> Rc<Cell<u
                                     day: DAY,
                                     naming: keys.0.copy(),
                                     ids: keys.1.copy(),
+                                    version: 1,
+                                    system: Secret::new([3; 32]),
+                                    system_hash: Secret::new([4; 16]),
                                 }
                             }
                             Ok(Request::Open { .. }) if mode == Fake::Closes => Answer::Keys {
@@ -161,6 +164,7 @@ fn tenant_keys_open_once_on_first_use_and_stay_cached() {
         let (connect, tries) = hosts(&[1]);
         let ring = Ring::new(connect, settings());
         assert_eq!(ring.naming(), None);
+        assert!(ring.system().is_none());
         assert!(ring.get(4, 1).is_none());
         let mut tasks = Vec::new();
         for _ in 0..20 {
@@ -184,6 +188,13 @@ fn tenant_keys_open_once_on_first_use_and_stay_cached() {
         assert_eq!(Some(*naming.expose()), ring.naming());
         assert!(ring.ids() == Some(ids));
         assert!(crypto::id_key(&naming) == hello(1).await.1);
+        let system = ring.system().expect("system keys");
+        assert_eq!((system.tenant(), system.generation()), (0, 0));
+        let zero = [&0u32.to_le_bytes()[..], &0u32.to_le_bytes()].concat();
+        let kept = system.seal(&zero, b"policy").expect("seal");
+        assert_eq!(system.open(&zero, &kept).expect("open"), b"policy");
+        assert!(system.seal(&label, b"policy").is_err());
+        assert!(opened[0].keys.open(&zero, &kept).is_err());
         let cached = ring.get(4, 1).expect("cached");
         assert_eq!(cached.keys.open(&label, &sealed).expect("open"), b"mail");
         assert_eq!(ring.open(9, 1).await.err(), Some(Fault::Unknown));

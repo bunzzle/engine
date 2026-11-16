@@ -12,7 +12,7 @@ use crate::cache::Cache;
 use crate::limit::{Limits, Rate};
 use crate::proto::{Answer, Frames, MAX_FRAME, Request};
 use crate::signers::{Done, Job, Signers};
-use crate::{Clock, Error, Keys, Step, Vault};
+use crate::{Clock, Error, Keys, Step, VERSION, Vault};
 
 const DAY_MS: u64 = 86_400_000;
 const ACCEPT_PAUSE: Duration = Duration::from_millis(100);
@@ -233,16 +233,24 @@ impl Core {
         Answer::Refused(error)
     }
 
+    fn hello(&self) -> Answer {
+        let Ok(naming) = Secret::from_slice(self.vault.naming().expose()) else {
+            return self.refused(Error::Failed);
+        };
+        let (system, system_hash) = self.vault.system();
+        Answer::Hello {
+            day: self.vault.day(),
+            ids: crypto::id_key(&naming),
+            naming,
+            version: VERSION,
+            system,
+            system_hash,
+        }
+    }
+
     async fn call(&mut self, request: Request, reply: &Sender<Answer>) -> Option<Answer> {
         let answer = match request {
-            Request::Hello { .. } => match Secret::from_slice(self.vault.naming().expose()) {
-                Ok(naming) => Answer::Hello {
-                    day: self.vault.day(),
-                    ids: crypto::id_key(&naming),
-                    naming,
-                },
-                Err(_) => self.refused(Error::Failed),
-            },
+            Request::Hello { .. } => self.hello(),
             Request::Create {
                 tenant,
                 generation,

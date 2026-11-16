@@ -64,6 +64,9 @@ pub enum Answer {
         day: u32,
         naming: Secret<16>,
         ids: Secret<16>,
+        version: u8,
+        system: Secret<32>,
+        system_hash: Secret<16>,
     },
     Keys {
         day: u32,
@@ -375,12 +378,26 @@ impl Answer {
     pub fn encode(&self, id: u32, out: &mut Plain) {
         match self {
             Self::Done => frame(out, 0x80, id, &[]),
-            Self::Hello { day, naming, ids } => {
+            Self::Hello {
+                day,
+                naming,
+                ids,
+                version,
+                system,
+                system_hash,
+            } => {
                 frame(
                     out,
                     0x81,
                     id,
-                    &[&day.to_le_bytes(), naming.expose(), ids.expose()],
+                    &[
+                        &day.to_le_bytes(),
+                        naming.expose(),
+                        ids.expose(),
+                        &[*version],
+                        system.expose(),
+                        system_hash.expose(),
+                    ],
                 );
             }
             Self::Keys {
@@ -429,6 +446,9 @@ impl Answer {
                 day: r.u32()?,
                 naming: r.secret()?,
                 ids: r.secret()?,
+                version: r.u8()?,
+                system: r.secret()?,
+                system_hash: r.secret()?,
             },
             0x82 => Self::Keys {
                 day: r.u32()?,
@@ -455,7 +475,7 @@ impl Answer {
     pub fn size(&self) -> usize {
         HEAD + match self {
             Self::Done => 0,
-            Self::Hello { .. } => 36,
+            Self::Hello { .. } => 85,
             Self::Keys { .. } => 121,
             Self::Key(_) => 32,
             Self::Dkim { public, blob } => 4 + public.len() + blob.len(),
@@ -605,6 +625,9 @@ mod tests {
                 day: 1,
                 naming: Secret::new([2; 16]),
                 ids: Secret::new([9; 16]),
+                version: 1,
+                system: Secret::new([7; 32]),
+                system_hash: Secret::new([8; 16]),
             },
             Answer::Keys {
                 day: 1,
