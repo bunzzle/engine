@@ -7,7 +7,8 @@ const RET_SHIFT: u8 = 2;
 const RET_MASK: u8 = 3 << RET_SHIFT;
 const SMTPUTF8: u8 = 1;
 const REQUIRETLS: u8 = 2;
-const REQUIRED: u8 = SMTPUTF8 | REQUIRETLS;
+const TLS_OPTIONAL: u8 = 4;
+const REQUIRED: u8 = SMTPUTF8 | REQUIRETLS | TLS_OPTIONAL;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Ret {
@@ -21,6 +22,29 @@ pub enum Ret {
 pub struct Required {
     pub smtputf8: bool,
     pub requiretls: bool,
+    tls_optional: bool,
+}
+
+impl Required {
+    pub fn new(smtputf8: bool, requiretls: bool) -> Self {
+        Self {
+            smtputf8,
+            requiretls,
+            tls_optional: false,
+        }
+    }
+
+    pub fn report() -> Self {
+        Self {
+            smtputf8: false,
+            requiretls: false,
+            tls_optional: true,
+        }
+    }
+
+    pub fn tls_optional(self) -> bool {
+        self.tls_optional
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -47,8 +71,12 @@ impl Envelope {
         let flags = (u8::from(self.eight_bit) * EIGHT_BIT)
             | (u8::from(self.declared) * DECLARED)
             | (ret << RET_SHIFT);
+        if self.required.tls_optional && self.required.requiretls {
+            return None;
+        }
         let required = (u8::from(self.required.smtputf8) * SMTPUTF8)
-            | (u8::from(self.required.requiretls) * REQUIRETLS);
+            | (u8::from(self.required.requiretls) * REQUIRETLS)
+            | (u8::from(self.required.tls_optional) * TLS_OPTIONAL);
         let mut out = Vec::with_capacity(8 + self.sender.len() + self.envid.len() + 5 * 2);
         out.extend_from_slice(&[VERSION, flags, required]);
         out.extend_from_slice(&sender.to_le_bytes());
@@ -66,7 +94,8 @@ impl Envelope {
     pub fn decode(bytes: &[u8]) -> Option<Self> {
         let mut read = Reader(bytes);
         let [version, flags, required] = read.array()?;
-        if version != VERSION || required & !REQUIRED != 0 {
+        let both = REQUIRETLS | TLS_OPTIONAL;
+        if version != VERSION || required & !REQUIRED != 0 || required & both == both {
             return None;
         }
         let sender = usize::from(u16::from_le_bytes(read.array()?));
@@ -97,6 +126,7 @@ impl Envelope {
             required: Required {
                 smtputf8: required & SMTPUTF8 != 0,
                 requiretls: required & REQUIRETLS != 0,
+                tls_optional: required & TLS_OPTIONAL != 0,
             },
             envid,
             signatures,
@@ -179,10 +209,7 @@ mod tests {
             eight_bit: true,
             declared: false,
             ret: Ret::Headers,
-            required: Required {
-                smtputf8: false,
-                requiretls: true,
-            },
+            required: Required::new(false, true),
             envid: b"env-1".to_vec(),
             signatures: vec![(7, DkimAlg::RsaSha256), (9, DkimAlg::Ed25519Sha256)],
         }
@@ -212,8 +239,32 @@ mod tests {
         let mut bytes = full().encode().expect("encode");
         bytes[1] |= 0x80;
         assert_eq!(Envelope::decode(&bytes), Some(full()));
-        bytes[2] |= 0x04;
+        bytes[2] |= 0x08;
         assert_eq!(Envelope::decode(&bytes), None);
+    }
+
+    #[test]
+    fn tls_optional_round_trips_but_never_with_requiretls() {
+        let report = Envelope {
+            sender: "tlsrpt@example.org".into(),
+            required: Required::report(),
+            ..Envelope::default()
+        };
+        let bytes = report.encode().expect("encode");
+        assert_eq!(bytes[2], TLS_OPTIONAL);
+        let decoded = Envelope::decode(&bytes).expect("decode");
+        assert!(decoded.required.tls_optional());
+        assert!(!Envelope::default().required.tls_optional());
+        let mut both = bytes;
+        both[2] |= REQUIRETLS;
+        assert_eq!(Envelope::decode(&both), None);
+        let mut required = Required::report();
+        required.requiretls = true;
+        let invalid = Envelope {
+            required,
+            ..Envelope::default()
+        };
+        assert_eq!(invalid.encode(), None);
     }
 
     #[test]

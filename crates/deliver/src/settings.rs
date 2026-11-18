@@ -47,6 +47,7 @@ pub struct Settings {
     pub dead: Duration,
     pub mta_sts: bool,
     pub tlsrpt: bool,
+    pub report_tenant: Option<u32>,
 }
 
 impl Settings {
@@ -64,6 +65,7 @@ impl Settings {
             dead: Duration::from_secs(60),
             mta_sts: false,
             tlsrpt: false,
+            report_tenant: None,
         }
     }
 }

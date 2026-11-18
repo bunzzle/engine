@@ -59,6 +59,7 @@ struct Seen {
     publics: RefCell<BTreeMap<String, Vec<u8>>>,
     headers: RefCell<BTreeMap<MessageId, (Vec<u8>, usize)>>,
     routed: RefCell<BTreeSet<String>>,
+    optional: Cell<u32>,
 }
 
 struct Idle(Rc<Seen>);
@@ -71,6 +72,9 @@ impl Transport for Idle {
         };
         for (_, recipient) in &prepared.recipients {
             seen.routed.borrow_mut().insert(recipient.address.clone());
+        }
+        if prepared.envelope.required.tls_optional() {
+            seen.optional.set(seen.optional.get() + 1);
         }
         let mut hash = BodyHash::new();
         match &mut prepared.body {
@@ -720,6 +724,7 @@ fn json_messages_are_signed_stored_and_routed() {
             assert!(header.contains("with HTTPS id"), "{header}");
             assert!(header.contains("Subject: =?utf-8?"), "{header}");
             assert!(header.contains("X-Campaign: c1"), "{header}");
+            assert_eq!(seen.optional.get(), 0);
             let bcc = header
                 .lines()
                 .any(|line| line.to_ascii_lowercase().starts_with("bcc:"));
@@ -773,6 +778,7 @@ fn refusals_answer_stable_codes_and_store_nothing() {
                 (first, r#"{"from":"ann@example.org","to":"bad","text":"x"}"#.into(), 400, "bad_address"),
                 (first, r#"{"from":"ann@example.org","to":"jörg@example.com","text":"x"}"#.into(), 400, "bad_address"),
                 (first, r#"{"from":"ann@example.org","to":"a@example.com","text":"x","headers":{"Bcc":"x@example.com"}}"#.into(), 400, "bad_header"),
+                (first, r#"{"from":"ann@example.org","to":"a@example.com","text":"x","headers":{"TLS-Required":"No"}}"#.into(), 400, "bad_header"),
                 (first, r#"{"from":"ann@example.org","to":"a@example.com","text":"x","headers":{"X-A":"a\r\nBcc: x@example.com"}}"#.into(), 400, "bad_header"),
                 (first, r#"{"from":"ann@example.org","to":"a@example.com","text":"x","attachments":[{"filename":"a","content_type":"text/plain","data":"aGVs bG8="}]}"#.into(), 400, "bad_message"),
                 (first, r#"{"from":"ann@example.org","text":"x"}"#.into(), 422, "no_recipients"),

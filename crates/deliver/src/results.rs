@@ -24,6 +24,7 @@ pub(crate) struct Failure {
 pub(crate) struct Scope {
     pub(crate) domain: String,
     pub(crate) policy: Applied,
+    pub(crate) muted: bool,
 }
 
 #[derive(Default)]
@@ -74,6 +75,9 @@ impl Results {
     }
 
     fn counts(&self, scope: &Scope, change: impl FnOnce(&mut Counts)) {
+        if scope.muted {
+            return;
+        }
         let day = wall_ms() / DAY_MS;
         let mut days = self.days.borrow_mut();
         let mut today = self.today.borrow_mut();
@@ -150,6 +154,7 @@ mod tests {
         Scope {
             domain: domain.to_owned(),
             policy: Applied::None,
+            muted: false,
         }
     }
 
@@ -202,6 +207,7 @@ mod tests {
                     policy: Applied::Tlsa {
                         records: vec![n.to_string()],
                     },
+                    muted: false,
                 };
                 results.success(&policy);
             }

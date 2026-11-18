@@ -256,10 +256,7 @@ impl<T: Transport + 'static, S: Source> Handler<'_, T, S> {
         };
         let envelope = Envelope {
             sender,
-            required: Required {
-                requiretls: require_tls,
-                ..Required::default()
-            },
+            required: Required::new(false, require_tls),
             ..Envelope::default()
         };
         let node = &self.context.node;

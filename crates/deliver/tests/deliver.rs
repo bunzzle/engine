@@ -562,17 +562,11 @@ fn skips_literal_and_local_addresses() {
 #[test]
 fn checks_what_the_message_needs() {
     let utf8 = Envelope {
-        required: Required {
-            smtputf8: true,
-            requiretls: false,
-        },
+        required: Required::new(true, false),
         ..envelope()
     };
     let tls = Envelope {
-        required: Required {
-            smtputf8: false,
-            requiretls: true,
-        },
+        required: Required::new(false, true),
         ..envelope()
     };
     let eight = Envelope {
@@ -1526,12 +1520,53 @@ fn report_owners_merge_every_core_and_keep_records() {
 }
 
 #[test]
+fn tls_optional_mail_skips_policies_and_is_not_counted() {
+    for optional in [true, false] {
+        let (outcomes, first, requests, taken) = run(async move {
+            let first = serve(MX1, Script::new(&[]));
+            drop(serve(MX2, Script::new(&["STARTTLS"])));
+            let requests = serve_policy(WEB, Rc::new(RefCell::new(policy(ENFORCE))));
+            let zone = zone();
+            sts(&zone, "1");
+            let mut settings = strict();
+            settings.tlsrpt = true;
+            let deliver = verifying(zone, settings);
+            let required = if optional {
+                Required::report()
+            } else {
+                Required::default()
+            };
+            let envelope = Envelope {
+                required,
+                ..envelope()
+            };
+            let outcomes = send(
+                &deliver,
+                &envelope,
+                &destination("example.com"),
+                &["a@example.com"],
+                b"hello\r\n",
+            )
+            .await;
+            (outcomes, first, requests, deliver.take_results())
+        });
+        assert_eq!(answers(&outcomes), [Answer::Delivered], "{optional}");
+        if optional {
+            assert!(mailed(&first));
+            assert_eq!(requests.borrow().len(), 0);
+            assert_eq!(taken, []);
+        } else {
+            assert_eq!(first.borrow().connections, 0);
+            assert_eq!(requests.borrow().len(), 1);
+            assert_eq!(taken.len(), 1);
+        }
+    }
+}
+
+#[test]
 fn requiretls_needs_verified_tls() {
     let tls = Envelope {
-        required: Required {
-            smtputf8: false,
-            requiretls: true,
-        },
+        required: Required::new(false, true),
         ..envelope()
     };
     let cases: [(bool, Records, &[&str], Answer, bool); 4] = [
@@ -1607,10 +1642,7 @@ fn requiretls_needs_verified_tls() {
 #[test]
 fn requiretls_defers_when_the_host_is_down() {
     let tls = Envelope {
-        required: Required {
-            smtputf8: false,
-            requiretls: true,
-        },
+        required: Required::new(false, true),
         ..envelope()
     };
     let outcomes = run(async move {
