@@ -181,6 +181,7 @@ fn keep_restores() {
 fn restores() -> Vec<Restore> {
     let mut restores =
         RESTORED.with_borrow_mut(|kept| kept.replace(Vec::new()).expect("keeping restores"));
+    restores.retain(|r| r.kind == control::KIND_STS);
     restores.sort_by_key(|r| r.records.home());
     restores
 }

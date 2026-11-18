@@ -28,6 +28,8 @@ pub struct Saved {
 }
 
 pub struct Restore {
+    pub kind: u8,
+    pub naming: [u8; 16],
     pub saved: Vec<Saved>,
     pub unread: u64,
     pub dropped: u64,
@@ -196,7 +198,7 @@ impl Owner for Fixed {
 
 pub(crate) struct Found {
     kind: u8,
-    pub(crate) shards: Vec<u16>,
+    shards: Vec<u16>,
     pub(crate) saved: Vec<Saved>,
     pub(crate) unread: u64,
     pub(crate) bad: Vec<(u16, u32, u32)>,
@@ -217,7 +219,7 @@ async fn system_keys(keys: &dyn Keys) -> Option<TenantKeys> {
     None
 }
 
-pub(crate) async fn load(core: &Core, kind: u8, keys: &dyn Keys) -> Result<Found, control::Error> {
+async fn load(core: &Core, kind: u8, keys: &dyn Keys) -> Result<Found, control::Error> {
     let reader = core.file.reader();
     let mut listed = Vec::new();
     for &shard in &core.shards {
@@ -269,11 +271,47 @@ pub(crate) async fn load(core: &Core, kind: u8, keys: &dyn Keys) -> Result<Found
     Ok(found)
 }
 
-pub(crate) async fn restore<T: Transport>(
+pub(crate) struct Loaded {
+    pub(crate) shards: Vec<u16>,
+    naming: [u8; 16],
+    found: Vec<Found>,
+}
+
+pub(crate) async fn load_all(
+    core: &Core,
+    keys: &dyn Keys,
+    naming: [u8; 16],
+) -> Result<Loaded, control::Error> {
+    let mut found = Vec::new();
+    for kind in [control::KIND_STS, control::KIND_RPT] {
+        found.push(load(core, kind, keys).await?);
+    }
+    Ok(Loaded {
+        shards: core.shards.clone(),
+        naming,
+        found,
+    })
+}
+
+pub(crate) async fn restore_all<T: Transport>(
+    transport: &T,
+    loaded: Loaded,
+    changes: &Changes,
+    keys: &Rc<dyn Keys>,
+) -> Vec<Rc<Stored>> {
+    let mut all = Vec::new();
+    for found in loaded.found {
+        all.push(restore(transport, found, changes, keys, loaded.naming).await);
+    }
+    all
+}
+
+async fn restore<T: Transport>(
     transport: &T,
     found: Found,
     changes: &Changes,
     keys: &Rc<dyn Keys>,
+    naming: [u8; 16],
 ) -> Rc<Stored> {
     let records = Rc::new(Stored::new(
         found.kind,
@@ -287,6 +325,8 @@ pub(crate) async fn restore<T: Transport>(
     }
     transport
         .restore(Restore {
+            kind: found.kind,
+            naming,
             saved: found.saved,
             unread: found.unread,
             dropped: found.bad.len() as u64,

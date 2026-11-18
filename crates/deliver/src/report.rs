@@ -16,7 +16,30 @@ pub enum ResultType {
     StsWebpkiInvalid,
 }
 
+const ALL: [ResultType; 11] = [
+    ResultType::StarttlsNotSupported,
+    ResultType::CertificateHostMismatch,
+    ResultType::CertificateExpired,
+    ResultType::CertificateNotTrusted,
+    ResultType::ValidationFailure,
+    ResultType::TlsaInvalid,
+    ResultType::DnssecInvalid,
+    ResultType::DaneRequired,
+    ResultType::StsPolicyFetchError,
+    ResultType::StsPolicyInvalid,
+    ResultType::StsWebpkiInvalid,
+];
+
 impl ResultType {
+    pub(crate) fn code(self) -> u8 {
+        let at = ALL.iter().position(|&result| result == self).unwrap_or(0);
+        u8::try_from(at).unwrap_or(0)
+    }
+
+    pub(crate) fn from_code(code: u8) -> Option<Self> {
+        ALL.get(usize::from(code)).copied()
+    }
+
     pub fn name(self) -> &'static str {
         match self {
             Self::StarttlsNotSupported => "starttls-not-supported",
