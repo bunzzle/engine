@@ -26,6 +26,7 @@ const UNREADABLE: u64 = 30_000;
 const UNROUTED: u64 = 30_000;
 const DAMAGED_TRIES: u8 = 3;
 const DAMAGED_KEPT: usize = 4096;
+const UPKEEP: u64 = 60_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Config {
@@ -155,6 +156,7 @@ struct Inner<T> {
     peers: OnceCell<Peers<Note>>,
     notify: Notify,
     expiry: Notify,
+    upkeep: Notify,
     expiring: RefCell<BTreeSet<MessageId>>,
     expired: Cell<u64>,
     closed: Cell<bool>,
@@ -230,6 +232,7 @@ impl<T: Transport + 'static> Sched<T> {
             peers: OnceCell::new(),
             notify: Notify::default(),
             expiry: Notify::default(),
+            upkeep: Notify::default(),
             expiring: RefCell::new(BTreeSet::new()),
             expired: Cell::new(0),
             closed: Cell::new(false),
@@ -252,9 +255,12 @@ impl<T: Transport + 'static> Sched<T> {
         let run = spawn(async move { runner.run().await });
         let expirer = sched.clone();
         let expiry = spawn(async move { expirer.expire().await });
+        let keeper = sched.clone();
+        let upkeep = spawn(async move { keeper.upkeep().await });
         let done = spawn(async move {
             run.await;
             expiry.await;
+            upkeep.await;
             mesh.await;
         });
         (sched, done)
@@ -404,6 +410,7 @@ impl<T: Transport + 'static> Sched<T> {
         self.inner.closed.set(true);
         self.inner.notify.notify();
         self.inner.expiry.notify();
+        self.inner.upkeep.notify();
         if let Some(peers) = self.inner.peers.get() {
             peers.close();
         }
@@ -1080,6 +1087,29 @@ impl<T: Transport + 'static> Sched<T> {
             }
             let next = inner.spool.next_expiry(now);
             self.wait(&inner.expiry, next).await;
+        }
+    }
+
+    async fn upkeep(&self) {
+        let inner = &self.inner;
+        while !inner.closed.get() {
+            {
+                let mut tick = pin!(inner.transport.tick());
+                let mut wake = pin!(inner.upkeep.wait());
+                poll_fn(|cx| {
+                    if wake.as_mut().poll(cx).is_ready() || tick.as_mut().poll(cx).is_ready() {
+                        Poll::Ready(())
+                    } else {
+                        Poll::Pending
+                    }
+                })
+                .await;
+            }
+            if inner.closed.get() {
+                break;
+            }
+            let next = inner.clock.now() + UPKEEP;
+            self.wait(&inner.upkeep, Some(next)).await;
         }
     }
 
