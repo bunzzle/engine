@@ -5,6 +5,7 @@ use spool::{MessageId, Stamp};
 use crate::lanes::QueueId;
 use crate::policy::Answer;
 use crate::sign::Outgoing;
+use crate::system::Restore;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Claimed {
@@ -40,4 +41,9 @@ pub struct Answered {
 
 pub trait Transport {
     fn send(&self, attempt: Attempt) -> impl Future<Output = Vec<Answered>>;
+
+    fn restore(&self, restore: Restore) -> impl Future<Output = ()> {
+        drop(restore);
+        std::future::ready(())
+    }
 }

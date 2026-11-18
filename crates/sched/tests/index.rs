@@ -23,8 +23,9 @@ use rt::sim::{Config, Disk, Faults, Machine, SimDriver, Stalls, check};
 use rt::{JoinHandle, Runtime, TcpListener, TcpStream, sleep, spawn, timeout};
 use sched::{
     Answered, Attempt, Batched, Begun, Clock, DAY, Draft, Hash, KIND_REQUEST, KIND_SUPPRESS,
-    Keyring, Keys, Meshes, Node, Parts, Reason, Refusal, Running, SHAPE, Settings, Suppression,
-    Ticket, Transport, Unsealable, Unwrapped, normalize, punycode, retain, retain_request,
+    Keyring, Keys, Meshes, Node, Parts, Reason, Refusal, Restore, Running, SHAPE, Settings,
+    Suppression, Ticket, Transport, Unsealable, Unwrapped, normalize, punycode, retain,
+    retain_request,
 };
 use spool::{Body, Head, HeadClear, Message, MessageId, SLICE, Slice, Stamp};
 use store::{Client, Committer, DataFile, Options, SLOT_SIZE, Setup, Tiering, boot};
@@ -96,6 +97,15 @@ fn toy_day_secret(tenant: u32, day: u32) -> Secret<32> {
 }
 
 impl Keys for Toy {
+    fn system(&self) -> Ready<'_> {
+        Box::pin(std::future::ready(Ok(TenantKeys::derive(
+            0,
+            0,
+            &Root::new(&Secret::new([42; 32])),
+            1,
+        ))))
+    }
+
     fn batch(&self, tenant: u32, generation: u32, shard: u16, first: u64) -> Batched<'_> {
         let batch = match self.get(tenant, generation) {
             Some(keys) => {
@@ -139,10 +149,42 @@ impl Keys for Toy {
 
 struct Idle;
 
+thread_local! {
+    static RESTORED: RefCell<Option<Vec<Restore>>> = const { RefCell::new(None) };
+}
+
 impl Transport for Idle {
     fn send(&self, _: Attempt) -> impl Future<Output = Vec<Answered>> {
         std::future::ready(Vec::new())
     }
+
+    fn restore(&self, restore: Restore) -> impl Future<Output = ()> {
+        RESTORED.with_borrow_mut(|kept| {
+            if let Some(kept) = kept {
+                kept.push(restore);
+            }
+        });
+        std::future::ready(())
+    }
+}
+
+fn keep_restores() {
+    RESTORED.with_borrow_mut(|kept| *kept = Some(Vec::new()));
+}
+
+fn restores() -> Vec<Restore> {
+    let mut restores =
+        RESTORED.with_borrow_mut(|kept| kept.replace(Vec::new()).expect("keeping restores"));
+    restores.sort_by_key(|r| r.records.home());
+    restores
+}
+
+fn saved(restores: &[Restore]) -> BTreeSet<(u16, u32, Vec<u8>)> {
+    restores
+        .iter()
+        .flat_map(|r| &r.saved)
+        .map(|s| (s.shard, s.id, s.data.clone()))
+        .collect()
 }
 
 struct Cluster {
@@ -2648,4 +2690,58 @@ fn sender_domains_pick_their_keys_and_keep_named_keys() {
             node.sign(1, ed.id, digest).await.expect("sign");
         }
     });
+}
+
+#[test]
+fn system_records_come_back_sealed_and_other_keys_drop_them() {
+    keep_restores();
+    let driver = Rc::new(SimDriver::with_disk(41, Config::default(), created(41)));
+    let cluster = started_with_keys(&driver, 2);
+    let restored = restores();
+    assert_eq!(restored.len(), 2);
+    assert!(restored.iter().all(|r| r.saved.is_empty() && r.unread == 0));
+    let homes: Vec<u16> = restored.iter().map(|r| r.records.home()).collect();
+    assert!(homes.iter().all(|&home| home != sched::CONTROL_SHARD));
+    let (first, second) = (homes[0], homes[1]);
+    cluster.run(async move {
+        keys_listening().await;
+        let one = &restored[0].records;
+        one.put(first, 1, b"one".to_vec()).await.expect("put");
+        one.put(first, 2, b"two".to_vec()).await.expect("put");
+        one.put(first, 2, b"two again".to_vec()).await.expect("put");
+        one.remove(first, 1).await.expect("remove");
+        one.remove(first, 7).await.expect("remove missing");
+        let two = &restored[1].records;
+        two.put(second, 1, b"other core".to_vec())
+            .await
+            .expect("put");
+    });
+    cluster.stop();
+
+    let driver = Rc::new(SimDriver::with_disk(42, Config::default(), driver.crash()));
+    let restarted = started_with_keys(&driver, 2);
+    let restored = restores();
+    let expected = BTreeSet::from([
+        (first, 2, b"two again".to_vec()),
+        (second, 1, b"other core".to_vec()),
+    ]);
+    assert_eq!(saved(&restored), expected);
+    assert!(restored.iter().all(|r| r.unread == 0 && r.dropped == 0));
+    restarted.stop();
+
+    let driver = Rc::new(SimDriver::with_disk(43, Config::default(), driver.crash()));
+    let other = started(&driver, 2);
+    let restored = restores();
+    assert!(saved(&restored).is_empty());
+    assert_eq!(restored.iter().map(|r| r.dropped).sum::<u64>(), 2);
+    let removed: u64 = other.nodes.iter().map(|n| n.system_records().removed).sum();
+    assert_eq!(removed, 2);
+    other.stop();
+
+    let driver = Rc::new(SimDriver::with_disk(44, Config::default(), driver.crash()));
+    let last = started_with_keys(&driver, 2);
+    let restored = restores();
+    assert!(saved(&restored).is_empty());
+    assert!(restored.iter().all(|r| r.dropped == 0 && r.unread == 0));
+    last.stop();
 }

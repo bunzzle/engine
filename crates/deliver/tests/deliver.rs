@@ -1,6 +1,7 @@
 mod common;
 
 use std::cell::{Cell, RefCell};
+use std::collections::BTreeMap;
 use std::net::{IpAddr, Ipv4Addr};
 use std::rc::Rc;
 use std::time::Duration;
@@ -11,7 +12,10 @@ use deliver::{Deliver, EightBit, Message, Outcome, Remote, Settings, limits};
 use dns::{Found, Name, Record, Type};
 use rt::sim::{Config, SimDriver};
 use rt::{Mesh, Runtime, now, sleep, spawn};
-use sched::{Answer, Body, Destination, Envelope, Kind, Recipient, Required};
+use sched::{
+    Answer, Body, Destination, Done, Envelope, Kind, Recipient, Records as Saving, Required,
+    Restore, Saved, Transport,
+};
 use tls::{Connector, simulated};
 
 const EGRESS: IpAddr = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
@@ -1065,6 +1069,74 @@ fn cached_policy_outlives_a_failed_fetch() {
     assert_eq!(answers(&outcomes), [Answer::Delivered; 3]);
     assert_eq!(first.borrow().connections, 0);
     assert_eq!(requests.borrow().len(), 2);
+}
+
+#[derive(Default)]
+struct Memory {
+    rows: RefCell<BTreeMap<(u16, u32), Vec<u8>>>,
+}
+
+impl Saving for Memory {
+    fn home(&self) -> u16 {
+        1
+    }
+
+    fn put(&self, shard: u16, id: u32, data: Vec<u8>) -> Done<'_> {
+        self.rows.borrow_mut().insert((shard, id), data);
+        Box::pin(std::future::ready(Ok(())))
+    }
+
+    fn remove(&self, shard: u16, id: u32) -> Done<'_> {
+        self.rows.borrow_mut().remove(&(shard, id));
+        Box::pin(std::future::ready(Ok(())))
+    }
+}
+
+fn restore(memory: &Rc<Memory>) -> Restore {
+    let saved = memory
+        .rows
+        .borrow()
+        .iter()
+        .map(|(&(shard, id), data)| Saved {
+            shard,
+            id,
+            data: data.clone(),
+        })
+        .collect();
+    Restore {
+        saved,
+        unread: 0,
+        dropped: 0,
+        records: Rc::clone(memory) as Rc<dyn Saving>,
+    }
+}
+
+#[test]
+fn saved_policy_is_enforced_after_a_restart_without_its_server() {
+    let (outcomes, first, requests, stats) = run(async {
+        let first = serve(MX1, Script::new(&["STARTTLS"]));
+        drop(serve(MX2, Script::new(&["STARTTLS"])));
+        let requests = serve_policy(WEB, Rc::new(RefCell::new(policy(ENFORCE))));
+        let zone = zone();
+        sts(&zone, "1");
+        let memory = Rc::new(Memory::default());
+        let deliver = verifying(zone.clone(), strict());
+        deliver.restore(restore(&memory)).await;
+        let mut outcomes = simple(&deliver, "example.com").await;
+        drop(deliver);
+        sleep(Duration::from_millis(1)).await;
+        assert_eq!(memory.rows.borrow().len(), 1);
+        sts(&zone, "2");
+        zone.fail("mta-sts.example.com", Type::A);
+        let again = verifying(zone, strict());
+        again.restore(restore(&memory)).await;
+        outcomes.extend(simple(&again, "example.com").await);
+        (outcomes, first, requests, again.policy_stats())
+    });
+    assert_eq!(answers(&outcomes), [Answer::Delivered; 2]);
+    assert_eq!(first.borrow().connections, 0);
+    assert_eq!(requests.borrow().len(), 1);
+    assert_eq!(stats.loaded, 1);
 }
 
 #[test]

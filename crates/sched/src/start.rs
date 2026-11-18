@@ -18,6 +18,7 @@ use crate::node::{Config, Note, Sched};
 use crate::requests::{KIND_REQUEST, RequestInputs, Requests, retain_request};
 use crate::sealing::{Holds, Keys};
 use crate::suppress::{self, Inputs, KIND_SUPPRESS, Suppressions};
+use crate::system::{self, RecordStats, Stored};
 use crate::transport::Transport;
 
 pub const CONTROL_SHARD: u16 = 0;
@@ -98,6 +99,7 @@ pub(crate) struct Inner<T> {
     restored: u64,
     pub(crate) dropped: Cell<u64>,
     pub(crate) delete_retries: Cell<u64>,
+    records: Rc<Stored>,
 }
 
 pub struct Node<T> {
@@ -175,7 +177,7 @@ impl<T: Transport + 'static> Node<T> {
             let gone = |tenant, generation| table.borrow().gone(tenant, generation);
             Queues::load(&core, settings.naming, &*parts.keys, &gone).await?
         };
-        let kept = core.shards.clone();
+        let found = system::load(&core, control::KIND_STS, &*parts.keys).await?;
         let (spool, shards, pending) =
             spool::Spool::open(core, settings.node, settings.spool).await?;
         let owner = spawn(shards.run());
@@ -195,7 +197,7 @@ impl<T: Transport + 'static> Node<T> {
             table: Rc::clone(&table),
             clock,
             naming: settings.naming,
-            shards: kept,
+            shards: found.shards.clone(),
         };
         let (suppressions, requests, mut index_done) =
             index_services(links.suppress, inputs).await?;
@@ -204,6 +206,7 @@ impl<T: Transport + 'static> Node<T> {
             changes.clone(),
             Rc::clone(&parts.keys) as Rc<dyn KeySource>,
         );
+        let records = system::restore(&parts.transport, found, &changes, &parts.keys).await;
 
         let (leases, leases_done) =
             start_leases(links.leases, &table, &spool, settings.naming.shards);
@@ -244,6 +247,7 @@ impl<T: Transport + 'static> Node<T> {
             restored,
             dropped: Cell::new(0),
             delete_retries: Cell::new(0),
+            records,
         });
         let ticks = maintain(Rc::downgrade(&inner), ticker);
         let drops = drop_deleted(Rc::downgrade(&inner), deletions);
@@ -303,6 +307,10 @@ impl<T: Transport + 'static> Node<T> {
 
     pub fn restored(&self) -> u64 {
         self.inner.restored
+    }
+
+    pub fn system_records(&self) -> RecordStats {
+        self.inner.records.stats()
     }
 
     pub fn controls(&self) -> bool {
