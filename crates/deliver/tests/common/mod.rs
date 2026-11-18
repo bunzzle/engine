@@ -23,6 +23,7 @@ pub struct Zone {
     answers: Rc<RefCell<Answers>>,
     signed: Rc<RefCell<BTreeSet<(String, Type)>>>,
     aliases: Rc<RefCell<BTreeMap<String, String>>>,
+    slow: Rc<RefCell<BTreeSet<(String, Type)>>>,
     pub asked: Rc<RefCell<Vec<(String, Type)>>>,
 }
 
@@ -37,6 +38,10 @@ impl Zone {
         self.answers
             .borrow_mut()
             .insert((name.to_owned(), kind), None);
+    }
+
+    pub fn time_out(&self, name: &str, kind: Type) {
+        self.slow.borrow_mut().insert((name.to_owned(), kind));
     }
 
     pub fn sign(&self, name: &str, kind: Type) {
@@ -59,6 +64,7 @@ impl Dns for Zone {
         let key = (name.to_string(), kind);
         self.asked.borrow_mut().push(key.clone());
         let found = match self.answers.borrow().get(&key) {
+            _ if self.slow.borrow().contains(&key) => Err(Error::Timeout),
             Some(Some(found)) => Ok(found.clone()),
             Some(None) => Err(Error::ServFail),
             None => Ok(Found::NxDomain),

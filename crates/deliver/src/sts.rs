@@ -14,6 +14,7 @@ use tls::{Connector, Verify};
 use crate::conn::left;
 use crate::https::{self, Parsed};
 use crate::mx::{self, Addresses, Dns};
+use crate::report::{Applied, ResultType};
 
 const MAX_AGE: u64 = 31_557_600;
 const BODY: usize = 64 * 1024;
@@ -44,6 +45,7 @@ pub(crate) struct Policy {
     pub(crate) mode: Mode,
     mx: Vec<String>,
     max_age: u64,
+    lines: Vec<String>,
 }
 
 impl Policy {
@@ -53,11 +55,13 @@ impl Policy {
         let mut mode = None;
         let mut max_age = None;
         let mut mx = Vec::new();
+        let mut lines = Vec::new();
         for line in text.split('\n') {
             let line = line.strip_suffix('\r').unwrap_or(line);
             if line.trim().is_empty() {
                 continue;
             }
+            lines.push(line.trim().to_owned());
             let (name, value) = line.split_once(':')?;
             let value = value.trim();
             match name {
@@ -96,7 +100,18 @@ impl Policy {
             mode,
             mx,
             max_age: max_age?,
+            lines,
         })
+    }
+
+    pub(crate) fn applied(&self) -> Applied {
+        match self.mode {
+            Mode::None => Applied::None,
+            Mode::Enforce | Mode::Testing => Applied::Sts {
+                lines: self.lines.clone(),
+                mx: self.mx.clone(),
+            },
+        }
     }
 
     pub(crate) fn allows(&self, host: &Name) -> bool {
@@ -154,6 +169,7 @@ pub(crate) fn id(records: &[Record]) -> Option<String> {
 pub(crate) enum Got {
     None,
     Policy(Rc<Policy>),
+    Failed(ResultType),
     Busy,
 }
 
@@ -307,32 +323,31 @@ pub(crate) struct Sts {
 
 enum Fetched {
     Policy(Rc<Policy>),
-    Failed,
+    Failed(ResultType),
     Busy,
 }
 
 #[derive(Default)]
 struct Joined {
-    done: Cell<bool>,
-    policy: RefCell<Option<Rc<Policy>>>,
+    done: RefCell<Option<Result<Rc<Policy>, ResultType>>>,
     wakers: RefCell<Vec<Waker>>,
 }
 
 impl Joined {
-    fn finish(&self, policy: Option<Rc<Policy>>) {
-        if self.done.replace(true) {
+    fn finish(&self, fetched: Result<Rc<Policy>, ResultType>) {
+        if self.done.borrow().is_some() {
             return;
         }
-        *self.policy.borrow_mut() = policy;
+        *self.done.borrow_mut() = Some(fetched);
         for waker in self.wakers.take() {
             waker.wake();
         }
     }
 
-    async fn wait(&self) -> Option<Rc<Policy>> {
+    async fn wait(&self) -> Result<Rc<Policy>, ResultType> {
         poll_fn(|cx| {
-            if self.done.get() {
-                return Poll::Ready(self.policy.borrow().clone());
+            if let Some(fetched) = &*self.done.borrow() {
+                return Poll::Ready(fetched.clone());
             }
             let mut wakers = self.wakers.borrow_mut();
             if !wakers.iter().any(|waker| waker.will_wake(cx.waker())) {
@@ -353,7 +368,7 @@ struct Leading<'a> {
 impl Drop for Leading<'_> {
     fn drop(&mut self) {
         self.joined.borrow_mut().remove(&self.domain);
-        self.done.finish(None);
+        self.done.finish(Err(ResultType::StsPolicyFetchError));
     }
 }
 
@@ -463,7 +478,9 @@ impl Sts {
         match self.fetch(dns, tls, egress, domain, id, end).await {
             Fetched::Policy(policy) => Got::Policy(policy),
             Fetched::Busy => cached.map_or(Got::Busy, |(_, policy)| Got::Policy(policy)),
-            Fetched::Failed => cached.map_or(Got::None, |(_, policy)| Got::Policy(policy)),
+            Fetched::Failed(result) => {
+                cached.map_or(Got::Failed(result), |(_, policy)| Got::Policy(policy))
+            }
         }
     }
 
@@ -479,8 +496,9 @@ impl Sts {
         let running = self.joined.borrow().get(domain).cloned();
         if let Some(joined) = running {
             return match timeout(left(end, FETCH), joined.wait()).await {
-                Ok(Some(policy)) => Fetched::Policy(policy),
-                _ => Fetched::Failed,
+                Ok(Ok(policy)) => Fetched::Policy(policy),
+                Ok(Err(result)) => Fetched::Failed(result),
+                Err(_) => Fetched::Failed(ResultType::StsPolicyFetchError),
             };
         }
         if self.fetching.get() >= FETCHES {
@@ -499,17 +517,21 @@ impl Sts {
         };
         let fetched = timeout(left(end, FETCH), get_policy(dns, tls, egress, domain)).await;
         drop(counted);
-        let policy = match fetched {
-            Ok(Some((policy, text))) => {
+        let fetched = match fetched {
+            Ok(Ok((policy, text))) => {
                 let policy = Rc::new(policy);
                 self.store(domain, id, Rc::clone(&policy), text);
-                Some(policy)
+                Ok(policy)
             }
-            _ => None,
+            Ok(Err(result)) => Err(result),
+            Err(_) => Err(ResultType::StsPolicyFetchError),
         };
-        joined.finish(policy.clone());
+        joined.finish(fetched.clone());
         drop(leading);
-        policy.map_or(Fetched::Failed, Fetched::Policy)
+        match fetched {
+            Ok(policy) => Fetched::Policy(policy),
+            Err(result) => Fetched::Failed(result),
+        }
     }
 
     pub(crate) async fn refresh<D: Dns>(
@@ -666,34 +688,54 @@ async fn get_policy<D: Dns>(
     tls: &Connector,
     egress: IpAddr,
     domain: &Name,
-) -> Option<(Policy, Vec<u8>)> {
-    let host = domain.prefixed("mta-sts").ok()?;
+) -> Result<(Policy, Vec<u8>), ResultType> {
+    let host = domain
+        .prefixed("mta-sts")
+        .map_err(|_| ResultType::StsPolicyFetchError)?;
     let Addresses::Found { ips, .. } = mx::addresses(dns, &host, egress.is_ipv6()).await else {
-        return None;
+        return Err(ResultType::StsPolicyFetchError);
     };
     let name = host.to_string();
+    let mut failed = ResultType::StsPolicyFetchError;
     for ip in ips {
-        if let Some(text) = get(tls, egress, ip, &name).await {
-            return Policy::parse(&text).map(|policy| (policy, text));
+        match get(tls, egress, ip, &name).await {
+            Ok(text) => {
+                return Policy::parse(&text)
+                    .map(|policy| (policy, text))
+                    .ok_or(ResultType::StsPolicyInvalid);
+            }
+            Err(result) => failed = result,
         }
     }
-    None
+    Err(failed)
 }
 
-async fn get(tls: &Connector, egress: IpAddr, ip: IpAddr, name: &str) -> Option<Vec<u8>> {
+async fn get(
+    tls: &Connector,
+    egress: IpAddr,
+    ip: IpAddr,
+    name: &str,
+) -> Result<Vec<u8>, ResultType> {
+    let fetch = ResultType::StsPolicyFetchError;
     let io = TcpStream::connect_from(egress, SocketAddr::new(ip, 443))
         .await
-        .ok()?;
-    let mut stream = tls.connect(io, name, Verify::WebPki).await.ok()?;
-    stream.write_all(&https::request(name, PATH)).await.ok()?;
+        .map_err(|_| fetch)?;
+    let mut stream = tls
+        .connect(io, name, Verify::WebPki)
+        .await
+        .map_err(|_| ResultType::StsWebpkiInvalid)?;
+    stream
+        .write_all(&https::request(name, PATH))
+        .await
+        .map_err(|_| fetch)?;
     let mut bytes = Vec::new();
     let mut buf = [0; READ];
     loop {
-        let n = stream.read(&mut buf).await.ok()?;
+        let n = stream.read(&mut buf).await.map_err(|_| fetch)?;
         bytes.extend_from_slice(&buf[..n]);
         match https::parse(&bytes, n == 0, BODY) {
-            Parsed::Done(body) => return Some(body),
-            Parsed::Bad => return None,
+            Parsed::Done(body) => return Ok(body),
+            Parsed::Bad => return Err(fetch),
             Parsed::More => {}
         }
     }

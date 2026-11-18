@@ -6,11 +6,11 @@ use std::sync::Arc;
 use aws_lc_rs::digest::{SHA256, SHA512, digest};
 use rt::sim::{Config, SimDriver};
 use rt::{Runtime, TcpListener, TcpStream, spawn};
-use tls::rustls::HandshakeKind;
 use tls::rustls::pki_types::CertificateDer;
 use tls::rustls::pki_types::pem::PemObject;
 use tls::rustls::server::ParsedCertificate;
-use tls::{Acceptor, Certs, Connector, Tlsa, Verify, simulated};
+use tls::rustls::{AlertDescription, CertificateError, Error as Rejected, HandshakeKind};
+use tls::{Acceptor, Certs, Connector, Refusal, Tlsa, Verify, refusal, simulated};
 
 const CA: &[u8] = include_bytes!("data/ca.pem");
 const A: &[u8] = include_bytes!("data/a.pem");
@@ -139,6 +139,38 @@ fn webpki_checks_roots_and_name() {
     assert_eq!(kinds(&results), ["Full", "InvalidData"]);
     let results = outcomes(A.to_vec(), None, vec![("mail.test", Verify::WebPki)]);
     assert_eq!(kinds(&results), ["InvalidInput"]);
+}
+
+#[test]
+fn refusals_name_the_certificate_problem() {
+    let results = outcomes(A.to_vec(), Some(CA), vec![("other.test", Verify::WebPki)]);
+    let error = results[0].as_ref().expect_err("refused");
+    assert_eq!(refusal(error), Refusal::NameMismatch);
+    let cases = [
+        (CertificateError::Expired, Refusal::Expired),
+        (CertificateError::NotValidYet, Refusal::Expired),
+        (CertificateError::UnknownIssuer, Refusal::Untrusted),
+        (CertificateError::BadSignature, Refusal::Untrusted),
+        (CertificateError::BadEncoding, Refusal::Unverified),
+        (CertificateError::NotValidForName, Refusal::NameMismatch),
+        (
+            CertificateError::ApplicationVerificationFailure,
+            Refusal::Unverified,
+        ),
+    ];
+    for (cert, want) in cases {
+        let error = io::Error::new(
+            io::ErrorKind::InvalidData,
+            Rejected::InvalidCertificate(cert),
+        );
+        assert_eq!(refusal(&error), want);
+    }
+    assert_eq!(refusal(&io::ErrorKind::UnexpectedEof.into()), Refusal::Lost);
+    let alert = io::Error::new(
+        io::ErrorKind::InvalidData,
+        Rejected::AlertReceived(AlertDescription::HandshakeFailure),
+    );
+    assert_eq!(refusal(&alert), Refusal::Unverified);
 }
 
 #[test]

@@ -7,6 +7,7 @@ mod https;
 mod mx;
 mod pool;
 mod report;
+mod results;
 mod settings;
 mod sts;
 
@@ -16,5 +17,6 @@ pub use gzip::gzip;
 pub use mx::Dns;
 pub use pool::{Remote, limits};
 pub use report::{Applied, Applies, Detail, Report, ResultType};
+pub use results::{ResultStats, Taken};
 pub use settings::{EightBit, Settings, Timeouts};
 pub use sts::PolicyStats;

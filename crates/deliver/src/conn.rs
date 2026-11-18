@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use rt::{Buf, Instant, TcpStream, now, timeout};
 use smtp::client::{QUIT, Response, Responses};
-use tls::{Connector, Stream, Verify};
+use tls::{Connector, Refusal, Stream, Verify, refusal};
 
 const READ: usize = 4096;
 const QUIT_WAIT: Duration = Duration::from_secs(5);
@@ -13,7 +13,7 @@ pub(crate) enum Lost {
     Timeout,
     Closed,
     Reply,
-    Tls,
+    Tls(Refusal),
     Store,
 }
 
@@ -23,7 +23,7 @@ impl Lost {
             Self::Timeout => b"451 4.4.2 Timed out",
             Self::Closed => b"451 4.4.2 Connection lost",
             Self::Reply => b"451 4.5.0 Malformed reply",
-            Self::Tls => b"451 4.7.5 TLS negotiation failed",
+            Self::Tls(_) => b"451 4.7.5 TLS negotiation failed",
             Self::Store => b"451 4.3.0 Stored message cannot be read",
         }
     }
@@ -107,7 +107,7 @@ impl Conn {
             return Err(Lost::Reply);
         }
         let Io::Plain(io) = self.io else {
-            return Err(Lost::Tls);
+            return Err(Lost::Tls(Refusal::Lost));
         };
         match timeout(left(self.end, limit), connector.connect(io, name, verify)).await {
             Ok(Ok(stream)) => Ok(Self {
@@ -115,7 +115,7 @@ impl Conn {
                 responses: Responses::default(),
                 end: self.end,
             }),
-            Ok(Err(_)) => Err(Lost::Tls),
+            Ok(Err(error)) => Err(Lost::Tls(refusal(&error))),
             Err(_) => Err(Lost::Timeout),
         }
     }
