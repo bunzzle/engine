@@ -1,8 +1,8 @@
 const POLY: u32 = 0x82F6_3B78;
 
-const TABLES: [[u32; 256]; 8] = tables();
+const TABLES: [[u32; 256]; 8] = tables(POLY);
 
-const fn tables() -> [[u32; 256]; 8] {
+pub(crate) const fn tables(poly: u32) -> [[u32; 256]; 8] {
     let mut tables = [[0u32; 256]; 8];
     let mut i = 0u32;
     while i < 256 {
@@ -10,7 +10,7 @@ const fn tables() -> [[u32; 256]; 8] {
         let mut bit = 0;
         while bit < 8 {
             crc = if crc & 1 == 1 {
-                (crc >> 1) ^ POLY
+                (crc >> 1) ^ poly
             } else {
                 crc >> 1
             };
@@ -135,22 +135,26 @@ impl Default for Hasher {
     }
 }
 
-pub fn software(mut crc: u32, data: &[u8]) -> u32 {
+pub fn software(crc: u32, data: &[u8]) -> u32 {
+    slice8(&TABLES, crc, data)
+}
+
+pub(crate) fn slice8(tables: &[[u32; 256]; 8], mut crc: u32, data: &[u8]) -> u32 {
     let (words, rest) = data.as_chunks::<8>();
     for word in words {
         let low = crc ^ u32::from_le_bytes([word[0], word[1], word[2], word[3]]);
         let high = u32::from_le_bytes([word[4], word[5], word[6], word[7]]);
-        crc = TABLES[7][(low & 0xff) as usize]
-            ^ TABLES[6][((low >> 8) & 0xff) as usize]
-            ^ TABLES[5][((low >> 16) & 0xff) as usize]
-            ^ TABLES[4][(low >> 24) as usize]
-            ^ TABLES[3][(high & 0xff) as usize]
-            ^ TABLES[2][((high >> 8) & 0xff) as usize]
-            ^ TABLES[1][((high >> 16) & 0xff) as usize]
-            ^ TABLES[0][(high >> 24) as usize];
+        crc = tables[7][(low & 0xff) as usize]
+            ^ tables[6][((low >> 8) & 0xff) as usize]
+            ^ tables[5][((low >> 16) & 0xff) as usize]
+            ^ tables[4][(low >> 24) as usize]
+            ^ tables[3][(high & 0xff) as usize]
+            ^ tables[2][((high >> 8) & 0xff) as usize]
+            ^ tables[1][((high >> 16) & 0xff) as usize]
+            ^ tables[0][(high >> 24) as usize];
     }
     for &byte in rest {
-        crc = TABLES[0][((crc ^ u32::from(byte)) & 0xff) as usize] ^ (crc >> 8);
+        crc = tables[0][((crc ^ u32::from(byte)) & 0xff) as usize] ^ (crc >> 8);
     }
     crc
 }
