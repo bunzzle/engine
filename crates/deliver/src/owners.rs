@@ -16,7 +16,11 @@ pub(crate) const SLOTS: usize = 20_000;
 const FLUSH: Duration = Duration::from_mins(10);
 const KEPT_DAYS: u64 = 2;
 const DAY_MS: u64 = 86_400_000;
-const FORMAT: u8 = 1;
+const FORMAT: u8 = 2;
+const START_MS: u64 = 15 * 60_000;
+const SPREAD_MS: u64 = 4 * 3_600_000;
+const RETRY_MS: u64 = 30 * 60_000;
+const TRIES: u8 = 3;
 
 type Day = (u64, String);
 
@@ -26,11 +30,57 @@ pub struct OwnerStats {
     pub dropped: u64,
     pub forwarded: u64,
     pub unsaved: u64,
+    pub late: u64,
+    pub sent: u64,
+    pub abandoned: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum State {
+    Pending,
+    Sent,
+    Dropped,
+}
+
+impl State {
+    fn code(self) -> u8 {
+        match self {
+            Self::Pending => 0,
+            Self::Sent => 1,
+            Self::Dropped => 2,
+        }
+    }
+
+    fn from_code(code: u8) -> Option<Self> {
+        match code {
+            0 => Some(Self::Pending),
+            1 => Some(Self::Sent),
+            2 => Some(Self::Dropped),
+            _ => None,
+        }
+    }
 }
 
 struct Owned {
     slot: Option<Slot>,
     policies: Vec<Applies>,
+    state: State,
+    tries: u8,
+    next: u64,
+    busy: bool,
+}
+
+impl Owned {
+    fn new(slot: Option<Slot>, policies: Vec<Applies>, state: State) -> Self {
+        Self {
+            slot,
+            policies,
+            state,
+            tries: 0,
+            next: 0,
+            busy: false,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -67,22 +117,25 @@ impl Table {
                 return;
             }
             let slot = self.saver.take(SLOTS);
-            owned.insert(
-                key.clone(),
-                Owned {
-                    slot,
-                    policies: Vec::new(),
-                },
-            );
+            owned.insert(key.clone(), Owned::new(slot, Vec::new(), State::Pending));
         }
         let entry = owned.get_mut(&key).expect("inserted above");
+        if entry.state != State::Pending {
+            self.count(|s| s.late += 1);
+            return;
+        }
         for applies in taken.policies {
             if !add(&mut entry.policies, applies) {
                 self.count(|s| s.dropped += 1);
             }
         }
+        self.save(&key, entry);
+    }
+
+    fn save(&self, key: &Day, entry: &Owned) {
         if let Some(slot) = entry.slot {
-            self.saver.save(slot, Some(encode(&key, &entry.policies)));
+            self.saver
+                .save(slot, Some(encode(key, entry.state, &entry.policies)));
         }
     }
 
@@ -199,7 +252,7 @@ impl Owners {
         let mut removed = Vec::new();
         for saved in restore.saved {
             let slot = (saved.shard, saved.id);
-            let Some((key, policies)) = decode(&saved.data) else {
+            let Some((key, state, policies)) = decode(&saved.data) else {
                 removed.push(slot);
                 continue;
             };
@@ -209,6 +262,9 @@ impl Owners {
             }
             if self.owner(&key.1).is_some() {
                 removed.push(slot);
+                if state != State::Pending {
+                    continue;
+                }
                 self.send(Taken {
                     day: key.0,
                     domain: key.1,
@@ -219,8 +275,12 @@ impl Owners {
             let full = loaded.len() >= SLOTS;
             match loaded.get_mut(&key) {
                 Some(kept) => {
-                    for applies in policies {
-                        add(&mut kept.policies, applies);
+                    if state != State::Pending {
+                        kept.state = state;
+                    } else if kept.state == State::Pending {
+                        for applies in policies {
+                            add(&mut kept.policies, applies);
+                        }
                     }
                     removed.push(slot);
                 }
@@ -229,13 +289,7 @@ impl Owners {
                     self.table.count(|s| s.dropped += 1);
                 }
                 None => {
-                    loaded.insert(
-                        key,
-                        Owned {
-                            slot: Some(slot),
-                            policies,
-                        },
-                    );
+                    loaded.insert(key, Owned::new(Some(slot), policies, state));
                 }
             }
         }
@@ -249,6 +303,57 @@ impl Owners {
         let waiting = std::mem::take(&mut *self.table.waiting.borrow_mut());
         for taken in waiting {
             self.table.merge(taken);
+        }
+    }
+
+    pub(crate) fn reports(&self) -> Vec<Taken> {
+        let wall = wall_ms();
+        let naming = self.naming.get();
+        let mut due = Vec::new();
+        for ((day, domain), entry) in self.table.owned.borrow_mut().iter_mut() {
+            let jitter = siphash(&naming, domain.as_bytes()) % SPREAD_MS;
+            let from = (day + 1) * DAY_MS + START_MS + jitter;
+            if entry.state != State::Pending || entry.busy || wall < from.max(entry.next) {
+                continue;
+            }
+            entry.busy = true;
+            due.push(Taken {
+                day: *day,
+                domain: domain.clone(),
+                policies: entry.policies.clone(),
+            });
+        }
+        due
+    }
+
+    pub(crate) fn mark(&self, day: u64, domain: &str, state: State) {
+        let key = (day, domain.to_owned());
+        let mut owned = self.table.owned.borrow_mut();
+        let Some(entry) = owned.get_mut(&key) else {
+            return;
+        };
+        entry.busy = false;
+        entry.state = state;
+        self.table.count(|s| match state {
+            State::Sent => s.sent += 1,
+            State::Dropped => s.abandoned += 1,
+            State::Pending => {}
+        });
+        self.table.save(&key, entry);
+    }
+
+    pub(crate) fn retry(&self, day: u64, domain: &str) {
+        let key = (day, domain.to_owned());
+        let mut owned = self.table.owned.borrow_mut();
+        let Some(entry) = owned.get_mut(&key) else {
+            return;
+        };
+        entry.busy = false;
+        entry.tries += 1;
+        entry.next = wall_ms() + RETRY_MS;
+        if entry.tries >= TRIES {
+            drop(owned);
+            self.mark(day, domain, State::Dropped);
         }
     }
 
@@ -274,10 +379,11 @@ impl Owners {
     }
 }
 
-fn encode((day, domain): &Day, policies: &[Applies]) -> Vec<u8> {
+fn encode((day, domain): &Day, state: State, policies: &[Applies]) -> Vec<u8> {
     let mut out = vec![FORMAT];
     out.extend_from_slice(&day.to_le_bytes());
     text(&mut out, domain);
+    out.push(state.code());
     out.push(u8::try_from(policies.len()).unwrap_or(u8::MAX));
     for applies in policies {
         let (tag, lines, mx): (u8, &[String], &[String]) = match &applies.policy {
@@ -379,13 +485,14 @@ impl Cursor<'_> {
     }
 }
 
-fn decode(data: &[u8]) -> Option<(Day, Vec<Applies>)> {
+fn decode(data: &[u8]) -> Option<(Day, State, Vec<Applies>)> {
     let mut at = Cursor(data);
     if at.byte()? != FORMAT {
         return None;
     }
     let day = at.u64()?;
     let domain = at.text()?;
+    let state = State::from_code(at.byte()?)?;
     let count = at.byte()?;
     let mut policies = Vec::new();
     for _ in 0..count {
@@ -431,14 +538,14 @@ fn decode(data: &[u8]) -> Option<(Day, Vec<Applies>)> {
             details,
         });
     }
-    at.0.is_empty().then_some(((day, domain), policies))
+    at.0.is_empty().then_some(((day, domain), state, policies))
 }
 
 #[cfg(test)]
 mod tests {
     use std::net::IpAddr;
 
-    use super::{add, decode, encode};
+    use super::{State, add, decode, encode};
     use crate::report::{Applied, Applies, Detail, ResultType};
     use crate::results::{DETAILS, POLICIES};
 
@@ -480,8 +587,8 @@ mod tests {
             ),
         ];
         let key = (20_000, "a.example".to_owned());
-        let data = encode(&key, &policies);
-        assert_eq!(decode(&data), Some((key, policies)));
+        let data = encode(&key, State::Sent, &policies);
+        assert_eq!(decode(&data), Some((key, State::Sent, policies)));
         assert_eq!(decode(&data[..data.len() - 1]), None);
         let mut longer = data.clone();
         longer.push(0);

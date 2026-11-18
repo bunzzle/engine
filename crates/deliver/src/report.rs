@@ -253,11 +253,65 @@ fn civil(days: u64) -> (u64, u64, u64) {
     (year, month, day)
 }
 
+pub const MAILTO: usize = 4;
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Rua {
+    pub mailto: Vec<String>,
+    pub https: Vec<String>,
+}
+
+pub(crate) fn rua(texts: &[&[u8]]) -> Option<Rua> {
+    let mut found = None;
+    for text in texts {
+        let Ok(text) = std::str::from_utf8(text) else {
+            continue;
+        };
+        let mut fields = text.split(';').map(str::trim);
+        if fields.next() != Some("v=TLSRPTv1") {
+            continue;
+        }
+        if found.is_some() {
+            return None;
+        }
+        found = Some(fields.collect::<Vec<_>>());
+    }
+    let mut uris = None;
+    for field in found? {
+        if let Some(value) = field.strip_prefix("rua=") {
+            if uris.is_some() {
+                return None;
+            }
+            uris = Some(value);
+        }
+    }
+    let mut out = Rua::default();
+    for uri in uris?.split(',').map(str::trim) {
+        if let Some(address) = uri.strip_prefix("mailto:") {
+            let address = address.split('?').next().unwrap_or_default();
+            let valid = address.split_once('@').is_some_and(|(local, host)| {
+                !local.is_empty() && !host.is_empty() && !address.contains(char::is_whitespace)
+            });
+            if !valid {
+                return None;
+            }
+            if out.mailto.len() < MAILTO {
+                out.mailto.push(address.to_owned());
+            }
+        } else if uri.starts_with("https://") && uri.len() > "https://".len() {
+            out.https.push(uri.to_owned());
+        } else {
+            return None;
+        }
+    }
+    (!out.mailto.is_empty() || !out.https.is_empty()).then_some(out)
+}
+
 #[cfg(test)]
 mod tests {
     use std::net::IpAddr;
 
-    use super::{Applied, Applies, Detail, Report, ResultType, datetime};
+    use super::{Applied, Applies, Detail, Report, ResultType, Rua, datetime, rua};
 
     fn ip(text: &str) -> IpAddr {
         text.parse().expect("ip")
@@ -367,5 +421,42 @@ mod tests {
         assert!(json.contains(r#"[{"result-type":"starttls-not-supported","sending-mta-ip":"10.0.0.1","receiving-ip":"10.0.0.2","failed-session-count":1}]"#));
         assert_eq!(datetime(0), "1970-01-01T00:00:00Z");
         assert_eq!(datetime(951_782_400 + 86_399), "2000-02-29T23:59:59Z");
+    }
+
+    #[test]
+    fn reads_the_reporting_record() {
+        let one = |text: &str| rua(&[text.as_bytes()]);
+        assert_eq!(
+            one("v=TLSRPTv1; rua=mailto:a@x.example,https://r.example/v1"),
+            Some(Rua {
+                mailto: vec!["a@x.example".into()],
+                https: vec!["https://r.example/v1".into()],
+            })
+        );
+        assert_eq!(
+            one("v=TLSRPTv1;rua=mailto:a@x.example?subject=x").map(|r| r.mailto),
+            Some(vec!["a@x.example".to_owned()])
+        );
+        let many = "v=TLSRPTv1; rua=mailto:1@x.example,mailto:2@x.example,mailto:3@x.example,mailto:4@x.example,mailto:5@x.example";
+        assert_eq!(one(many).map(|r| r.mailto.len()), Some(4));
+        for bad in [
+            "v=TLSRPTv2; rua=mailto:a@x.example",
+            "v=TLSRPTv1",
+            "v=TLSRPTv1; rua=",
+            "v=TLSRPTv1; rua=ftp://x.example",
+            "v=TLSRPTv1; rua=mailto:nobody",
+            "v=TLSRPTv1; rua=https://",
+            "v=TLSRPTv1; rua=mailto:a@x.example; rua=mailto:b@x.example",
+            "rua=mailto:a@x.example; v=TLSRPTv1",
+        ] {
+            assert_eq!(one(bad), None, "{bad}");
+        }
+        let two = rua(&[
+            b"v=TLSRPTv1; rua=mailto:a@x.example",
+            b"v=TLSRPTv1; rua=mailto:b@x.example",
+        ]);
+        assert_eq!(two, None);
+        let other = rua(&[b"something else", b"v=TLSRPTv1; rua=mailto:a@x.example"]);
+        assert!(other.is_some());
     }
 }
