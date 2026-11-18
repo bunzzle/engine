@@ -10,8 +10,8 @@ use control::{KIND_RPT, KIND_STS, Leases};
 use dns::Name;
 use rt::{Ends, Instant, JoinHandle, now, timeout};
 use sched::{
-    Answer, Answered, Attempt, Body, Destination, Envelope, Kind, Recipient, Restore, Ret,
-    Transport,
+    Answer, Answered, Attempt, Body, Destination, Envelope, Kind, Recipient, Required, Restore,
+    Ret, Transport,
 };
 use smtp::client::{
     self, Answer as Reply, Capabilities, Dots, Mail, Rcpt, Refused, Response, Step, Transaction,
@@ -120,6 +120,7 @@ impl Need {
         Some(Scope {
             domain: text(target),
             policy: Applied::Tlsa { records },
+            muted: false,
         })
     }
 
@@ -237,7 +238,7 @@ impl<D: Dns> Deliver<D> {
         let Some(egress) = egress else {
             return every(TEMPORARY, NO_EGRESS);
         };
-        let requiretls = message.envelope.required.requiretls;
+        let envelope = message.envelope;
         let Ok(domain) = Name::parse(&destination.domain) else {
             return every(Answer::Failed, BAD_DOMAIN);
         };
@@ -250,13 +251,11 @@ impl<D: Dns> Deliver<D> {
                 Ok(Hosts::Failed) => return every(TEMPORARY, MX_FAILED),
                 Err(_) => return every(TEMPORARY, Lost::Timeout.text()),
             };
-        let (sts, scope) = match self.enforce(egress, &domain, &mut hosts, end).await {
+        let enforced = self.enforce(egress, &domain, (&mut hosts, secure), (end, envelope));
+        let (sts, scope) = match enforced.await {
             Ok(enforced) => enforced,
             Err((answer, reply)) => return every(answer, reply),
         };
-        if requiretls && !secure && sts != Check::Enforce {
-            return every(Answer::Failed, REQUIRETLS);
-        }
         let remote: Remote = (egress, destination.domain.clone());
         let mut slot = None;
         let mut last = NO_HOST.to_vec();
@@ -282,14 +281,14 @@ impl<D: Dns> Deliver<D> {
                     break;
                 }
             };
-            let dane = secure && dnssec && !found.is_empty();
+            let dane = secure && dnssec && !found.is_empty() && !scope.muted;
             let Some(need) = self.need(end, (egress, host), &target, dane, sts).await else {
                 last = TLSA_FAILED.to_vec();
                 others = true;
                 continue;
             };
             let scope = need.scope(&target).unwrap_or_else(|| scope.clone());
-            if requiretls && matches!(need, Need::Any | Need::Encrypt) {
+            if envelope.required.requiretls && matches!(need, Need::Any | Need::Encrypt) {
                 last = REQUIRETLS.to_vec();
                 continue;
             }
@@ -320,7 +319,7 @@ impl<D: Dns> Deliver<D> {
         }
         if now() >= end {
             last = Lost::Timeout.text().to_vec();
-        } else if requiretls && !others && last == REQUIRETLS {
+        } else if envelope.required.requiretls && !others && last == REQUIRETLS {
             return every(Answer::Failed, REQUIRETLS);
         }
         every(TEMPORARY, &last)
@@ -330,14 +329,30 @@ impl<D: Dns> Deliver<D> {
         &self,
         egress: IpAddr,
         domain: &Name,
+        (hosts, secure): (&mut Vec<Name>, bool),
+        (end, envelope): (Instant, &Envelope),
+    ) -> Result<(Check, Scope), (Answer, &'static [u8])> {
+        let relaxed = envelope.required.tls_optional();
+        let (check, scope) = self.policy(egress, domain, hosts, (end, relaxed)).await?;
+        if envelope.required.requiretls && !secure && check != Check::Enforce {
+            return Err((Answer::Failed, REQUIRETLS));
+        }
+        Ok((check, scope))
+    }
+
+    async fn policy(
+        &self,
+        egress: IpAddr,
+        domain: &Name,
         hosts: &mut Vec<Name>,
-        end: Instant,
+        (end, relaxed): (Instant, bool),
     ) -> Result<(Check, Scope), (Answer, &'static [u8])> {
         let scope = |policy| Scope {
             domain: text(domain),
             policy,
+            muted: relaxed,
         };
-        if !self.settings.mta_sts {
+        if relaxed || !self.settings.mta_sts {
             return Ok((Check::Off, scope(Applied::None)));
         }
         let got = self
@@ -402,6 +417,7 @@ impl<D: Dns> Deliver<D> {
                     policy: Applied::Tlsa {
                         records: Vec::new(),
                     },
+                    muted: false,
                 };
                 let bogus = failure(ResultType::DnssecInvalid, egress, Some(host), None);
                 self.results.failure(&tlsa, bogus);
@@ -734,6 +750,14 @@ impl<D: Dns> Deliver<D> {
     }
 }
 
+fn honoured(required: Required, tenant: u32, report: Option<u32>) -> Required {
+    if required.tls_optional() && report != Some(tenant) {
+        Required::new(required.smtputf8, required.requiretls)
+    } else {
+        required
+    }
+}
+
 fn text(name: &Name) -> String {
     name.to_string().trim_end_matches('.').to_ascii_lowercase()
 }
@@ -791,6 +815,7 @@ impl<D: Dns> Transport for Deliver<D> {
 
     async fn send(&self, attempt: Attempt) -> Vec<Answered> {
         let Attempt {
+            tenant,
             destination,
             recipients: claimed,
             outgoing,
@@ -801,6 +826,11 @@ impl<D: Dns> Transport for Deliver<D> {
             Ok(prepared) => prepared,
             Err(fault) => return fault.answers(&claimed),
         };
+        prepared.envelope.required = honoured(
+            prepared.envelope.required,
+            tenant,
+            self.settings.report_tenant,
+        );
         let mut body = mem::replace(&mut prepared.body, Body::Inline(Vec::new()));
         let header = prepared.header();
         let size = u64::try_from(header.len())
@@ -916,4 +946,22 @@ async fn body(conn: &mut Conn, message: &mut Message<'_>, limit: Duration) -> Re
     }
     dots.finish(&mut out);
     conn.write(&out, limit).await
+}
+
+#[cfg(test)]
+mod tests {
+    use sched::Required;
+
+    use super::honoured;
+
+    #[test]
+    fn only_the_report_tenant_keeps_tls_optional() {
+        let report = Required::report();
+        assert!(honoured(report, 4, Some(4)).tls_optional());
+        assert!(!honoured(report, 5, Some(4)).tls_optional());
+        assert!(!honoured(report, 4, None).tls_optional());
+        let plain = Required::new(true, true);
+        assert_eq!(honoured(plain, 4, Some(4)), plain);
+        assert_eq!(honoured(plain, 5, Some(4)), plain);
+    }
 }
