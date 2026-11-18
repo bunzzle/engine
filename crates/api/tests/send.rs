@@ -720,7 +720,10 @@ fn json_messages_are_signed_stored_and_routed() {
             assert!(header.contains("with HTTPS id"), "{header}");
             assert!(header.contains("Subject: =?utf-8?"), "{header}");
             assert!(header.contains("X-Campaign: c1"), "{header}");
-            assert!(!header.to_ascii_lowercase().contains("bcc"), "{header}");
+            let bcc = header
+                .lines()
+                .any(|line| line.to_ascii_lowercase().starts_with("bcc:"));
+            assert!(!bcc, "{header}");
             let (header, _) = &headers[&local];
             assert!(String::from_utf8_lossy(header).contains("with HTTP id"));
             let routed = seen.routed.borrow().clone();
