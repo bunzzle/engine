@@ -83,6 +83,19 @@ impl Keys for Keyring {
         self.ring.ids()
     }
 
+    fn system(&self) -> Ready<'_> {
+        Box::pin(async move {
+            if let Some(keys) = self.ring.system() {
+                return Ok(keys);
+            }
+            self.ring.hello().await.map_err(|error| match error {
+                keys::Error::Failed => KeyError::Failed,
+                _ => KeyError::Unavailable,
+            })?;
+            self.ring.system().ok_or(KeyError::Unavailable)
+        })
+    }
+
     fn tick(&self) {
         self.batches.borrow_mut().sweep(rt::now());
     }

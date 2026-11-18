@@ -8,7 +8,8 @@ use control::Leases;
 use dns::Name;
 use rt::{Instant, now, timeout};
 use sched::{
-    Answer, Answered, Attempt, Body, Destination, Envelope, Kind, Recipient, Ret, Transport,
+    Answer, Answered, Attempt, Body, Destination, Envelope, Kind, Recipient, Restore, Ret,
+    Transport,
 };
 use smtp::client::{
     self, Answer as Reply, Capabilities, Dots, Mail, Rcpt, Refused, Response, Step, Transaction,
@@ -21,7 +22,7 @@ use crate::dane::{self, Dane};
 use crate::mx::{self, Addresses, Dns, Hosts};
 use crate::pool::{Key, Level, Link, Pool, Remote, Slot};
 use crate::settings::{EightBit, Settings};
-use crate::sts::{Got, Mode, Sts};
+use crate::sts::{Got, Mode, PolicyStats, Sts};
 
 const ADDRESSES: usize = 10;
 const CHUNK: usize = 64 * 1024;
@@ -153,6 +154,10 @@ impl<D: Dns> Deliver<D> {
 
     pub fn policies(&self) -> usize {
         self.sts.len()
+    }
+
+    pub fn policy_stats(&self) -> PolicyStats {
+        self.sts.stats()
     }
 
     pub async fn deliver(
@@ -600,6 +605,10 @@ impl<D: Dns> Deliver<D> {
 }
 
 impl<D: Dns> Transport for Deliver<D> {
+    async fn restore(&self, restore: Restore) {
+        self.sts.restore(restore);
+    }
+
     async fn send(&self, attempt: Attempt) -> Vec<Answered> {
         let Attempt {
             destination,

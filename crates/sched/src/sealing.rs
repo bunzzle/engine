@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::pin::Pin;
 use std::rc::Rc;
 
-use control::{KeyError, KeySource};
+use control::{KeyError, KeySource, Ready};
 use crypto::{
     AAD, BatchKey, ChunkKey, DkimAlg, Opener as ChunkOpener, Sealer as ChunkSealer, Secret, TAG,
     Wrap, aad,
@@ -80,6 +80,10 @@ pub trait Keys: KeySource {
 
     fn ids(&self) -> Option<Secret<16>> {
         None
+    }
+
+    fn system(&self) -> Ready<'_> {
+        Box::pin(async { Err(KeyError::Unavailable) })
     }
 
     fn sign(

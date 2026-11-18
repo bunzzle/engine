@@ -13,3 +13,4 @@ pub use deliver::{Deliver, Message, Outcome};
 pub use mx::Dns;
 pub use pool::{Remote, limits};
 pub use settings::{EightBit, Settings, Timeouts};
+pub use sts::PolicyStats;
