@@ -1,5 +1,5 @@
 use std::io;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 
 use aws_lc_rs::digest::{SHA256, SHA512, digest};
 use rt::TcpStream;
@@ -49,6 +49,10 @@ pub fn refusal(error: &io::Error) -> Refusal {
     else {
         return Refusal::Lost;
     };
+    refused(rejected)
+}
+
+fn refused(rejected: &rustls::Error) -> Refusal {
     let rustls::Error::InvalidCertificate(cert) = rejected else {
         return Refusal::Unverified;
     };
@@ -67,9 +71,23 @@ pub fn refusal(error: &io::Error) -> Refusal {
     }
 }
 
+#[derive(Debug, Default)]
+pub struct Observed(Mutex<Option<Result<(), Refusal>>>);
+
+impl Observed {
+    pub fn verdict(&self) -> Option<Result<(), Refusal>> {
+        *self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn set(&self, verdict: Result<(), Refusal>) {
+        *self.0.lock().unwrap_or_else(PoisonError::into_inner) = Some(verdict);
+    }
+}
+
 pub enum Verify {
     Any,
     WebPki,
+    Observe(Arc<Observed>),
     Dane {
         names: Vec<String>,
         records: Vec<Tlsa>,
@@ -80,6 +98,7 @@ pub struct Connector {
     provider: Arc<CryptoProvider>,
     any: Arc<ClientConfig>,
     webpki: Option<Arc<ClientConfig>>,
+    verifier: Option<Arc<WebPkiServerVerifier>>,
 }
 
 impl Connector {
@@ -90,6 +109,7 @@ impl Connector {
             .with_custom_certificate_verifier(any)
             .with_no_client_auth();
         config.resumption = Resumption::store(Arc::new(ClientSessionMemoryCache::new(SESSIONS)));
+        let mut kept = None;
         let webpki = match roots {
             Some(pem) => {
                 let mut store = RootCertStore::empty();
@@ -105,6 +125,7 @@ impl Connector {
                 )
                 .build()
                 .map_err(|_| Error::NoCertificate)?;
+                kept = Some(Arc::clone(&verifier));
                 let mut config = builder(&provider)?
                     .with_webpki_verifier(verifier)
                     .with_no_client_auth();
@@ -118,6 +139,7 @@ impl Connector {
             provider,
             any: Arc::new(config),
             webpki,
+            verifier: kept,
         })
     }
 
@@ -129,6 +151,24 @@ impl Connector {
                     .as_ref()
                     .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "no roots"))?,
             ),
+            Verify::Observe(observed) => {
+                let inner = self
+                    .verifier
+                    .as_ref()
+                    .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "no roots"))?;
+                let observe = Observe {
+                    inner: Arc::clone(inner),
+                    provider: Arc::clone(&self.provider),
+                    observed,
+                };
+                let mut config = builder(&self.provider)
+                    .map_err(io::Error::other)?
+                    .dangerous()
+                    .with_custom_certificate_verifier(Arc::new(observe))
+                    .with_no_client_auth();
+                config.resumption = Resumption::disabled();
+                Arc::new(config)
+            }
             Verify::Dane { names, records } => {
                 let dane = Dane::new(Arc::clone(&self.provider), names, records)?;
                 let mut config = builder(&self.provider)
@@ -222,6 +262,56 @@ impl ServerCertVerifier for Any {
 
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
         self.0.signature_verification_algorithms.supported_schemes()
+    }
+}
+
+#[derive(Debug)]
+struct Observe {
+    inner: Arc<WebPkiServerVerifier>,
+    provider: Arc<CryptoProvider>,
+    observed: Arc<Observed>,
+}
+
+impl ServerCertVerifier for Observe {
+    fn verify_server_cert(
+        &self,
+        end: &CertificateDer<'_>,
+        chain: &[CertificateDer<'_>],
+        name: &ServerName<'_>,
+        ocsp: &[u8],
+        now: UnixTime,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        let verdict = self
+            .inner
+            .verify_server_cert(end, chain, name, ocsp, now)
+            .map(drop)
+            .map_err(|rejected| refused(&rejected));
+        self.observed.set(verdict);
+        Ok(ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        signature12(&self.provider, message, cert, dss)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        signature13(&self.provider, message, cert, dss)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.provider
+            .signature_verification_algorithms
+            .supported_schemes()
     }
 }
 

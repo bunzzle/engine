@@ -1429,6 +1429,44 @@ fn only_servfail_on_tlsa_counts_as_dnssec_invalid() {
 }
 
 #[test]
+fn testing_mode_observes_certificates_and_mx_names_without_blocking() {
+    for reports in [true, false] {
+        let (outcomes, taken) = run(async move {
+            drop(serve(MX2, Script::new(&["STARTTLS"])));
+            let text = "version: STSv1\nmode: testing\nmx: mx2.example.com\nmax_age: 86400\n";
+            drop(serve_policy(WEB, Rc::new(RefCell::new(policy(text)))));
+            let zone = zone();
+            zone.set("example.com", Type::Mx, mx(&[(10, "mx3.example.com")]));
+            zone.set("mx3.example.com", Type::A, a(&[MX2]));
+            sts(&zone, "1");
+            let mut settings = strict();
+            settings.tlsrpt = reports;
+            let deliver = verifying(zone, settings);
+            (
+                simple(&deliver, "example.com").await,
+                deliver.take_results(),
+            )
+        });
+        assert_eq!(answers(&outcomes), [Answer::Delivered], "{reports}");
+        let (domain, applies) = one(&taken);
+        assert_eq!(domain, "example.com");
+        assert!(matches!(applies.policy, Applied::Sts { .. }));
+        if reports {
+            assert_eq!((applies.success, applies.failure), (0, 2));
+            let mismatch = detail(ResultType::ValidationFailure, "mx3.example.com", None);
+            let cert = detail(
+                ResultType::CertificateHostMismatch,
+                "mx3.example.com",
+                Some(MX2),
+            );
+            assert_eq!(applies.details, [cert, mismatch]);
+        } else {
+            assert_eq!((applies.success, applies.failure), (1, 0));
+        }
+    }
+}
+
+#[test]
 fn requiretls_needs_verified_tls() {
     let tls = Envelope {
         required: Required {

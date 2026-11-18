@@ -5,7 +5,7 @@ mod provider;
 mod stream;
 
 pub use certs::Certs;
-pub use client::{Connector, Refusal, Tlsa, Verify, refusal};
+pub use client::{Connector, Observed, Refusal, Tlsa, Verify, refusal};
 pub use error::Error;
 pub use provider::{Clock, provider, simulated};
 pub use rustls;

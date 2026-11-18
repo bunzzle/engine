@@ -3,6 +3,7 @@ use std::collections::BTreeMap;
 use std::fmt::Write;
 use std::mem;
 use std::net::{IpAddr, SocketAddr};
+use std::sync::Arc;
 use std::time::Duration;
 
 use control::Leases;
@@ -15,7 +16,7 @@ use sched::{
 use smtp::client::{
     self, Answer as Reply, Capabilities, Dots, Mail, Rcpt, Refused, Response, Step, Transaction,
 };
-use tls::{Connector, Refusal, Tlsa, Verify};
+use tls::{Connector, Observed, Refusal, Tlsa, Verify};
 
 use crate::classify;
 use crate::conn::{Conn, Lost, left};
@@ -81,9 +82,17 @@ pub struct Deliver<D> {
     turn: Cell<u64>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Check {
+    Off,
+    Observe,
+    Enforce,
+}
+
 enum Need {
     Any,
     Encrypt,
+    Observe,
     Sts,
     Dane {
         names: Vec<String>,
@@ -114,7 +123,7 @@ impl Need {
 
     fn level(&self) -> Level {
         match self {
-            Self::Any => Level::Any,
+            Self::Any | Self::Observe => Level::Any,
             Self::Encrypt => Level::Encrypt,
             Self::Sts => Level::Sts,
             Self::Dane { .. } => Level::Dane,
@@ -125,6 +134,10 @@ impl Need {
         match self {
             Self::Any | Self::Encrypt => (host.to_string(), Verify::Any),
             Self::Sts => (host.to_string(), Verify::WebPki),
+            Self::Observe => (
+                host.to_string(),
+                Verify::Observe(Arc::new(Observed::default())),
+            ),
             Self::Dane { names, records } => (
                 names.first().cloned().unwrap_or_else(|| host.to_string()),
                 Verify::Dane {
@@ -226,7 +239,7 @@ impl<D: Dns> Deliver<D> {
             Ok(enforced) => enforced,
             Err((answer, reply)) => return every(answer, reply),
         };
-        if requiretls && !secure && !sts {
+        if requiretls && !secure && sts != Check::Enforce {
             return every(Answer::Failed, REQUIRETLS);
         }
         let remote: Remote = (egress, destination.domain.clone());
@@ -304,13 +317,13 @@ impl<D: Dns> Deliver<D> {
         domain: &Name,
         hosts: &mut Vec<Name>,
         end: Instant,
-    ) -> Result<(bool, Scope), (Answer, &'static [u8])> {
+    ) -> Result<(Check, Scope), (Answer, &'static [u8])> {
         let scope = |policy| Scope {
             domain: text(domain),
             policy,
         };
         if !self.settings.mta_sts {
-            return Ok((false, scope(Applied::None)));
+            return Ok((Check::Off, scope(Applied::None)));
         }
         let got = self
             .sts
@@ -325,7 +338,7 @@ impl<D: Dns> Deliver<D> {
                 });
                 self.results
                     .failure(&failed, failure(result, egress, None, None));
-                Ok((false, scope(Applied::None)))
+                Ok((Check::Off, scope(Applied::None)))
             }
             Got::Policy(policy) if policy.mode == Mode::Enforce => {
                 let applied = scope(policy.applied());
@@ -335,10 +348,18 @@ impl<D: Dns> Deliver<D> {
                     self.results.failure(&applied, mismatch);
                     return Err((TEMPORARY, STS_NO_MX));
                 }
-                Ok((true, applied))
+                Ok((Check::Enforce, applied))
             }
-            Got::Policy(policy) => Ok((false, scope(policy.applied()))),
-            Got::None => Ok((false, scope(Applied::None))),
+            Got::Policy(policy) if policy.mode == Mode::Testing && self.settings.tlsrpt => {
+                let applied = scope(policy.applied());
+                for host in hosts.iter().filter(|host| !policy.allows(host)) {
+                    let mismatch = failure(ResultType::ValidationFailure, egress, Some(host), None);
+                    self.results.failure(&applied, mismatch);
+                }
+                Ok((Check::Observe, applied))
+            }
+            Got::Policy(policy) => Ok((Check::Off, scope(policy.applied()))),
+            Got::None => Ok((Check::Off, scope(Applied::None))),
         }
     }
 
@@ -348,7 +369,7 @@ impl<D: Dns> Deliver<D> {
         (egress, host): (IpAddr, &Name),
         target: &Name,
         dane: bool,
-        sts: bool,
+        sts: Check,
     ) -> Option<Need> {
         let found = if dane {
             let lookup = dane::lookup(&self.dns, self.settings.port, host, target);
@@ -372,7 +393,8 @@ impl<D: Dns> Deliver<D> {
                 None
             }
             Dane::Verify { names, records } => Some(Need::Dane { names, records }),
-            _ if sts => Some(Need::Sts),
+            _ if sts == Check::Enforce => Some(Need::Sts),
+            _ if sts == Check::Observe => Some(Need::Observe),
             Dane::Encrypt => Some(Need::Encrypt),
             Dane::None => Some(Need::Any),
         }
@@ -555,6 +577,10 @@ impl<D: Dns> Deliver<D> {
         match command(&mut conn, client::STARTTLS, t.starttls).await {
             Ok(reply) if reply.code == 220 => {
                 let (name, verify) = need.verify(&key.host);
+                let observed = match &verify {
+                    Verify::Observe(observed) => Some(Arc::clone(observed)),
+                    _ => None,
+                };
                 conn = match conn.starttls(&self.tls, &name, verify, t.starttls).await {
                     Ok(conn) => conn,
                     Err(lost) => {
@@ -566,7 +592,11 @@ impl<D: Dns> Deliver<D> {
                         return Err(lost.text().to_vec());
                     }
                 };
-                self.results.success(scope);
+                let verdict = observed.and_then(|observed| observed.verdict());
+                match verdict.and_then(Result::err).and_then(refused_type) {
+                    Some(result) => failed(result),
+                    None => self.results.success(scope),
+                }
                 caps = match self.hello(&mut conn).await {
                     Ok(caps) => caps,
                     Err(failed) => return Err(next(conn, failed).await),
