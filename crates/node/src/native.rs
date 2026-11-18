@@ -25,6 +25,7 @@ where
 pub fn deliver(path: &Path) -> Result<(), Error> {
     let (config, certs, roots) = load(path).map_err(Error::Config)?;
     let mesh = Mesh::new(config.cores);
+    let reports = Mesh::new(config.cores);
     let key = *Secret::<16>::random().map_err(|_| Error::Random)?.expose();
     let dns = config.dns.clone();
     let delivery = config.delivery.clone();
@@ -37,14 +38,17 @@ pub fn deliver(path: &Path) -> Result<(), Error> {
         let connector =
             Connector::new(tls::provider(), roots.as_deref()).map_err(|e| e.to_string())?;
         let turn = Secret::<8>::random().map_err(|_| "no random source")?;
-        Deliver::new(
+        let mut deliver = Deliver::new(
             resolver,
             connector,
             delivery.settings.clone(),
             Some(leases),
             u64::from_le_bytes(*turn.expose()),
         )
-        .map_err(|_| String::from("`ehlo` cannot be sent"))
+        .map_err(|_| String::from("`ehlo` cannot be sent"))?;
+        let ends = reports.take(core).ok_or("report mesh already taken")?;
+        drop(deliver.reports(ends));
+        Ok(deliver)
     })
 }
 

@@ -6,9 +6,9 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
-use control::Leases;
+use control::{KIND_RPT, KIND_STS, Leases};
 use dns::Name;
-use rt::{Instant, now, timeout};
+use rt::{Ends, Instant, JoinHandle, now, timeout};
 use sched::{
     Answer, Answered, Attempt, Body, Destination, Envelope, Kind, Recipient, Restore, Ret,
     Transport,
@@ -22,6 +22,7 @@ use crate::classify;
 use crate::conn::{Conn, Lost, left};
 use crate::dane::{self, Dane};
 use crate::mx::{self, Addresses, Dns, Hosts};
+use crate::owners::{OwnerStats, Owners};
 use crate::pool::{Key, Level, Link, Pool, Remote, Slot};
 use crate::report::{Applied, ResultType};
 use crate::results::{Failure, ResultStats, Results, Scope, Taken};
@@ -75,6 +76,7 @@ pub struct Deliver<D> {
     pool: Pool,
     sts: Sts,
     results: Results,
+    owners: Owners,
     dead: RefCell<BTreeMap<(IpAddr, IpAddr), Instant>>,
     ehlo: Vec<u8>,
     helo: Vec<u8>,
@@ -174,6 +176,7 @@ impl<D: Dns> Deliver<D> {
             pool,
             sts: Sts::default(),
             results: Results::default(),
+            owners: Owners::default(),
             dead: RefCell::new(BTreeMap::new()),
             ehlo,
             helo,
@@ -198,8 +201,20 @@ impl<D: Dns> Deliver<D> {
         self.sts.stats()
     }
 
+    pub fn reports(&mut self, ends: Ends<Taken>) -> JoinHandle<()> {
+        self.owners.start(ends)
+    }
+
     pub fn take_results(&self) -> Vec<Taken> {
         self.results.take()
+    }
+
+    pub fn owned_reports(&self) -> Vec<Taken> {
+        self.owners.owned()
+    }
+
+    pub fn owner_stats(&self) -> OwnerStats {
+        self.owners.stats()
     }
 
     pub fn result_stats(&self) -> ResultStats {
@@ -748,11 +763,23 @@ fn refused_type(refused: Refusal) -> Option<ResultType> {
 }
 
 impl<D: Dns> Transport for Deliver<D> {
-    async fn restore(&self, restore: Restore) {
-        self.sts.restore(restore);
+    fn restore(&self, restore: Restore) -> impl Future<Output = ()> {
+        match restore.kind {
+            KIND_STS => self.sts.restore(restore),
+            KIND_RPT => self.owners.restore(restore),
+            _ => {}
+        }
+        std::future::ready(())
     }
 
     async fn tick(&self) {
+        if self.owners.due() {
+            let taken = self.results.take();
+            if self.settings.tlsrpt {
+                self.owners.flush(taken);
+            }
+            self.owners.prune();
+        }
         if self.settings.mta_sts {
             let jitter = |n: u64| {
                 let n = usize::try_from(n).unwrap_or(usize::MAX);

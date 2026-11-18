@@ -1110,6 +1110,8 @@ fn restore(memory: &Rc<Memory>) -> Restore {
         })
         .collect();
     Restore {
+        kind: control::KIND_STS,
+        naming: [0; 16],
         saved,
         unread: 0,
         dropped: 0,
@@ -1464,6 +1466,63 @@ fn testing_mode_observes_certificates_and_mx_names_without_blocking() {
             assert_eq!((applies.success, applies.failure), (1, 0));
         }
     }
+}
+
+fn reporting(zone: Zone) -> Deliver<Zone> {
+    let mut settings = settings();
+    settings.tlsrpt = true;
+    deliverer(zone, settings)
+}
+
+async fn restored(deliver: &Deliver<Zone>, memory: &Rc<Memory>, naming: [u8; 16]) {
+    let mut sts = restore(&Rc::new(Memory::default()));
+    sts.naming = naming;
+    deliver.restore(sts).await;
+    let mut rpt = restore(memory);
+    rpt.kind = control::KIND_RPT;
+    rpt.naming = naming;
+    deliver.restore(rpt).await;
+}
+
+#[test]
+fn report_owners_merge_every_core_and_keep_records() {
+    let naming = [7; 16];
+    let (owned, again) = run(async move {
+        drop(serve(MX1, Script::new(&[])));
+        let mesh = Mesh::new(2);
+        let memories = [Rc::new(Memory::default()), Rc::new(Memory::default())];
+        let mut cores = Vec::new();
+        for (core, memory) in memories.iter().enumerate() {
+            let mut deliver = reporting(zone());
+            let ends = mesh
+                .take(u16::try_from(core).expect("small"))
+                .expect("ends");
+            drop(deliver.reports(ends));
+            restored(&deliver, memory, naming).await;
+            deliver.tick().await;
+            cores.push(deliver);
+        }
+        for deliver in &cores {
+            simple(deliver, "example.com").await;
+        }
+        sleep(Duration::from_mins(11)).await;
+        for deliver in &cores {
+            deliver.tick().await;
+        }
+        sleep(Duration::from_millis(10)).await;
+        let owned: Vec<Vec<Taken>> = cores.iter().map(Deliver::owned_reports).collect();
+        let keeper = usize::from(owned[0].is_empty());
+        let again = reporting(zone());
+        restored(&again, &memories[keeper], naming).await;
+        (owned, again.owned_reports())
+    });
+    let keeper = usize::from(owned[0].is_empty());
+    assert_eq!(owned[1 - keeper], []);
+    let (domain, applies) = one(&owned[keeper]);
+    assert_eq!(domain, "example.com");
+    assert_eq!((applies.success, applies.failure), (0, 2));
+    assert_eq!(applies.details[0].count, 2);
+    assert_eq!(again, owned[keeper]);
 }
 
 #[test]

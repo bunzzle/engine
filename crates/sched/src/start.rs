@@ -99,7 +99,7 @@ pub(crate) struct Inner<T> {
     restored: u64,
     pub(crate) dropped: Cell<u64>,
     pub(crate) delete_retries: Cell<u64>,
-    records: Rc<Stored>,
+    records: Vec<Rc<Stored>>,
 }
 
 pub struct Node<T> {
@@ -177,7 +177,7 @@ impl<T: Transport + 'static> Node<T> {
             let gone = |tenant, generation| table.borrow().gone(tenant, generation);
             Queues::load(&core, settings.naming, &*parts.keys, &gone).await?
         };
-        let found = system::load(&core, control::KIND_STS, &*parts.keys).await?;
+        let found = system::load_all(&core, &*parts.keys, settings.naming.key).await?;
         let (spool, shards, pending) =
             spool::Spool::open(core, settings.node, settings.spool).await?;
         let owner = spawn(shards.run());
@@ -206,7 +206,7 @@ impl<T: Transport + 'static> Node<T> {
             changes.clone(),
             Rc::clone(&parts.keys) as Rc<dyn KeySource>,
         );
-        let records = system::restore(&parts.transport, found, &changes, &parts.keys).await;
+        let records = system::restore_all(&parts.transport, found, &changes, &parts.keys).await;
 
         let (leases, leases_done) =
             start_leases(links.leases, &table, &spool, settings.naming.shards);
@@ -310,7 +310,14 @@ impl<T: Transport + 'static> Node<T> {
     }
 
     pub fn system_records(&self) -> RecordStats {
-        self.inner.records.stats()
+        let mut all = RecordStats::default();
+        for records in &self.inner.records {
+            let stats = records.stats();
+            all.put += stats.put;
+            all.removed += stats.removed;
+            all.failed += stats.failed;
+        }
+        all
     }
 
     pub fn controls(&self) -> bool {

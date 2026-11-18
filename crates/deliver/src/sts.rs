@@ -7,14 +7,15 @@ use std::task::{Poll, Waker};
 use std::time::Duration;
 
 use dns::{Found, Name, Record, Type};
-use rt::{Instant, TcpStream, now, spawn, timeout, wall_ms};
-use sched::{Records, Restore};
+use rt::{Instant, TcpStream, now, timeout, wall_ms};
+use sched::Restore;
 use tls::{Connector, Verify};
 
 use crate::conn::left;
 use crate::https::{self, Parsed};
 use crate::mx::{self, Addresses, Dns};
 use crate::report::{Applied, ResultType};
+use crate::saver::{Saver, Slot};
 
 const MAX_AGE: u64 = 31_557_600;
 const BODY: usize = 64 * 1024;
@@ -181,8 +182,6 @@ pub struct PolicyStats {
     pub unsaved: u64,
 }
 
-type Slot = (u16, u32);
-
 struct Cached {
     id: String,
     policy: Rc<Policy>,
@@ -256,66 +255,13 @@ fn field(data: &[u8]) -> Option<(&[u8], &[u8])> {
     (rest.len() >= len).then(|| rest.split_at(len))
 }
 
-#[derive(Default)]
-struct Saver {
-    records: RefCell<Option<Rc<dyn Records>>>,
-    taken: RefCell<BTreeSet<Slot>>,
-    pending: RefCell<BTreeMap<Slot, Option<Vec<u8>>>>,
-    busy: Cell<bool>,
-    stats: Cell<PolicyStats>,
-}
-
-impl Saver {
-    fn count(&self, change: impl Fn(&mut PolicyStats)) {
-        let mut stats = self.stats.get();
-        change(&mut stats);
-        self.stats.set(stats);
-    }
-
-    fn take(&self, bound: usize) -> Option<Slot> {
-        let home = self.records.borrow().as_ref()?.home();
-        let mut taken = self.taken.borrow_mut();
-        let id = (0..u32::try_from(bound).unwrap_or(u32::MAX))
-            .find(|&id| !taken.contains(&(home, id)))?;
-        taken.insert((home, id));
-        Some((home, id))
-    }
-
-    fn save(self: &Rc<Self>, slot: Slot, data: Option<Vec<u8>>) {
-        if data.is_none() {
-            self.taken.borrow_mut().remove(&slot);
-        }
-        self.pending.borrow_mut().insert(slot, data);
-        if !self.busy.replace(true) {
-            drop(spawn(Rc::clone(self).drain()));
-        }
-    }
-
-    async fn drain(self: Rc<Self>) {
-        loop {
-            let next = self.pending.borrow_mut().pop_first();
-            let records = self.records.borrow().clone();
-            let (Some(((shard, id), data)), Some(records)) = (next, records) else {
-                self.busy.set(false);
-                return;
-            };
-            let done = match data {
-                Some(data) => records.put(shard, id, data).await,
-                None => records.remove(shard, id).await,
-            };
-            if done.is_err() {
-                self.count(|s| s.unsaved += 1);
-            }
-        }
-    }
-}
-
 pub(crate) struct Sts {
     cache: RefCell<BTreeMap<Name, Cached>>,
     fetching: Rc<Cell<usize>>,
     joined: RefCell<BTreeMap<Name, Rc<Joined>>>,
     bound: usize,
     saver: Rc<Saver>,
+    stats: Cell<PolicyStats>,
     egress: Cell<Option<IpAddr>>,
     round: Cell<Option<Instant>>,
     due: RefCell<BTreeSet<(Instant, Name)>>,
@@ -394,6 +340,7 @@ impl Sts {
             joined: RefCell::default(),
             bound,
             saver: Rc::default(),
+            stats: Cell::new(PolicyStats::default()),
             egress: Cell::new(None),
             round: Cell::new(None),
             due: RefCell::default(),
@@ -405,7 +352,10 @@ impl Sts {
     }
 
     pub(crate) fn stats(&self) -> PolicyStats {
-        self.saver.stats.get()
+        PolicyStats {
+            unsaved: self.saver.unsaved(),
+            ..self.stats.get()
+        }
     }
 
     pub(crate) fn restore(&self, restore: Restore) {
@@ -414,6 +364,7 @@ impl Sts {
             unread,
             dropped,
             records,
+            ..
         } = restore;
         let (at, wall) = (now(), wall_ms());
         let mut loaded: BTreeMap<Name, Cached> = BTreeMap::new();
@@ -443,13 +394,13 @@ impl Sts {
                 }
             }
         }
-        *self.saver.records.borrow_mut() = Some(records);
-        *self.saver.taken.borrow_mut() = loaded.values().filter_map(|c| c.slot).collect();
-        self.saver.count(|s| {
-            s.loaded += loaded.len() as u64;
-            s.dropped += dropped + removed.len() as u64;
-            s.unread += unread;
-        });
+        self.saver
+            .attach(records, loaded.values().filter_map(|c| c.slot).collect());
+        let mut stats = self.stats.get();
+        stats.loaded += loaded.len() as u64;
+        stats.dropped += dropped + removed.len() as u64;
+        stats.unread += unread;
+        self.stats.set(stats);
         for slot in removed {
             self.saver.save(slot, None);
         }
@@ -795,6 +746,8 @@ mod tests {
 
     fn restored(sts: &Sts, saved: Vec<Saved>, records: &Rc<Memory>) {
         sts.restore(Restore {
+            kind: control::KIND_STS,
+            naming: [0; 16],
             saved,
             unread: 0,
             dropped: 0,

@@ -15,6 +15,7 @@ pub const KIND_ACCESS: u8 = 6;
 pub const KIND_DOMAIN: u8 = 7;
 pub const KIND_FLOOR: u8 = 8;
 pub const KIND_STS: u8 = 9;
+pub const KIND_RPT: u8 = 10;
 pub const SYSTEM: u32 = 0;
 pub const MAX_POOLS: usize = 16;
 pub const MAX_ADDRESSES: usize = 64;
