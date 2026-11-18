@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use control::{KIND_RPT, KIND_STS, Leases};
-use dns::Name;
+use dns::{Found, Name, Record, Type};
 use rt::{Ends, Instant, JoinHandle, now, timeout};
 use sched::{
     Answer, Answered, Attempt, Body, Destination, Envelope, Kind, Recipient, Required, Restore,
@@ -22,14 +22,15 @@ use crate::classify;
 use crate::conn::{Conn, Lost, left};
 use crate::dane::{self, Dane};
 use crate::mx::{self, Addresses, Dns, Hosts};
-use crate::owners::{OwnerStats, Owners};
+use crate::owners::{OwnerStats, Owners, State};
 use crate::pool::{Key, Level, Link, Pool, Remote, Slot};
-use crate::report::{Applied, ResultType};
+use crate::report::{Applied, Report, ResultType, Rua, rua};
 use crate::results::{Failure, ResultStats, Results, Scope, Taken};
 use crate::settings::{EightBit, Settings};
 use crate::sts::{Got, Mode, PolicyStats, Sts};
 
 const ADDRESSES: usize = 10;
+const LOOKUP: Duration = Duration::from_secs(30);
 const CHUNK: usize = 64 * 1024;
 const DEAD_MOST: usize = 10_000;
 const TEMPORARY: Answer = Answer::Deferred(Kind::Temporary);
@@ -66,6 +67,12 @@ pub struct Outcome {
     pub recipient: u32,
     pub answer: Answer,
     pub reply: Vec<u8>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Due {
+    pub report: Report,
+    pub rua: Rua,
 }
 
 pub struct Deliver<D> {
@@ -208,6 +215,50 @@ impl<D: Dns> Deliver<D> {
 
     pub fn take_results(&self) -> Vec<Taken> {
         self.results.take()
+    }
+
+    pub async fn due_reports(&self) -> Vec<Due> {
+        let mut due = Vec::new();
+        for taken in self.owners.reports() {
+            let name = Name::parse(&taken.domain)
+                .and_then(|name| name.prefixed("_tls"))
+                .and_then(|name| name.prefixed("_smtp"));
+            let Ok(name) = name else {
+                self.owners.mark(taken.day, &taken.domain, State::Dropped);
+                continue;
+            };
+            let Ok(Ok(lookup)) = timeout(LOOKUP, self.dns.lookup(&name, Type::Txt)).await else {
+                self.owners.retry(taken.day, &taken.domain);
+                continue;
+            };
+            let Some(rua) = reporting(&lookup.found) else {
+                self.owners.mark(taken.day, &taken.domain, State::Dropped);
+                continue;
+            };
+            let reporter = &self.settings.reporter;
+            let report = Report {
+                organization: reporter.organization.clone(),
+                contact: reporter.contact.clone(),
+                submitter: reporter.submitter.clone(),
+                domain: taken.domain,
+                day: taken.day,
+                policies: taken.policies,
+            };
+            due.push(Due { report, rua });
+        }
+        due
+    }
+
+    pub fn report_sent(&self, day: u64, domain: &str) {
+        self.owners.mark(day, domain, State::Sent);
+    }
+
+    pub fn report_dropped(&self, day: u64, domain: &str) {
+        self.owners.mark(day, domain, State::Dropped);
+    }
+
+    pub fn report_failed(&self, day: u64, domain: &str) {
+        self.owners.retry(day, domain);
     }
 
     pub fn owned_reports(&self) -> Vec<Taken> {
@@ -748,6 +799,20 @@ impl<D: Dns> Deliver<D> {
         self.random.set(x);
         usize::try_from(x >> 32).unwrap_or(0) % n
     }
+}
+
+fn reporting(found: &Found) -> Option<Rua> {
+    let Found::Records(records) = found else {
+        return None;
+    };
+    let texts: Vec<&[u8]> = records
+        .iter()
+        .filter_map(|record| match record {
+            Record::Txt(text) => Some(text.as_slice()),
+            _ => None,
+        })
+        .collect();
+    rua(&texts)
 }
 
 fn honoured(required: Required, tenant: u32, report: Option<u32>) -> Required {

@@ -14,12 +14,12 @@ mod settings;
 mod sts;
 
 pub use classify::{answer, kind};
-pub use deliver::{Deliver, Message, Outcome};
+pub use deliver::{Deliver, Due, Message, Outcome};
 pub use gzip::gzip;
 pub use mx::Dns;
 pub use owners::OwnerStats;
 pub use pool::{Remote, limits};
-pub use report::{Applied, Applies, Detail, Report, ResultType};
+pub use report::{Applied, Applies, Detail, MAILTO, Report, ResultType, Rua};
 pub use results::{ResultStats, Taken};
-pub use settings::{EightBit, Settings, Timeouts};
+pub use settings::{EightBit, Reporter, Settings, Timeouts};
 pub use sts::PolicyStats;

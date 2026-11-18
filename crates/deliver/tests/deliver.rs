@@ -1564,6 +1564,76 @@ fn tls_optional_mail_skips_policies_and_is_not_counted() {
 }
 
 #[test]
+fn due_reports_come_once_after_the_day_and_stay_sent() {
+    let naming = [7; 16];
+    let (early, due, again, restarted, stats) = run(async move {
+        drop(serve(MX1, Script::new(&[])));
+        let zone = zone();
+        zone.set(
+            "_smtp._tls.example.com",
+            Type::Txt,
+            Found::Records(vec![Record::Txt(
+                b"v=TLSRPTv1; rua=mailto:tls@example.com,https://r.example/v1".to_vec(),
+            )]),
+        );
+        let memory = Rc::new(Memory::default());
+        let deliver = reporting(zone.clone());
+        restored(&deliver, &memory, naming).await;
+        deliver.tick().await;
+        simple(&deliver, "example.com").await;
+        sleep(Duration::from_mins(11)).await;
+        deliver.tick().await;
+        let early = deliver.due_reports().await;
+        sleep(Duration::from_hours(29)).await;
+        let due = deliver.due_reports().await;
+        let again = deliver.due_reports().await;
+        for one in &due {
+            deliver.report_sent(one.report.day, &one.report.domain);
+        }
+        sleep(Duration::from_millis(1)).await;
+        let fresh = reporting(zone);
+        restored(&fresh, &memory, naming).await;
+        let restarted = fresh.due_reports().await;
+        (early, due, again, restarted, deliver.owner_stats())
+    });
+    assert_eq!(early, []);
+    assert_eq!(due.len(), 1);
+    let report = &due[0].report;
+    assert_eq!(report.domain, "example.com");
+    assert_eq!(due[0].rua.mailto, ["tls@example.com"]);
+    assert_eq!(due[0].rua.https, ["https://r.example/v1"]);
+    assert_eq!(report.policies[0].failure, 1);
+    assert!(report.json().contains("starttls-not-supported"));
+    assert_eq!(again, []);
+    assert_eq!(restarted, []);
+    assert_eq!(stats.sent, 1);
+}
+
+#[test]
+fn failed_reporting_lookups_are_retried_then_dropped() {
+    let (found, stats) = run(async move {
+        drop(serve(MX1, Script::new(&[])));
+        let zone = zone();
+        zone.time_out("_smtp._tls.example.com", Type::Txt);
+        let deliver = reporting(zone);
+        restored(&deliver, &Rc::new(Memory::default()), [7; 16]).await;
+        deliver.tick().await;
+        simple(&deliver, "example.com").await;
+        sleep(Duration::from_mins(11)).await;
+        deliver.tick().await;
+        sleep(Duration::from_hours(29)).await;
+        let mut found = 0;
+        for _ in 0..8 {
+            found += deliver.due_reports().await.len();
+            sleep(Duration::from_mins(31)).await;
+        }
+        (found, deliver.owner_stats())
+    });
+    assert_eq!(found, 0);
+    assert_eq!(stats.abandoned, 1);
+}
+
+#[test]
 fn requiretls_needs_verified_tls() {
     let tls = Envelope {
         required: Required::new(false, true),

@@ -33,6 +33,13 @@ impl Default for Timeouts {
     }
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Reporter {
+    pub organization: String,
+    pub contact: String,
+    pub submitter: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Settings {
     pub ehlo: String,
@@ -48,6 +55,7 @@ pub struct Settings {
     pub mta_sts: bool,
     pub tlsrpt: bool,
     pub report_tenant: Option<u32>,
+    pub reporter: Reporter,
 }
 
 impl Settings {
@@ -66,6 +74,7 @@ impl Settings {
             mta_sts: false,
             tlsrpt: false,
             report_tenant: None,
+            reporter: Reporter::default(),
         }
     }
 }
