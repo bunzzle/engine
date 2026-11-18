@@ -11,7 +11,10 @@ use std::time::Duration;
 
 use common::{Script, Seen, Zone, policy, serve, serve_policy};
 use control::Leases;
-use deliver::{Deliver, EightBit, Message, Outcome, Remote, Settings, limits};
+use deliver::{
+    Applied, Applies, Deliver, Detail, EightBit, Message, Outcome, Remote, ResultType, Settings,
+    Taken, limits,
+};
 use dns::{Found, Name, Record, Type};
 use rt::sim::{Config, SimDriver};
 use rt::{Mesh, Runtime, now, sleep, spawn};
@@ -1283,6 +1286,146 @@ fn refreshes_do_not_keep_an_unused_policy() {
     });
     assert!(refreshed > 1, "{refreshed}");
     assert_eq!(left, 0);
+}
+
+fn one(taken: &[Taken]) -> (&str, &Applies) {
+    assert_eq!(taken.len(), 1, "{taken:?}");
+    assert_eq!(taken[0].policies.len(), 1, "{taken:?}");
+    (&taken[0].domain, &taken[0].policies[0])
+}
+
+fn detail(result: ResultType, mx: &str, receiving: Option<IpAddr>) -> Detail {
+    Detail {
+        result,
+        sending: EGRESS,
+        mx: (!mx.is_empty()).then(|| mx.to_owned()),
+        receiving,
+        count: 1,
+        reason: None,
+    }
+}
+
+#[test]
+fn sessions_count_successes_per_policy_domain() {
+    let taken = run(async {
+        drop(serve(MX2, Script::new(&["STARTTLS"])));
+        drop(serve_policy(WEB, Rc::new(RefCell::new(policy(ENFORCE)))));
+        let zone = zone();
+        sts(&zone, "1");
+        let deliver = verifying(zone, strict());
+        simple(&deliver, "example.com").await;
+        simple(&deliver, "example.com").await;
+        deliver.take_results()
+    });
+    let (domain, applies) = one(&taken);
+    assert_eq!(domain, "example.com");
+    let lines = ENFORCE.lines().map(ToString::to_string).collect();
+    let mx = vec!["mx2.example.com".to_owned()];
+    assert_eq!(applies.policy, Applied::Sts { lines, mx });
+    assert_eq!((applies.success, applies.failure), (1, 0));
+}
+
+#[test]
+fn sessions_without_starttls_are_failures() {
+    let (taken, again) = run(async {
+        drop(serve(MX1, Script::new(&[])));
+        let deliver = deliverer(zone(), settings());
+        simple(&deliver, "example.com").await;
+        (deliver.take_results(), deliver.take_results())
+    });
+    let (domain, applies) = one(&taken);
+    assert_eq!(domain, "example.com");
+    assert_eq!(applies.policy, Applied::None);
+    assert_eq!((applies.success, applies.failure), (0, 1));
+    let want = detail(
+        ResultType::StarttlsNotSupported,
+        "mx1.example.com",
+        Some(MX1),
+    );
+    assert_eq!(applies.details, [want]);
+    assert_eq!(again, []);
+}
+
+#[test]
+fn certificate_and_policy_failures_are_named() {
+    let (mismatch, fetch) = run(async {
+        drop(serve(MX2, Script::new(&["STARTTLS"])));
+        let text = "version: STSv1\nmode: enforce\nmx: mx3.example.com\nmax_age: 86400\n";
+        drop(serve_policy(WEB, Rc::new(RefCell::new(policy(text)))));
+        let zone = zone();
+        zone.set("example.com", Type::Mx, mx(&[(10, "mx3.example.com")]));
+        zone.set("mx3.example.com", Type::A, a(&[MX2]));
+        sts(&zone, "1");
+        let deliver = verifying(zone.clone(), strict());
+        simple(&deliver, "example.com").await;
+        let mismatch = deliver.take_results();
+        let fresh = verifying(zone.clone(), strict());
+        zone.fail("mta-sts.example.com", Type::A);
+        simple(&fresh, "example.com").await;
+        (mismatch, fresh.take_results())
+    });
+    let (_, applies) = one(&mismatch);
+    let want = detail(
+        ResultType::CertificateHostMismatch,
+        "mx3.example.com",
+        Some(MX2),
+    );
+    assert_eq!(applies.details, [want]);
+    let failed = fetch
+        .iter()
+        .flat_map(|t| &t.policies)
+        .find(|a| matches!(&a.policy, Applied::Sts { lines, .. } if lines.is_empty()))
+        .expect("fetch failure");
+    assert_eq!(
+        failed.details,
+        [detail(ResultType::StsPolicyFetchError, "", None)]
+    );
+}
+
+#[test]
+fn dane_sessions_report_to_the_mx_host() {
+    let taken = run(async {
+        drop(serve(MX1, Script::new(&["STARTTLS"])));
+        let zone = signed(true);
+        tlsa(&zone, "mx1.example.com", &[(3, 1, 1, LEAF)]);
+        let deliver = deliverer(zone, settings());
+        simple(&deliver, "example.com").await;
+        deliver.take_results()
+    });
+    let (domain, applies) = one(&taken);
+    assert_eq!(domain, "mx1.example.com");
+    let records = vec![format!("3 1 1 {LEAF}")];
+    assert_eq!(applies.policy, Applied::Tlsa { records });
+    assert_eq!((applies.success, applies.failure), (1, 0));
+}
+
+#[test]
+fn only_servfail_on_tlsa_counts_as_dnssec_invalid() {
+    let mut found = Vec::new();
+    for slow in [false, true] {
+        let taken = run(async move {
+            drop(serve(MX1, Script::new(&["STARTTLS"])));
+            let zone = signed(true);
+            tlsa(&zone, "mx1.example.com", &[(3, 1, 1, LEAF)]);
+            let name = "_25._tcp.mx1.example.com";
+            if slow {
+                zone.time_out(name, Type::Tlsa);
+            } else {
+                zone.fail(name, Type::Tlsa);
+            }
+            let deliver = deliverer(zone, settings());
+            simple(&deliver, "example.com").await;
+            deliver.take_results()
+        });
+        found.push(taken);
+    }
+    let (domain, applies) = one(&found[0]);
+    assert_eq!(domain, "mx1.example.com");
+    let records = Vec::new();
+    assert_eq!(applies.policy, Applied::Tlsa { records });
+    let bogus = detail(ResultType::DnssecInvalid, "mx1.example.com", None);
+    assert_eq!(applies.details, [bogus]);
+    assert_eq!(found[1], []);
 }
 
 #[test]

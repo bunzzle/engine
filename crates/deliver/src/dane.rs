@@ -11,7 +11,9 @@ pub(crate) enum Dane {
         names: Vec<String>,
         records: Vec<Tlsa>,
     },
-    Failed,
+    Failed {
+        bogus: bool,
+    },
 }
 
 pub(crate) async fn lookup<D: Dns>(dns: &D, port: u16, host: &Name, target: &Name) -> Dane {
@@ -26,8 +28,13 @@ pub(crate) async fn lookup<D: Dns>(dns: &D, port: u16, host: &Name, target: &Nam
         else {
             continue;
         };
-        let Ok(lookup) = dns.lookup(&name, Type::Tlsa).await else {
-            return Dane::Failed;
+        let lookup = match dns.lookup(&name, Type::Tlsa).await {
+            Ok(lookup) => lookup,
+            Err(error) => {
+                return Dane::Failed {
+                    bogus: error == dns::Error::ServFail,
+                };
+            }
         };
         if !lookup.secure {
             continue;

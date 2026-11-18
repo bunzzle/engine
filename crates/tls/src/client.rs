@@ -33,6 +33,40 @@ impl Tlsa {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Refusal {
+    Expired,
+    NameMismatch,
+    Untrusted,
+    Unverified,
+    Lost,
+}
+
+pub fn refusal(error: &io::Error) -> Refusal {
+    let Some(rejected) = error
+        .get_ref()
+        .and_then(|inner| inner.downcast_ref::<rustls::Error>())
+    else {
+        return Refusal::Lost;
+    };
+    let rustls::Error::InvalidCertificate(cert) = rejected else {
+        return Refusal::Unverified;
+    };
+    match cert {
+        CertificateError::Expired
+        | CertificateError::ExpiredContext { .. }
+        | CertificateError::NotValidYet
+        | CertificateError::NotValidYetContext { .. } => Refusal::Expired,
+        CertificateError::NotValidForName | CertificateError::NotValidForNameContext { .. } => {
+            Refusal::NameMismatch
+        }
+        CertificateError::UnknownIssuer
+        | CertificateError::BadSignature
+        | CertificateError::Revoked => Refusal::Untrusted,
+        _ => Refusal::Unverified,
+    }
+}
+
 pub enum Verify {
     Any,
     WebPki,

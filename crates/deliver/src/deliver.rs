@@ -1,5 +1,6 @@
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
+use std::fmt::Write;
 use std::mem;
 use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
@@ -14,13 +15,15 @@ use sched::{
 use smtp::client::{
     self, Answer as Reply, Capabilities, Dots, Mail, Rcpt, Refused, Response, Step, Transaction,
 };
-use tls::{Connector, Tlsa, Verify};
+use tls::{Connector, Refusal, Tlsa, Verify};
 
 use crate::classify;
 use crate::conn::{Conn, Lost, left};
 use crate::dane::{self, Dane};
 use crate::mx::{self, Addresses, Dns, Hosts};
 use crate::pool::{Key, Level, Link, Pool, Remote, Slot};
+use crate::report::{Applied, ResultType};
+use crate::results::{Failure, ResultStats, Results, Scope, Taken};
 use crate::settings::{EightBit, Settings};
 use crate::sts::{Got, Mode, PolicyStats, Sts};
 
@@ -70,6 +73,7 @@ pub struct Deliver<D> {
     leases: Option<Leases<Remote>>,
     pool: Pool,
     sts: Sts,
+    results: Results,
     dead: RefCell<BTreeMap<(IpAddr, IpAddr), Instant>>,
     ehlo: Vec<u8>,
     helo: Vec<u8>,
@@ -88,6 +92,26 @@ enum Need {
 }
 
 impl Need {
+    fn scope(&self, target: &Name) -> Option<Scope> {
+        let Self::Dane { records, .. } = self else {
+            return None;
+        };
+        let records = records
+            .iter()
+            .map(|r| {
+                let mut line = format!("{} {} {} ", r.usage, r.selector, r.matching);
+                for byte in &r.data {
+                    let _ = write!(line, "{byte:02x}");
+                }
+                line
+            })
+            .collect();
+        Some(Scope {
+            domain: text(target),
+            policy: Applied::Tlsa { records },
+        })
+    }
+
     fn level(&self) -> Level {
         match self {
             Self::Any => Level::Any,
@@ -136,6 +160,7 @@ impl<D: Dns> Deliver<D> {
             leases,
             pool,
             sts: Sts::default(),
+            results: Results::default(),
             dead: RefCell::new(BTreeMap::new()),
             ehlo,
             helo,
@@ -158,6 +183,14 @@ impl<D: Dns> Deliver<D> {
 
     pub fn policy_stats(&self) -> PolicyStats {
         self.sts.stats()
+    }
+
+    pub fn take_results(&self) -> Vec<Taken> {
+        self.results.take()
+    }
+
+    pub fn result_stats(&self) -> ResultStats {
+        self.results.stats()
     }
 
     pub async fn deliver(
@@ -189,8 +222,8 @@ impl<D: Dns> Deliver<D> {
                 Ok(Hosts::Failed) => return every(TEMPORARY, MX_FAILED),
                 Err(_) => return every(TEMPORARY, Lost::Timeout.text()),
             };
-        let sts = match self.enforce(egress, &domain, &mut hosts, end).await {
-            Ok(sts) => sts,
+        let (sts, scope) = match self.enforce(egress, &domain, &mut hosts, end).await {
+            Ok(enforced) => enforced,
             Err((answer, reply)) => return every(answer, reply),
         };
         if requiretls && !secure && !sts {
@@ -222,11 +255,12 @@ impl<D: Dns> Deliver<D> {
                 }
             };
             let dane = secure && dnssec && !found.is_empty();
-            let Some(need) = self.need(end, host, &target, dane, sts).await else {
+            let Some(need) = self.need(end, (egress, host), &target, dane, sts).await else {
                 last = TLSA_FAILED.to_vec();
                 others = true;
                 continue;
             };
+            let scope = need.scope(&target).unwrap_or_else(|| scope.clone());
             if requiretls && matches!(need, Need::Any | Need::Encrypt) {
                 last = REQUIRETLS.to_vec();
                 continue;
@@ -244,7 +278,7 @@ impl<D: Dns> Deliver<D> {
                     level: need.level(),
                 };
                 match self
-                    .session(end, &key, &need, &remote, &mut slot, &mut message)
+                    .session(end, &key, (&need, &scope), &remote, &mut slot, &mut message)
                     .await
                 {
                     Tried::Done(outcomes) => return outcomes,
@@ -270,9 +304,13 @@ impl<D: Dns> Deliver<D> {
         domain: &Name,
         hosts: &mut Vec<Name>,
         end: Instant,
-    ) -> Result<bool, (Answer, &'static [u8])> {
+    ) -> Result<(bool, Scope), (Answer, &'static [u8])> {
+        let scope = |policy| Scope {
+            domain: text(domain),
+            policy,
+        };
         if !self.settings.mta_sts {
-            return Ok(false);
+            return Ok((false, scope(Applied::None)));
         }
         let got = self
             .sts
@@ -280,21 +318,34 @@ impl<D: Dns> Deliver<D> {
             .await;
         match got {
             Got::Busy => Err((Answer::Later(self.wait()), STS_BUSY)),
+            Got::Failed(result) => {
+                let failed = scope(Applied::Sts {
+                    lines: Vec::new(),
+                    mx: Vec::new(),
+                });
+                self.results
+                    .failure(&failed, failure(result, egress, None, None));
+                Ok((false, scope(Applied::None)))
+            }
             Got::Policy(policy) if policy.mode == Mode::Enforce => {
+                let applied = scope(policy.applied());
                 hosts.retain(|host| policy.allows(host));
                 if hosts.is_empty() {
+                    let mismatch = failure(ResultType::ValidationFailure, egress, None, None);
+                    self.results.failure(&applied, mismatch);
                     return Err((TEMPORARY, STS_NO_MX));
                 }
-                Ok(true)
+                Ok((true, applied))
             }
-            Got::Policy(_) | Got::None => Ok(false),
+            Got::Policy(policy) => Ok((false, scope(policy.applied()))),
+            Got::None => Ok((false, scope(Applied::None))),
         }
     }
 
     async fn need(
         &self,
         end: Instant,
-        host: &Name,
+        (egress, host): (IpAddr, &Name),
         target: &Name,
         dane: bool,
         sts: bool,
@@ -303,12 +354,23 @@ impl<D: Dns> Deliver<D> {
             let lookup = dane::lookup(&self.dns, self.settings.port, host, target);
             timeout(left(end, self.settings.deadline), lookup)
                 .await
-                .unwrap_or(Dane::Failed)
+                .unwrap_or(Dane::Failed { bogus: false })
         } else {
             Dane::None
         };
         match found {
-            Dane::Failed => None,
+            Dane::Failed { bogus: false } => None,
+            Dane::Failed { bogus: true } => {
+                let tlsa = Scope {
+                    domain: text(target),
+                    policy: Applied::Tlsa {
+                        records: Vec::new(),
+                    },
+                };
+                let bogus = failure(ResultType::DnssecInvalid, egress, Some(host), None);
+                self.results.failure(&tlsa, bogus);
+                None
+            }
             Dane::Verify { names, records } => Some(Need::Dane { names, records }),
             _ if sts => Some(Need::Sts),
             Dane::Encrypt => Some(Need::Encrypt),
@@ -324,7 +386,7 @@ impl<D: Dns> Deliver<D> {
         &self,
         end: Instant,
         key: &Key,
-        need: &Need,
+        (need, scope): (&Need, &Scope),
         remote: &Remote,
         slot: &mut Option<Slot>,
         message: &mut Message<'_>,
@@ -342,7 +404,7 @@ impl<D: Dns> Deliver<D> {
                     Err(()) => return Tried::Busy,
                 }
             }
-            match self.open(end, key, need).await {
+            match self.open(end, key, need, scope).await {
                 Ok((conn, caps)) => Link {
                     conn,
                     caps,
@@ -458,7 +520,12 @@ impl<D: Dns> Deliver<D> {
         end: Instant,
         key: &Key,
         need: &Need,
+        scope: &Scope,
     ) -> Result<(Conn, Capabilities), Vec<u8>> {
+        let failed = |result| {
+            let detail = failure(result, key.egress, Some(&key.host), Some(key.remote));
+            self.results.failure(scope, detail);
+        };
         let t = &self.settings.timeouts;
         let to = SocketAddr::new(key.remote, self.settings.port);
         let mut conn = match Conn::open(key.egress, to, end, t.connect).await {
@@ -478,6 +545,7 @@ impl<D: Dns> Deliver<D> {
         };
         let required = key.level != Level::Any;
         if !caps.starttls {
+            failed(ResultType::StarttlsNotSupported);
             if required {
                 conn.quit().await;
                 return Err(NO_STARTTLS.to_vec());
@@ -487,17 +555,34 @@ impl<D: Dns> Deliver<D> {
         match command(&mut conn, client::STARTTLS, t.starttls).await {
             Ok(reply) if reply.code == 220 => {
                 let (name, verify) = need.verify(&key.host);
-                conn = conn
-                    .starttls(&self.tls, &name, verify, t.starttls)
-                    .await
-                    .map_err(|lost| lost.text().to_vec())?;
+                conn = match conn.starttls(&self.tls, &name, verify, t.starttls).await {
+                    Ok(conn) => conn,
+                    Err(lost) => {
+                        if let Lost::Tls(refused) = lost
+                            && let Some(result) = refused_type(refused)
+                        {
+                            failed(result);
+                        }
+                        return Err(lost.text().to_vec());
+                    }
+                };
+                self.results.success(scope);
                 caps = match self.hello(&mut conn).await {
                     Ok(caps) => caps,
                     Err(failed) => return Err(next(conn, failed).await),
                 };
             }
-            Ok(reply) if required => return Err(next(conn, Ok(reply)).await),
-            Ok(_) => {}
+            Ok(reply) if required => {
+                if reply.code >= 500 {
+                    failed(ResultType::StarttlsNotSupported);
+                }
+                return Err(next(conn, Ok(reply)).await);
+            }
+            Ok(reply) => {
+                if reply.code >= 500 {
+                    failed(ResultType::StarttlsNotSupported);
+                }
+            }
             Err(lost) => return Err(lost.text().to_vec()),
         }
         Ok((conn, caps))
@@ -601,6 +686,34 @@ impl<D: Dns> Deliver<D> {
         x ^= x << 17;
         self.random.set(x);
         usize::try_from(x >> 32).unwrap_or(0) % n
+    }
+}
+
+fn text(name: &Name) -> String {
+    name.to_string().trim_end_matches('.').to_ascii_lowercase()
+}
+
+fn failure(
+    result: ResultType,
+    sending: IpAddr,
+    mx: Option<&Name>,
+    receiving: Option<IpAddr>,
+) -> Failure {
+    Failure {
+        result,
+        sending,
+        mx: mx.map(text),
+        receiving,
+    }
+}
+
+fn refused_type(refused: Refusal) -> Option<ResultType> {
+    match refused {
+        Refusal::Expired => Some(ResultType::CertificateExpired),
+        Refusal::NameMismatch => Some(ResultType::CertificateHostMismatch),
+        Refusal::Untrusted => Some(ResultType::CertificateNotTrusted),
+        Refusal::Unverified => Some(ResultType::ValidationFailure),
+        Refusal::Lost => None,
     }
 }
 
