@@ -12,6 +12,7 @@ dns = { path = "../dns" }
 rt = { path = "../rt" }
 sched = { path = "../sched" }
 smtp = { path = "../smtp" }
+sys = { path = "../sys" }
 tls = { path = "../tls" }
 
 [dev-dependencies]
