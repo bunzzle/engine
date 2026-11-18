@@ -10,7 +10,7 @@ use tls::rustls::pki_types::CertificateDer;
 use tls::rustls::pki_types::pem::PemObject;
 use tls::rustls::server::ParsedCertificate;
 use tls::rustls::{AlertDescription, CertificateError, Error as Rejected, HandshakeKind};
-use tls::{Acceptor, Certs, Connector, Refusal, Tlsa, Verify, refusal, simulated};
+use tls::{Acceptor, Certs, Connector, Observed, Refusal, Tlsa, Verify, refusal, simulated};
 
 const CA: &[u8] = include_bytes!("data/ca.pem");
 const A: &[u8] = include_bytes!("data/a.pem");
@@ -139,6 +139,31 @@ fn webpki_checks_roots_and_name() {
     assert_eq!(kinds(&results), ["Full", "InvalidData"]);
     let results = outcomes(A.to_vec(), None, vec![("mail.test", Verify::WebPki)]);
     assert_eq!(kinds(&results), ["InvalidInput"]);
+}
+
+#[test]
+fn observing_records_the_verdict_and_never_fails() {
+    let good = Arc::new(Observed::default());
+    let bad = Arc::new(Observed::default());
+    let results = outcomes(
+        A.to_vec(),
+        Some(CA),
+        vec![
+            ("mail.test", Verify::Observe(Arc::clone(&good))),
+            ("other.test", Verify::Observe(Arc::clone(&bad))),
+        ],
+    );
+    assert_eq!(kinds(&results), ["Full", "Full"]);
+    assert_eq!(good.verdict(), Some(Ok(())));
+    assert_eq!(bad.verdict(), Some(Err(Refusal::NameMismatch)));
+    let unseen = Arc::new(Observed::default());
+    let results = outcomes(
+        A.to_vec(),
+        None,
+        vec![("mail.test", Verify::Observe(Arc::clone(&unseen)))],
+    );
+    assert_eq!(kinds(&results), ["InvalidInput"]);
+    assert_eq!(unseen.verdict(), None);
 }
 
 #[test]

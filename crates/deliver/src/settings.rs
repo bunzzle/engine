@@ -46,6 +46,7 @@ pub struct Settings {
     pub pooled: usize,
     pub dead: Duration,
     pub mta_sts: bool,
+    pub tlsrpt: bool,
 }
 
 impl Settings {
@@ -62,6 +63,7 @@ impl Settings {
             pooled: 1000,
             dead: Duration::from_secs(60),
             mta_sts: false,
+            tlsrpt: false,
         }
     }
 }
