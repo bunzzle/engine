@@ -10,7 +10,7 @@ publish.workspace = true
 crypto = { path = "../crypto" }
 
 [dev-dependencies]
-aws-lc-rs = "=1.18.2"
+aws-lc-rs = "=1.19.0"
 
 [lints]
 workspace = true
