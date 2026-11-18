@@ -609,6 +609,16 @@ impl<D: Dns> Transport for Deliver<D> {
         self.sts.restore(restore);
     }
 
+    async fn tick(&self) {
+        if self.settings.mta_sts {
+            let jitter = |n: u64| {
+                let n = usize::try_from(n).unwrap_or(usize::MAX);
+                u64::try_from(self.pick(n)).unwrap_or(0)
+            };
+            self.sts.refresh(&self.dns, &self.tls, jitter).await;
+        }
+    }
+
     async fn send(&self, attempt: Attempt) -> Vec<Answered> {
         let Attempt {
             destination,

@@ -2,8 +2,11 @@ mod common;
 
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
+use std::future::poll_fn;
 use std::net::{IpAddr, Ipv4Addr};
+use std::pin::pin;
 use std::rc::Rc;
+use std::task::Poll;
 use std::time::Duration;
 
 use common::{Script, Seen, Zone, policy, serve, serve_policy};
@@ -1137,6 +1140,149 @@ fn saved_policy_is_enforced_after_a_restart_without_its_server() {
     assert_eq!(first.borrow().connections, 0);
     assert_eq!(requests.borrow().len(), 1);
     assert_eq!(stats.loaded, 1);
+}
+
+fn policy_for(mx: &str, max_age: u64) -> String {
+    policy(&format!(
+        "version: STSv1\nmode: enforce\n{mx}max_age: {max_age}\n"
+    ))
+}
+
+async fn both<A: Future, B: Future>(a: A, b: B) -> (A::Output, B::Output) {
+    let (mut a, mut b) = (pin!(a), pin!(b));
+    let (mut x, mut y) = (None, None);
+    poll_fn(|cx| {
+        if x.is_none()
+            && let Poll::Ready(out) = a.as_mut().poll(cx)
+        {
+            x = Some(out);
+        }
+        if y.is_none()
+            && let Poll::Ready(out) = b.as_mut().poll(cx)
+        {
+            y = Some(out);
+        }
+        if x.is_some() && y.is_some() {
+            Poll::Ready(())
+        } else {
+            Poll::Pending
+        }
+    })
+    .await;
+    (x.expect("first"), y.expect("second"))
+}
+
+async fn ticks(deliver: &Deliver<Zone>, every: Duration, count: u32) {
+    for _ in 0..count {
+        deliver.tick().await;
+        sleep(every).await;
+    }
+}
+
+#[test]
+fn concurrent_deliveries_share_one_policy_fetch() {
+    let (outcomes, first, requests) = run(async {
+        let first = serve(MX1, Script::new(&["STARTTLS"]));
+        drop(serve(MX2, Script::new(&["STARTTLS"])));
+        let requests = serve_policy(WEB, Rc::new(RefCell::new(policy(ENFORCE))));
+        let zone = zone();
+        sts(&zone, "1");
+        let deliver = verifying(zone, strict());
+        let (mut a, b) = both(
+            simple(&deliver, "example.com"),
+            simple(&deliver, "example.com"),
+        )
+        .await;
+        a.extend(b);
+        (a, first, requests)
+    });
+    assert_eq!(answers(&outcomes), [Answer::Delivered; 2]);
+    assert_eq!(first.borrow().connections, 0);
+    assert_eq!(requests.borrow().len(), 1);
+}
+
+#[test]
+fn daily_refresh_fetches_a_changed_policy_without_mail() {
+    let (fetched, after) = run(async {
+        drop(serve(MX2, Script::new(&["STARTTLS"])));
+        let response = Rc::new(RefCell::new(policy_for("mx: mx2.example.com\n", 604_800)));
+        let requests = serve_policy(WEB, Rc::clone(&response));
+        let zone = zone();
+        sts(&zone, "1");
+        let deliver = verifying(zone.clone(), strict());
+        simple(&deliver, "example.com").await;
+        ticks(&deliver, Duration::from_mins(1), 5).await;
+        assert_eq!(requests.borrow().len(), 1);
+        *response.borrow_mut() = policy_for("mx: mx2.example.com\nmx: mx1.example.com\n", 604_800);
+        sts(&zone, "2");
+        sleep(Duration::from_hours(24)).await;
+        ticks(&deliver, Duration::from_mins(1), 200).await;
+        let fetched = requests.borrow().len();
+        simple(&deliver, "example.com").await;
+        let after = requests.borrow().len();
+        (fetched, after)
+    });
+    assert_eq!(fetched, 2);
+    assert_eq!(after, 2);
+}
+
+#[test]
+fn refresh_extends_a_policy_close_to_expiry() {
+    let fetched = run(async {
+        drop(serve(MX2, Script::new(&["STARTTLS"])));
+        let response = Rc::new(RefCell::new(policy_for("mx: mx2.example.com\n", 345_600)));
+        let requests = serve_policy(WEB, response);
+        let zone = zone();
+        sts(&zone, "1");
+        let deliver = verifying(zone, strict());
+        simple(&deliver, "example.com").await;
+        let mut fetched = Vec::new();
+        for _ in 0..4 {
+            ticks(&deliver, Duration::from_mins(10), 144).await;
+            fetched.push(requests.borrow().len());
+        }
+        fetched
+    });
+    assert_eq!(fetched, [1, 1, 1, 2]);
+}
+
+#[test]
+fn policies_unused_for_half_a_year_are_dropped() {
+    let (before, after) = run(async {
+        drop(serve(MX2, Script::new(&["STARTTLS"])));
+        let year = policy_for("mx: mx2.example.com\n", 31_557_600);
+        drop(serve_policy(WEB, Rc::new(RefCell::new(year))));
+        let zone = zone();
+        sts(&zone, "1");
+        let deliver = verifying(zone, strict());
+        simple(&deliver, "example.com").await;
+        deliver.tick().await;
+        sleep(Duration::from_hours(24 * 179)).await;
+        deliver.tick().await;
+        let before = deliver.policies();
+        sleep(Duration::from_hours(24 * 2)).await;
+        deliver.tick().await;
+        (before, deliver.policies())
+    });
+    assert_eq!((before, after), (1, 0));
+}
+
+#[test]
+fn refreshes_do_not_keep_an_unused_policy() {
+    let (refreshed, left) = run(async {
+        drop(serve(MX2, Script::new(&["STARTTLS"])));
+        let week = policy_for("mx: mx2.example.com\n", 604_800);
+        let requests = serve_policy(WEB, Rc::new(RefCell::new(week)));
+        let zone = zone();
+        sts(&zone, "1");
+        let deliver = verifying(zone, strict());
+        simple(&deliver, "example.com").await;
+        ticks(&deliver, Duration::from_hours(1), 24 * 181).await;
+        let refreshed = requests.borrow().len();
+        (refreshed, deliver.policies())
+    });
+    assert!(refreshed > 1, "{refreshed}");
+    assert_eq!(left, 0);
 }
 
 #[test]

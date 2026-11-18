@@ -1,7 +1,9 @@
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
+use std::future::poll_fn;
 use std::net::{IpAddr, SocketAddr};
 use std::rc::Rc;
+use std::task::{Poll, Waker};
 use std::time::Duration;
 
 use dns::{Found, Name, Record, Type};
@@ -23,6 +25,12 @@ const PATH: &str = "/.well-known/mta-sts.txt";
 const FORMAT: u8 = 1;
 const FIXED: usize = 21;
 const DAY_MS: u64 = 86_400_000;
+const ROUND: Duration = Duration::from_hours(24);
+const BUSY: Duration = Duration::from_mins(1);
+const SPREAD_MS: u64 = 3 * 3_600_000;
+const STALE_MS: u64 = 12 * 3_600_000;
+const RECENT_MS: u64 = 30 * DAY_MS;
+const UNUSED_MS: u64 = 180 * DAY_MS;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Mode {
@@ -179,7 +187,7 @@ impl Cached {
         out.extend_from_slice(&self.fetched.to_le_bytes());
         out.extend_from_slice(&self.until.to_le_bytes());
         out.extend_from_slice(
-            &u32::try_from(self.saved_day)
+            &u32::try_from(self.used / DAY_MS)
                 .unwrap_or(u32::MAX)
                 .to_le_bytes(),
         );
@@ -289,8 +297,64 @@ impl Saver {
 pub(crate) struct Sts {
     cache: RefCell<BTreeMap<Name, Cached>>,
     fetching: Rc<Cell<usize>>,
+    joined: RefCell<BTreeMap<Name, Rc<Joined>>>,
     bound: usize,
     saver: Rc<Saver>,
+    egress: Cell<Option<IpAddr>>,
+    round: Cell<Option<Instant>>,
+    due: RefCell<BTreeSet<(Instant, Name)>>,
+}
+
+enum Fetched {
+    Policy(Rc<Policy>),
+    Failed,
+    Busy,
+}
+
+#[derive(Default)]
+struct Joined {
+    done: Cell<bool>,
+    policy: RefCell<Option<Rc<Policy>>>,
+    wakers: RefCell<Vec<Waker>>,
+}
+
+impl Joined {
+    fn finish(&self, policy: Option<Rc<Policy>>) {
+        if self.done.replace(true) {
+            return;
+        }
+        *self.policy.borrow_mut() = policy;
+        for waker in self.wakers.take() {
+            waker.wake();
+        }
+    }
+
+    async fn wait(&self) -> Option<Rc<Policy>> {
+        poll_fn(|cx| {
+            if self.done.get() {
+                return Poll::Ready(self.policy.borrow().clone());
+            }
+            let mut wakers = self.wakers.borrow_mut();
+            if !wakers.iter().any(|waker| waker.will_wake(cx.waker())) {
+                wakers.push(cx.waker().clone());
+            }
+            Poll::Pending
+        })
+        .await
+    }
+}
+
+struct Leading<'a> {
+    joined: &'a RefCell<BTreeMap<Name, Rc<Joined>>>,
+    domain: Name,
+    done: Rc<Joined>,
+}
+
+impl Drop for Leading<'_> {
+    fn drop(&mut self) {
+        self.joined.borrow_mut().remove(&self.domain);
+        self.done.finish(None);
+    }
 }
 
 impl Default for Sts {
@@ -312,8 +376,12 @@ impl Sts {
         Self {
             cache: RefCell::default(),
             fetching: Rc::default(),
+            joined: RefCell::default(),
             bound,
             saver: Rc::default(),
+            egress: Cell::new(None),
+            round: Cell::new(None),
+            due: RefCell::default(),
         }
     }
 
@@ -381,16 +449,8 @@ impl Sts {
         domain: &Name,
         end: Instant,
     ) -> Got {
-        let Ok(name) = domain.prefixed("_mta-sts") else {
-            return Got::None;
-        };
-        let id = match timeout(left(end, FETCH), dns.lookup(&name, Type::Txt)).await {
-            Ok(Ok(lookup)) => match &lookup.found {
-                Found::Records(records) => id(records),
-                _ => None,
-            },
-            _ => None,
-        };
+        self.egress.set(Some(egress));
+        let id = txt_id(dns, domain, end).await;
         let cached = self.cached(domain);
         let Some(id) = id else {
             return cached.map_or(Got::None, |(_, policy)| Got::Policy(policy));
@@ -400,20 +460,123 @@ impl Sts {
         {
             return Got::Policy(Rc::clone(policy));
         }
+        match self.fetch(dns, tls, egress, domain, id, end).await {
+            Fetched::Policy(policy) => Got::Policy(policy),
+            Fetched::Busy => cached.map_or(Got::Busy, |(_, policy)| Got::Policy(policy)),
+            Fetched::Failed => cached.map_or(Got::None, |(_, policy)| Got::Policy(policy)),
+        }
+    }
+
+    async fn fetch<D: Dns>(
+        &self,
+        dns: &D,
+        tls: &Connector,
+        egress: IpAddr,
+        domain: &Name,
+        id: String,
+        end: Instant,
+    ) -> Fetched {
+        let running = self.joined.borrow().get(domain).cloned();
+        if let Some(joined) = running {
+            return match timeout(left(end, FETCH), joined.wait()).await {
+                Ok(Some(policy)) => Fetched::Policy(policy),
+                _ => Fetched::Failed,
+            };
+        }
         if self.fetching.get() >= FETCHES {
-            return cached.map_or(Got::Busy, |(_, policy)| Got::Policy(policy));
+            return Fetched::Busy;
         }
         self.fetching.set(self.fetching.get() + 1);
-        let guard = Fetching(Rc::clone(&self.fetching));
-        let fetched = timeout(left(end, FETCH), fetch(dns, tls, egress, domain)).await;
-        drop(guard);
-        match fetched {
+        let counted = Fetching(Rc::clone(&self.fetching));
+        let joined = Rc::new(Joined::default());
+        self.joined
+            .borrow_mut()
+            .insert(domain.clone(), Rc::clone(&joined));
+        let leading = Leading {
+            joined: &self.joined,
+            domain: domain.clone(),
+            done: Rc::clone(&joined),
+        };
+        let fetched = timeout(left(end, FETCH), get_policy(dns, tls, egress, domain)).await;
+        drop(counted);
+        let policy = match fetched {
             Ok(Some((policy, text))) => {
                 let policy = Rc::new(policy);
                 self.store(domain, id, Rc::clone(&policy), text);
-                Got::Policy(policy)
+                Some(policy)
             }
-            _ => cached.map_or(Got::None, |(_, policy)| Got::Policy(policy)),
+            _ => None,
+        };
+        joined.finish(policy.clone());
+        drop(leading);
+        policy.map_or(Fetched::Failed, Fetched::Policy)
+    }
+
+    pub(crate) async fn refresh<D: Dns>(
+        &self,
+        dns: &D,
+        tls: &Connector,
+        jitter: impl Fn(u64) -> u64,
+    ) {
+        let at = now();
+        if self.round.get().is_none_or(|round| round <= at) {
+            self.plan(at, jitter);
+            self.round.set(Some(at + ROUND));
+        }
+        loop {
+            let next = {
+                let mut due = self.due.borrow_mut();
+                match due.first() {
+                    Some((when, _)) if *when <= now() => due.pop_first(),
+                    _ => None,
+                }
+            };
+            let Some((_, domain)) = next else {
+                return;
+            };
+            self.refresh_one(dns, tls, &domain).await;
+        }
+    }
+
+    fn plan(&self, at: Instant, jitter: impl Fn(u64) -> u64) {
+        let wall = wall_ms();
+        let mut cache = self.cache.borrow_mut();
+        let unused: Vec<Name> = cache
+            .iter()
+            .filter(|(_, entry)| entry.expires <= at || entry.used.saturating_add(UNUSED_MS) < wall)
+            .map(|(domain, _)| domain.clone())
+            .collect();
+        for domain in unused {
+            if let Some(slot) = cache.remove(&domain).and_then(|entry| entry.slot) {
+                self.saver.save(slot, None);
+            }
+        }
+        let mut due = self.due.borrow_mut();
+        due.clear();
+        for (domain, entry) in cache.iter() {
+            let recent = entry.used.saturating_add(RECENT_MS) >= wall;
+            let stale = entry.fetched.saturating_add(STALE_MS) <= wall;
+            if recent && stale {
+                let delay = Duration::from_millis(jitter(SPREAD_MS));
+                due.insert((at + delay, domain.clone()));
+            }
+        }
+    }
+
+    async fn refresh_one<D: Dns>(&self, dns: &D, tls: &Connector, domain: &Name) {
+        let end = now() + FETCH;
+        let Some(id) = txt_id(dns, domain, end).await else {
+            return;
+        };
+        let wall = wall_ms();
+        let needed = self.cache.borrow().get(domain).is_some_and(|entry| {
+            let left = entry.until.saturating_sub(wall);
+            entry.id != id || left < max_age_ms(&entry.policy) / 4
+        });
+        if let (true, Some(egress)) = (needed, self.egress.get())
+            && let Fetched::Busy = self.fetch(dns, tls, egress, domain, id, end).await
+        {
+            self.due.borrow_mut().insert((now() + BUSY, domain.clone()));
         }
     }
 
@@ -443,13 +606,13 @@ impl Sts {
         let at = now();
         let wall = wall_ms();
         let mut cache = self.cache.borrow_mut();
-        let slot = if let Some(old) = cache.get(domain) {
-            old.slot
+        let (slot, used, saved_day) = if let Some(old) = cache.get(domain) {
+            (old.slot, old.used, old.saved_day)
         } else {
             if cache.len() >= self.bound {
                 self.make_room(&mut cache, at);
             }
-            self.saver.take(self.bound)
+            (self.saver.take(self.bound), wall, wall / DAY_MS)
         };
         let entry = Cached {
             id,
@@ -457,8 +620,8 @@ impl Sts {
             expires: at + Duration::from_secs(policy.max_age),
             fetched: wall,
             until: wall.saturating_add(max_age_ms(&policy)),
-            used: wall,
-            saved_day: wall / DAY_MS,
+            used,
+            saved_day,
             policy,
             slot,
         };
@@ -487,7 +650,18 @@ impl Sts {
     }
 }
 
-async fn fetch<D: Dns>(
+async fn txt_id<D: Dns>(dns: &D, domain: &Name, end: Instant) -> Option<String> {
+    let name = domain.prefixed("_mta-sts").ok()?;
+    match timeout(left(end, FETCH), dns.lookup(&name, Type::Txt)).await {
+        Ok(Ok(lookup)) => match &lookup.found {
+            Found::Records(records) => id(records),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+async fn get_policy<D: Dns>(
     dns: &D,
     tls: &Connector,
     egress: IpAddr,

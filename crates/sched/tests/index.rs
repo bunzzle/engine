@@ -151,6 +151,7 @@ struct Idle;
 
 thread_local! {
     static RESTORED: RefCell<Option<Vec<Restore>>> = const { RefCell::new(None) };
+    static TICKS: Cell<u32> = const { Cell::new(0) };
 }
 
 impl Transport for Idle {
@@ -164,6 +165,11 @@ impl Transport for Idle {
                 kept.push(restore);
             }
         });
+        std::future::ready(())
+    }
+
+    fn tick(&self) -> impl Future<Output = ()> {
+        TICKS.set(TICKS.get() + 1);
         std::future::ready(())
     }
 }
@@ -2744,4 +2750,16 @@ fn system_records_come_back_sealed_and_other_keys_drop_them() {
     assert!(saved(&restored).is_empty());
     assert!(restored.iter().all(|r| r.dropped == 0 && r.unread == 0));
     last.stop();
+}
+
+#[test]
+fn the_transport_ticks_every_minute_until_close() {
+    let driver = Rc::new(SimDriver::with_disk(45, Config::default(), created(45)));
+    let cluster = started(&driver, 2);
+    let before = TICKS.get();
+    cluster.run(async {
+        sleep(Duration::from_secs(150)).await;
+    });
+    assert_eq!(TICKS.get() - before, 4);
+    cluster.stop();
 }

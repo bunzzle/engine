@@ -46,4 +46,8 @@ pub trait Transport {
         drop(restore);
         std::future::ready(())
     }
+
+    fn tick(&self) -> impl Future<Output = ()> {
+        std::future::ready(())
+    }
 }
