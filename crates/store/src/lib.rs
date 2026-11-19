@@ -24,6 +24,7 @@ mod superblock;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 mod threads;
 mod usage;
+mod watch;
 
 pub use boot::{Booted, Core, Setup, Start, boot};
 pub use checkpoint::{KIND_CHECKPOINT, Loaded, PART_TAG_OTHER, Part, load};
@@ -68,3 +69,4 @@ pub use sys::crc32c::{Hasher as Crc32c, checksum};
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 pub use threads::launch;
 pub use usage::{Count, Usage};
+pub use watch::Watch;
