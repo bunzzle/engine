@@ -22,12 +22,12 @@ use keys::{
 use rt::sim::{Config, Disk, Faults, Machine, SimDriver, Stalls, check};
 use rt::{JoinHandle, Runtime, TcpListener, TcpStream, sleep, spawn, timeout};
 use sched::{
-    Answered, Attempt, Batched, Begun, Clock, DAY, Draft, EVENT_DAYS, EVENT_SHAPE, EVENT_VALUE,
-    Event, EventBody, EventKind, Hash, KIND_EVENT, KIND_REQUEST, KIND_SUPPRESS, Keyring, Keys,
-    MAX_REPLY, Meshes, Node, Parts, ReadError, Reason, Recipient, Refusal, Restore, Running, SHAPE,
-    Settings, Suppression, Ticket, Transport, Unsealable, Unwrapped, encode_slice, event_record,
-    event_sealed, event_sequence, normalize, punycode, retain, retain_event, retain_request,
-    retired_events,
+    Answer, Answered, Attempt, Batched, Begun, Clock, DAY, Draft, EVENT_DAYS, EVENT_SHAPE,
+    EVENT_VALUE, Event, EventBody, EventKind, Fault, Hash, KIND_EVENT, KIND_REQUEST, KIND_SUPPRESS,
+    Keyring, Keys, MAX_REPLY, Meshes, Node, Parts, ReadError, Reason, Recipient, Refusal, Restore,
+    Running, SHAPE, Settings, Suppression, Ticket, Transport, Unsealable, Unwrapped, encode_slice,
+    event_record, event_sealed, event_sequence, normalize, punycode, retain, retain_event,
+    retain_request, retired_events,
 };
 use spool::{Body, Head, HeadClear, Message, MessageId, SLICE, Slice, Stamp};
 use store::{Client, Committer, DataFile, Options, SLOT_SIZE, Setup, Tiering, boot};
@@ -154,11 +154,72 @@ struct Idle;
 thread_local! {
     static RESTORED: RefCell<Option<Vec<Restore>>> = const { RefCell::new(None) };
     static TICKS: Cell<u32> = const { Cell::new(0) };
+    static ANSWERS: RefCell<Option<Answers>> = const { RefCell::new(None) };
+}
+
+type Given = (MessageId, u32, u16, EventKind);
+
+struct Answers {
+    clock: Clock,
+    given: Vec<Given>,
+}
+
+fn mix(mut x: u64) -> u64 {
+    x = x.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    x = (x ^ (x >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    x ^ (x >> 31)
+}
+
+async fn answer(attempt: Attempt) -> Vec<Answered> {
+    let Some(clock) = ANSWERS.with_borrow(|a| a.as_ref().map(|a| a.clock)) else {
+        return Vec::new();
+    };
+    let opener = match attempt.outgoing.prepare().await {
+        Ok(prepared) => prepared.opener,
+        Err(Fault::Format(opener) | Fault::Recipients(opener) | Fault::Signer(opener)) => opener,
+        Err(_) => return Vec::new(),
+    };
+    let mut answered = Vec::new();
+    for c in &attempt.recipients {
+        let attempts = c.attempts.saturating_add(1);
+        let roll =
+            mix(attempt.message.key ^ u64::from(c.recipient) << 32 ^ u64::from(attempts)) % 4;
+        let (answer, kind) = match roll {
+            0 | 1 => (Answer::Delivered, EventKind::Delivered),
+            2 => (Answer::Failed, EventKind::Failed),
+            _ if attempts >= 3 => (Answer::Delivered, EventKind::Delivered),
+            _ => (
+                Answer::Deferred(sched::Kind::RetryAfter(1000)),
+                EventKind::Deferred,
+            ),
+        };
+        let body = EventBody {
+            kind,
+            time: clock.now(),
+            address: Vec::new(),
+            reply: b"250 ok".to_vec(),
+            attempts,
+            class: c.class,
+        };
+        ANSWERS.with_borrow_mut(|a| {
+            if let Some(a) = a {
+                a.given.push((attempt.message, c.recipient, attempts, kind));
+            }
+        });
+        answered.push(Answered {
+            recipient: c.recipient,
+            answer,
+            reply: Vec::new(),
+            event: opener.event(c.recipient, c.stamp, &body).ok(),
+        });
+    }
+    answered
 }
 
 impl Transport for Idle {
-    fn send(&self, _: Attempt) -> impl Future<Output = Vec<Answered>> {
-        std::future::ready(Vec::new())
+    fn send(&self, attempt: Attempt) -> impl Future<Output = Vec<Answered>> {
+        answer(attempt)
     }
 
     fn restore(&self, restore: Restore) -> impl Future<Output = ()> {
@@ -3177,4 +3238,179 @@ fn the_transport_ticks_every_minute_until_close() {
     });
     assert_eq!(TICKS.get() - before, 4);
     cluster.stop();
+}
+
+const MILLION: u32 = 1_000_000;
+
+async fn read_all(
+    node: &Node<Idle>,
+    after: Option<String>,
+    limit: usize,
+) -> (Vec<Given>, u32, String) {
+    let mut found = Vec::new();
+    let mut lost = 0;
+    let mut cursor = after;
+    loop {
+        let page = node
+            .events(1, cursor.as_deref(), limit)
+            .await
+            .expect("page");
+        for read in &page.events {
+            let body = read.body.as_ref().expect("opened");
+            lost += read.event.lost;
+            found.push((
+                read.event.message,
+                read.event.recipient,
+                body.attempts,
+                read.event.kind,
+            ));
+        }
+        cursor = Some(page.next);
+        if !page.more {
+            return (found, lost, cursor.unwrap_or_default());
+        }
+    }
+}
+
+async fn accept_some(nodes: &[Node<Idle>], from: usize, count: usize) {
+    for n in from..from + count {
+        let node = &nodes[n % nodes.len()];
+        let shard = owned_shard(node).await;
+        let addresses: Vec<String> = (0..3).map(|r| format!("r{n}.{r}@example.org")).collect();
+        let addresses: Vec<&str> = addresses.iter().map(String::as_str).collect();
+        accept_listed(node, shard, &addresses, u64::MAX / 2).await;
+    }
+}
+
+fn answering(nodes: &[Node<Idle>]) {
+    let clock = nodes[0].sched().clock();
+    ANSWERS.with_borrow_mut(|a| {
+        let given = a.take().map(|a| a.given).unwrap_or_default();
+        *a = Some(Answers { clock, given });
+    });
+}
+
+fn crashed_while_answering(seed: u64) -> Disk {
+    let config = Config {
+        halt_after: Some(30 + seed * 7_919 % 80),
+        faults: Faults {
+            torn_write: MILLION / 4,
+            ..Faults::default()
+        },
+        ..Config::default()
+    };
+    let first = Rc::new(SimDriver::with_disk(seed, config, created(seed)));
+    if let Some(cluster) = try_started(&first, 2, 0, None, false, settings_named(NAMING)) {
+        let nodes = cluster.nodes.clone();
+        let power = Rc::clone(&first);
+        cluster.run(async move {
+            let work = async {
+                ready(&nodes).await;
+                answering(&nodes);
+                accept_some(&nodes, 0, 8).await;
+                sleep(Duration::from_secs(3600)).await;
+            };
+            let _ = unless_halted(&power, work).await;
+        });
+        if !first.is_halted() {
+            cluster.stop();
+        }
+    }
+    first.crash()
+}
+
+fn check_events(seed: u64, whole: &[Given], given: &[Given]) {
+    let mut keys = BTreeSet::new();
+    for event in whole {
+        assert!(
+            given.contains(event),
+            "seed {seed}: event without an answer {event:?}"
+        );
+        assert!(
+            keys.insert((event.0.bytes(), event.1, event.2)),
+            "seed {seed}: event twice {event:?}"
+        );
+        if event.3 != EventKind::Deferred {
+            assert!(
+                !given
+                    .iter()
+                    .any(|g| (g.0, g.1) == (event.0, event.1) && g.2 > event.2),
+                "seed {seed}: final event before a later attempt {event:?}"
+            );
+        }
+    }
+    let mut finals: BTreeMap<([u8; 16], u32), Given> = BTreeMap::new();
+    for g in given {
+        finals.insert((g.0.bytes(), g.1), *g);
+    }
+    assert!(!finals.is_empty(), "seed {seed}: nothing answered");
+    for g in finals.values() {
+        assert_ne!(
+            g.3,
+            EventKind::Deferred,
+            "seed {seed}: last answer not final {g:?}"
+        );
+        assert!(
+            whole.contains(g),
+            "seed {seed}: final answer without event {g:?}"
+        );
+    }
+}
+
+fn events_follow_results(seed: u64) {
+    ANSWERS.set(None);
+    let disk = crashed_while_answering(seed);
+    let second = Rc::new(SimDriver::with_disk(seed + 1, Config::default(), disk));
+    let cluster = started(&second, 2);
+    let nodes = cluster.nodes.clone();
+    cluster.run(async move {
+        ready(&nodes).await;
+        answering(&nodes);
+        let done = Rc::new(Cell::new(false));
+        let reader = nodes[1].clone();
+        let finished = Rc::clone(&done);
+        let polling = spawn(async move {
+            let mut collected = Vec::new();
+            let mut lost = 0;
+            let mut cursor = None;
+            loop {
+                let closing = finished.get();
+                let (part, more_lost, next) = read_all(&reader, cursor.take(), 2).await;
+                collected.extend(part);
+                lost += more_lost;
+                cursor = Some(next);
+                if closing {
+                    return (collected, lost);
+                }
+                sleep(Duration::from_millis(300)).await;
+            }
+        });
+        accept_some(&nodes, 8, 4).await;
+        let empty = || nodes.iter().all(|n| n.spool().messages_of(1).is_empty());
+        for _ in 0..20_000 {
+            if empty() {
+                break;
+            }
+            sleep(Duration::from_millis(100)).await;
+        }
+        assert!(empty(), "seed {seed}: messages left");
+        done.set(true);
+        let (mut polled, polled_lost) = polling.await;
+        let (mut whole, lost, _) = read_all(&nodes[0], None, 1000).await;
+        assert_eq!((lost, polled_lost), (0, 0), "seed {seed}: events lost");
+        polled.sort_unstable_by_key(|e| (e.0.bytes(), e.1, e.2));
+        whole.sort_unstable_by_key(|e| (e.0.bytes(), e.1, e.2));
+        assert_eq!(
+            polled, whole,
+            "seed {seed}: cursor reads differ from a full read"
+        );
+        let given = ANSWERS.with_borrow_mut(|a| a.take().map(|a| a.given).unwrap_or_default());
+        check_events(seed, &whole, &given);
+    });
+    cluster.stop();
+}
+
+#[test]
+fn events_follow_results_across_a_crash() {
+    check(0..6, events_follow_results);
 }
