@@ -9,7 +9,7 @@ use std::rc::Rc;
 use std::task::Poll;
 use std::time::Duration;
 
-use common::{Script, Seen, Zone, policy, serve, serve_policy};
+use common::{Script, Seen, Zone, policy, policy_server, serve, serve_policy};
 use control::Leases;
 use deliver::{
     Applied, Applies, Deliver, Detail, EightBit, Message, Outcome, Remote, ResultType, Settings,
@@ -1223,6 +1223,26 @@ fn daily_refresh_fetches_a_changed_policy_without_mail() {
     });
     assert_eq!(fetched, 2);
     assert_eq!(after, 2);
+}
+
+#[test]
+fn refresh_uses_the_default_egress() {
+    let sources = run(async {
+        drop(serve(MX2, Script::new(&["STARTTLS"])));
+        let response = Rc::new(RefCell::new(policy_for("mx: mx2.example.com\n", 604_800)));
+        let (_, sources) = policy_server(WEB, Rc::clone(&response));
+        let zone = zone();
+        sts(&zone, "1");
+        let mut settings = strict();
+        settings.egress = Some(EGRESS2);
+        let deliver = verifying(zone.clone(), settings);
+        simple(&deliver, "example.com").await;
+        sts(&zone, "2");
+        sleep(Duration::from_hours(24)).await;
+        ticks(&deliver, Duration::from_mins(1), 200).await;
+        sources.borrow().clone()
+    });
+    assert_eq!(sources, [EGRESS, EGRESS2]);
 }
 
 #[test]

@@ -272,6 +272,16 @@ fn deliver(mut table: Table, delivery: &mut Delivery, roots: bool) -> Result<(),
             return Err(entry.error("needs `roots` in [tls]"));
         }
     }
+    if let Some(entry) = table.take("egress") {
+        let ip = entry
+            .str()?
+            .parse::<IpAddr>()
+            .map_err(|_| entry.error("must be an IP address"))?;
+        if ip.is_unspecified() || ip.is_multicast() {
+            return Err(entry.error("must be a unicast address"));
+        }
+        settings.egress = Some(ip);
+    }
     if let Some(entry) = table.take("eight_bit") {
         settings.eight_bit = match entry.str()? {
             "send" => deliver::EightBit::Send,

@@ -489,6 +489,7 @@ impl Sts {
         &self,
         dns: &D,
         tls: &Connector,
+        fixed: Option<IpAddr>,
         jitter: impl Fn(u64) -> u64,
     ) {
         let at = now();
@@ -507,7 +508,7 @@ impl Sts {
             let Some((_, domain)) = next else {
                 return;
             };
-            self.refresh_one(dns, tls, &domain).await;
+            self.refresh_one(dns, tls, fixed, &domain).await;
         }
     }
 
@@ -536,7 +537,13 @@ impl Sts {
         }
     }
 
-    async fn refresh_one<D: Dns>(&self, dns: &D, tls: &Connector, domain: &Name) {
+    async fn refresh_one<D: Dns>(
+        &self,
+        dns: &D,
+        tls: &Connector,
+        fixed: Option<IpAddr>,
+        domain: &Name,
+    ) {
         let end = now() + FETCH;
         let Some(id) = txt_id(dns, domain, end).await else {
             return;
@@ -546,7 +553,7 @@ impl Sts {
             let left = entry.until.saturating_sub(wall);
             entry.id != id || left < max_age_ms(&entry.policy) / 4
         });
-        if let (true, Some(egress)) = (needed, self.egress.get())
+        if let (true, Some(egress)) = (needed, fixed.or(self.egress.get()))
             && let Fetched::Busy = self.fetch(dns, tls, egress, domain, id, end).await
         {
             self.due.borrow_mut().insert((now() + BUSY, domain.clone()));
