@@ -13,7 +13,7 @@ use spool::{
     BODY_ITEM, Body, HEAD_CLEAR, Head, HeadClear, MessageId, Slice, Stamp, WRAP, slice_item,
     state_item,
 };
-use store::{HEAD_ITEM, INDEX_SIZE, MAX_PAYLOAD};
+use store::{HEAD_ITEM, INDEX_SIZE, IndexRecord, MAX_PAYLOAD};
 
 use crate::error::Refusal;
 use crate::intake::Draft;
@@ -243,6 +243,9 @@ pub struct Opener {
     generation: u32,
     message: [u8; 16],
     key: Rc<BatchKey>,
+    wrap: Box<[u8; WRAP]>,
+    batch: u64,
+    day: u32,
     replies: RefCell<BTreeSet<(u32, Stamp)>>,
     events: RefCell<BTreeSet<(u32, Stamp)>>,
 }
@@ -310,6 +313,27 @@ impl Opener {
         }
         let (key, aad) = self.stamped_key(recipient, stamp, LABEL_EVENT);
         Ok(key.seal_one(&aad, body))
+    }
+
+    pub fn event(
+        &self,
+        recipient: u32,
+        stamp: Stamp,
+        body: &crate::events::Body,
+    ) -> Result<IndexRecord, Unsealable> {
+        let sealed = self.seal_event(recipient, stamp, &body.encode())?;
+        let event = crate::events::Event {
+            generation: self.generation,
+            time: body.time,
+            kind: body.kind,
+            lost: 0,
+            message: MessageId::from_bytes(self.message),
+            recipient,
+            stamp,
+            batch: self.batch,
+            day: self.day,
+        };
+        crate::events::record(self.tenant, &event, &self.wrap, &sealed).ok_or(Unsealable::Bad)
     }
 
     pub fn open_event(
@@ -403,6 +427,9 @@ pub(crate) async fn opener(
         generation,
         message: id.bytes(),
         key,
+        wrap: Box::new(*wrap),
+        batch: clear.batch_key,
+        day: clear.day,
         replies: RefCell::new(BTreeSet::new()),
         events: RefCell::new(BTreeSet::new()),
     })

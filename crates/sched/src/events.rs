@@ -2,6 +2,7 @@ use index::{Entry, Shape};
 use spool::{MessageId, Stamp, WRAP};
 use store::IndexRecord;
 
+use crate::policy::Answer;
 use crate::requests::DAY;
 
 pub const KIND_EVENT: u8 = 3;
@@ -20,6 +21,15 @@ pub enum Kind {
 }
 
 impl Kind {
+    pub fn of(answer: Answer) -> Option<Self> {
+        match answer {
+            Answer::Delivered => Some(Self::Delivered),
+            Answer::Failed => Some(Self::Failed),
+            Answer::Deferred(_) | Answer::Later(_) => Some(Self::Deferred),
+            Answer::Unopened { .. } => None,
+        }
+    }
+
     fn code(self) -> u8 {
         match self {
             Self::Delivered => 1,
@@ -170,10 +180,50 @@ pub fn record(tenant: u32, event: &Event, wrap: &[u8; WRAP], sealed: &[u8]) -> O
     })
 }
 
+pub(crate) fn add_lost(record: &mut IndexRecord, lost: u32) -> bool {
+    let Some(event) = Event::decode(&record.entry.value) else {
+        return false;
+    };
+    if lost == 0 {
+        return false;
+    }
+    let lost = event.lost.saturating_add(lost);
+    record.entry.value = Event { lost, ..event }.encode();
+    true
+}
+
 pub fn sealed(payload: &[u8]) -> Option<(&[u8; WRAP], &[u8])> {
     payload.split_first_chunk::<WRAP>()
 }
 
 pub fn sequence(key: &[u8; index::KEY]) -> u64 {
     u64::from_be_bytes(key[4..12].try_into().expect("8"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lost_counts_add_to_the_value_only() {
+        let event = Event {
+            generation: 1,
+            time: 2,
+            kind: Kind::Deferred,
+            lost: 3,
+            message: MessageId::from_bytes([1; 16]),
+            recipient: 0,
+            stamp: Stamp { boot: 1, write: 1 },
+            batch: 4,
+            day: 5,
+        };
+        let mut record = record(9, &event, &[0; WRAP], b"sealed").expect("record");
+        let payload = record.entry.payload.clone();
+        assert!(!add_lost(&mut record, 0));
+        assert!(add_lost(&mut record, 4));
+        assert_eq!(Event::decode(&record.entry.value).map(|e| e.lost), Some(7));
+        assert_eq!(record.entry.payload, payload);
+        record.entry.value.pop();
+        assert!(!add_lost(&mut record, 1));
+    }
 }

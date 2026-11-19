@@ -3,7 +3,8 @@ use std::mem;
 
 use rt::{Sender, channel, spawn};
 use store::{
-    Batch, Change, Delivery, HEAD_ITEM, INDEX_SIZE, Keeper, MAX_PAYLOAD, Op, fits, record_size,
+    Batch, Change, Delivery, HEAD_ITEM, INDEX_SIZE, IndexRecord, Keeper, MAX_PAYLOAD, Op, fits,
+    record_size,
 };
 
 use crate::error::Error;
@@ -71,10 +72,18 @@ pub struct Reply {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Event {
+    pub record: IndexRecord,
+    pub stamp: Stamp,
+    pub carried: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Report {
     pub recipient: u32,
     pub outcome: Outcome,
     pub reply: Option<Reply>,
+    pub event: Option<Event>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -162,6 +171,8 @@ impl Entry {
 
 struct Merge {
     batch: Batch,
+    events: Vec<IndexRecord>,
+    carried: u32,
     calls: Vec<Call>,
     ending: Vec<Waiter>,
     completing: bool,
@@ -174,6 +185,8 @@ pub(crate) struct Table {
     writes: BTreeMap<u16, u64>,
     open: BTreeMap<u32, u64>,
     days: BTreeMap<u32, u64>,
+    lost: BTreeMap<u32, u32>,
+    lost_total: u64,
 }
 
 impl Table {
@@ -288,10 +301,27 @@ impl Table {
 
 fn state_bytes(report: &Report) -> usize {
     let sealed = report.reply.as_ref().map_or(0, |r| r.sealed.len());
-    record_size(INDEX_SIZE + STATE_CLEAR + sealed)
+    let event = report
+        .event
+        .as_ref()
+        .map_or(0, |e| record_size(e.record.encode().len()));
+    record_size(INDEX_SIZE + STATE_CLEAR + sealed) + event
 }
 
 impl Spool {
+    pub fn take_lost(&self, tenant: u32) -> u32 {
+        self.inner
+            .table
+            .borrow_mut()
+            .lost
+            .remove(&tenant)
+            .unwrap_or(0)
+    }
+
+    pub fn lost_events(&self) -> u64 {
+        self.inner.table.borrow().lost_total
+    }
+
     pub fn stamp(&self, shard: u16) -> Result<Stamp, Error> {
         let boot = self
             .inner
@@ -403,47 +433,74 @@ impl Spool {
 
     pub async fn report(&self, id: MessageId, reports: Vec<Report>) -> Result<Done, Error> {
         let (waiter, mut answer) = channel();
-        {
-            let mut table = self.inner.table.borrow_mut();
-            let written = table.writes.get(&id.shard).copied().unwrap_or(0);
-            let entry = table
-                .messages
-                .get_mut(&(id.shard, id.key))
-                .ok_or(Error::State("message"))?;
-            let mut seen = BTreeSet::new();
-            for report in &reports {
-                let r = report.recipient;
-                if !seen.insert(r) || !entry.claimed.contains(&r) || entry.reported.contains(&r) {
-                    return Err(Error::State("not claimed"));
-                }
-                if report
-                    .reply
-                    .as_ref()
-                    .is_some_and(|r| r.stamp.write >= written)
-                {
-                    return Err(Error::State("stamp"));
-                }
+        let admitted = self.admit(id, &reports);
+        match admitted {
+            Err(error) => {
+                self.lose(&reports);
+                return Err(error);
             }
-            let bytes: usize = reports.iter().map(state_bytes).sum();
-            let large = reports.iter().any(|report| {
-                let sealed = report.reply.as_ref().map_or(0, |r| r.sealed.len());
-                INDEX_SIZE + STATE_CLEAR + sealed > MAX_PAYLOAD
-            });
-            if reports.is_empty()
-                || large
-                || bytes as u64 > self.inner.region_size
-                || !fits(1, 1, reports.len(), reports.len())
-            {
-                return Err(Error::Limit("report"));
+            Ok(seen) => {
+                let mut table = self.inner.table.borrow_mut();
+                let entry = table
+                    .messages
+                    .get_mut(&(id.shard, id.key))
+                    .expect("admitted message");
+                entry.reported.extend(seen);
+                entry.pending.push(Call { reports, waiter });
+                self.start(entry, id);
             }
-            entry.reported.extend(seen);
-            entry.pending.push(Call { reports, waiter });
-            self.start(entry, id);
         }
         answer
             .recv()
             .await
             .unwrap_or(Err(Error::Store(store::Error::Failed)))
+    }
+
+    fn admit(&self, id: MessageId, reports: &[Report]) -> Result<BTreeSet<u32>, Error> {
+        let table = self.inner.table.borrow();
+        let written = table.writes.get(&id.shard).copied().unwrap_or(0);
+        let entry = table
+            .messages
+            .get(&(id.shard, id.key))
+            .ok_or(Error::State("message"))?;
+        let mut seen = BTreeSet::new();
+        for report in reports {
+            let r = report.recipient;
+            if !seen.insert(r) || !entry.claimed.contains(&r) || entry.reported.contains(&r) {
+                return Err(Error::State("not claimed"));
+            }
+            let late = |stamp: Stamp| stamp.write >= written;
+            if report.reply.as_ref().is_some_and(|r| late(r.stamp))
+                || report.event.as_ref().is_some_and(|e| late(e.stamp))
+            {
+                return Err(Error::State("stamp"));
+            }
+        }
+        let bytes: usize = reports.iter().map(state_bytes).sum();
+        let large = reports.iter().any(|report| {
+            let sealed = report.reply.as_ref().map_or(0, |r| r.sealed.len());
+            INDEX_SIZE + STATE_CLEAR + sealed > MAX_PAYLOAD
+        });
+        let events = reports.iter().filter(|r| r.event.is_some()).count();
+        if reports.is_empty()
+            || large
+            || bytes as u64 > self.inner.region_size
+            || !fits(1, 1, reports.len() + events, reports.len())
+        {
+            return Err(Error::Limit("report"));
+        }
+        Ok(seen)
+    }
+
+    fn lose(&self, reports: &[Report]) {
+        let mut table = self.inner.table.borrow_mut();
+        for event in reports.iter().filter_map(|r| r.event.as_ref()) {
+            let tenant = event.record.write(0).tenant;
+            let lost = event.carried.saturating_add(1);
+            let count = table.lost.entry(tenant).or_default();
+            *count = count.saturating_add(lost);
+            table.lost_total += u64::from(lost);
+        }
     }
 
     pub async fn cancel(&self, id: MessageId) -> Result<(), Error> {
@@ -490,14 +547,19 @@ impl Spool {
         let mut calls = Vec::new();
         let mut bytes = 0u64;
         let mut count = 0;
+        let mut live = 0;
         while let Some(call) = entry.pending.first() {
             let more: u64 = call.reports.iter().map(|r| state_bytes(r) as u64).sum();
             let n = count + call.reports.len();
-            if !calls.is_empty() && (bytes + more > self.inner.region_size || !fits(1, 1, n, n)) {
+            let l = live
+                + call.reports.len()
+                + call.reports.iter().filter(|r| r.event.is_some()).count();
+            if !calls.is_empty() && (bytes + more > self.inner.region_size || !fits(1, 1, l, n)) {
                 break;
             }
             bytes += more;
             count = n;
+            live = l;
             calls.push(entry.pending.remove(0));
         }
         let ends = !entry.ending.is_empty() && entry.claimed.len() == count;
@@ -546,6 +608,12 @@ impl Spool {
         } else {
             Vec::new()
         };
+        let events: Vec<IndexRecord> = reports()
+            .filter_map(|r| r.event.as_ref().map(|e| e.record.clone()))
+            .collect();
+        let carried = reports()
+            .filter_map(|r| r.event.as_ref())
+            .fold(0u32, |sum, e| sum.saturating_add(e.carried));
         let batch = Batch {
             shard,
             message,
@@ -554,6 +622,8 @@ impl Spool {
         };
         Some(Merge {
             batch,
+            events,
+            carried,
             calls,
             ending,
             completing,
@@ -562,16 +632,42 @@ impl Spool {
 
     async fn flush(&self, shard: u16, message: u64) {
         while let Some(merge) = self.merge(shard, message) {
-            let result = self.inner.changes.apply(merge.batch).await;
+            let tenant = merge.batch.tenant;
+            let events = merge.events.len();
+            let (result, kept) = if merge.events.is_empty() {
+                (self.inner.changes.apply(merge.batch).await.map(drop), true)
+            } else {
+                let plain = merge.batch.clone();
+                match self
+                    .inner
+                    .changes
+                    .apply_indexed(merge.batch, shard, merge.events, true)
+                    .await
+                {
+                    Ok(applied) => (Ok(()), !applied.indexed.is_empty()),
+                    Err(store::Error::Invalid(_) | store::Error::CommitTooLarge) => {
+                        (self.inner.changes.apply(plain).await.map(drop), false)
+                    }
+                    Err(e) => (Err(e), false),
+                }
+            };
             let mut table = self.inner.table.borrow_mut();
+            if !kept {
+                let lost = u32::try_from(events)
+                    .unwrap_or(u32::MAX)
+                    .saturating_add(merge.carried);
+                let count = table.lost.entry(tenant).or_default();
+                *count = count.saturating_add(lost);
+                table.lost_total += u64::from(lost);
+            }
             let key = (shard, message);
             let mut closed = None;
             let answer = match result {
-                Ok(_) if merge.completing => {
+                Ok(()) if merge.completing => {
                     closed = table.remove(key);
                     Ok(Done::Dropped)
                 }
-                Ok(_) => {
+                Ok(()) => {
                     let entry = table.messages.get_mut(&key).expect("flushed message");
                     let mut finals = 0;
                     for report in merge.calls.iter().flat_map(|c| c.reports.iter()) {

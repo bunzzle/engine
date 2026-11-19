@@ -1156,6 +1156,23 @@ fn events_seal_under_their_message_and_open_from_the_record() {
             ..event
         };
         assert!(node.event_opener(1, &older, wrap).await.is_err());
+        let next = node.spool().stamp(shard).expect("stamp");
+        let built = opener.event(1, next, &capped).expect("event");
+        let value = Event::decode(&built.entry.value).expect("value");
+        assert_eq!(
+            value,
+            Event {
+                recipient: 1,
+                stamp: next,
+                lost: 0,
+                ..event
+            }
+        );
+        let (wrap, inner) = event_sealed(&built.entry.payload).expect("payload");
+        assert_eq!(wrap, &sealed.wrap);
+        let clear = reader.open_event(1, next, inner).expect("open");
+        assert_eq!(EventBody::decode(&clear), Some(capped.clone()));
+        assert_eq!(opener.event(1, next, &capped).err(), Some(Unsealable::Bad));
     });
     cluster.stop();
 }
