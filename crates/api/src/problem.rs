@@ -66,6 +66,14 @@ impl Problem {
         Self::new(Status::BAD_REQUEST, "bad_message", message)
     }
 
+    pub fn bad_cursor() -> Self {
+        Self::new(
+            Status::BAD_REQUEST,
+            "bad_cursor",
+            "`after` is not a valid cursor",
+        )
+    }
+
     pub fn unauthorized() -> Self {
         Self::new(Status::UNAUTHORIZED, "unauthorized", "unauthorized")
     }

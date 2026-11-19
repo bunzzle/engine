@@ -42,7 +42,7 @@ impl<T: Transport + 'static, S: Source> Handler<'_, T, S> {
         let answer = match route {
             Route::Messages => self.send(request).await?,
             Route::Raw => self.raw(request).await?,
-            Route::Health | Route::Other => return Err(Problem::not_found().into()),
+            Route::Events | Route::Health | Route::Other => return Err(Problem::not_found().into()),
         };
         Ok(match answer {
             Answer::Accepted(message) => accepted(id, &message),

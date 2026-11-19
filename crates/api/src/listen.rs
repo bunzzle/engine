@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::rc::Rc;
 
 use intake::{End, Guard, Listener};
@@ -85,6 +86,7 @@ pub fn start<T: Transport + 'static>(
         guard: guard.clone(),
         stats: Rc::clone(&stats),
         forward: Rc::clone(&forward),
+        reading: RefCell::default(),
     });
     let owner = Rc::clone(&context);
     forward.serve_with(Box::new(move |inbound, open| {

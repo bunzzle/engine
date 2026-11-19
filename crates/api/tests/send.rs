@@ -24,8 +24,8 @@ use keys::{
 use rt::sim::{Config, Disk, Machine, SimDriver, Stalls, check};
 use rt::{Ends, JoinHandle, Mesh, Notify, Runtime, TcpListener, TcpStream, sleep, spawn, timeout};
 use sched::{
-    Answered, Attempt, Body, Clock, Keyring, Keys, Meshes, Node, Parts, Reason, Running, Settings,
-    Transport,
+    Answer, Answered, Attempt, Body, Clock, EventBody, EventKind, Keyring, Keys, Meshes, Node,
+    Parts, Reason, Running, Settings, Transport,
 };
 use spool::MessageId;
 use store::{Client, Committer, DataFile, Options, SLOT_SIZE, Setup, boot};
@@ -60,6 +60,7 @@ struct Seen {
     headers: RefCell<BTreeMap<MessageId, (Vec<u8>, usize)>>,
     routed: RefCell<BTreeSet<String>>,
     optional: Cell<u32>,
+    deliver: Cell<Option<Clock>>,
 }
 
 struct Idle(Rc<Seen>);
@@ -90,7 +91,35 @@ impl Transport for Idle {
         seen.headers
             .borrow_mut()
             .insert(attempt.message, (header, count));
-        Vec::new()
+        let Some(clock) = seen.deliver.get() else {
+            return Vec::new();
+        };
+        attempt
+            .recipients
+            .iter()
+            .map(|c| {
+                let address = prepared
+                    .recipients
+                    .iter()
+                    .find(|(r, _)| *r == c.recipient)
+                    .map(|(_, r)| r.address.as_bytes().to_vec())
+                    .unwrap_or_default();
+                let body = EventBody {
+                    kind: EventKind::Delivered,
+                    time: clock.now(),
+                    address,
+                    reply: b"250 2.0.0 ok".to_vec(),
+                    attempts: c.attempts.saturating_add(1),
+                    class: c.class,
+                };
+                Answered {
+                    recipient: c.recipient,
+                    answer: Answer::Delivered,
+                    reply: Vec::new(),
+                    event: prepared.opener.event(c.recipient, c.stamp, &body).ok(),
+                }
+            })
+            .collect()
     }
 }
 
@@ -1662,6 +1691,182 @@ fn tenants_never_share_keys_or_senders() {
             ports.close().await;
         });
         owners.join(&cluster.machine);
+        cluster.stop();
+    });
+}
+
+fn get(token: &str, query: &str) -> Vec<u8> {
+    format!(
+        "GET /v1/events{query} HTTP/1.1\r\nHost: api.test\r\nAuthorization: Bearer {token}\r\n\r\n"
+    )
+    .into_bytes()
+}
+
+fn page(reply: &Reply) -> (Vec<Value>, String, bool) {
+    assert_eq!(reply.status, 200, "{reply:?}");
+    let value = reply.json();
+    let events = value
+        .get("events")
+        .and_then(Value::as_array)
+        .expect("events")
+        .to_vec();
+    let next = value
+        .get("next")
+        .and_then(Value::as_str)
+        .expect("next")
+        .to_owned();
+    let more = value.get("more").and_then(Value::as_bool).expect("more");
+    (events, next, more)
+}
+
+#[test]
+fn events_are_read_in_pages_over_http() {
+    check(0..2, |seed| {
+        let cluster = started(seed, 2);
+        let nodes = cluster.nodes.clone();
+        let seen = Rc::clone(&cluster.seen);
+        cluster.run(async move {
+            let tokens = prepare(&nodes).await;
+            seen.deliver.set(Some(nodes[0].sched().clock()));
+            let ports = serve(&nodes[0], seed, ApiConfig::new("mx1.example.net".into())).await;
+            let mut http = Http::plain().await;
+            let mut expected = BTreeSet::new();
+            for to in [
+                r#"["a@example.com","b@example.com"]"#,
+                r#""c@example.com""#,
+                r#"["d@example.com","e@example.com"]"#,
+            ] {
+                let body = format!(r#"{{"from":"ann@example.org","to":{to},"text":"x"}}"#);
+                let id = http.post(&tokens.first, &body).await.id();
+                let count = to.matches('@').count();
+                for recipient in 0..count {
+                    expected.insert((id.clone(), recipient as u64));
+                }
+            }
+
+            let mut found = Vec::new();
+            let mut cursor = String::new();
+            for _ in 0..2000 {
+                let query = if cursor.is_empty() {
+                    "?limit=2".to_owned()
+                } else {
+                    format!("?limit=2&after={cursor}")
+                };
+                let (events, next, more) =
+                    page(&http.send_reply(&get(&tokens.first, &query)).await);
+                assert!(events.len() <= 2);
+                found.extend(events);
+                cursor = next;
+                if found.len() >= expected.len() && !more {
+                    break;
+                }
+                if !more {
+                    sleep(Duration::from_millis(10)).await;
+                }
+            }
+            let mut keys = BTreeSet::new();
+            for event in &found {
+                let text = |name: &str| {
+                    event
+                        .get(name)
+                        .and_then(Value::as_str)
+                        .expect(name)
+                        .to_owned()
+                };
+                let number = |name: &str| event.get(name).and_then(Value::as_u64).expect(name);
+                assert_eq!(text("type"), "delivered");
+                let time = text("time");
+                assert!(time.len() == 24 && time.ends_with('Z'), "{time}");
+                assert!(text("address").ends_with("@example.com"));
+                assert_eq!(text("reply"), "250 2.0.0 ok");
+                assert_eq!(number("attempts"), 1);
+                assert!(event.get("lost").is_none());
+                keys.insert((text("message_id"), number("recipient")));
+            }
+            assert_eq!(found.len(), expected.len());
+            assert_eq!(keys, expected);
+            let after = format!("?after={cursor}");
+            let (events, _, more) = page(&http.send_reply(&get(&tokens.first, &after)).await);
+            assert!(events.is_empty() && !more);
+
+            let (events, _, more) = page(&http.send_reply(&get(&tokens.second, "")).await);
+            assert!(events.is_empty() && !more);
+            let reply = http.send_reply(&get(&tokens.second, &after)).await;
+            assert_eq!((reply.status, reply.code().as_str()), (400, "bad_cursor"));
+            assert_eq!(ports.count(Route::Events, 400), 1);
+            ports.close().await;
+        });
+        cluster.stop();
+    });
+}
+
+#[test]
+fn event_reads_refuse_bad_queries_and_parallel_reads() {
+    check(0..2, |seed| {
+        let cluster = started(seed, 2);
+        let nodes = cluster.nodes.clone();
+        cluster.run(async move {
+            let tokens = prepare(&nodes).await;
+            let ports = serve(&nodes[0], seed, ApiConfig::new("mx1.example.net".into())).await;
+            let mut http = Http::plain().await;
+            let (_, cursor, _) = page(&http.send_reply(&get(&tokens.first, "")).await);
+            let reply = http
+                .send_reply(&get(&tokens.second, &format!("?after={cursor}")))
+                .await;
+            assert_eq!((reply.status, reply.code().as_str()), (400, "bad_cursor"));
+            for query in ["?after=zz", "?after="] {
+                let reply = http.send_reply(&get(&tokens.first, query)).await;
+                assert_eq!(
+                    (reply.status, reply.code().as_str()),
+                    (400, "bad_cursor"),
+                    "{query}"
+                );
+            }
+            for query in [
+                "?limit=0",
+                "?limit=1001",
+                "?limit=+5",
+                "?limit=",
+                "?limit=99999999999999999999999",
+                "?limit=1&limit=1",
+                "?other=1",
+                "?limit",
+                "?limit=1&",
+            ] {
+                let reply = http.send_reply(&get(&tokens.first, query)).await;
+                assert_eq!(
+                    (reply.status, reply.code().as_str()),
+                    (400, "bad_request"),
+                    "{query}"
+                );
+            }
+            let reply = http.send_reply(&get(&tokens.first, "?")).await;
+            assert_eq!(reply.status, 200);
+            let reply = http.send_reply(&get(&tokens.smtp, "")).await;
+            assert_eq!(reply.status, 401);
+            for method in ["POST", "OPTIONS", "DELETE"] {
+                let request = format!(
+                    "{method} /v1/events HTTP/1.1\r\nHost: api.test\r\nContent-Length: 0\r\n\r\n"
+                );
+                let reply = http.send_reply(request.as_bytes()).await;
+                assert_eq!(reply.status, 405, "{method}");
+                assert_eq!(reply.header("allow"), Some("GET, HEAD"));
+            }
+
+            let head = format!(
+                "HEAD /v1/events HTTP/1.1\r\nHost: api.test\r\nAuthorization: Bearer {}\r\n\
+                 Connection: close\r\n\r\n",
+                tokens.first
+            );
+            let mut probe = Http::plain().await;
+            probe.send(head.as_bytes()).await;
+            while probe.fill().await {}
+            let text = String::from_utf8(probe.input.clone()).expect("ascii");
+            assert!(text.starts_with("HTTP/1.1 200"), "{text}");
+            assert!(text.ends_with("\r\n\r\n"), "{text}");
+            assert!(ports.count(Route::Events, 200) >= 3);
+            ports.close().await;
+        });
         cluster.stop();
     });
 }

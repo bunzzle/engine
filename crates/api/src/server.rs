@@ -1,5 +1,5 @@
 use std::cell::{Cell, RefCell};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::future::poll_fn;
 use std::net::IpAddr;
@@ -16,6 +16,7 @@ use rt::{Instant, TcpStream, now, timeout};
 use sched::{Node, Transport};
 use tls::Acceptor;
 
+use crate::events;
 use crate::forward::{Ahead, Back, Forwarder, Inbound, Link, Open, Remote};
 use crate::handler::{Handler, Source, chunk, key, ok, refusal};
 use crate::problem::Problem;
@@ -47,6 +48,7 @@ impl Config {
 pub enum Route {
     Messages,
     Raw,
+    Events,
     Health,
     Other,
 }
@@ -63,6 +65,7 @@ pub(crate) struct Context<T> {
     pub(crate) guard: Guard,
     pub(crate) stats: Rc<Stats>,
     pub(crate) forward: Rc<Forwarder>,
+    pub(crate) reading: RefCell<BTreeSet<u32>>,
 }
 
 pub(crate) struct Port {
@@ -284,6 +287,10 @@ impl<T: Transport + 'static> Session<'_, T> {
                 (Route::Raw, self.post(Route::Raw, request, &id).await)
             }
             "/v1/messages/raw" => (Route::Raw, Err(Problem::method("POST").into())),
+            "/v1/events" if request.method == "GET" || request.method == "HEAD" => {
+                (Route::Events, self.events(request, &id).await)
+            }
+            "/v1/events" => (Route::Events, Err(Problem::method("GET, HEAD").into())),
             _ => (Route::Other, Err(Problem::not_found().into())),
         };
         match answer {
@@ -304,6 +311,11 @@ impl<T: Transport + 'static> Session<'_, T> {
             return Err(Problem::unavailable().into());
         }
         Ok(ok(id, "{\"status\":\"ok\"}".into()))
+    }
+
+    async fn events(&mut self, request: &Request, id: &str) -> Result<Response, Stop> {
+        let grant = self.auth(request).await?;
+        events::read(self.context, grant.tenant, request, id).await
     }
 
     async fn post(&mut self, route: Route, request: &Request, id: &str) -> Result<Response, Stop> {
