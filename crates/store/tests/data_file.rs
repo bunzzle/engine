@@ -294,8 +294,58 @@ fn a_failed_sync_fails_the_data_file() {
 }
 
 #[test]
+fn a_store_without_a_checkpoint_keeps_room_for_two() {
+    let mut fresh = Regions::new(8, 0);
+    let mut taken = 0;
+    while fresh.acquire(Claim::Internal).is_ok() {
+        taken += 1;
+    }
+    assert_eq!(taken, 4);
+    for _ in 0..4 {
+        fresh.acquire(Claim::Checkpoint).expect("checkpoint region");
+    }
+    let mut steady = Regions::new(8, 0);
+    steady.checkpointed();
+    let mut taken = 0;
+    while steady.acquire(Claim::Internal).is_ok() {
+        taken += 1;
+    }
+    assert_eq!(taken, 6);
+}
+
+#[test]
+fn the_smallest_accepted_layout_completes_its_first_checkpoint() {
+    let mut regions = Regions::new(9, 1);
+    regions.add_state_reserve();
+    regions.add_flush_reserve(1);
+    for claim in [
+        Claim::Intake,
+        Claim::Control,
+        Claim::Internal,
+        Claim::Flush,
+        Claim::State,
+    ] {
+        while regions.acquire(claim).is_ok() {}
+    }
+    for _ in 0..4 {
+        regions
+            .acquire(Claim::Checkpoint)
+            .expect("checkpoint region");
+    }
+}
+
+#[test]
+#[should_panic(expected = "reserve exceeds region count")]
+fn a_layout_without_room_for_the_first_checkpoint_is_refused() {
+    let mut regions = Regions::new(9, 1);
+    regions.add_state_reserve();
+    regions.add_flush_reserve(2);
+}
+
+#[test]
 fn each_claim_stops_at_its_reserve() {
     let mut regions = Regions::new(8, 2);
+    regions.checkpointed();
     assert_eq!(regions.acquire(Claim::Intake).expect("first"), 0);
     assert_eq!(regions.acquire(Claim::Intake).expect("second"), 1);
     assert!(matches!(
@@ -330,6 +380,7 @@ fn each_claim_stops_at_its_reserve() {
 #[test]
 fn a_compaction_reservation_holds_regions_from_intake_and_control() {
     let mut regions = Regions::new(10, 1);
+    regions.checkpointed();
     regions.reserve_internal(3).expect("reserve");
     assert!(matches!(regions.reserve_internal(6), Err(Error::Full)));
     regions.acquire(Claim::Intake).expect("intake");
@@ -353,6 +404,7 @@ fn a_compaction_reservation_holds_regions_from_intake_and_control() {
 #[test]
 fn each_session_keeps_one_region_for_state() {
     let mut regions = Regions::new(9, 1);
+    regions.checkpointed();
     regions.add_state_reserve();
     assert_eq!(regions.state_reserve(), 1);
     for _ in 0..3 {
@@ -377,6 +429,7 @@ fn each_session_keeps_one_region_for_state() {
 #[test]
 fn flushes_and_merges_keep_their_own_reserves() {
     let mut regions = Regions::new(12, 1);
+    regions.checkpointed();
     regions.add_state_reserve();
     regions.add_flush_reserve(2);
     assert_eq!((regions.floor(), regions.held()), (5, 7));
@@ -406,6 +459,7 @@ fn flushes_and_merges_keep_their_own_reserves() {
 #[test]
 fn merges_claim_only_what_they_reserved() {
     let mut regions = Regions::new(14, 0);
+    regions.checkpointed();
     regions.add_flush_reserve(1);
     assert!(matches!(regions.acquire(Claim::Index), Err(Error::Full)));
     regions.reserve_index(9).expect("reserve");

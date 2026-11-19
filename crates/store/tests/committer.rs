@@ -18,7 +18,7 @@ const PATH: &str = "/data/store";
 const OPTIONS: Options = Options {
     journal_size: 16 * SLOT_SIZE,
     region_size: 2 * SLOT_SIZE,
-    region_count: 8,
+    region_count: 10,
     shards: 4,
 };
 
@@ -143,6 +143,7 @@ fn the_stream_moves_to_a_new_region_when_full() {
     let driver = created(2);
     run(&driver, async {
         let (client, committer) = start(0).await;
+        client.checkpoint().await.expect("checkpoint");
         let mut regions = BTreeSet::new();
         for step in 0..30u64 {
             let durable = client
@@ -250,6 +251,7 @@ fn intake_is_refused_at_the_reserve() {
     let driver = created(4);
     run(&driver, async {
         let (client, committer) = start(3).await;
+        client.checkpoint().await.expect("checkpoint");
         client
             .commit(submission(vec![payload(0, 0, 10)]))
             .await
@@ -263,7 +265,7 @@ fn intake_is_refused_at_the_reserve() {
             .await
             .expect("internal claim");
         drop(client);
-        assert_eq!(committer.await.regions().free(), 5);
+        assert_eq!(committer.await.regions().free(), 7);
     });
 }
 

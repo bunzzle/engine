@@ -409,6 +409,7 @@ impl Committer {
         for region in std::mem::replace(&mut self.checkpoint, regions) {
             self.regions.release(region);
         }
+        self.regions.checkpointed();
         self.free_unpinned(pending);
         self.release_state(&referenced);
         Ok(position)

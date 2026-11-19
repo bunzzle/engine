@@ -23,12 +23,13 @@ pub struct Regions {
     flush_reserve: u32,
     reserved: u32,
     merging: u32,
+    first: bool,
 }
 
 impl Regions {
     pub fn new(count: u32, reserve: u32) -> Self {
         assert!(
-            reserve + COMPACTION_RESERVE + CHECKPOINT_RESERVE <= count,
+            reserve + COMPACTION_RESERVE + 2 * CHECKPOINT_RESERVE <= count,
             "reserve exceeds region count"
         );
         Self {
@@ -39,6 +40,19 @@ impl Regions {
             flush_reserve: 0,
             reserved: 0,
             merging: 0,
+            first: true,
+        }
+    }
+
+    pub fn checkpointed(&mut self) {
+        self.first = false;
+    }
+
+    fn checkpoint_reserve(&self) -> u32 {
+        if self.first {
+            2 * CHECKPOINT_RESERVE
+        } else {
+            CHECKPOINT_RESERVE
         }
     }
 
@@ -79,7 +93,7 @@ impl Regions {
     }
 
     pub fn floor(&self) -> u32 {
-        CHECKPOINT_RESERVE + self.state_reserve + self.flush_reserve
+        self.checkpoint_reserve() + self.state_reserve + self.flush_reserve
     }
 
     pub fn held(&self) -> u32 {
@@ -135,8 +149,8 @@ impl Regions {
             Claim::Intake => self.reserve + held,
             Claim::Control => held,
             Claim::Internal => self.floor() + self.merging,
-            Claim::State => CHECKPOINT_RESERVE,
-            Claim::Flush => CHECKPOINT_RESERVE + self.state_reserve,
+            Claim::State => self.checkpoint_reserve(),
+            Claim::Flush => self.checkpoint_reserve() + self.state_reserve,
             Claim::Index => self.floor() + self.reserved + self.merging - 1,
             Claim::Checkpoint => 0,
         };

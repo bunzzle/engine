@@ -7,7 +7,7 @@ use rt::sim::{Config, Faults, SimDriver, check};
 use rt::{Buf, File, JoinHandle, OpenOptions, Runtime, sleep, spawn};
 use store::{
     Body, Claim, Client, Committer, DataFile, Durable, Error, Location, Options, Range, Record,
-    Recovered, SLOT_SIZE, Submission, Write, checksum, load, recover,
+    Recovered, SLOT_SIZE, Setup, Submission, Write, boot, checksum, load, recover,
 };
 
 const MILLION: u32 = 1_000_000;
@@ -346,6 +346,47 @@ fn a_full_store_can_still_checkpoint() {
         client.checkpoint().await.expect("checkpoint");
         drop((leases, client));
         committer.await;
+    });
+}
+
+#[test]
+fn a_fresh_store_filled_before_its_first_checkpoint_keeps_checkpointing() {
+    let driver = created(6);
+    run(&driver, async {
+        let (client, committer) = start().await;
+        let mut leases = Vec::new();
+        while let Ok(lease) = client.allocate(Claim::Internal).await {
+            leases.push(lease);
+        }
+        for round in 0..3 {
+            client
+                .checkpoint()
+                .await
+                .unwrap_or_else(|e| panic!("checkpoint {round}: {e}"));
+        }
+        drop((leases, client));
+        committer.await;
+    });
+}
+
+#[test]
+fn a_fresh_store_at_the_reserve_limit_boots() {
+    let driver = created(7);
+    run(&driver, async {
+        let setup = Setup {
+            cores: 1,
+            credits: 4,
+            reserve: OPTIONS.region_count - 9,
+            flush: 1,
+        };
+        let booted = boot(PATH, setup).await.expect("boot");
+        assert_eq!(booted.starts.len(), 1);
+        drop(booted);
+        let tight = Setup {
+            reserve: setup.reserve + 1,
+            ..setup
+        };
+        assert!(matches!(boot(PATH, tight).await, Err(Error::Config(_))));
     });
 }
 
