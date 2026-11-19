@@ -29,7 +29,7 @@ pub struct Regions {
 impl Regions {
     pub fn new(count: u32, reserve: u32) -> Self {
         assert!(
-            reserve + COMPACTION_RESERVE + CHECKPOINT_RESERVE <= count,
+            reserve + COMPACTION_RESERVE + 2 * CHECKPOINT_RESERVE <= count,
             "reserve exceeds region count"
         );
         Self {
@@ -74,7 +74,7 @@ impl Regions {
 
     pub fn add_state_reserve(&mut self) {
         assert!(
-            self.reserve + COMPACTION_RESERVE + self.base_floor() < self.count(),
+            self.reserve + COMPACTION_RESERVE + self.floor() < self.count(),
             "reserve exceeds region count"
         );
         self.state_reserve += 1;
@@ -86,14 +86,10 @@ impl Regions {
 
     pub fn add_flush_reserve(&mut self, regions: u32) {
         assert!(
-            self.reserve + COMPACTION_RESERVE + self.base_floor() + regions <= self.count(),
+            self.reserve + COMPACTION_RESERVE + self.floor() + regions <= self.count(),
             "reserve exceeds region count"
         );
         self.flush_reserve += regions;
-    }
-
-    fn base_floor(&self) -> u32 {
-        CHECKPOINT_RESERVE + self.state_reserve + self.flush_reserve
     }
 
     pub fn floor(&self) -> u32 {

@@ -314,6 +314,35 @@ fn a_store_without_a_checkpoint_keeps_room_for_two() {
 }
 
 #[test]
+fn the_smallest_accepted_layout_completes_its_first_checkpoint() {
+    let mut regions = Regions::new(9, 1);
+    regions.add_state_reserve();
+    regions.add_flush_reserve(1);
+    for claim in [
+        Claim::Intake,
+        Claim::Control,
+        Claim::Internal,
+        Claim::Flush,
+        Claim::State,
+    ] {
+        while regions.acquire(claim).is_ok() {}
+    }
+    for _ in 0..4 {
+        regions
+            .acquire(Claim::Checkpoint)
+            .expect("checkpoint region");
+    }
+}
+
+#[test]
+#[should_panic(expected = "reserve exceeds region count")]
+fn a_layout_without_room_for_the_first_checkpoint_is_refused() {
+    let mut regions = Regions::new(9, 1);
+    regions.add_state_reserve();
+    regions.add_flush_reserve(2);
+}
+
+#[test]
 fn each_claim_stops_at_its_reserve() {
     let mut regions = Regions::new(8, 2);
     regions.checkpointed();

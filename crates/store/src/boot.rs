@@ -62,7 +62,7 @@ pub async fn boot(path: impl AsRef<Path>, setup: Setup) -> Result<Booted, Error>
         .checked_add(1)
         .and_then(|per_core| per_core.checked_mul(u32::from(setup.cores)))
         .and_then(|cores| cores.checked_add(setup.reserve))
-        .and_then(|kept| kept.checked_add(CHECKPOINT_RESERVE + COMPACTION_RESERVE));
+        .and_then(|kept| kept.checked_add(2 * CHECKPOINT_RESERVE + COMPACTION_RESERVE));
     if kept.is_none_or(|kept| kept >= superblock.region_count()) {
         return Err(Error::Config("reserves leave no region for intake"));
     }

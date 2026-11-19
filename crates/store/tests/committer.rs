@@ -18,7 +18,7 @@ const PATH: &str = "/data/store";
 const OPTIONS: Options = Options {
     journal_size: 16 * SLOT_SIZE,
     region_size: 2 * SLOT_SIZE,
-    region_count: 8,
+    region_count: 10,
     shards: 4,
 };
 
@@ -265,7 +265,7 @@ fn intake_is_refused_at_the_reserve() {
             .await
             .expect("internal claim");
         drop(client);
-        assert_eq!(committer.await.regions().free(), 5);
+        assert_eq!(committer.await.regions().free(), 7);
     });
 }
 

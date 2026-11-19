@@ -376,16 +376,16 @@ fn a_fresh_store_at_the_reserve_limit_boots() {
         let setup = Setup {
             cores: 1,
             credits: 4,
-            reserve: OPTIONS.region_count - 7,
+            reserve: OPTIONS.region_count - 9,
             flush: 1,
         };
         let booted = boot(PATH, setup).await.expect("boot");
         assert_eq!(booted.starts.len(), 1);
+        drop(booted);
         let tight = Setup {
             reserve: setup.reserve + 1,
             ..setup
         };
-        drop(booted);
         assert!(matches!(boot(PATH, tight).await, Err(Error::Config(_))));
     });
 }

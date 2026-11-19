@@ -16,7 +16,7 @@ const PATH: &str = "/data/store";
 const OPTIONS: Options = Options {
     journal_size: 16 * SLOT_SIZE,
     region_size: 2 * SLOT_SIZE,
-    region_count: 8,
+    region_count: 10,
     shards: 4,
 };
 
