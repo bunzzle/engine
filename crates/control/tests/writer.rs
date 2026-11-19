@@ -7,9 +7,9 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use control::{
-    Access, Created, Dkim, Domain, Error, KIND_ACCESS, KIND_DKIM, KIND_DOMAIN, KIND_TENANT,
-    KeyError, KeySource, Limits, Loaded, Object, Pool, Ready, Scopes, Snapshot, State, Table,
-    Tenant, Update, Verification, Writer,
+    Access, Created, Dkim, Domain, Error, KIND_ACCESS, KIND_DKIM, KIND_DOMAIN, KIND_HOOK,
+    KIND_TENANT, KeyError, KeySource, Limits, Loaded, Object, Pool, Ready, Scopes, Snapshot, State,
+    Table, Tenant, Update, Verification, Writer,
 };
 use crypto::{DkimAlg, Secret, Tenant as Root, TenantKeys};
 use rt::sim::{Config, Disk, SimDriver, check};
@@ -653,6 +653,65 @@ fn domains_load_sealed_and_removed_dkim_keys_stay_gone() {
         assert_eq!(writer.skipped(), 0);
         assert_eq!(writer.reserve_domain().await.expect("reserve"), 3);
         assert_eq!(writer.dkim_next(), 3);
+        node.close().await;
+    });
+}
+
+#[test]
+fn hooks_load_sealed_keep_their_ids_and_go_with_their_tenant() {
+    let ((), driver) = on(3, Config::default(), created(3), || async {
+        let (node, loaded, _) = Node::open(BUDGET).await;
+        let mut writer = loaded.writer(node.changes.clone());
+        writer
+            .write(tenant(4, State::Active))
+            .await
+            .expect("tenant");
+        writer
+            .write(tenant(5, State::Active))
+            .await
+            .expect("tenant");
+        for id in 1..=3 {
+            assert_eq!(writer.reserve_hook().await.expect("reserve"), id);
+        }
+        let first = Object::Hook(super::hook::hook(1, 4));
+        assert!(matches!(
+            writer.write(first.clone()).await,
+            Err(Error::Invalid("kind"))
+        ));
+        writer.write_sealed(first, &keys(4, 1)).await.expect("hook");
+        writer
+            .write_sealed(Object::Hook(super::hook::hook(2, 5)), &keys(5, 1))
+            .await
+            .expect("hook");
+        writer
+            .write_sealed(Object::Hook(super::hook::hook(3, 4)), &keys(4, 1))
+            .await
+            .expect("hook");
+        writer
+            .remove(&Object::Hook(super::hook::hook(3, 4)))
+            .await
+            .expect("remove");
+        node.close().await;
+    });
+    on(4, Config::default(), driver.crash(), || async {
+        let (node, loaded, snapshot) = Node::open(BUDGET).await;
+        let table = table(snapshot);
+        let opened = table.hook(4, 1).expect("hook");
+        assert_eq!(&*opened.url, "https://hooks.example.org/in?token=abc");
+        assert!(table.hook(5, 1).is_none());
+        assert_eq!(table.hooks(4).map(|h| h.id).collect::<Vec<_>>(), [1]);
+        assert_eq!(table.hooks(5).map(|h| h.id).collect::<Vec<_>>(), [2]);
+        let mut writer = loaded.writer(node.changes.clone());
+        assert_eq!(writer.skipped(), 0);
+        assert_eq!(writer.hook_next(), 4);
+        let mut removed = Vec::new();
+        writer
+            .sweep(&|tenant, _| tenant == 4, &mut removed)
+            .await
+            .expect("sweep");
+        let found: Vec<(u8, u32)> = removed.iter().map(|r| (r.kind, r.id)).collect();
+        assert_eq!(found, [(KIND_HOOK, 1)]);
+        assert_eq!(writer.reserve_hook().await.expect("reserve"), 4);
         node.close().await;
     });
 }

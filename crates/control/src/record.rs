@@ -16,12 +16,15 @@ pub const KIND_DOMAIN: u8 = 7;
 pub const KIND_FLOOR: u8 = 8;
 pub const KIND_STS: u8 = 9;
 pub const KIND_RPT: u8 = 10;
+pub const KIND_HOOK: u8 = 11;
 pub const SYSTEM: u32 = 0;
 pub const MAX_POOLS: usize = 16;
 pub const MAX_ADDRESSES: usize = 64;
 pub const MAX_SELECTOR: usize = 63;
 pub const MAX_PUBLIC: usize = 1024;
 pub const MAX_BLOB: usize = 3072;
+pub const MAX_URL: usize = 2048;
+pub const ALL_EVENTS: u8 = 0x3f;
 
 const FORMAT: u8 = 1;
 const HEAD: usize = 16;
@@ -32,6 +35,7 @@ const DKIM: usize = 16;
 const DKIM_SECRET: usize = 4;
 const ACCESS: usize = 48;
 const DOMAIN: usize = 24;
+const HOOK: usize = 24;
 const DOMAINKEY: &str = "._domainkey.";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -207,6 +211,77 @@ impl Domain {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HookState {
+    Active,
+    Paused,
+    Gone,
+    Failing,
+}
+
+impl HookState {
+    fn code(self) -> u8 {
+        match self {
+            Self::Active => 1,
+            Self::Paused => 2,
+            Self::Gone => 3,
+            Self::Failing => 4,
+        }
+    }
+
+    fn from_code(code: u8) -> Option<Self> {
+        match code {
+            1 => Some(Self::Active),
+            2 => Some(Self::Paused),
+            3 => Some(Self::Gone),
+            4 => Some(Self::Failing),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Hook {
+    pub id: u32,
+    pub tenant: u32,
+    pub generation: u32,
+    pub state: HookState,
+    pub events: u8,
+    pub version: u8,
+    pub previous_until: u64,
+    pub url: Box<str>,
+}
+
+impl Hook {
+    pub fn wants(&self, kind: u8) -> bool {
+        kind < 8 && self.events & (1 << kind) != 0
+    }
+}
+
+pub fn hook_url_ok(url: &str) -> bool {
+    let Some(rest) = url.strip_prefix("https://") else {
+        return false;
+    };
+    let authority = &rest[..rest.find(['/', '?']).unwrap_or(rest.len())];
+    let (host, port) = match authority.rsplit_once(':') {
+        Some((host, port)) => (host, Some(port)),
+        None => (authority, None),
+    };
+    let port_ok = port.is_none_or(|port| {
+        !port.starts_with('0') && port.parse::<u16>().is_ok_and(|port| port > 0)
+    });
+    let numeric = host
+        .rsplit('.')
+        .next()
+        .is_some_and(|label| label.bytes().all(|b| b.is_ascii_digit()));
+    url.len() <= MAX_URL
+        && url.bytes().all(|b| b.is_ascii_graphic() && b != b'#')
+        && port_ok
+        && domain_ok(host)
+        && host.contains('.')
+        && !numeric
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Object {
     Tenant(Tenant),
@@ -214,6 +289,7 @@ pub enum Object {
     Dkim(Dkim),
     Access(Access),
     Domain(Domain),
+    Hook(Hook),
 }
 
 impl Object {
@@ -224,6 +300,7 @@ impl Object {
             Self::Dkim(_) => KIND_DKIM,
             Self::Access(_) => KIND_ACCESS,
             Self::Domain(_) => KIND_DOMAIN,
+            Self::Hook(_) => KIND_HOOK,
         }
     }
 
@@ -234,6 +311,7 @@ impl Object {
             Self::Dkim(d) => d.id,
             Self::Access(a) => a.id,
             Self::Domain(d) => d.id,
+            Self::Hook(h) => h.id,
         }
     }
 
@@ -244,6 +322,7 @@ impl Object {
             Self::Dkim(d) => d.tenant,
             Self::Access(a) => a.tenant,
             Self::Domain(d) => d.tenant,
+            Self::Hook(h) => h.tenant,
         }
     }
 
@@ -253,6 +332,7 @@ impl Object {
             Self::Dkim(d) => Some((d.tenant, d.generation)),
             Self::Access(a) => Some((a.tenant, a.generation)),
             Self::Domain(d) => Some((d.tenant, d.generation)),
+            Self::Hook(h) => Some((h.tenant, h.generation)),
         }
     }
 
@@ -270,6 +350,13 @@ impl Object {
                 generation: d.generation,
                 kind: KIND_DOMAIN,
                 id: d.id,
+                hash: None,
+            }),
+            Self::Hook(h) => Some(Label {
+                tenant: h.tenant,
+                generation: h.generation,
+                kind: KIND_HOOK,
+                id: h.id,
                 hash: None,
             }),
             Self::Tenant(_) | Self::Pool(_) | Self::Access(_) => None,
@@ -324,6 +411,23 @@ impl Object {
                 }
                 if d.rsa != 0 && d.rsa == d.ed25519 {
                     return Err(Error::Invalid("dkim keys"));
+                }
+            }
+            Self::Hook(h) => {
+                if h.id == 0 {
+                    return Err(Error::Invalid("hook id"));
+                }
+                if h.tenant == SYSTEM {
+                    return Err(Error::Invalid("tenant id"));
+                }
+                if h.events == 0 || h.events & !ALL_EVENTS != 0 {
+                    return Err(Error::Invalid("events"));
+                }
+                if h.version == 0 || (h.previous_until != 0 && h.version == 1) {
+                    return Err(Error::Invalid("secret version"));
+                }
+                if !hook_url_ok(&h.url) {
+                    return Err(Error::Invalid("url"));
                 }
             }
         }
@@ -402,6 +506,16 @@ impl Update {
                 body[16..20].copy_from_slice(&d.ed25519.to_le_bytes());
                 out.extend_from_slice(&body);
             }
+            Object::Hook(h) => {
+                let mut body = [0; HOOK];
+                body[0..4].copy_from_slice(&h.generation.to_le_bytes());
+                body[4] = h.state.code();
+                body[5] = h.events;
+                body[6] = h.version;
+                body[12..16].copy_from_slice(&h.tenant.to_le_bytes());
+                body[16..24].copy_from_slice(&h.previous_until.to_le_bytes());
+                out.extend_from_slice(&body);
+            }
         }
         out
     }
@@ -410,6 +524,7 @@ impl Update {
         match &self.object {
             Object::Tenant(_) | Object::Pool(_) | Object::Access(_) => Vec::new(),
             Object::Domain(d) => d.name.as_bytes().to_vec(),
+            Object::Hook(h) => h.url.as_bytes().to_vec(),
             Object::Dkim(d) => {
                 let mut out = vec![0; DKIM_SECRET];
                 out[0] = u8::try_from(d.domain.len()).expect("domain checked");
@@ -437,6 +552,7 @@ impl Update {
             KIND_DKIM => Object::Dkim(dkim(id, rest, secret)?),
             KIND_ACCESS if secret.is_empty() => Object::Access(access(id, rest)?),
             KIND_DOMAIN => Object::Domain(domain(id, rest, secret)?),
+            KIND_HOOK => Object::Hook(hook(id, rest, secret)?),
             _ => return None,
         };
         object.check().ok()?;
@@ -458,7 +574,7 @@ pub(crate) fn sealed_label(clear: &[u8]) -> Option<Label> {
     let (kind, id, _) = peek(clear)?;
     let body = clear
         .get(HEAD..HEAD + DKIM)
-        .filter(|_| kind == KIND_DKIM || kind == KIND_DOMAIN)?;
+        .filter(|_| matches!(kind, KIND_DKIM | KIND_DOMAIN | KIND_HOOK))?;
     Some(Label {
         tenant: u32_at(body, 12)?,
         generation: u32_at(body, 0)?,
@@ -588,5 +704,21 @@ fn domain(id: u32, rest: &[u8], secret: &[u8]) -> Option<Domain> {
         rsa: u32_at(rest, 8)?,
         ed25519: u32_at(rest, 16)?,
         name: str::from_utf8(secret).ok()?.into(),
+    })
+}
+
+fn hook(id: u32, rest: &[u8], secret: &[u8]) -> Option<Hook> {
+    if rest.len() != HOOK || rest[7..12] != [0; 5] {
+        return None;
+    }
+    Some(Hook {
+        id,
+        tenant: u32_at(rest, 12)?,
+        generation: u32_at(rest, 0)?,
+        state: HookState::from_code(rest[4])?,
+        events: rest[5],
+        version: rest[6],
+        previous_until: u64::from_le_bytes(rest[16..24].try_into().ok()?),
+        url: str::from_utf8(secret).ok()?.into(),
     })
 }

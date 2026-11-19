@@ -10,8 +10,8 @@ use crate::error::Error;
 use crate::names::{Fixed, wait_keys};
 use crate::queue::KeySource;
 use crate::record::{
-    KIND_ACCESS, KIND_DKIM, KIND_DOMAIN, KIND_NODE, KIND_POOL, KIND_TENANT, Object, SYSTEM, Update,
-    peek, sealed_label,
+    KIND_ACCESS, KIND_DKIM, KIND_DOMAIN, KIND_HOOK, KIND_NODE, KIND_POOL, KIND_TENANT, Object,
+    SYSTEM, Update, peek, sealed_label,
 };
 use crate::siphash::siphash;
 use crate::table::{Removal, Snapshot};
@@ -25,6 +25,7 @@ const DKIM_IDS: u32 = 1;
 const ACCESS_IDS: u32 = 2;
 const DOMAIN_IDS: u32 = 3;
 const NODE_ID: u32 = 4;
+const HOOK_IDS: u32 = 5;
 
 pub fn naming_check(key: &[u8; 16]) -> u64 {
     siphash(key, b"bunzzle naming check")
@@ -65,6 +66,7 @@ pub struct Loaded {
     dkim_next: u32,
     access_next: u32,
     domain_next: u32,
+    hook_next: u32,
     owners: BTreeMap<(u8, u32), (u32, u32)>,
     hidden: Vec<Hidden>,
 }
@@ -93,7 +95,11 @@ impl Loaded {
             .iter()
             .filter_map(|object| match object {
                 Object::Tenant(t) => Some((t.id, (t.generation, t.state.deleted()))),
-                Object::Pool(_) | Object::Dkim(_) | Object::Access(_) | Object::Domain(_) => None,
+                Object::Pool(_)
+                | Object::Dkim(_)
+                | Object::Access(_)
+                | Object::Domain(_)
+                | Object::Hook(_) => None,
             })
             .collect();
         let gone = |tenant: u32, generation: u32| {
@@ -153,6 +159,7 @@ impl Loaded {
             KIND_DKIM => &mut self.dkim_next,
             KIND_ACCESS => &mut self.access_next,
             KIND_DOMAIN => &mut self.domain_next,
+            KIND_HOOK => &mut self.hook_next,
             _ => return,
         };
         *next = (*next).max(id.saturating_add(1));
@@ -186,6 +193,7 @@ impl Writer {
             dkim_next: 1,
             access_next: 1,
             domain_next: 1,
+            hook_next: 1,
             owners: BTreeMap::new(),
             hidden: Vec::new(),
         };
@@ -212,6 +220,10 @@ impl Writer {
                         let next = u32::try_from(next).unwrap_or(u32::MAX);
                         loaded.domain_next = loaded.domain_next.max(next);
                     }
+                    (HOOK_IDS, Some(next)) => {
+                        let next = u32::try_from(next).unwrap_or(u32::MAX);
+                        loaded.hook_next = loaded.hook_next.max(next);
+                    }
                     _ => {
                         loaded.skipped += 1;
                         continue;
@@ -220,7 +232,7 @@ impl Writer {
                 loaded.track(kind, id, item.clear.len());
                 continue;
             }
-            if kind == KIND_DKIM || kind == KIND_DOMAIN {
+            if matches!(kind, KIND_DKIM | KIND_DOMAIN | KIND_HOOK) {
                 match peek(&item.clear).filter(|&(k, i, _)| k == kind && i == id) {
                     Some((_, _, version)) => {
                         loaded.version = loaded.version.max(version);
@@ -334,6 +346,18 @@ impl Writer {
         let next = id.checked_add(1).ok_or(Error::Full)?;
         self.put_node(DOMAIN_IDS, u64::from(next)).await?;
         self.loaded.domain_next = next;
+        Ok(id)
+    }
+
+    pub fn hook_next(&self) -> u32 {
+        self.loaded.hook_next
+    }
+
+    pub async fn reserve_hook(&mut self) -> Result<u32, Error> {
+        let id = self.loaded.hook_next;
+        let next = id.checked_add(1).ok_or(Error::Full)?;
+        self.put_node(HOOK_IDS, u64::from(next)).await?;
+        self.loaded.hook_next = next;
         Ok(id)
     }
 
