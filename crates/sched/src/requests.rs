@@ -13,6 +13,7 @@ use store::{Changes, IndexRecord};
 
 use crate::clock::Clock;
 use crate::error::Refusal;
+use crate::events::KIND_EVENT;
 use crate::suppress::{Hash, keyed_hash, keys_of, owner_shard, refusal};
 
 pub const KIND_REQUEST: u8 = 2;
@@ -370,6 +371,11 @@ impl Requests {
                 .parts
                 .changes
                 .retire(KIND_REQUEST, day, day.saturating_sub(1))
+                .await;
+            let _ = inner
+                .parts
+                .changes
+                .retire(KIND_EVENT, day, crate::events::retired(day))
                 .await;
             let next = u64::from(day + 1) * DAY;
             let mut wake = pin!(inner.wake.wait());

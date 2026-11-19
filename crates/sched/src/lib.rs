@@ -25,8 +25,9 @@ pub use clock::Clock;
 pub use envelope::{Envelope, Recipient, Required, Ret, decode_slice, encode_slice};
 pub use error::{Error, Refusal};
 pub use events::{
-    Body as EventBody, EVENT_SHAPE, EVENT_VALUE, Event, KIND_EVENT, Kind as EventKind, MAX_REPLY,
-    record as event_record, sealed as event_sealed, sequence as event_sequence,
+    Body as EventBody, EVENT_DAYS, EVENT_SHAPE, EVENT_VALUE, Event, KIND_EVENT, Kind as EventKind,
+    MAX_REPLY, record as event_record, retain as retain_event, retired as retired_events,
+    sealed as event_sealed, sequence as event_sequence,
 };
 pub use intake::{Draft, domain_of};
 pub use keyring::Keyring;

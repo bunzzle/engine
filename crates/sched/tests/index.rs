@@ -22,11 +22,12 @@ use keys::{
 use rt::sim::{Config, Disk, Faults, Machine, SimDriver, Stalls, check};
 use rt::{JoinHandle, Runtime, TcpListener, TcpStream, sleep, spawn, timeout};
 use sched::{
-    Answered, Attempt, Batched, Begun, Clock, DAY, Draft, EVENT_VALUE, Event, EventBody, EventKind,
-    Hash, KIND_EVENT, KIND_REQUEST, KIND_SUPPRESS, Keyring, Keys, MAX_REPLY, Meshes, Node, Parts,
-    Reason, Recipient, Refusal, Restore, Running, SHAPE, Settings, Suppression, Ticket, Transport,
-    Unsealable, Unwrapped, encode_slice, event_record, event_sealed, event_sequence, normalize,
-    punycode, retain, retain_request,
+    Answered, Attempt, Batched, Begun, Clock, DAY, Draft, EVENT_DAYS, EVENT_SHAPE, EVENT_VALUE,
+    Event, EventBody, EventKind, Hash, KIND_EVENT, KIND_REQUEST, KIND_SUPPRESS, Keyring, Keys,
+    MAX_REPLY, Meshes, Node, Parts, Reason, Recipient, Refusal, Restore, Running, SHAPE, Settings,
+    Suppression, Ticket, Transport, Unsealable, Unwrapped, encode_slice, event_record,
+    event_sealed, event_sequence, normalize, punycode, retain, retain_event, retain_request,
+    retired_events,
 };
 use spool::{Body, Head, HeadClear, Message, MessageId, SLICE, Slice, Stamp};
 use store::{Client, Committer, DataFile, Options, SLOT_SIZE, Setup, Tiering, boot};
@@ -538,6 +539,42 @@ fn retain_drops_old_generations_and_expired_entries_only_at_the_oldest_run() {
     assert_eq!(tombstone.op, Op::Delete);
     assert!(retain(&table, 100, &tombstone, true));
     assert_eq!(KIND_SUPPRESS, 1);
+}
+
+#[test]
+fn event_retention_keeps_a_week_and_drops_old_generations() {
+    let mut table = Table::default();
+    table.take(control::Note::Snapshot(control::Snapshot {
+        version: 1,
+        objects: vec![tenant(1, 2, State::Active)],
+    }));
+    let entry = |tenant: u32, generation: u32| {
+        let event = Event {
+            generation,
+            time: 1,
+            kind: EventKind::Delivered,
+            lost: 0,
+            message: MessageId::from_bytes([1; 16]),
+            recipient: 0,
+            stamp: Stamp { boot: 1, write: 1 },
+            batch: 1,
+            day: 1,
+        };
+        Entry::put(index::key(tenant, [0; 16]), event.encode(), Vec::new())
+    };
+    assert!(!retain_event(&table, &entry(1, 1)));
+    assert!(retain_event(&table, &entry(1, 2)));
+    assert!(retain_event(&table, &entry(9, 1)));
+    let mut short = entry(1, 1);
+    short.value.pop();
+    assert!(retain_event(&table, &short));
+    assert!(retain_event(
+        &table,
+        &Entry::delete(index::key(1, [0; 16]), EVENT_SHAPE)
+    ));
+    assert_eq!(EVENT_DAYS, 7);
+    assert_eq!(retired_events(20), 14);
+    assert_eq!(retired_events(3), 0);
 }
 
 #[test]
@@ -1298,6 +1335,37 @@ fn an_expired_message_leaves_an_expired_event() {
             (found[0].kind, found[0].message),
             (EventKind::Expired, gone)
         );
+    });
+    cluster.stop();
+}
+
+#[test]
+fn event_days_past_the_retention_are_dropped() {
+    let driver = Rc::new(SimDriver::with_disk(46, Config::default(), created(46)));
+    let cluster = started(&driver, 2);
+    let nodes = cluster.nodes.clone();
+    let client = cluster.client.clone();
+    cluster.run(async move {
+        ready(&nodes).await;
+        let node = &nodes[0];
+        let shard = owned_shard(node).await;
+        let (gone, _) = accept_listed(node, shard, &["w@example.org"], 1).await;
+        while node.spool().tenant(gone).is_some() {
+            sleep(Duration::from_millis(50)).await;
+        }
+        let changes = node.spool().changes();
+        let first = changes.partitions(KIND_EVENT).await.expect("partitions");
+        assert_eq!(first.len(), 1);
+        sleep(Duration::from_millis(u64::from(EVENT_DAYS - 1) * DAY)).await;
+        client.checkpoint().await.expect("checkpoint");
+        let kept = changes.partitions(KIND_EVENT).await.expect("partitions");
+        assert_eq!(kept, first);
+        sleep(Duration::from_millis(2 * DAY)).await;
+        for _ in 0..2 {
+            client.checkpoint().await.expect("checkpoint");
+        }
+        let left = changes.partitions(KIND_EVENT).await.expect("partitions");
+        assert_eq!(left, []);
     });
     cluster.stop();
 }
