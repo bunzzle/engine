@@ -741,3 +741,70 @@ fn retire_closes_and_drops_partitions_of_one_kind() {
         assert_eq!(keeper.runs(0, (KIND, 7)), 2);
     });
 }
+
+#[test]
+fn the_watch_follows_durable_sequences_and_tenants_with_new_records_across_a_restart() {
+    let driver = Rc::new(SimDriver::with_disk(12, Config::default(), created(12)));
+    let (head, last) = Runtime::new(driver.clone()).block_on(async {
+        let node = open(None).await;
+        let watch = Rc::clone(node.changes.watch());
+        assert_eq!(watch.head(), 0);
+        assert_eq!(watch.take(KIND).len(), 0);
+        let created = node.changes.create(vec![batch(1)]).await.expect("create");
+        assert_eq!(watch.head(), created[0][0].sequence);
+        assert_eq!(watch.take(KIND).len(), 0);
+        watch.wait().await;
+        let mut last = 0;
+        for (tenant, n) in [(4, 1), (2, 2), (4, 3)] {
+            let applied = node
+                .changes
+                .apply_indexed(batch(1), 0, vec![event(tenant, n)], false)
+                .await
+                .expect("apply");
+            last = applied.indexed[0].sequence;
+            assert_eq!(watch.head(), last);
+        }
+        let other = IndexRecord {
+            kind: KIND + 1,
+            ..event(9, 1)
+        };
+        node.changes
+            .apply_indexed(batch(1), 0, vec![other], false)
+            .await
+            .expect("apply");
+        watch.wait().await;
+        assert_eq!(watch.take(KIND).into_iter().collect::<Vec<_>>(), [2, 4]);
+        assert_eq!(watch.take(KIND).len(), 0);
+        assert_eq!(watch.take(KIND + 1).into_iter().collect::<Vec<_>>(), [9]);
+        let head = watch.head();
+        let from = index::key(4, [0; 16]);
+        let to = index::key(5, [0; 16]);
+        let seen = node
+            .changes
+            .scan_kind(KIND, from..to, usize::MAX)
+            .await
+            .expect("scan");
+        assert!(
+            seen.iter()
+                .all(|(_, e)| u64::from_be_bytes(e.key[4..12].try_into().expect("stamp")) <= head)
+        );
+        drop(node.stop().await);
+        (head, last)
+    });
+    let driver = Rc::new(SimDriver::with_disk(13, Config::default(), driver.crash()));
+    Runtime::new(driver).block_on(async move {
+        let node = open(None).await;
+        let watch = Rc::clone(node.changes.watch());
+        assert_eq!(watch.head(), head);
+        assert!(watch.head() >= last);
+        assert_eq!(watch.take(KIND).len(), 0);
+        let applied = node
+            .changes
+            .apply_indexed(batch(1), 0, vec![event(4, 7)], false)
+            .await
+            .expect("apply");
+        assert!(applied.indexed[0].sequence > head);
+        assert_eq!(watch.head(), applied.indexed[0].sequence);
+        drop(node.stop().await);
+    });
+}

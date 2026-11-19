@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ops::Range as Keys;
+use std::rc::Rc;
 use std::time::Duration;
 
 use rt::{Receiver, Sender, channel, sleep, spawn};
@@ -18,6 +19,7 @@ use crate::record::{Record, rebase};
 use crate::regions::Claim;
 use crate::session::{Event, Owned, Results, Session};
 use crate::shard::{Change, HEAD_ITEM, Index, Item, KIND_STATE, Key};
+use crate::watch::Watch;
 use sys::crc32c::checksum;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -195,6 +197,7 @@ enum Input {
 #[derive(Clone)]
 pub struct Changes {
     sender: Sender<Input>,
+    watch: Rc<Watch>,
 }
 
 impl Changes {
@@ -397,6 +400,10 @@ impl Changes {
     pub fn close(&self) {
         let _ = self.sender.send(Input::Close);
     }
+
+    pub fn watch(&self) -> &Rc<Watch> {
+        &self.watch
+    }
 }
 
 pub struct Shards {
@@ -406,6 +413,7 @@ pub struct Shards {
     file: CoreFile,
     keeper: Keeper,
     owned: Vec<u16>,
+    watch: Rc<Watch>,
     inputs: Receiver<Input>,
     busy: BTreeMap<(u16, u64), VecDeque<Request>>,
     waiting: VecDeque<(u64, Submission)>,
@@ -422,6 +430,7 @@ impl Shards {
     pub fn new(core: Core) -> (Self, Changes) {
         let Core {
             shards,
+            durable,
             session,
             results,
             file,
@@ -429,6 +438,7 @@ impl Shards {
             ..
         } = core;
         let (sender, inputs) = channel();
+        let watch = Rc::new(Watch::starting(durable));
         let owner = Self {
             session,
             results: Some(results),
@@ -436,6 +446,7 @@ impl Shards {
             file,
             keeper,
             owned: shards,
+            watch: Rc::clone(&watch),
             inputs,
             busy: BTreeMap::new(),
             waiting: VecDeque::new(),
@@ -447,7 +458,7 @@ impl Shards {
             merging: false,
             closing: false,
         };
-        (owner, Changes { sender })
+        (owner, Changes { sender, watch })
     }
 
     pub async fn run(mut self) -> Keeper {
@@ -900,17 +911,37 @@ impl Shards {
         }
     }
 
+    fn apply_record(
+        &mut self,
+        shard: u16,
+        record: IndexRecord,
+        sequence: u64,
+    ) -> Result<(), Error> {
+        let (kind, tenant) = (record.kind, index::tenant(&record.entry.key));
+        self.keeper.apply_index(shard, record.stamped(sequence))?;
+        self.watch.indexed(kind, tenant);
+        Ok(())
+    }
+
+    fn durable(&self, locations: &[Location]) {
+        if let Some(last) = locations.iter().map(|l| l.sequence).max() {
+            self.watch.durable(last);
+            self.watch.wake();
+        }
+    }
+
     async fn event(&mut self, event: Event) {
         match event {
             Event::Durable { tag, locations, .. } if self.indexed.contains_key(&tag) => {
                 let indexing = self.indexed.remove(&tag).expect("indexed");
                 let mut result = Ok(());
                 for (record, location) in indexing.records.into_iter().zip(&locations) {
-                    let record = record.stamped(location.sequence);
-                    if let Err(error) = self.keeper.apply_index(indexing.shard, record) {
+                    if let Err(error) = self.apply_record(indexing.shard, record, location.sequence)
+                    {
                         result = Err(error);
                     }
                 }
+                self.durable(&locations);
                 let _ = indexing.reply.send(result);
             }
             Event::Rejected { tag, error } if self.indexed.contains_key(&tag) => {
@@ -942,11 +973,12 @@ impl Shards {
                 if let Some(attached) = attached {
                     let indexed = locations.split_off(locations.len() - attached.records.len());
                     for (record, location) in attached.records.into_iter().zip(&indexed) {
-                        let record = record.stamped(location.sequence);
-                        let _ = self.keeper.apply_index(attached.shard, record);
+                        let _ = self.apply_record(attached.shard, record, location.sequence);
                     }
                     request.indexed = indexed;
                 }
+                self.durable(&locations);
+                self.durable(&request.indexed);
                 self.finish(request, Ok(locations));
             }
             Event::Rejected { tag, error } => {

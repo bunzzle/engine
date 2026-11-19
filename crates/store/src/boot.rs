@@ -31,6 +31,7 @@ pub struct Start {
     index: u16,
     boot: u32,
     shards: Vec<u16>,
+    durable: u64,
     session: Session,
     results: Results,
     source: Source,
@@ -41,6 +42,7 @@ pub struct Start {
 pub struct Core {
     pub index: u16,
     pub shards: Vec<u16>,
+    pub durable: u64,
     pub session: Session,
     pub results: Results,
     pub file: CoreFile,
@@ -68,6 +70,7 @@ pub async fn boot(path: impl AsRef<Path>, setup: Setup) -> Result<Booted, Error>
     }
     let loaded = load(&data, setup.reserve).await?;
     let recovered = recover(&data, loaded.position, loaded.state).await?;
+    let durable = recovered.state.record_sequence.saturating_sub(1);
     let boot = data.next_boot().await?;
     let (mut committer, client) = Committer::new(data, recovered.journal, recovered.state);
     let parts: Arc<[Part]> = loaded.parts.into();
@@ -83,6 +86,7 @@ pub async fn boot(path: impl AsRef<Path>, setup: Setup) -> Result<Booted, Error>
                     .filter(|s| s % u32::from(setup.cores) == u32::from(index))
                     .map(|s| u16::try_from(s).expect("shard fits in u16"))
                     .collect(),
+                durable,
                 session,
                 results,
                 source: source.clone(),
@@ -110,6 +114,7 @@ impl Start {
             index: self.index,
             ids: Ids::new(self.boot, &self.shards),
             shards: self.shards,
+            durable: self.durable,
             session: self.session,
             results: self.results,
             file,
