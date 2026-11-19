@@ -265,14 +265,14 @@ impl Reader {
     }
 }
 
-fn kept(entry: &Entry, generation: u32) -> Option<Event> {
+pub(crate) fn kept(entry: &Entry, generation: u32) -> Option<Event> {
     if entry.op != index::Op::Put {
         return None;
     }
     Event::decode(&entry.value).filter(|event| event.generation == generation)
 }
 
-fn stamped(tenant: u32, sequence: u64) -> index::Key {
+pub(crate) fn stamped(tenant: u32, sequence: u64) -> index::Key {
     let mut hash = [0; 16];
     hash[..8].copy_from_slice(&sequence.to_be_bytes());
     index::key(tenant, hash)
@@ -326,7 +326,7 @@ fn merge(parts: Vec<Part>, positions: &[u64], limit: usize) -> (Taken, Vec<u64>,
     (taken, next, more)
 }
 
-fn event_id(keys: &crypto::TenantKeys, shard: u16, sequence: u64) -> [u8; 16] {
+pub(crate) fn event_id(keys: &crypto::TenantKeys, shard: u16, sequence: u64) -> [u8; 16] {
     let mut data = [0; 15];
     data[..5].copy_from_slice(EVENT_ID);
     data[5..7].copy_from_slice(&shard.to_be_bytes());
@@ -334,7 +334,12 @@ fn event_id(keys: &crypto::TenantKeys, shard: u16, sequence: u64) -> [u8; 16] {
     index::siphash128(keys.hash_key().expose(), &data)
 }
 
-async fn open(keys: &dyn Keys, tenant: u32, event: &Event, payload: &[u8]) -> Option<Body> {
+pub(crate) async fn open(
+    keys: &dyn Keys,
+    tenant: u32,
+    event: &Event,
+    payload: &[u8],
+) -> Option<Body> {
     let (wrap, inner) = sealed(payload)?;
     let opener = event_opener(keys, tenant, event, wrap).await.ok()?;
     let clear = opener

@@ -19,6 +19,7 @@ mod requests;
 mod sealing;
 mod sign;
 mod start;
+mod stream;
 mod suppress;
 mod system;
 mod transport;
@@ -54,6 +55,7 @@ pub use sealing::{
 };
 pub use sign::{Body, Fault, KEYS_WAIT, Outgoing, Plain, Prepared, SIGNED_BYTES};
 pub use start::{CONTROL_SHARD, Links, Meshes, Node, Parts, Running, Settings};
+pub use stream::{BATCH_BYTES, BATCH_EVENTS, Call, Deliver, Outcome, Sending};
 pub use suppress::{
     Ask, Hash, Inputs, KIND_SUPPRESS, Listed, Page, Reason, SEAL_SUPPRESS, SHAPE, Suppression,
     Suppressions, keyed_hash, retain,
