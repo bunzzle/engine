@@ -1,7 +1,8 @@
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::pin::Pin;
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::Duration;
 
 use crypto::{DkimAlg, Secret, TenantKeys, Wrap};
@@ -29,6 +30,7 @@ pub struct RingSettings {
     pub retry: Duration,
     pub retry_max: Duration,
     pub tenants: usize,
+    pub hooks: usize,
 }
 
 impl RingSettings {
@@ -40,6 +42,7 @@ impl RingSettings {
             retry: Duration::from_millis(100),
             retry_max: Duration::from_secs(5),
             tenants: 65_536,
+            hooks: 4096,
         }
     }
 }
@@ -98,9 +101,12 @@ pub struct RingStats {
     pub dkim_new: u64,
     pub loads: u64,
     pub signs: u64,
+    pub hook_secrets: u64,
     pub behind: u32,
     pub settled: u32,
     pub tenants: CacheStats,
+    pub hooks: CacheStats,
+    pub held_hooks: usize,
 }
 
 enum Link {
@@ -108,6 +114,9 @@ enum Link {
     Connecting,
     Up(Rc<Client>),
 }
+
+type HookKey = (u32, u32, u32, u8);
+type HookWaiters = Vec<Sender<Result<Arc<Secret<32>>, Fault>>>;
 
 #[derive(Clone)]
 pub struct Ring {
@@ -123,6 +132,9 @@ struct Inner {
     day: Cell<u32>,
     failed: Cell<bool>,
     tenants: RefCell<Cache<(u32, u32), Working>>,
+    hooks: RefCell<Cache<HookKey, Arc<Secret<32>>>>,
+    hooking: RefCell<HashMap<HookKey, HookWaiters>>,
+    hooks_gone: RefCell<HashSet<(u32, u32)>>,
     opening: RefCell<HashMap<(u32, u32), Waiters>>,
     unwrapping: RefCell<HashMap<(u32, u32, u16, u64), Unwrapping>>,
     loading: RefCell<HashMap<(u32, u32, u32), Loading>>,
@@ -171,6 +183,9 @@ impl Ring {
                 day: Cell::new(0),
                 failed: Cell::new(false),
                 tenants: RefCell::new(Cache::new(settings.tenants)),
+                hooks: RefCell::new(Cache::new(settings.hooks)),
+                hooking: RefCell::new(HashMap::new()),
+                hooks_gone: RefCell::new(HashSet::new()),
                 opening: RefCell::new(HashMap::new()),
                 unwrapping: RefCell::new(HashMap::new()),
                 loading: RefCell::new(HashMap::new()),
@@ -218,6 +233,8 @@ impl Ring {
     pub fn stats(&self) -> RingStats {
         RingStats {
             tenants: self.inner.tenants.borrow().stats(),
+            hooks: self.inner.hooks.borrow().stats(),
+            held_hooks: self.inner.hooks.borrow().len(),
             ..self.inner.stats.get()
         }
     }
@@ -234,6 +251,31 @@ impl Ring {
         let key = (tenant, generation);
         self.inner.tenants.borrow_mut().remove(&key);
         self.inner.refreshed.borrow_mut().remove(&key);
+        self.inner
+            .hooks
+            .borrow_mut()
+            .retain(|id, _| id.0 != tenant || id.1 > generation);
+        self.inner
+            .hooks_gone
+            .borrow_mut()
+            .retain(|gone| gone.0 != tenant);
+    }
+
+    pub fn forget_hook(&self, tenant: u32, hook: u32) {
+        self.inner.hooks_gone.borrow_mut().insert((tenant, hook));
+        self.inner
+            .hooks
+            .borrow_mut()
+            .retain(|id, _| (id.0, id.2) != (tenant, hook));
+    }
+
+    fn hook_live(&self, tenant: u32, generation: u32, hook: u32) -> Result<(), Fault> {
+        self.live(tenant, generation)?;
+        if self.inner.hooks_gone.borrow().contains(&(tenant, hook)) {
+            self.count(|s| s.gone += 1);
+            return Err(Fault::Gone);
+        }
+        Ok(())
     }
 
     pub fn forgotten(&self, tenant: u32, generation: u32) -> bool {
@@ -303,7 +345,8 @@ impl Ring {
             Request::Hello { .. }
             | Request::Open { .. }
             | Request::Unwrap { .. }
-            | Request::Sign { .. } => settings.deadline,
+            | Request::Sign { .. }
+            | Request::Hook { .. } => settings.deadline,
             _ => settings.slow,
         };
         match client.call_within(request, limit).await {
@@ -587,6 +630,60 @@ impl Ring {
         }
     }
 
+    pub async fn hook_secret(
+        &self,
+        tenant: u32,
+        generation: u32,
+        hook: u32,
+        version: u8,
+    ) -> Result<Arc<Secret<32>>, Fault> {
+        self.hook_live(tenant, generation, hook)?;
+        if self.failed() {
+            self.count(|s| s.refused += 1);
+            return Err(Fault::Failed);
+        }
+        let key = (tenant, generation, hook, version);
+        if let Some(found) = self.inner.hooks.borrow_mut().get(&key) {
+            return Ok(found);
+        }
+        let (reply, mut answer) = rt::channel();
+        let first = {
+            let mut hooking = self.inner.hooking.borrow_mut();
+            let waiting = hooking.entry(key).or_default();
+            waiting.push(reply);
+            waiting.len() == 1
+        };
+        if first {
+            let ring = self.clone();
+            rt::spawn(async move {
+                ring.count(|s| s.hook_secrets += 1);
+                let request = Request::Hook {
+                    tenant,
+                    generation,
+                    hook,
+                    version,
+                };
+                let result = match ring.checked(&request).await {
+                    Ok(Answer::Key(secret)) => ring
+                        .hook_live(tenant, generation, hook)
+                        .map(|()| Arc::new(secret)),
+                    Ok(_) => Err(ring.fault(None, None)),
+                    Err(fault) => Err(fault),
+                };
+                if let Ok(secret) = &result
+                    && !ring.failed()
+                {
+                    ring.inner.hooks.borrow_mut().put(key, Arc::clone(secret));
+                }
+                let waiting = ring.inner.hooking.borrow_mut().remove(&key);
+                for waiter in waiting.unwrap_or_default() {
+                    let _ = waiter.send(result.clone());
+                }
+            });
+        }
+        answer.recv().await.unwrap_or(Err(Fault::Unavailable))
+    }
+
     pub async fn delete(&self, tenant: u32, generation: u32) -> Result<(), Fault> {
         self.forget(tenant, generation);
         match self
@@ -753,6 +850,7 @@ impl Ring {
             client.close();
             self.inner.failed.set(true);
             self.inner.tenants.borrow_mut().clear();
+            self.inner.hooks.borrow_mut().clear();
             return Err(Error::Changed);
         }
         self.saw_day(day);

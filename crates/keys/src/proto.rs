@@ -56,6 +56,12 @@ pub enum Request {
         alg: DkimAlg,
         digest: [u8; 32],
     },
+    Hook {
+        tenant: u32,
+        generation: u32,
+        hook: u32,
+        version: u8,
+    },
 }
 
 pub enum Answer {
@@ -257,6 +263,22 @@ impl Request {
             Self::DkimNew { .. } | Self::Load { .. } | Self::Sign { .. } => {
                 self.encode_dkim(id, out);
             }
+            Self::Hook {
+                tenant,
+                generation,
+                hook,
+                version,
+            } => frame(
+                out,
+                11,
+                id,
+                &[
+                    &tenant.to_le_bytes(),
+                    &generation.to_le_bytes(),
+                    &hook.to_le_bytes(),
+                    &[*version],
+                ],
+            ),
         }
     }
 
@@ -366,6 +388,12 @@ impl Request {
                 key: r.u32()?,
                 alg: r.alg()?,
                 digest: r.array()?,
+            },
+            11 => Self::Hook {
+                tenant: r.u32()?,
+                generation: r.u32()?,
+                hook: r.u32()?,
+                version: r.u8()?,
             },
             _ => return Err(Error::Bad),
         };

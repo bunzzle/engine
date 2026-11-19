@@ -800,3 +800,63 @@ fn a_load_over_the_frame_limit_is_refused_by_the_client() {
         assert_eq!(day(&client).await, DAY);
     });
 }
+
+fn hook(tenant: u32, generation: u32, hook: u32, version: u8) -> Request {
+    Request::Hook {
+        tenant,
+        generation,
+        hook,
+        version,
+    }
+}
+
+fn key(answer: Answer) -> [u8; 32] {
+    match answer {
+        Answer::Key(key) => *key.expose(),
+        _ => panic!("expected a key"),
+    }
+}
+
+#[test]
+fn hook_secrets_are_derived_per_tenant_hook_and_version_until_delete() {
+    let driver = Rc::new(SimDriver::new(25, quiet()));
+    run(&driver, async {
+        let _server = start(Settings::default()).await;
+        let client = client().await;
+        created(&client, 3).await;
+        created(&client, 5).await;
+        let first = key(client.call(&hook(3, 1, 1, 1)).await.expect("hook"));
+        assert_eq!(
+            key(client.call(&hook(3, 1, 1, 1)).await.expect("hook")),
+            first
+        );
+        for other in [hook(3, 1, 2, 1), hook(3, 1, 1, 2), hook(5, 1, 1, 1)] {
+            assert_ne!(key(client.call(&other).await.expect("hook")), first);
+        }
+        for unknown in [hook(9, 1, 1, 1), hook(3, 2, 1, 1)] {
+            let answer = client.call(&unknown).await.expect("hook");
+            assert_eq!(refused(&answer), Error::Unknown);
+        }
+        let delete = Request::Delete {
+            tenant: 3,
+            generation: 1,
+        };
+        assert!(done(&client.call(&delete).await.expect("delete")));
+        let gone = client.call(&hook(3, 1, 1, 1)).await.expect("hook");
+        assert_eq!(refused(&gone), Error::Unknown);
+        key(client.call(&hook(5, 1, 1, 1)).await.expect("hook"));
+        sleep(Duration::from_secs(2)).await;
+    });
+    let disk = driver.disk();
+    let audit = disk.contents(&Path::new(DIR).join("audit")).expect("audit");
+    let audit = String::from_utf8(audit.to_vec()).expect("text");
+    let noted = |prefix: &str| -> u32 {
+        audit
+            .lines()
+            .filter_map(|line| line.split_once(prefix))
+            .map(|(_, count)| count.parse::<u32>().expect("count"))
+            .sum()
+    };
+    assert_eq!(noted(&format!(" hook 3 1 {DAY} ")), 4, "{audit}");
+    assert_eq!(noted(&format!(" hook 5 1 {DAY} ")), 2, "{audit}");
+}

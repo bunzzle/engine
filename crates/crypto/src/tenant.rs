@@ -28,6 +28,15 @@ impl Tenant {
             .expand::<32>(&[b"dkim", &generation.to_le_bytes(), &[version]]);
         DataKey::new(&key, version)
     }
+
+    pub fn hook_secret(&self, generation: u32, hook: u32, version: u8) -> Secret<32> {
+        self.0.expand(&[
+            b"hook",
+            &generation.to_le_bytes(),
+            &hook.to_le_bytes(),
+            &[version],
+        ])
+    }
 }
 
 pub fn next_day(state: &Secret<32>) -> Secret<32> {
@@ -105,6 +114,10 @@ mod tests {
             hex(tenant.hash_key(1).expose()),
             "bd7f2bae6ff8c12b0d35b5e12a9ebeb7"
         );
+        assert_eq!(
+            hex(tenant.hook_secret(1, 3, 2).expose()),
+            "63ad8d3fdf512fd218ab2222b41a185feff0894e9e8db302888518a43c93335e"
+        );
     }
 
     #[test]
@@ -115,6 +128,12 @@ mod tests {
         assert!(tenant.data_key(2, 1).open(b"l", &sealed).is_err());
         assert!(tenant.dkim_key(1, 1).open(b"l", &sealed).is_err());
         assert_eq!(tenant.dkim_key(1, 2).version(), 2);
+        let hook = tenant.hook_secret(1, 3, 1);
+        assert!(hook == tenant.hook_secret(1, 3, 1));
+        assert!(hook != tenant.hook_secret(2, 3, 1));
+        assert!(hook != tenant.hook_secret(1, 4, 1));
+        assert!(hook != tenant.hook_secret(1, 3, 2));
+        assert!(hook != tenant.data_secret(1, 1));
         assert_eq!(
             tenant.data_key(1, 1).open(b"l", &sealed).expect("opens"),
             b"x"

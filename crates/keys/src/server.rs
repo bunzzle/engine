@@ -322,6 +322,12 @@ impl Core {
             Request::DkimNew { .. } | Request::Load { .. } | Request::Sign { .. } => {
                 return self.dkim_call(request, reply);
             }
+            Request::Hook {
+                tenant,
+                generation,
+                hook,
+                version,
+            } => self.hook(tenant, generation, hook, version),
             Request::Delete { tenant, generation } => {
                 self.dkim
                     .retain(|id, _| id.0 != tenant || id.1 > generation);
@@ -339,6 +345,17 @@ impl Core {
             }
         };
         Some(answer)
+    }
+
+    fn hook(&mut self, tenant: u32, generation: u32, hook: u32, version: u8) -> Answer {
+        match self.vault.hook(tenant, generation, hook, version) {
+            Ok(secret) => {
+                self.audit
+                    .note(Op::Hook, tenant, generation, self.vault.day());
+                Answer::Key(secret)
+            }
+            Err(error) => self.refused(error),
+        }
     }
 
     fn dkim_call(&mut self, request: Request, reply: &Sender<Answer>) -> Option<Answer> {
