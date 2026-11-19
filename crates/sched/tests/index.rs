@@ -3929,3 +3929,52 @@ fn a_webhook_paused_and_resumed_while_sending_keeps_one_call_and_every_event() {
     });
     cluster.stop();
 }
+
+async fn cursors_everywhere(nodes: &[Node<Idle>], hook: u32, present: bool) {
+    for node in nodes {
+        let changes = node.spool().changes();
+        for shard in node.spool().shards() {
+            for _ in 0..200 {
+                let found = read_cursor(changes, shard, 1, hook).await.expect("read");
+                if found.is_some() == present {
+                    break;
+                }
+                sleep(Duration::from_millis(50)).await;
+            }
+            let found = read_cursor(changes, shard, 1, hook).await.expect("read");
+            assert_eq!(found.is_some(), present, "hook {hook} shard {shard}");
+        }
+    }
+}
+
+#[test]
+fn webhook_cursors_stay_while_paused_and_go_with_their_endpoint() {
+    let driver = Rc::new(SimDriver::with_disk(55, Config::default(), created(55)));
+    let cluster = started(&driver, 2);
+    let nodes = cluster.nodes.clone();
+    cluster.run(async move {
+        ready(&nodes).await;
+        let control = nodes.iter().find(|n| n.controls()).expect("control core");
+        let at = "https://hooks.example.org/in";
+        let paused = control.hook_new(1, at, 0).await.expect("new").id;
+        let removed = control.hook_new(1, at, 0).await.expect("new").id;
+        let caught = Rc::new(Caught::default());
+        let tasks: Vec<_> = nodes
+            .iter()
+            .map(|n| n.start_hooks(Rc::new(Catch(Rc::clone(&caught)))))
+            .collect();
+        cursors_everywhere(&nodes, paused, true).await;
+        cursors_everywhere(&nodes, removed, true).await;
+        let off = HookChange {
+            enabled: Some(false),
+            ..HookChange::default()
+        };
+        control.hook_change(1, paused, off).await.expect("pause");
+        control.hook_remove(1, removed).await.expect("remove");
+        cursors_everywhere(&nodes, removed, false).await;
+        sleep(Duration::from_secs(3)).await;
+        cursors_everywhere(&nodes, paused, true).await;
+        drop(tasks);
+    });
+    cluster.stop();
+}

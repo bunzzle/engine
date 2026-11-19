@@ -1,5 +1,10 @@
+use std::collections::BTreeMap;
+
 use control::KIND_CURSOR;
-use store::{Batch, Change, Changes, Delivery, HEAD_ITEM, Key, Op, control_key};
+use store::{
+    Batch, CONTROL_BOOT, Change, Changes, Core, Delivery, HEAD_ITEM, Key, Op, control_key,
+    is_control, split_key,
+};
 
 const FORMAT: u8 = 1;
 const SIZE: usize = 25;
@@ -100,4 +105,25 @@ pub async fn drop_cursor(
         Ok(_) | Err(store::Error::NotFound) => Ok(()),
         Err(error) => Err(error),
     }
+}
+
+pub(crate) fn listed(core: &Core) -> BTreeMap<u32, (u32, u32)> {
+    let mut found = BTreeMap::new();
+    for &shard in &core.shards {
+        let Some(state) = core.keeper.state(shard) else {
+            continue;
+        };
+        for (key, item) in state.entries() {
+            if !is_control(key.message) || key.item != HEAD_ITEM {
+                continue;
+            }
+            let (boot, hook) = split_key(key.message);
+            if CONTROL_BOOT - boot != u32::from(KIND_CURSOR) {
+                continue;
+            }
+            let generation = Cursor::decode(&item.clear).map_or(0, |c| c.generation);
+            found.insert(hook, (item.tenant, generation));
+        }
+    }
+    found
 }

@@ -1,4 +1,5 @@
 use std::cell::{Cell, Ref, RefCell};
+use std::collections::BTreeMap;
 use std::rc::{Rc, Weak};
 use std::time::Duration;
 
@@ -106,6 +107,7 @@ pub(crate) struct Inner<T> {
     restored: u64,
     pub(crate) dropped: Cell<u64>,
     pub(crate) delete_retries: Cell<u64>,
+    pub(crate) cursored: RefCell<BTreeMap<u32, (u32, u32)>>,
     records: Vec<Rc<Stored>>,
 }
 
@@ -192,8 +194,7 @@ impl<T: Transport + 'static> Node<T> {
 
         let writer = match control {
             Some(loaded) => {
-                let writer = control_writer(loaded, changes.clone(), check, settings.node).await?;
-                Some(sweep_at_start(writer, &table, &config, cores).await?)
+                Some(swept(loaded, &changes, check, &settings, (&table, &config, cores)).await?)
             }
             None => None,
         };
@@ -213,7 +214,7 @@ impl<T: Transport + 'static> Node<T> {
             changes.clone(),
             Rc::clone(&parts.keys) as Rc<dyn KeySource>,
         );
-        let records = system::restore_all(&parts.transport, found, &changes, &parts.keys).await;
+        let (records, cursored) = system::restore_all(&parts, found, &changes).await;
 
         let (leases, leases_done) =
             start_leases(links.leases, &table, &spool, settings.naming.shards);
@@ -254,6 +255,7 @@ impl<T: Transport + 'static> Node<T> {
             restored,
             dropped: Cell::new(0),
             delete_retries: Cell::new(0),
+            cursored: RefCell::new(cursored),
             records,
         });
         let ticks = maintain(Rc::downgrade(&inner), ticker);
@@ -645,6 +647,17 @@ async fn sweep_at_start(
     }
     result?;
     Ok(writer)
+}
+
+async fn swept(
+    loaded: control::Loaded,
+    changes: &Changes,
+    check: u64,
+    settings: &Settings,
+    (table, config, cores): (&RefCell<Table>, &Peers<control::Note>, u16),
+) -> Result<Writer, Error> {
+    let writer = control_writer(loaded, changes.clone(), check, settings.node).await?;
+    sweep_at_start(writer, table, config, cores).await
 }
 
 async fn control_writer(

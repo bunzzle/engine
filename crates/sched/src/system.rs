@@ -1,4 +1,5 @@
 use std::cell::Cell;
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::rc::Rc;
@@ -12,7 +13,7 @@ use store::{
 };
 
 use crate::sealing::Keys;
-use crate::start::CONTROL_SHARD;
+use crate::start::{CONTROL_SHARD, Parts};
 use crate::transport::Transport;
 
 const FORMAT: u8 = 1;
@@ -275,6 +276,7 @@ pub(crate) struct Loaded {
     pub(crate) shards: Vec<u16>,
     naming: [u8; 16],
     found: Vec<Found>,
+    cursored: BTreeMap<u32, (u32, u32)>,
 }
 
 pub(crate) async fn load_all(
@@ -290,20 +292,21 @@ pub(crate) async fn load_all(
         shards: core.shards.clone(),
         naming,
         found,
+        cursored: crate::cursor::listed(core),
     })
 }
 
 pub(crate) async fn restore_all<T: Transport>(
-    transport: &T,
+    parts: &Parts<T>,
     loaded: Loaded,
     changes: &Changes,
-    keys: &Rc<dyn Keys>,
-) -> Vec<Rc<Stored>> {
+) -> (Vec<Rc<Stored>>, BTreeMap<u32, (u32, u32)>) {
     let mut all = Vec::new();
     for found in loaded.found {
-        all.push(restore(transport, found, changes, keys, loaded.naming).await);
+        let restored = restore(&parts.transport, found, changes, &parts.keys, loaded.naming);
+        all.push(restored.await);
     }
-    all
+    (all, loaded.cursored)
 }
 
 async fn restore<T: Transport>(
