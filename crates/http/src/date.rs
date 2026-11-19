@@ -18,6 +18,19 @@ pub fn imf(ms: u64) -> String {
     )
 }
 
+pub fn rfc3339(ms: u64) -> String {
+    let seconds = ms / 1000;
+    let time = seconds % 86_400;
+    let (year, month, day) = civil(seconds / 86_400);
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}.{:03}Z",
+        time / 3600,
+        time % 3600 / 60,
+        time % 60,
+        ms % 1000,
+    )
+}
+
 fn civil(days: u64) -> (u64, u64, u64) {
     let z = days + 719_468;
     let era = z / 146_097;
@@ -46,6 +59,19 @@ mod tests {
         ];
         for (ms, text) in cases {
             assert_eq!(imf(ms), text);
+        }
+    }
+
+    #[test]
+    fn formats_rfc3339_times() {
+        let cases = [
+            (0, "1970-01-01T00:00:00.000Z"),
+            (784_111_777_042, "1994-11-06T08:49:37.042Z"),
+            (1_709_251_199_999, "2024-02-29T23:59:59.999Z"),
+            (4_102_444_800_000, "2100-01-01T00:00:00.000Z"),
+        ];
+        for (ms, text) in cases {
+            assert_eq!(rfc3339(ms), text);
         }
     }
 }

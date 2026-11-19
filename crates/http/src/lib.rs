@@ -5,7 +5,7 @@ mod response;
 mod server;
 mod status;
 
-pub use date::imf;
+pub use date::{imf, rfc3339};
 pub use request::{Framing, Headers, Request};
 pub use response::{Invalid, Response};
 pub use server::{CHUNK, Event, Limits, Phase, Server, Timeouts};
