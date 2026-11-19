@@ -42,7 +42,7 @@ async fn reports<T: Transport + 'static>(node: Node<T>, tlsrpt: Tlsrpt, origin: 
     }
 }
 
-pub(crate) async fn submit<T: Transport + 'static>(
+pub async fn submit<T: Transport + 'static>(
     node: &Node<T>,
     tlsrpt: &Tlsrpt,
     (origin, turn): (&Origin<'_>, usize),
