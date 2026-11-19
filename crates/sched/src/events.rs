@@ -98,10 +98,16 @@ impl Event {
     pub fn partition(&self) -> u32 {
         u32::try_from(self.time / DAY).unwrap_or(u32::MAX)
     }
+
+    pub fn checked(&self, body: &Body) -> bool {
+        (self.kind, self.time) == (body.kind, body.time)
+    }
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Body {
+    pub kind: Kind,
+    pub time: u64,
     pub address: Vec<u8>,
     pub reply: Vec<u8>,
     pub attempts: u16,
@@ -112,7 +118,9 @@ impl Body {
     pub fn encode(&self) -> Vec<u8> {
         let address = &self.address[..self.address.len().min(usize::from(u16::MAX))];
         let reply = &self.reply[..self.reply.len().min(MAX_REPLY)];
-        let mut out = Vec::with_capacity(7 + address.len() + reply.len());
+        let mut out = Vec::with_capacity(16 + address.len() + reply.len());
+        out.push(self.kind.code());
+        out.extend_from_slice(&self.time.to_le_bytes());
         out.extend_from_slice(&self.attempts.to_le_bytes());
         out.push(self.class);
         for part in [address, reply] {
@@ -123,7 +131,7 @@ impl Body {
     }
 
     pub fn decode(bytes: &[u8]) -> Option<Self> {
-        let (head, mut rest) = bytes.split_at_checked(3)?;
+        let (head, mut rest) = bytes.split_at_checked(12)?;
         let mut parts = Vec::with_capacity(2);
         for _ in 0..2 {
             let (length, tail) = rest.split_first_chunk::<2>()?;
@@ -137,10 +145,12 @@ impl Body {
         let reply = parts.pop().expect("two parts");
         let address = parts.pop().expect("two parts");
         Some(Self {
+            kind: Kind::from_code(head[0])?,
+            time: u64::from_le_bytes(head[1..9].try_into().expect("8")),
             address,
             reply,
-            attempts: u16::from_le_bytes([head[0], head[1]]),
-            class: head[2],
+            attempts: u16::from_le_bytes([head[9], head[10]]),
+            class: head[11],
         })
     }
 }

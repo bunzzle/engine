@@ -1095,6 +1095,8 @@ fn events_seal_under_their_message_and_open_from_the_record() {
             .expect("opener");
         let stamp = node.spool().stamp(shard).expect("stamp");
         let body = EventBody {
+            kind: EventKind::Delivered,
+            time: 3 * DAY + 5,
             address: b"a@example.com".to_vec(),
             reply: vec![b'x'; MAX_REPLY + 10],
             attempts: 3,
@@ -1133,7 +1135,13 @@ fn events_seal_under_their_message_and_open_from_the_record() {
             reply: vec![b'x'; MAX_REPLY],
             ..body
         };
-        assert_eq!(EventBody::decode(&clear), Some(capped));
+        assert_eq!(EventBody::decode(&clear).as_ref(), Some(&capped));
+        assert!(decoded.checked(&capped));
+        let edited = Event {
+            kind: EventKind::Failed,
+            ..decoded
+        };
+        assert!(!edited.checked(&capped));
         let bad = Some(Unsealable::Bad);
         assert_eq!(reader.open_reply(0, stamp, inner).err(), bad);
         assert_eq!(reader.open_event(0, stamp, &reply).err(), bad);
@@ -1172,6 +1180,8 @@ fn event_values_and_bodies_refuse_damage() {
     assert_eq!(Event::decode(&value), None);
     assert_eq!(Event::decode(&value[1..]), None);
     let body = EventBody {
+        kind: EventKind::Canceled,
+        time: 8,
         address: b"b@example.org".to_vec(),
         reply: b"550 no".to_vec(),
         attempts: 1,
@@ -1183,6 +1193,9 @@ fn event_values_and_bodies_refuse_damage() {
     let mut long = bytes.clone();
     long.push(0);
     assert_eq!(EventBody::decode(&long), None);
+    let mut kind = bytes.clone();
+    kind[0] = 0;
+    assert_eq!(EventBody::decode(&kind), None);
     let mut key = index::key(1, [0; 16]);
     key[4..12].copy_from_slice(&77u64.to_be_bytes());
     assert_eq!(event_sequence(&key), 77);
