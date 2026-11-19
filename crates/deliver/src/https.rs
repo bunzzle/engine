@@ -14,6 +14,28 @@ pub(crate) fn request(host: &str, path: &str) -> Vec<u8> {
     .into_bytes()
 }
 
+pub(crate) fn post(host: &str, path: &str, media: &str, body: &[u8]) -> Vec<u8> {
+    let mut out = format!(
+        "POST {path} HTTP/1.1\r\nHost: {host}\r\nContent-Type: {media}\r\n\
+         Content-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    )
+    .into_bytes();
+    out.extend_from_slice(body);
+    out
+}
+
+pub(crate) fn status(bytes: &[u8]) -> Option<u16> {
+    let end = bytes.windows(2).position(|w| w == b"\r\n")?;
+    let line = std::str::from_utf8(&bytes[..end]).ok()?;
+    let mut parts = line.splitn(3, ' ');
+    if !matches!(parts.next()?, "HTTP/1.1" | "HTTP/1.0") {
+        return None;
+    }
+    let code = parts.next()?;
+    (code.len() == 3).then(|| code.parse().ok()).flatten()
+}
+
 pub(crate) fn parse(bytes: &[u8], closed: bool, most: usize) -> Parsed {
     let Some(at) = bytes.windows(4).position(|w| w == b"\r\n\r\n") else {
         return if closed || bytes.len() > HEAD {
@@ -128,7 +150,7 @@ fn chunks(mut rest: &[u8], most: usize) -> Result<Option<Vec<u8>>, ()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Parsed, parse};
+    use super::{Parsed, parse, post, status};
 
     const OK: &str = "HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\n";
 
@@ -179,5 +201,19 @@ mod tests {
         for case in &cases {
             assert_eq!(whole(case), Parsed::Bad, "{case}");
         }
+    }
+
+    #[test]
+    fn posts_and_reads_the_status() {
+        let request = post("r.example", "/v1?a=b", "application/tlsrpt+gzip", b"xyz");
+        assert_eq!(
+            request,
+            b"POST /v1?a=b HTTP/1.1\r\nHost: r.example\r\nContent-Type: application/tlsrpt+gzip\r\nContent-Length: 3\r\nConnection: close\r\n\r\nxyz"
+        );
+        assert_eq!(status(b"HTTP/1.1 204 No Content\r\n"), Some(204));
+        assert_eq!(status(b"HTTP/1.0 500 Oops\r\n\r\n"), Some(500));
+        assert_eq!(status(b"HTTP/1.1 200"), None);
+        assert_eq!(status(b"HTTP/2 200 OK\r\n"), None);
+        assert_eq!(status(b"HTTP/1.1 20x OK\r\n"), None);
     }
 }

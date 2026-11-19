@@ -21,7 +21,8 @@ use tls::{Connector, Observed, Refusal, Tlsa, Verify};
 use crate::classify;
 use crate::conn::{Conn, Lost, left};
 use crate::dane::{self, Dane};
-use crate::mail::report_mail;
+use crate::gzip::gzip;
+use crate::mail::{MAX_JSON, report_mail};
 use crate::mx::{self, Addresses, Dns, Hosts};
 use crate::owners::{OwnerStats, Owners, State};
 use crate::pool::{Key, Level, Link, Pool, Remote, Slot};
@@ -29,6 +30,7 @@ use crate::report::{Applied, Report, ResultType, Rua, rua};
 use crate::results::{Failure, ResultStats, Results, Scope, Taken};
 use crate::settings::{EightBit, Settings};
 use crate::sts::{Got, Mode, PolicyStats, Sts};
+use crate::upload::upload;
 
 const ADDRESSES: usize = 10;
 const LOOKUP: Duration = Duration::from_secs(30);
@@ -85,6 +87,7 @@ pub struct Deliver<D> {
     sts: Sts,
     results: Results,
     owners: Owners,
+    last: Cell<Option<IpAddr>>,
     dead: RefCell<BTreeMap<(IpAddr, IpAddr), Instant>>,
     ehlo: Vec<u8>,
     helo: Vec<u8>,
@@ -186,6 +189,7 @@ impl<D: Dns> Deliver<D> {
             sts: Sts::default(),
             results: Results::default(),
             owners: Owners::default(),
+            last: Cell::new(None),
             dead: RefCell::new(BTreeMap::new()),
             ehlo,
             helo,
@@ -250,6 +254,22 @@ impl<D: Dns> Deliver<D> {
         due
     }
 
+    async fn upload(&self, due: &Due) -> bool {
+        let (Some(egress), false) = (self.last.get(), due.rua.https.is_empty()) else {
+            return false;
+        };
+        let json = due.report.json();
+        if json.len() > MAX_JSON {
+            return false;
+        }
+        let body = gzip(json.as_bytes());
+        let mut any = false;
+        for uri in &due.rua.https {
+            any |= upload(&self.dns, &self.tls, egress, uri, &body).await;
+        }
+        any
+    }
+
     pub fn report_sent(&self, day: u64, domain: &str) {
         self.owners.mark(day, domain, State::Sent);
     }
@@ -290,6 +310,7 @@ impl<D: Dns> Deliver<D> {
         let Some(egress) = egress else {
             return every(TEMPORARY, NO_EGRESS);
         };
+        self.last.set(Some(egress));
         let envelope = message.envelope;
         let Ok(domain) = Name::parse(&destination.domain) else {
             return every(Answer::Failed, BAD_DOMAIN);
@@ -867,7 +888,13 @@ impl<D: Dns> Transport for Deliver<D> {
         let mut mails = Vec::new();
         for due in self.due_reports().await {
             let (day, domain) = (due.report.day, due.report.domain.clone());
+            let uploaded = self.upload(&due).await;
             if due.rua.mailto.is_empty() {
+                if uploaded {
+                    self.report_sent(day, &domain);
+                } else {
+                    self.report_failed(day, &domain);
+                }
                 continue;
             }
             match report_mail(&due.report, &from, &due.rua.mailto) {

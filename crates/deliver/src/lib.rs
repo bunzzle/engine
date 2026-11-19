@@ -13,6 +13,7 @@ mod results;
 mod saver;
 mod settings;
 mod sts;
+mod upload;
 
 pub use classify::{answer, kind};
 pub use deliver::{Deliver, Due, Message, Outcome};
