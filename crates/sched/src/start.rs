@@ -14,6 +14,7 @@ use store::{Changes, Core, Keeper};
 use crate::clock::Clock;
 use crate::delete::sweep_queues;
 use crate::error::Error;
+use crate::events::{self, KIND_EVENT};
 use crate::node::{Config, Note, Sched};
 use crate::requests::{KIND_REQUEST, RequestInputs, Requests, retain_request};
 use crate::sealing::{Holds, Keys};
@@ -713,6 +714,7 @@ fn retain_current(core: &mut Core, table: &Rc<RefCell<Table>>, clock: Clock) {
             match kind {
                 KIND_SUPPRESS => suppress::retain(&table, clock.now(), entry, oldest),
                 KIND_REQUEST => retain_request(&table, clock.now(), entry),
+                KIND_EVENT => events::retain(&table, entry),
                 _ => true,
             }
         }),
