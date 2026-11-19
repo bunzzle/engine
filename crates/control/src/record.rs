@@ -17,6 +17,7 @@ pub const KIND_FLOOR: u8 = 8;
 pub const KIND_STS: u8 = 9;
 pub const KIND_RPT: u8 = 10;
 pub const KIND_HOOK: u8 = 11;
+pub const KIND_CURSOR: u8 = 12;
 pub const SYSTEM: u32 = 0;
 pub const MAX_POOLS: usize = 16;
 pub const MAX_ADDRESSES: usize = 64;

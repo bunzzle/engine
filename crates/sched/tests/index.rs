@@ -22,12 +22,13 @@ use keys::{
 use rt::sim::{Config, Disk, Faults, Machine, SimDriver, Stalls, check};
 use rt::{JoinHandle, Runtime, TcpListener, TcpStream, sleep, spawn, timeout};
 use sched::{
-    Answer, Answered, Attempt, Batched, Begun, Clock, DAY, Draft, EVENT_DAYS, EVENT_SHAPE,
+    Answer, Answered, Attempt, Batched, Begun, Clock, Cursor, DAY, Draft, EVENT_DAYS, EVENT_SHAPE,
     EVENT_VALUE, Event, EventBody, EventKind, Fault, Hash, HookChange, KIND_EVENT, KIND_REQUEST,
     KIND_SUPPRESS, Keyring, Keys, MAX_HOOKS, MAX_REPLY, Meshes, Node, Parts, ROTATION_MS,
     ReadError, Reason, Recipient, Refusal, Restore, Running, SHAPE, Settings, Suppression, Ticket,
-    Transport, Unsealable, Unwrapped, encode_slice, event_record, event_sealed, event_sequence,
-    normalize, punycode, retain, retain_event, retain_request, retired_events,
+    Transport, Unsealable, Unwrapped, drop_cursor, encode_slice, event_record, event_sealed,
+    event_sequence, normalize, punycode, read_cursor, retain, retain_event, retain_request,
+    retired_events, write_cursor,
 };
 use spool::{Body, Head, HeadClear, Message, MessageId, SLICE, Slice, Stamp};
 use store::{Client, Committer, DataFile, Options, SLOT_SIZE, Setup, Tiering, boot};
@@ -3597,4 +3598,108 @@ fn events_follow_results(seed: u64) {
 #[test]
 fn events_follow_results_across_a_crash() {
     check(0..6, events_follow_results);
+}
+
+#[test]
+fn cursor_items_are_written_read_dropped_and_kept_across_a_restart() {
+    let driver = Rc::new(SimDriver::with_disk(49, Config::default(), created(49)));
+    let cluster = started_with_keys(&driver, 2);
+    let nodes = cluster.nodes.clone();
+    let records = cluster.run(async move {
+        keys_listening().await;
+        ready(&nodes).await;
+        let control = nodes.iter().find(|n| n.controls()).expect("control core");
+        let records = control.control_records();
+        for node in &nodes {
+            let changes = node.spool().changes();
+            for shard in node.spool().shards() {
+                assert_eq!(
+                    read_cursor(changes, shard, 1, 3).await.expect("read"),
+                    (None)
+                );
+                let first = Cursor {
+                    generation: 1,
+                    acked: u64::from(shard) + 10,
+                    lost: 0,
+                    counted: 0,
+                };
+                write_cursor(changes, shard, 1, 3, &first)
+                    .await
+                    .expect("write");
+                assert_eq!(
+                    read_cursor(changes, shard, 1, 3).await.expect("read"),
+                    (Some(first))
+                );
+                assert_eq!(
+                    read_cursor(changes, shard, 2, 3).await.expect("read"),
+                    (None)
+                );
+                let moved = Cursor {
+                    acked: first.acked + 5,
+                    lost: 2,
+                    counted: 20_000,
+                    ..first
+                };
+                write_cursor(changes, shard, 1, 3, &moved)
+                    .await
+                    .expect("write");
+                assert_eq!(
+                    read_cursor(changes, shard, 1, 3).await.expect("read"),
+                    (Some(moved))
+                );
+                write_cursor(changes, shard, 1, 4, &first)
+                    .await
+                    .expect("write");
+                drop_cursor(changes, shard, 1, 4).await.expect("drop");
+                drop_cursor(changes, shard, 1, 4).await.expect("drop again");
+                assert_eq!(
+                    read_cursor(changes, shard, 1, 4).await.expect("read"),
+                    (None)
+                );
+            }
+        }
+        assert_eq!(control.control_records(), records);
+        records
+    });
+    cluster.stop();
+    let driver = Rc::new(SimDriver::with_disk(50, Config::default(), driver.crash()));
+    let restarted = started_with_keys(&driver, 2);
+    let nodes = restarted.nodes.clone();
+    restarted.run(async move {
+        keys_listening().await;
+        wait_for(&nodes, 1, 1, State::Active).await;
+        let control = nodes.iter().find(|n| n.controls()).expect("control core");
+        assert_eq!(control.control_records(), records);
+        for node in &nodes {
+            let changes = node.spool().changes();
+            for shard in node.spool().shards() {
+                let kept = read_cursor(changes, shard, 1, 3).await.expect("read");
+                assert_eq!(
+                    kept.map(|c| (c.acked, c.lost)),
+                    Some((u64::from(shard) + 15, 2))
+                );
+                assert_eq!(
+                    read_cursor(changes, shard, 1, 4).await.expect("read"),
+                    (None)
+                );
+            }
+        }
+    });
+    restarted.stop();
+}
+
+#[test]
+fn cursor_bytes_round_trip_and_refuse_other_formats() {
+    let cursor = Cursor {
+        generation: 7,
+        acked: u64::MAX - 1,
+        lost: 3,
+        counted: 20_001,
+    };
+    let bytes = cursor.encode();
+    assert_eq!(Cursor::decode(&bytes), Some(cursor));
+    let mut other = bytes;
+    other[0] = 2;
+    assert_eq!(Cursor::decode(&other), None);
+    assert_eq!(Cursor::decode(&bytes[..24]), None);
 }

@@ -1,5 +1,6 @@
 mod access;
 mod clock;
+mod cursor;
 mod delete;
 mod dkim;
 mod domain;
@@ -24,6 +25,7 @@ mod transport;
 mod unopened;
 
 pub use clock::Clock;
+pub use cursor::{Cursor, drop_cursor, read_cursor, write_cursor};
 pub use envelope::{Envelope, Recipient, Required, Ret, decode_slice, encode_slice};
 pub use error::{Error, Refusal};
 pub use events::{
