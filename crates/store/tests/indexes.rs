@@ -262,6 +262,7 @@ fn put(kind: u8, partition: u32, n: u64, round: u64) -> IndexRecord {
         vec![u8::try_from(n % 251).expect("fits"); usize::try_from(n % 40).expect("fits")]
     };
     IndexRecord {
+        sequenced: false,
         kind,
         partition,
         entry: Entry::put(key(3, n), (n ^ round).to_le_bytes().to_vec(), payload),
@@ -270,6 +271,7 @@ fn put(kind: u8, partition: u32, n: u64, round: u64) -> IndexRecord {
 
 fn delete(kind: u8, partition: u32, n: u64) -> IndexRecord {
     IndexRecord {
+        sequenced: false,
         kind,
         partition,
         entry: Entry::delete(key(3, n), SHAPE),
@@ -293,8 +295,13 @@ fn index_records_round_trip_and_refuse_damage() {
     op[1] = 3;
     assert_eq!(IndexRecord::decode(&op), None);
     let mut reserved = bytes.clone();
-    reserved[12] = 1;
+    reserved[12] = 2;
     assert_eq!(IndexRecord::decode(&reserved), None);
+    let sequenced = IndexRecord {
+        sequenced: true,
+        ..record.clone()
+    };
+    assert_eq!(IndexRecord::decode(&sequenced.encode()), Some(sequenced));
     let mut long = bytes.clone();
     long.push(0);
     assert_eq!(IndexRecord::decode(&long), None);

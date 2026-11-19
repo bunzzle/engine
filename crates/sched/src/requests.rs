@@ -269,6 +269,7 @@ impl Requests {
             return Err(Refusal::Message);
         }
         Ok(IndexRecord {
+            sequenced: false,
             kind: KIND_REQUEST,
             partition: self.today(),
             entry: Entry::put(index::key(ticket.tenant, ticket.hash), value, payload),
