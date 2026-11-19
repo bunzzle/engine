@@ -16,6 +16,7 @@ use crate::delete::sweep_queues;
 use crate::error::Error;
 use crate::events::{self, KIND_EVENT};
 use crate::node::{Config, Note, Sched};
+use crate::reader::{self, EventPage, ReadError, Reader};
 use crate::requests::{KIND_REQUEST, RequestInputs, Requests, retain_request};
 use crate::sealing::{Holds, Keys};
 use crate::suppress::{self, Inputs, KIND_SUPPRESS, Suppressions};
@@ -30,6 +31,7 @@ pub struct Meshes {
     leases: Mesh<Ask<u32>>,
     sched: Mesh<Note>,
     suppress: Mesh<suppress::Ask>,
+    events: Mesh<reader::Ask>,
     steps: Mesh<()>,
 }
 
@@ -41,6 +43,7 @@ impl Meshes {
             leases: Mesh::new(cores),
             sched: Mesh::new(cores),
             suppress: Mesh::new(cores),
+            events: Mesh::new(cores),
             steps: Mesh::new(cores),
         }
     }
@@ -52,6 +55,7 @@ impl Meshes {
             leases: self.leases.take(core)?,
             sched: self.sched.take(core)?,
             suppress: self.suppress.take(core)?,
+            events: self.events.take(core)?,
             steps: self.steps.take(core)?,
         })
     }
@@ -63,6 +67,7 @@ pub struct Links {
     leases: Ends<Ask<u32>>,
     sched: Ends<Note>,
     suppress: Ends<suppress::Ask>,
+    events: Ends<reader::Ask>,
     steps: Ends<()>,
 }
 
@@ -94,6 +99,7 @@ pub(crate) struct Inner<T> {
     pub(crate) table: Rc<RefCell<Table>>,
     pub(crate) suppressions: Suppressions,
     pub(crate) requests: Requests,
+    reader: Reader,
     config: Peers<control::Note>,
     writer: RefCell<Option<Writer>>,
     writing: Cell<bool>,
@@ -200,8 +206,8 @@ impl<T: Transport + 'static> Node<T> {
             naming: settings.naming,
             shards: found.shards.clone(),
         };
-        let (suppressions, requests, mut index_done) =
-            index_services(links.suppress, inputs).await?;
+        let (suppressions, requests, reader, mut index_done) =
+            index_services(links.suppress, links.events, inputs).await?;
         let (queues, names_done) = loaded.start(
             links.names,
             changes.clone(),
@@ -222,8 +228,7 @@ impl<T: Transport + 'static> Node<T> {
         );
         sched.use_keys(Rc::clone(&parts.keys));
         sched.use_table(Rc::clone(&table));
-        let restored = pending.len() as u64;
-        restore_live(&sched, pending, &table);
+        let restored = restore_live(&sched, pending, &table);
 
         leases.opened().await;
         barrier(links.steps).await;
@@ -242,6 +247,7 @@ impl<T: Transport + 'static> Node<T> {
             table,
             suppressions,
             requests,
+            reader,
             config,
             writer: RefCell::new(writer),
             writing: Cell::new(false),
@@ -292,6 +298,18 @@ impl<T: Transport + 'static> Node<T> {
 
     pub fn requests(&self) -> &Requests {
         &self.inner.requests
+    }
+
+    pub async fn events(
+        &self,
+        tenant: u32,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<EventPage, ReadError> {
+        self.inner
+            .reader
+            .read(self.keys(), tenant, after, limit)
+            .await
     }
 
     pub fn suppressions(&self) -> &Suppressions {
@@ -478,14 +496,18 @@ impl<T: Transport + 'static> Node<T> {
         inner.leases.close();
         inner.suppressions.close();
         inner.requests.close();
+        inner.reader.close();
         inner.config.close();
     }
 }
 
 async fn index_services(
     ends: Ends<suppress::Ask>,
+    events: Ends<reader::Ask>,
     inputs: Inputs,
-) -> Result<(Suppressions, Requests, Vec<JoinHandle<()>>), Error> {
+) -> Result<(Suppressions, Requests, Reader, Vec<JoinHandle<()>>), Error> {
+    let (reader, reader_done) =
+        Reader::start(events, inputs.changes.clone(), Rc::clone(&inputs.table));
     let request_inputs = RequestInputs {
         keys: Rc::clone(&inputs.keys),
         changes: inputs.changes.clone(),
@@ -498,7 +520,12 @@ async fn index_services(
     let (requests, requests_done) = Requests::start(request_inputs)
         .await
         .map_err(spool::Error::from)?;
-    Ok((suppressions, requests, vec![lists_done, requests_done]))
+    Ok((
+        suppressions,
+        requests,
+        reader,
+        vec![lists_done, requests_done, reader_done],
+    ))
 }
 
 const TICK: Duration = Duration::from_secs(1);
@@ -657,13 +684,15 @@ fn restore_live<T: Transport + 'static>(
     sched: &Sched<T>,
     pending: Vec<Pending>,
     table: &Rc<RefCell<Table>>,
-) {
+) -> u64 {
+    let restored = pending.len() as u64;
     let table = table.borrow();
     let live = pending
         .into_iter()
         .filter(|m| !table.tenant(m.tenant).is_some_and(|t| t.state.deleted()))
         .collect();
     sched.restore(live, |tenant| table.tenant(tenant).map(|t| t.generation));
+    restored
 }
 
 type Started = (

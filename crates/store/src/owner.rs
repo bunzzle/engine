@@ -163,6 +163,13 @@ struct Scan {
     reply: Sender<Result<Vec<index::Entry>, Error>>,
 }
 
+struct ScanKind {
+    kind: u8,
+    keys: Keys<index::Key>,
+    limit: usize,
+    reply: Sender<Result<Vec<(u16, index::Entry)>, Error>>,
+}
+
 struct Retire {
     kind: u8,
     close: u32,
@@ -176,6 +183,7 @@ enum Input {
     Lookup(Lookup),
     Items(Items),
     Scan(Scan),
+    ScanKind(ScanKind),
     Partitions(u8, Sender<Vec<(u16, u32)>>),
     Retire(Retire),
     Event(Event),
@@ -345,6 +353,25 @@ impl Changes {
         answer.recv().await.unwrap_or(Err(Error::Failed))
     }
 
+    pub async fn scan_kind(
+        &self,
+        kind: u8,
+        keys: Keys<index::Key>,
+        limit: usize,
+    ) -> Result<Vec<(u16, index::Entry)>, Error> {
+        let (reply, mut answer) = channel();
+        let scan = ScanKind {
+            kind,
+            keys,
+            limit,
+            reply,
+        };
+        if self.sender.send(Input::ScanKind(scan)).is_err() {
+            return Err(Error::Failed);
+        }
+        answer.recv().await.unwrap_or(Err(Error::Failed))
+    }
+
     pub async fn partitions(&self, kind: u8) -> Result<Vec<(u16, u32)>, Error> {
         let (reply, mut answer) = channel();
         if self.sender.send(Input::Partitions(kind, reply)).is_err() {
@@ -453,6 +480,7 @@ impl Shards {
                     let _ = items.reply.send(self.items(items.shard, &items.keys));
                 }
                 Input::Scan(scan) => self.scan(scan).await,
+                Input::ScanKind(scan) => self.scan_kind(scan).await,
                 Input::Partitions(kind, reply) => {
                     let _ = reply.send(self.kept_partitions(kind));
                 }
@@ -689,6 +717,44 @@ impl Shards {
             Err(Error::Invalid("owner"))
         };
         let _ = scan.reply.send(result);
+    }
+
+    async fn scan_kind(&self, scan: ScanKind) {
+        let mut found = Vec::new();
+        let mut result = Ok(());
+        let mut keys = scan.keys.clone();
+        for (shard, partition) in self.kept_partitions(scan.kind) {
+            if keys.start >= keys.end {
+                break;
+            }
+            match self
+                .keeper
+                .range(
+                    &self.file,
+                    shard,
+                    (scan.kind, partition),
+                    keys.clone(),
+                    scan.limit,
+                )
+                .await
+            {
+                Ok(entries) => found.extend(entries.into_iter().map(|e| (shard, e))),
+                Err(error) => {
+                    result = Err(error);
+                    break;
+                }
+            }
+            if found.len() >= scan.limit {
+                found.sort_by_key(|(shard, entry)| (entry.key, *shard));
+                found.truncate(scan.limit);
+                if let Some((_, last)) = found.last() {
+                    keys.end = after(last.key);
+                }
+            }
+        }
+        found.sort_by_key(|(shard, entry)| (entry.key, *shard));
+        found.truncate(scan.limit);
+        let _ = scan.reply.send(result.map(|()| found));
     }
 
     fn start(&mut self, request: Request) {
@@ -1183,4 +1249,14 @@ async fn move_body(
     written.ok()?;
     target.offset += length;
     Some(moved)
+}
+
+fn after(mut key: index::Key) -> index::Key {
+    for byte in key.iter_mut().rev() {
+        *byte = byte.wrapping_add(1);
+        if *byte != 0 {
+            return key;
+        }
+    }
+    [0xff; index::KEY]
 }

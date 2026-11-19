@@ -12,6 +12,7 @@ mod lanes;
 mod node;
 mod normal;
 mod policy;
+mod reader;
 mod requests;
 mod sealing;
 mod sign;
@@ -38,6 +39,7 @@ pub use policy::{
     Answer, BACKOFF, CLASS_FULL, CLASS_GREYLIST, CLASS_RETRY_AFTER, CLASS_THROTTLE, Kind, LONGEST,
     clamp, delay, report_retry,
 };
+pub use reader::{EventPage, MAX_LIMIT as EVENTS_LIMIT, Read as EventRead, ReadError};
 pub use requests::{
     Begun, DAY, INLINE_IDS, KIND_REQUEST, REQUEST_SHAPE, RequestInputs, Requests, Ticket,
     retain_request,
