@@ -187,19 +187,31 @@ pub fn policy(text: &str) -> String {
     )
 }
 
-pub fn serve_policy(ip: IpAddr, response: Rc<RefCell<String>>) -> Rc<RefCell<Vec<String>>> {
+pub type Shared<T> = Rc<RefCell<Vec<T>>>;
+
+pub fn serve_policy(ip: IpAddr, response: Rc<RefCell<String>>) -> Shared<String> {
+    policy_server(ip, response).0
+}
+
+pub fn policy_server(
+    ip: IpAddr,
+    response: Rc<RefCell<String>>,
+) -> (Shared<String>, Shared<IpAddr>) {
     let requests = Rc::new(RefCell::new(Vec::new()));
+    let sources = Rc::new(RefCell::new(Vec::new()));
     let shared = Rc::clone(&requests);
+    let seen = Rc::clone(&sources);
     let certs = Arc::new(Certs::new(CERT, &key()).expect("certs"));
     let acceptor = Rc::new(Acceptor::new(simulated(3), certs).expect("acceptor"));
     drop(spawn(async move {
         let listener = TcpListener::bind(SocketAddr::new(ip, 443), 16)
             .await
             .expect("bind");
-        while let Ok((io, _)) = listener.accept().await {
+        while let Ok((io, peer)) = listener.accept().await {
             let acceptor = Rc::clone(&acceptor);
             let response = response.borrow().clone();
             let shared = Rc::clone(&shared);
+            seen.borrow_mut().push(peer.ip());
             drop(spawn(async move {
                 let Ok(mut stream) = acceptor.accept(io).await else {
                     return;
@@ -221,7 +233,7 @@ pub fn serve_policy(ip: IpAddr, response: Rc<RefCell<String>>) -> Rc<RefCell<Vec
             }));
         }
     }));
-    requests
+    (requests, sources)
 }
 
 fn line(buf: &mut Vec<u8>) -> Option<String> {

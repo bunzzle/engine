@@ -183,6 +183,7 @@ reuse = 20
 pooled = 50
 dead = "2m"
 mta_sts = true
+egress = "192.0.2.7"
 eight_bit = "fail"
 connect_timeout = "10s"
 banner_timeout = "1m"
@@ -237,6 +238,7 @@ cache = 500"#,
     );
     assert_eq!((settings.reuse, settings.pooled), (20, 50));
     assert!(settings.mta_sts);
+    assert_eq!(settings.egress, Some("192.0.2.7".parse().expect("ip")));
     assert_eq!(settings.eight_bit, deliver::EightBit::Fail);
     let t = settings.timeouts;
     assert_eq!(
@@ -304,6 +306,20 @@ contact = "mailto:postmaster@ops.example"
     assert!(parse(&bad).is_err());
     let missing = roots(format!("{MINIMAL}[tlsrpt]\non = true\ntenant = 3\n"));
     assert!(parse(&missing).is_err());
+}
+
+#[test]
+fn egress_must_be_a_unicast_address() {
+    for (line, want) in [
+        ("egress = \"mx.example\"", "`egress` must be an IP address"),
+        ("egress = \"0.0.0.0\"", "`egress` must be a unicast address"),
+        ("egress = \"ff02::1\"", "`egress` must be a unicast address"),
+    ] {
+        assert_eq!(
+            error(&format!("{MINIMAL}[deliver]\n{line}\n")),
+            format!("line 22, column 1: {want}")
+        );
+    }
 }
 
 #[test]

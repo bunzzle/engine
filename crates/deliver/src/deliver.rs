@@ -255,7 +255,8 @@ impl<D: Dns> Deliver<D> {
     }
 
     async fn upload(&self, due: &Due) -> bool {
-        let (Some(egress), false) = (self.last.get(), due.rua.https.is_empty()) else {
+        let fixed = self.settings.egress.or(self.last.get());
+        let (Some(egress), false) = (fixed, due.rua.https.is_empty()) else {
             return false;
         };
         let json = due.report.json();
@@ -932,7 +933,9 @@ impl<D: Dns> Transport for Deliver<D> {
                 let n = usize::try_from(n).unwrap_or(usize::MAX);
                 u64::try_from(self.pick(n)).unwrap_or(0)
             };
-            self.sts.refresh(&self.dns, &self.tls, jitter).await;
+            self.sts
+                .refresh(&self.dns, &self.tls, self.settings.egress, jitter)
+                .await;
         }
     }
 
