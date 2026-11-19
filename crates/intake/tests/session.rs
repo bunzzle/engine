@@ -122,6 +122,7 @@ fn answered(claimed: &[Claimed], answer: Answer) -> Vec<Answered> {
             recipient: c.recipient,
             answer,
             reply: Vec::new(),
+            event: None,
         })
         .collect()
 }

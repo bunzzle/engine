@@ -8,10 +8,10 @@ use std::time::Duration;
 
 use control::{KIND_RPT, KIND_STS, Leases};
 use dns::{Found, Name, Record, Type};
-use rt::{Ends, Instant, JoinHandle, now, timeout};
+use rt::{Ends, Instant, JoinHandle, now, timeout, wall_ms};
 use sched::{
-    Answer, Answered, Attempt, Body, Destination, Envelope, Kind, Recipient, ReportMail, Reported,
-    Required, Restore, Ret, Transport,
+    Answer, Answered, Attempt, Body, Destination, Envelope, EventBody, EventKind, Kind, Recipient,
+    ReportMail, Reported, Required, Restore, Ret, Transport,
 };
 use smtp::client::{
     self, Answer as Reply, Capabilities, Dots, Mail, Rcpt, Refused, Response, Step, Transaction,
@@ -971,12 +971,30 @@ impl<D: Dns> Transport for Deliver<D> {
             size,
         };
         let outcomes = self.deliver(&destination, message).await;
+        let time = wall_ms();
         claimed
             .iter()
             .map(|c| {
                 let outcome = outcomes.iter().find(|o| o.recipient == c.recipient);
                 let (answer, reply) = outcome.map_or((TEMPORARY, Lost::Closed.text()), |o| {
                     (o.answer, o.reply.as_slice())
+                });
+                let address = prepared
+                    .recipients
+                    .iter()
+                    .find(|(r, _)| *r == c.recipient)
+                    .map(|(_, r)| r.address.as_bytes().to_vec())
+                    .unwrap_or_default();
+                let event = EventKind::of(answer).and_then(|kind| {
+                    let body = EventBody {
+                        kind,
+                        time,
+                        address,
+                        reply: reply.to_vec(),
+                        attempts: c.attempts.saturating_add(1),
+                        class: c.class,
+                    };
+                    prepared.opener.event(c.recipient, c.stamp, &body).ok()
                 });
                 Answered {
                     recipient: c.recipient,
@@ -985,6 +1003,7 @@ impl<D: Dns> Transport for Deliver<D> {
                         .opener
                         .seal_reply(c.recipient, c.stamp, reply)
                         .unwrap_or_default(),
+                    event,
                 }
             })
             .collect()

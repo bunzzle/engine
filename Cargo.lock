@@ -354,6 +354,7 @@ dependencies = [
 name = "spool"
 version = "0.0.0"
 dependencies = [
+ "index",
  "rt",
  "store",
 ]

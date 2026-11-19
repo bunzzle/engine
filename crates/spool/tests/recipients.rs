@@ -3,12 +3,12 @@ use std::rc::Rc;
 use rt::sim::{Config, Disk, SimDriver};
 use rt::{JoinHandle, Runtime, spawn};
 use spool::{
-    Body, Done, Error, Head, HeadClear, Limits, Message, MessageId, Outcome, Recipient, Reply,
-    Report, Slice, Spool, Stamp, StateClear, Status, state_item,
+    Body, Done, Error, Event, Head, HeadClear, Limits, Message, MessageId, Outcome, Recipient,
+    Reply, Report, Slice, Spool, Stamp, StateClear, Status, state_item,
 };
 use store::{
-    Change, Client, DataFile, Delivery, Index, Keeper, Key, MAX_PAYLOAD, Options, SLOT_SIZE, Setup,
-    boot, control_key,
+    Change, Client, DataFile, Delivery, Index, IndexRecord, Keeper, Key, MAX_PAYLOAD, Options,
+    SLOT_SIZE, Setup, boot, control_key,
 };
 
 const PATH: &str = "/data/store";
@@ -124,6 +124,7 @@ fn deferred(recipient: u32, due: u64) -> Report {
             notified: true,
         },
         reply: None,
+        event: None,
     }
 }
 
@@ -132,6 +133,7 @@ fn done(recipient: u32, outcome: Outcome) -> Report {
         recipient,
         outcome,
         reply: None,
+        event: None,
     }
 }
 
@@ -149,6 +151,103 @@ const READY: Recipient = Recipient {
     class: 0,
     notified: false,
 };
+
+fn event(n: u8) -> Event {
+    Event {
+        record: IndexRecord {
+            sequenced: true,
+            kind: 3,
+            partition: 0,
+            entry: index::Entry::put(index::key(7, [0; 16]), vec![n; 61], vec![n; 5]),
+        },
+        carried: 0,
+    }
+}
+
+async fn events(spool: &Spool) -> Vec<(u64, u8)> {
+    spool
+        .changes()
+        .scan(0, (3, 0), [0; 20]..[0xff; 20], usize::MAX)
+        .await
+        .expect("scan")
+        .into_iter()
+        .map(|e| {
+            let stamp = u64::from_be_bytes(e.key[4..12].try_into().expect("stamp"));
+            (stamp, e.value[0])
+        })
+        .collect()
+}
+
+#[test]
+fn events_commit_with_their_reports_and_the_drop() {
+    let (seen, disk) = on(created(), || async {
+        let node = Node::open().await;
+        let spool = &node.spool;
+        let id = node.accept(0, 2, 500).await;
+        spool.claim(id, 0).expect("claim");
+        let first = Report {
+            event: Some(event(1)),
+            ..deferred(0, 50)
+        };
+        assert_eq!(
+            spool.report(id, vec![first]).await.expect("report"),
+            Done::Kept
+        );
+        spool.claim(id, 0).expect("claim");
+        spool.claim(id, 1).expect("claim");
+        let last = vec![
+            Report {
+                event: Some(event(2)),
+                ..done(0, Outcome::Delivered)
+            },
+            Report {
+                event: Some(event(3)),
+                ..done(1, Outcome::Failed)
+            },
+        ];
+        assert_eq!(spool.report(id, last).await.expect("report"), Done::Dropped);
+        let seen = events(spool).await;
+        assert_eq!(seen.iter().map(|e| e.1).collect::<Vec<_>>(), [1, 2, 3]);
+        assert!(seen.windows(2).all(|w| w[0].0 < w[1].0));
+        assert_eq!((spool.take_lost(7), spool.lost_events()), (0, 0));
+        node.close().await;
+        seen
+    });
+    on(disk, || async move {
+        let node = Node::open().await;
+        assert_eq!(events(&node.spool).await, seen);
+        node.close().await;
+    });
+}
+
+#[test]
+fn refused_events_are_counted_as_lost_with_what_they_carried() {
+    on(created(), || async {
+        let node = Node::open().await;
+        let spool = &node.spool;
+        let id = node.accept(0, 2, 500).await;
+        spool.claim(id, 0).expect("claim");
+        let first = Report {
+            event: Some(event(1)),
+            ..deferred(0, 50)
+        };
+        spool.report(id, vec![first]).await.expect("report");
+        spool.claim(id, 0).expect("claim");
+        let mut wide = event(2);
+        wide.record.entry.value.push(0);
+        wide.carried = 4;
+        let refused = Report {
+            event: Some(wide),
+            ..deferred(0, 60)
+        };
+        assert!(spool.report(id, vec![refused]).await.is_err());
+        assert_eq!(spool.lost_events(), 5);
+        assert_eq!(spool.take_lost(7), 5);
+        assert_eq!(spool.take_lost(7), 0);
+        assert_eq!(events(spool).await.len(), 1);
+        node.close().await;
+    });
+}
 
 #[test]
 fn reports_need_a_claim_and_a_valid_reply() {

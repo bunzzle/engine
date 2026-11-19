@@ -9,7 +9,7 @@ use std::task::Poll;
 use control::{Table, Tenancy, queue_shard};
 use rt::{Ends, JoinHandle, Notify, Peers, sleep_until, spawn};
 use spool::{
-    Done, Error, Message, MessageId, Outcome, Pending, Reply, Report, Spool, Stamp, Stored,
+    Done, Error, Event, Message, MessageId, Outcome, Pending, Reply, Report, Spool, Stamp, Stored,
 };
 
 use crate::clock::Clock;
@@ -699,14 +699,19 @@ impl<T: Transport + 'static> Sched<T> {
                         }
                     }
                 };
-                let reply = answered.filter(|a| !a.reply.is_empty()).map(|a| Reply {
-                    stamp: c.stamp,
-                    sealed: a.reply,
+                let (reply, event) = answered.map_or((None, None), |a| {
+                    let event = a.event.map(|record| Event { record, carried: 0 });
+                    let reply = (!a.reply.is_empty()).then_some(Reply {
+                        stamp: c.stamp,
+                        sealed: a.reply,
+                    });
+                    (reply, event)
                 });
                 Report {
                     recipient: c.recipient,
                     outcome,
                     reply,
+                    event,
                 }
             })
             .collect();
@@ -840,6 +845,7 @@ impl<T: Transport + 'static> Sched<T> {
                                 notified: c.notified,
                             },
                             reply: None,
+                            event: None,
                         }
                     })
                     .collect(),
@@ -856,9 +862,10 @@ impl<T: Transport + 'static> Sched<T> {
         self.send(self.owner(route.message), note);
     }
 
-    fn report(&self, route: Route, reports: Vec<Report>) {
+    fn report(&self, route: Route, mut reports: Vec<Report>) {
         let sched = self.clone();
         drop(spawn(async move {
+            carry_lost(&sched.inner.spool, route.tenant, &mut reports);
             let back: Vec<(u32, Option<u64>)> = reports
                 .iter()
                 .map(|r| match r.outcome {
@@ -973,6 +980,7 @@ impl<T: Transport + 'static> Sched<T> {
                             notified: c.notified,
                         },
                         reply: None,
+                        event: None,
                     })
                     .collect(),
             },
@@ -1151,5 +1159,18 @@ impl<T: Transport + 'static> Sched<T> {
             let deadline = inner.lanes.borrow().deadline();
             self.wait(&inner.notify, deadline).await;
         }
+    }
+}
+
+fn carry_lost(spool: &Spool, tenant: u32, reports: &mut [Report]) {
+    let Some(event) = reports.iter_mut().find_map(|r| r.event.as_mut()) else {
+        return;
+    };
+    if crate::events::Event::decode(&event.record.entry.value).is_none() {
+        return;
+    }
+    let carried = spool.take_lost(tenant);
+    if crate::events::add_lost(&mut event.record, carried) {
+        event.carried = carried;
     }
 }

@@ -11,6 +11,9 @@ autotests = false
 rt = { path = "../rt" }
 store = { path = "../store" }
 
+[dev-dependencies]
+index = { path = "../index" }
+
 [[test]]
 name = "spool"
 path = "tests/main.rs"

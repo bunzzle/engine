@@ -223,6 +223,7 @@ async fn round(spool: &Spool, id: MessageId, step: u64, rng: &mut Rng, model: &S
             recipient: r,
             outcome,
             reply,
+            event: None,
         });
     }
     if calls.iter().all(|c| !c.is_empty()) {

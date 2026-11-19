@@ -245,6 +245,7 @@ impl Transport for Simulated {
                         recipient: c.recipient,
                         answer,
                         reply: Vec::new(),
+                        event: None,
                     }
                 })
                 .collect();
@@ -269,6 +270,7 @@ impl Transport for Simulated {
                     recipient: c.recipient,
                     answer,
                     reply,
+                    event: None,
                 }
             })
             .collect()

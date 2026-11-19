@@ -3,7 +3,8 @@ use std::mem;
 
 use rt::{Sender, channel, spawn};
 use store::{
-    Batch, Change, Delivery, HEAD_ITEM, INDEX_SIZE, Keeper, MAX_PAYLOAD, Op, fits, record_size,
+    Batch, Change, Delivery, HEAD_ITEM, INDEX_SIZE, IndexRecord, Keeper, MAX_PAYLOAD, Op, fits,
+    record_size,
 };
 
 use crate::error::Error;
@@ -71,10 +72,17 @@ pub struct Reply {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Event {
+    pub record: IndexRecord,
+    pub carried: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Report {
     pub recipient: u32,
     pub outcome: Outcome,
     pub reply: Option<Reply>,
+    pub event: Option<Event>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -162,6 +170,8 @@ impl Entry {
 
 struct Merge {
     batch: Batch,
+    events: Vec<IndexRecord>,
+    carried: u32,
     calls: Vec<Call>,
     ending: Vec<Waiter>,
     completing: bool,
@@ -174,6 +184,8 @@ pub(crate) struct Table {
     writes: BTreeMap<u16, u64>,
     open: BTreeMap<u32, u64>,
     days: BTreeMap<u32, u64>,
+    lost: BTreeMap<u32, u32>,
+    lost_total: u64,
 }
 
 impl Table {
@@ -288,10 +300,27 @@ impl Table {
 
 fn state_bytes(report: &Report) -> usize {
     let sealed = report.reply.as_ref().map_or(0, |r| r.sealed.len());
-    record_size(INDEX_SIZE + STATE_CLEAR + sealed)
+    let event = report
+        .event
+        .as_ref()
+        .map_or(0, |e| record_size(e.record.encode().len()));
+    record_size(INDEX_SIZE + STATE_CLEAR + sealed) + event
 }
 
 impl Spool {
+    pub fn take_lost(&self, tenant: u32) -> u32 {
+        self.inner
+            .table
+            .borrow_mut()
+            .lost
+            .remove(&tenant)
+            .unwrap_or(0)
+    }
+
+    pub fn lost_events(&self) -> u64 {
+        self.inner.table.borrow().lost_total
+    }
+
     pub fn stamp(&self, shard: u16) -> Result<Stamp, Error> {
         let boot = self
             .inner
@@ -546,6 +575,12 @@ impl Spool {
         } else {
             Vec::new()
         };
+        let events: Vec<IndexRecord> = reports()
+            .filter_map(|r| r.event.as_ref().map(|e| e.record.clone()))
+            .collect();
+        let carried = reports()
+            .filter_map(|r| r.event.as_ref())
+            .fold(0u32, |sum, e| sum.saturating_add(e.carried));
         let batch = Batch {
             shard,
             message,
@@ -554,6 +589,8 @@ impl Spool {
         };
         Some(Merge {
             batch,
+            events,
+            carried,
             calls,
             ending,
             completing,
@@ -562,16 +599,38 @@ impl Spool {
 
     async fn flush(&self, shard: u16, message: u64) {
         while let Some(merge) = self.merge(shard, message) {
-            let result = self.inner.changes.apply(merge.batch).await;
+            let tenant = merge.batch.tenant;
+            let events = merge.events.len();
+            let (result, kept) = if merge.events.is_empty() {
+                (self.inner.changes.apply(merge.batch).await.map(drop), true)
+            } else {
+                match self
+                    .inner
+                    .changes
+                    .apply_indexed(merge.batch, shard, merge.events, true)
+                    .await
+                {
+                    Ok(applied) => (Ok(()), !applied.indexed.is_empty()),
+                    Err(e) => (Err(e), false),
+                }
+            };
             let mut table = self.inner.table.borrow_mut();
+            if !kept {
+                let lost = u32::try_from(events)
+                    .unwrap_or(u32::MAX)
+                    .saturating_add(merge.carried);
+                let count = table.lost.entry(tenant).or_default();
+                *count = count.saturating_add(lost);
+                table.lost_total += u64::from(lost);
+            }
             let key = (shard, message);
             let mut closed = None;
             let answer = match result {
-                Ok(_) if merge.completing => {
+                Ok(()) if merge.completing => {
                     closed = table.remove(key);
                     Ok(Done::Dropped)
                 }
-                Ok(_) => {
+                Ok(()) => {
                     let entry = table.messages.get_mut(&key).expect("flushed message");
                     let mut finals = 0;
                     for report in merge.calls.iter().flat_map(|c| c.reports.iter()) {
