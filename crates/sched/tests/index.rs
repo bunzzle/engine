@@ -22,13 +22,13 @@ use keys::{
 use rt::sim::{Config, Disk, Faults, Machine, SimDriver, Stalls, check};
 use rt::{JoinHandle, Runtime, TcpListener, TcpStream, sleep, spawn, timeout};
 use sched::{
-    Answer, Answered, Attempt, Batched, Begun, Clock, Cursor, DAY, Draft, EVENT_DAYS, EVENT_SHAPE,
-    EVENT_VALUE, Event, EventBody, EventKind, Fault, Hash, HookChange, KIND_EVENT, KIND_REQUEST,
-    KIND_SUPPRESS, Keyring, Keys, MAX_HOOKS, MAX_REPLY, Meshes, Node, Parts, ROTATION_MS,
-    ReadError, Reason, Recipient, Refusal, Restore, Running, SHAPE, Settings, Suppression, Ticket,
-    Transport, Unsealable, Unwrapped, drop_cursor, encode_slice, event_record, event_sealed,
-    event_sequence, normalize, punycode, read_cursor, retain, retain_event, retain_request,
-    retired_events, write_cursor,
+    Answer, Answered, Attempt, Batched, Begun, Call, Clock, Cursor, DAY, Deliver, Draft,
+    EVENT_DAYS, EVENT_SHAPE, EVENT_VALUE, Event, EventBody, EventKind, Fault, Hash, HookChange,
+    KIND_EVENT, KIND_REQUEST, KIND_SUPPRESS, Keyring, Keys, MAX_HOOKS, MAX_REPLY, Meshes, Node,
+    Outcome, Parts, ROTATION_MS, ReadError, Reason, Recipient, Refusal, Restore, Running, SHAPE,
+    Sending, Settings, Suppression, Ticket, Transport, Unsealable, Unwrapped, drop_cursor,
+    encode_slice, event_record, event_sealed, event_sequence, normalize, punycode, read_cursor,
+    retain, retain_event, retain_request, retired_events, write_cursor,
 };
 use spool::{Body, Head, HeadClear, Message, MessageId, SLICE, Slice, Stamp};
 use store::{Client, Committer, DataFile, Options, SLOT_SIZE, Setup, Tiering, boot};
@@ -3702,4 +3702,230 @@ fn cursor_bytes_round_trip_and_refuse_other_formats() {
     other[0] = 2;
     assert_eq!(Cursor::decode(&other), None);
     assert_eq!(Cursor::decode(&bytes[..24]), None);
+}
+
+type Streamed = (MessageId, u32, EventKind, u16, u64);
+
+#[derive(Default)]
+struct Caught {
+    calls: RefCell<Vec<(u32, Vec<Streamed>)>>,
+    refuse: Cell<u32>,
+    slow: Cell<bool>,
+    flying: Cell<u32>,
+    most: Cell<u32>,
+}
+
+struct Catch(Rc<Caught>);
+
+impl Deliver for Catch {
+    fn deliver(&self, call: Rc<Call>) -> Sending {
+        let caught = Rc::clone(&self.0);
+        Box::pin(async move {
+            if caught.refuse.get() > 0 {
+                caught.refuse.set(caught.refuse.get() - 1);
+                return Outcome::Retry(Duration::from_secs(2));
+            }
+            caught.flying.set(caught.flying.get() + 1);
+            caught.most.set(caught.most.get().max(caught.flying.get()));
+            if caught.slow.get() {
+                sleep(Duration::from_secs(3)).await;
+            }
+            caught.flying.set(caught.flying.get() - 1);
+            let events = call
+                .events
+                .iter()
+                .map(|r| {
+                    assert!(r.body.is_some(), "event body opened");
+                    (
+                        r.event.message,
+                        r.event.recipient,
+                        r.event.kind,
+                        r.shard,
+                        r.sequence,
+                    )
+                })
+                .collect();
+            caught.calls.borrow_mut().push((call.hook, events));
+            Outcome::Acked
+        })
+    }
+}
+
+async fn drained(nodes: &[Node<Idle>]) {
+    for _ in 0..20_000 {
+        if nodes.iter().all(|n| n.spool().messages_of(1).is_empty()) {
+            return;
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
+    panic!("messages left");
+}
+
+fn delivered_to(caught: &Caught, hook: u32) -> Vec<Streamed> {
+    caught
+        .calls
+        .borrow()
+        .iter()
+        .filter(|(h, _)| *h == hook)
+        .flat_map(|(_, events)| events.iter().copied())
+        .collect()
+}
+
+fn check_streamed(seed: u64, got: &[Streamed], want: &[Given]) {
+    let mut once = BTreeSet::new();
+    for event in got {
+        assert!(
+            once.insert((event.3, event.4)),
+            "seed {seed}: event twice {event:?}"
+        );
+    }
+    let mut last: BTreeMap<(MessageId, u32), u64> = BTreeMap::new();
+    for event in got {
+        let before = last.insert((event.0, event.1), event.4);
+        assert!(
+            before.is_none_or(|b| b < event.4),
+            "seed {seed}: out of order {event:?}"
+        );
+    }
+    let mut got: Vec<_> = got.iter().map(|e| (e.0.bytes(), e.1, e.2 as u8)).collect();
+    let mut want: Vec<_> = want.iter().map(|e| (e.0.bytes(), e.1, e.3 as u8)).collect();
+    got.sort_unstable();
+    want.sort_unstable();
+    assert_eq!(got, want, "seed {seed}: streamed events differ");
+}
+
+#[test]
+fn webhook_streams_send_each_matching_event_once_from_the_head() {
+    ANSWERS.set(None);
+    let seed = 51;
+    let driver = Rc::new(SimDriver::with_disk(seed, Config::default(), created(seed)));
+    let cluster = started(&driver, 2);
+    let nodes = cluster.nodes.clone();
+    let caught = Rc::new(Caught::default());
+    let watching = Rc::clone(&caught);
+    let (all, some) = cluster.run(async move {
+        let caught = watching;
+        ready(&nodes).await;
+        answering(&nodes);
+        accept_some(&nodes, 0, 2).await;
+        drained(&nodes).await;
+        let (before, _, _) = read_all(&nodes[0], None, 1000).await;
+        let control = nodes.iter().find(|n| n.controls()).expect("control core");
+        let at = "https://hooks.example.org/in";
+        let all = control.hook_new(1, at, 0).await.expect("new").id;
+        let some = control.hook_new(1, at, 1).await.expect("new").id;
+        let other = control.hook_new(2, at, 0).await.expect("new").id;
+        caught.refuse.set(2);
+        let tasks: Vec<_> = nodes
+            .iter()
+            .map(|n| n.start_hooks(Rc::new(Catch(Rc::clone(&caught)))))
+            .collect();
+        sleep(Duration::from_secs(2)).await;
+        accept_some(&nodes, 2, 6).await;
+        drained(&nodes).await;
+        sleep(Duration::from_secs(10)).await;
+        let (whole, _, _) = read_all(&nodes[0], None, 1000).await;
+        let fresh: Vec<Given> = whole.into_iter().filter(|e| !before.contains(e)).collect();
+        assert_ne!(fresh.len(), 0);
+        check_streamed(seed, &delivered_to(&caught, all), &fresh);
+        let wanted: Vec<Given> = fresh
+            .iter()
+            .copied()
+            .filter(|e| e.3 == EventKind::Delivered)
+            .collect();
+        check_streamed(seed, &delivered_to(&caught, some), &wanted);
+        assert_eq!(delivered_to(&caught, other).len(), 0);
+        assert_eq!(caught.refuse.get(), 0);
+        for node in &nodes {
+            let changes = node.spool().changes();
+            for shard in node.spool().shards() {
+                let top = delivered_to(&caught, all)
+                    .iter()
+                    .filter(|e| e.3 == shard)
+                    .map(|e| e.4)
+                    .max()
+                    .unwrap_or(0);
+                let cursor = read_cursor(changes, shard, 1, all).await.expect("read");
+                assert!(cursor.is_some_and(|c| c.acked >= top), "shard {shard}");
+            }
+        }
+        drop(tasks);
+        (all, some)
+    });
+    cluster.stop();
+    let sent = caught.calls.borrow().len();
+    let driver = Rc::new(SimDriver::with_disk(
+        seed + 1,
+        Config::default(),
+        driver.crash(),
+    ));
+    let restarted = started(&driver, 2);
+    let nodes = restarted.nodes.clone();
+    let watching = Rc::clone(&caught);
+    restarted.run(async move {
+        wait_for(&nodes, 1, 1, State::Active).await;
+        let tasks: Vec<_> = nodes
+            .iter()
+            .map(|n| n.start_hooks(Rc::new(Catch(Rc::clone(&watching)))))
+            .collect();
+        sleep(Duration::from_secs(5)).await;
+        assert_eq!(
+            watching.calls.borrow().len(),
+            sent,
+            "acknowledged events sent again"
+        );
+        drop(tasks);
+    });
+    restarted.stop();
+    assert!(delivered_to(&caught, all).len() > delivered_to(&caught, some).len());
+}
+
+#[test]
+fn a_webhook_paused_and_resumed_while_sending_keeps_one_call_and_every_event() {
+    ANSWERS.set(None);
+    let seed = 53;
+    let driver = Rc::new(SimDriver::with_disk(seed, Config::default(), created(seed)));
+    let cluster = started(&driver, 1);
+    let nodes = cluster.nodes.clone();
+    cluster.run(async move {
+        ready(&nodes).await;
+        answering(&nodes);
+        let control = &nodes[0];
+        let hook = control
+            .hook_new(1, "https://hooks.example.org/in", 0)
+            .await
+            .expect("new")
+            .id;
+        let caught = Rc::new(Caught::default());
+        caught.slow.set(true);
+        let task = control.start_hooks(Rc::new(Catch(Rc::clone(&caught))));
+        sleep(Duration::from_secs(2)).await;
+        accept_some(&nodes, 0, 4).await;
+        drained(&nodes).await;
+        for enabled in [false, true, false, true] {
+            sleep(Duration::from_millis(700)).await;
+            let change = HookChange {
+                enabled: Some(enabled),
+                ..HookChange::default()
+            };
+            control.hook_change(1, hook, change).await.expect("change");
+        }
+        caught.slow.set(false);
+        accept_some(&nodes, 4, 2).await;
+        drained(&nodes).await;
+        sleep(Duration::from_secs(20)).await;
+        assert_eq!(caught.most.get(), 1, "two calls in flight");
+        let (whole, _, _) = read_all(&nodes[0], None, 1000).await;
+        let got: BTreeSet<_> = delivered_to(&caught, hook)
+            .iter()
+            .map(|e| (e.0.bytes(), e.1, e.2 as u8))
+            .collect();
+        let want: BTreeSet<_> = whole
+            .iter()
+            .map(|e| (e.0.bytes(), e.1, e.3 as u8))
+            .collect();
+        assert_eq!(got, want, "events missing");
+        drop(task);
+    });
+    cluster.stop();
 }

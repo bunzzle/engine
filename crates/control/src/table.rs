@@ -156,6 +156,10 @@ impl Table {
         self.hooks.get(&id).filter(|h| h.tenant == tenant)
     }
 
+    pub fn every_hook(&self) -> impl Iterator<Item = &Hook> {
+        self.hooks.values()
+    }
+
     pub fn hook_owner(&self, id: u32) -> Option<u32> {
         self.hooks.get(&id).map(|h| h.tenant)
     }
