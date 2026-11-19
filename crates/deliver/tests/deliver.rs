@@ -19,8 +19,8 @@ use dns::{Found, Name, Record, Type};
 use rt::sim::{Config, SimDriver};
 use rt::{Mesh, Runtime, now, sleep, spawn};
 use sched::{
-    Answer, Body, Destination, Done, Envelope, Kind, Recipient, Records as Saving, Required,
-    Restore, Saved, Transport,
+    Answer, Body, Destination, Done, Envelope, Kind, Recipient, Records as Saving, Reported,
+    Required, Restore, Saved, Transport,
 };
 use tls::{Connector, simulated};
 
@@ -1491,7 +1491,7 @@ fn report_owners_merge_every_core_and_keep_records() {
             let ends = mesh
                 .take(u16::try_from(core).expect("small"))
                 .expect("ends");
-            drop(deliver.reports(ends));
+            drop(deliver.report_mesh(ends));
             restored(&deliver, memory, naming).await;
             deliver.tick().await;
             cores.push(deliver);
@@ -1607,6 +1607,48 @@ fn due_reports_come_once_after_the_day_and_stay_sent() {
     assert_eq!(again, []);
     assert_eq!(restarted, []);
     assert_eq!(stats.sent, 1);
+}
+
+#[test]
+fn report_mails_go_to_mailto_addresses_only() {
+    let mut found = Vec::new();
+    for record in [
+        "v=TLSRPTv1; rua=mailto:tls@example.com",
+        "v=TLSRPTv1; rua=https://r.example/v1",
+    ] {
+        let (mails, stats) = run(async move {
+            drop(serve(MX1, Script::new(&[])));
+            let zone = zone();
+            let txt = Found::Records(vec![Record::Txt(record.as_bytes().to_vec())]);
+            zone.set("_smtp._tls.example.com", Type::Txt, txt);
+            let mut settings = settings();
+            settings.tlsrpt = true;
+            settings.reporter.from = "tlsrpt@sender.example".into();
+            settings.reporter.submitter = "sender.example".into();
+            let deliver = deliverer(zone, settings);
+            restored(&deliver, &Rc::new(Memory::default()), [7; 16]).await;
+            deliver.tick().await;
+            simple(&deliver, "example.com").await;
+            sleep(Duration::from_mins(11)).await;
+            deliver.tick().await;
+            sleep(Duration::from_hours(29)).await;
+            let mails = deliver.reports().await;
+            for mail in &mails {
+                deliver.reported(mail.day, &mail.domain, Reported::Sent);
+            }
+            (mails, deliver.owner_stats())
+        });
+        found.push((mails, stats.sent));
+    }
+    let (mails, sent) = &found[0];
+    assert_eq!(*sent, 1);
+    assert_eq!(mails.len(), 1);
+    assert_eq!(mails[0].domain, "example.com");
+    assert_eq!(mails[0].from, "tlsrpt@sender.example");
+    assert_eq!(mails[0].to, ["tls@example.com"]);
+    let text = String::from_utf8_lossy(&mails[0].message);
+    assert!(text.contains("TLS-Report-Domain: example.com\r\n"));
+    assert_eq!(found[1], (Vec::new(), 0));
 }
 
 #[test]

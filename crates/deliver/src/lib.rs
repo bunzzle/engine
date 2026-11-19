@@ -4,6 +4,7 @@ mod dane;
 mod deliver;
 mod gzip;
 mod https;
+mod mail;
 mod mx;
 mod owners;
 mod pool;

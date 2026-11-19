@@ -35,6 +35,7 @@ impl Default for Timeouts {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Reporter {
+    pub from: String,
     pub organization: String,
     pub contact: String,
     pub submitter: String,

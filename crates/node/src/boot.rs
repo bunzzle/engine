@@ -12,6 +12,7 @@ use store::Core;
 use tls::rustls::crypto::CryptoProvider;
 use tls::{Acceptor, Certs};
 
+use crate::report;
 use crate::{Config, Error};
 
 const BACKLOG: u32 = 1024;
@@ -169,6 +170,7 @@ pub async fn run<T: Transport + 'static>(
     }
     let up = starting.await?;
     orders.until(|o| o.go.get() || o.stop.get()).await;
+    report::start(&up.node, &plan.config);
     let session = Rc::new(plan.config.session.clone());
     let listeners: Vec<Listener> = up
         .sockets

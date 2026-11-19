@@ -270,6 +270,14 @@ impl<T: Transport + 'static> Sched<T> {
         self.inner.clock
     }
 
+    pub fn transport(&self) -> &T {
+        &self.inner.transport
+    }
+
+    pub fn closed(&self) -> bool {
+        self.inner.closed.get()
+    }
+
     pub fn active(&self) -> u32 {
         self.inner.lanes.borrow().active()
     }

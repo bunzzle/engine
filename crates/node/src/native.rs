@@ -47,7 +47,7 @@ pub fn deliver(path: &Path) -> Result<(), Error> {
         )
         .map_err(|_| String::from("`ehlo` cannot be sent"))?;
         let ends = reports.take(core).ok_or("report mesh already taken")?;
-        drop(deliver.reports(ends));
+        drop(deliver.report_mesh(ends));
         Ok(deliver)
     })
 }

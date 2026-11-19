@@ -22,6 +22,13 @@ pub struct Config {
     pub api: Option<Api>,
     pub dns: dns::Settings,
     pub delivery: Delivery,
+    pub tlsrpt: Option<Tlsrpt>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Tlsrpt {
+    pub tenant: u32,
+    pub from: String,
 }
 
 #[derive(Clone, Debug)]
@@ -101,6 +108,10 @@ pub fn parse(text: &str) -> Result<Config, Error> {
     if let Some(table) = root.table("deliver") {
         deliver(table, &mut delivery, tls.roots.is_some())?;
     }
+    let tlsrpt = match root.table("tlsrpt") {
+        Some(table) => tlsrpt(table, &mut delivery.settings, tls.roots.is_some())?,
+        None => None,
+    };
     root.finish()?;
     Ok(Config {
         id,
@@ -115,7 +126,60 @@ pub fn parse(text: &str) -> Result<Config, Error> {
         api,
         dns,
         delivery,
+        tlsrpt,
     })
+}
+
+fn tlsrpt(
+    mut table: Table,
+    settings: &mut deliver::Settings,
+    roots: bool,
+) -> Result<Option<Tlsrpt>, Error> {
+    let on = match table.take("on") {
+        Some(entry) => {
+            let on = entry.bool()?;
+            if on && !roots {
+                return Err(entry.error("needs `roots` in [tls]"));
+            }
+            on
+        }
+        None => false,
+    };
+    if !on {
+        table.finish()?;
+        return Ok(None);
+    }
+    let tenant = int(&table.require("tenant")?, 1, u32::MAX.into())?;
+    let from = table.require("from")?;
+    let submitter = match from.str()?.rsplit_once('@') {
+        Some((local, domain)) if !local.is_empty() && intake::node_name(domain) => {
+            domain.to_ascii_lowercase()
+        }
+        _ => return Err(from.error("must be an address")),
+    };
+    let mut text = |key: &str| -> Result<String, Error> {
+        let entry = table.require(key)?;
+        let value = entry.str()?;
+        if value.is_empty() {
+            return Err(entry.error("must not be empty"));
+        }
+        Ok(value.to_owned())
+    };
+    let organization = text("organization")?;
+    let contact = text("contact")?;
+    table.finish()?;
+    settings.tlsrpt = true;
+    settings.report_tenant = Some(tenant);
+    settings.reporter = deliver::Reporter {
+        from: from.str()?.to_owned(),
+        organization,
+        contact,
+        submitter,
+    };
+    Ok(Some(Tlsrpt {
+        tenant,
+        from: from.str()?.to_owned(),
+    }))
 }
 
 fn store(mut table: Table) -> Result<Store, Error> {
