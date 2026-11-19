@@ -650,7 +650,7 @@ async fn get_policy<D: Dns>(
     let host = domain
         .prefixed("mta-sts")
         .map_err(|_| ResultType::StsPolicyFetchError)?;
-    let Addresses::Found { ips, .. } = mx::addresses(dns, &host, egress.is_ipv6()).await else {
+    let Addresses::Found { ips, .. } = mx::public(dns, &host, egress.is_ipv6()).await else {
         return Err(ResultType::StsPolicyFetchError);
     };
     let name = host.to_string();

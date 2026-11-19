@@ -68,7 +68,7 @@ async fn send<D: Dns>(
     let Ok(name) = Name::parse(&target.host) else {
         return false;
     };
-    let Addresses::Found { ips, .. } = mx::addresses(dns, &name, egress.is_ipv6()).await else {
+    let Addresses::Found { ips, .. } = mx::public(dns, &name, egress.is_ipv6()).await else {
         return false;
     };
     let request = https::post(&target.host, &target.path, MEDIA, body);
