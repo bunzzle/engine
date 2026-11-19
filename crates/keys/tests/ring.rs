@@ -2,6 +2,7 @@ use std::cell::Cell;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::Path;
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::Duration;
 
 use aws_lc_rs::signature::{ED25519, UnparsedPublicKey};
@@ -629,5 +630,75 @@ fn a_forgotten_tenant_is_refused_on_every_call_but_delete() {
         assert!(ring.open(5, 1).await.is_ok());
         assert_eq!(ring.delete(5, 0).await, Err(Fault::Conflict));
         assert!(ring.open(5, 1).await.is_ok());
+    });
+}
+
+#[test]
+fn hook_secrets_are_fetched_once_and_dropped_with_their_hook_or_tenant() {
+    let driver = Rc::new(SimDriver::new(9, quiet()));
+    run(&driver, async {
+        let _server = serve("/a", 1).await;
+        create(1, 4).await;
+        create(1, 5).await;
+        let (connect, _) = hosts(&[1]);
+        let ring = Ring::new(connect, settings());
+        let first = ring.hook_secret(4, 1, 1, 1).await.expect("secret");
+        let again = ring.hook_secret(4, 1, 1, 1).await.expect("secret");
+        assert!(Arc::ptr_eq(&first, &again));
+        assert_eq!(ring.stats().hook_secrets, 1);
+        let next = ring.hook_secret(4, 1, 1, 2).await.expect("secret");
+        let other = ring.hook_secret(5, 1, 1, 1).await.expect("secret");
+        assert!(*first != *next && *first != *other);
+        assert_eq!(ring.stats().hook_secrets, 3);
+        let kept = ring.hook_secret(4, 1, 2, 1).await.expect("secret");
+        assert_eq!(ring.stats().held_hooks, 4);
+        ring.forget_hook(4, 1);
+        assert_eq!(ring.stats().held_hooks, 2);
+        assert_eq!(ring.hook_secret(4, 1, 1, 1).await.err(), Some(Fault::Gone));
+        assert_eq!(ring.hook_secret(4, 1, 1, 3).await.err(), Some(Fault::Gone));
+        let again = ring.hook_secret(4, 1, 2, 1).await.expect("secret");
+        assert!(Arc::ptr_eq(&kept, &again));
+        assert_eq!(ring.stats().hook_secrets, 4);
+        assert_eq!(
+            ring.hook_secret(9, 1, 1, 1).await.err(),
+            Some(Fault::Unknown)
+        );
+        ring.forget(4, 1);
+        assert_eq!(ring.stats().held_hooks, 1);
+        assert_eq!(ring.hook_secret(4, 1, 1, 1).await.err(), Some(Fault::Gone));
+        assert_eq!(ring.hook_secret(4, 1, 1, 2).await.err(), Some(Fault::Gone));
+        ring.hook_secret(5, 1, 1, 1).await.expect("secret");
+        assert_eq!(ring.stats().hook_secrets, 5);
+    });
+}
+
+#[test]
+fn hook_secret_fetches_are_shared_and_a_hook_deleted_meanwhile_is_gone() {
+    let driver = Rc::new(SimDriver::new(10, quiet()));
+    run(&driver, async {
+        let _server = serve("/a", 1).await;
+        create(1, 4).await;
+        let (connect, _) = hosts(&[1]);
+        let ring = Ring::new(connect, settings());
+        ring.open(4, 1).await.expect("open");
+        let tasks: Vec<_> = (0..6)
+            .map(|_| {
+                let ring = ring.clone();
+                spawn(async move { ring.hook_secret(4, 1, 1, 1).await })
+            })
+            .collect();
+        let mut secrets = Vec::new();
+        for task in tasks {
+            secrets.push(task.await.expect("secret"));
+        }
+        assert!(secrets.iter().all(|s| Arc::ptr_eq(s, &secrets[0])));
+        assert_eq!(ring.stats().hook_secrets, 1);
+        let asking = ring.clone();
+        let fetch = spawn(async move { asking.hook_secret(4, 1, 2, 1).await });
+        sleep(Duration::from_micros(1)).await;
+        ring.forget_hook(4, 2);
+        assert_eq!(fetch.await.err(), Some(Fault::Gone));
+        assert_eq!(ring.stats().hook_secrets, 2);
+        assert_eq!(ring.stats().held_hooks, 1);
     });
 }

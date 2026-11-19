@@ -341,6 +341,17 @@ impl Vault {
         Ok(Tenant::new(&entry.key).dkim_key(generation, VERSION))
     }
 
+    pub fn hook(
+        &self,
+        tenant: u32,
+        generation: u32,
+        hook: u32,
+        version: u8,
+    ) -> Result<Secret<32>, Error> {
+        let entry = self.durable(tenant, generation)?;
+        Ok(Tenant::new(&entry.key).hook_secret(generation, hook, version))
+    }
+
     pub fn active(&self, tenant: u32, generation: u32) -> Result<(), Error> {
         self.durable(tenant, generation).map(drop)
     }

@@ -22,6 +22,7 @@ pub enum Op {
     Refused,
     DkimNew,
     Load,
+    Hook,
 }
 
 impl Op {
@@ -39,6 +40,7 @@ impl Op {
             Self::Refused => "refused",
             Self::DkimNew => "dkim-new",
             Self::Load => "load",
+            Self::Hook => "hook",
         }
     }
 }
