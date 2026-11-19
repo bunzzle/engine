@@ -22,9 +22,10 @@ use keys::{
 use rt::sim::{Config, Disk, Faults, Machine, SimDriver, Stalls, check};
 use rt::{JoinHandle, Runtime, TcpListener, TcpStream, sleep, spawn, timeout};
 use sched::{
-    Answered, Attempt, Batched, Begun, Clock, DAY, Draft, Hash, KIND_REQUEST, KIND_SUPPRESS,
-    Keyring, Keys, Meshes, Node, Parts, Reason, Refusal, Restore, Running, SHAPE, Settings,
-    Suppression, Ticket, Transport, Unsealable, Unwrapped, normalize, punycode, retain,
+    Answered, Attempt, Batched, Begun, Clock, DAY, Draft, EVENT_VALUE, Event, EventBody, EventKind,
+    Hash, KIND_EVENT, KIND_REQUEST, KIND_SUPPRESS, Keyring, Keys, MAX_REPLY, Meshes, Node, Parts,
+    Reason, Refusal, Restore, Running, SHAPE, Settings, Suppression, Ticket, Transport, Unsealable,
+    Unwrapped, event_record, event_sealed, event_sequence, normalize, punycode, retain,
     retain_request,
 };
 use spool::{Body, Head, HeadClear, Message, MessageId, SLICE, Slice, Stamp};
@@ -1076,6 +1077,115 @@ fn replies_seal_once_per_stamp_and_open_only_under_it() {
         assert_ne!(other, reply);
     });
     cluster.stop();
+}
+
+#[test]
+fn events_seal_under_their_message_and_open_from_the_record() {
+    let driver = Rc::new(SimDriver::with_disk(43, Config::default(), created(43)));
+    let cluster = started(&driver, 2);
+    let nodes = cluster.nodes.clone();
+    cluster.run(async move {
+        ready(&nodes).await;
+        let node = &nodes[0];
+        let shard = owned_shard(node).await;
+        let sealed = seal_one(node, shard, 0).await;
+        let opener = node
+            .opener(1, 1, sealed.id, &sealed.clear, &sealed.wrap)
+            .await
+            .expect("opener");
+        let stamp = node.spool().stamp(shard).expect("stamp");
+        let body = EventBody {
+            address: b"a@example.com".to_vec(),
+            reply: vec![b'x'; MAX_REPLY + 10],
+            attempts: 3,
+            class: 2,
+        };
+        let sealed_body = opener.seal_event(0, stamp, &body.encode()).expect("seal");
+        assert_eq!(
+            opener.seal_event(0, stamp, &body.encode()).err(),
+            Some(Unsealable::Bad)
+        );
+        let reply = opener.seal_reply(0, stamp, b"250 ok").expect("reply");
+        let event = Event {
+            generation: 1,
+            time: 3 * DAY + 5,
+            kind: EventKind::Delivered,
+            lost: 2,
+            message: sealed.id,
+            recipient: 0,
+            stamp,
+            batch: sealed.clear.batch_key,
+            day: sealed.clear.day,
+        };
+        let record = event_record(1, &event, &sealed.wrap, &sealed_body).expect("record");
+        assert!(record.sequenced);
+        assert_eq!((record.kind, record.partition), (KIND_EVENT, 3));
+        assert_eq!(record.entry.key, index::key(1, [0; 16]));
+        let decoded = Event::decode(&record.entry.value).expect("value");
+        assert_eq!(decoded, event);
+        let (wrap, inner) = event_sealed(&record.entry.payload).expect("payload");
+        let reader = node
+            .event_opener(1, &decoded, wrap)
+            .await
+            .expect("event opener");
+        let clear = reader.open_event(0, stamp, inner).expect("open");
+        let capped = EventBody {
+            reply: vec![b'x'; MAX_REPLY],
+            ..body
+        };
+        assert_eq!(EventBody::decode(&clear), Some(capped));
+        let bad = Some(Unsealable::Bad);
+        assert_eq!(reader.open_reply(0, stamp, inner).err(), bad);
+        assert_eq!(reader.open_event(0, stamp, &reply).err(), bad);
+        assert_eq!(reader.open_event(1, stamp, inner).err(), bad);
+        let moved = Event {
+            day: event.day + 1,
+            ..event
+        };
+        assert!(node.event_opener(1, &moved, wrap).await.is_err());
+        let older = Event {
+            generation: 2,
+            ..event
+        };
+        assert!(node.event_opener(1, &older, wrap).await.is_err());
+    });
+    cluster.stop();
+}
+
+#[test]
+fn event_values_and_bodies_refuse_damage() {
+    let event = Event {
+        generation: 7,
+        time: 1,
+        kind: EventKind::Suppressed,
+        lost: 0,
+        message: MessageId::from_bytes([9; 16]),
+        recipient: 4,
+        stamp: Stamp { boot: 1, write: 2 },
+        batch: 5,
+        day: 6,
+    };
+    let mut value = event.encode();
+    assert_eq!(value.len(), EVENT_VALUE);
+    assert_eq!(Event::decode(&value), Some(event));
+    value[12] = 9;
+    assert_eq!(Event::decode(&value), None);
+    assert_eq!(Event::decode(&value[1..]), None);
+    let body = EventBody {
+        address: b"b@example.org".to_vec(),
+        reply: b"550 no".to_vec(),
+        attempts: 1,
+        class: 0,
+    };
+    let bytes = body.encode();
+    assert_eq!(EventBody::decode(&bytes), Some(body));
+    assert_eq!(EventBody::decode(&bytes[..bytes.len() - 1]), None);
+    let mut long = bytes.clone();
+    long.push(0);
+    assert_eq!(EventBody::decode(&long), None);
+    let mut key = index::key(1, [0; 16]);
+    key[4..12].copy_from_slice(&77u64.to_be_bytes());
+    assert_eq!(event_sequence(&key), 77);
 }
 
 #[test]
