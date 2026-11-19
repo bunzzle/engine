@@ -4,6 +4,7 @@ use std::fmt::Write as _;
 
 use crypto::Ids;
 use http::{Request, Response, rfc3339};
+use rt::timeout;
 use sched::{EVENTS_LIMIT, EventKind, EventPage, EventRead, ReadError, Transport};
 
 use crate::handler::ok;
@@ -26,7 +27,11 @@ pub(crate) async fn read<T: Transport + 'static>(
     let node = &context.node;
     let ids = node.ids().ok_or_else(Problem::unavailable)?;
     let ids = Ids::new(&ids).map_err(|_| Problem::unavailable())?;
-    let page = node.events(tenant, after, limit).await.map_err(problem)?;
+    let wait = context.guard.limits().ask;
+    let page = timeout(wait, node.events(tenant, after, limit))
+        .await
+        .map_err(|_| Problem::unavailable())?
+        .map_err(problem)?;
     Ok(ok(id, body(&page, &ids)))
 }
 
@@ -90,7 +95,8 @@ fn problem(error: ReadError) -> Problem {
         ReadError::Tenant => Problem::suspended(),
         ReadError::Limit => bad_limit(),
         ReadError::Cursor => Problem::bad_cursor(),
-        ReadError::Stale | ReadError::Unavailable | ReadError::Failed => Problem::unavailable(),
+        ReadError::Stale => Problem::cursor_expired(),
+        ReadError::Unavailable | ReadError::Failed => Problem::unavailable(),
     }
 }
 
@@ -157,6 +163,22 @@ mod tests {
         assert!(Held::take(&reading, 1).is_some());
         drop(other);
         assert!(reading.borrow().is_empty());
+    }
+
+    #[test]
+    fn read_errors_keep_their_status() {
+        let cases = [
+            (ReadError::Tenant, 403, "tenant_suspended"),
+            (ReadError::Limit, 400, "bad_request"),
+            (ReadError::Cursor, 400, "bad_cursor"),
+            (ReadError::Stale, 410, "cursor_expired"),
+            (ReadError::Unavailable, 503, "unavailable"),
+            (ReadError::Failed, 503, "unavailable"),
+        ];
+        for (error, status, code) in cases {
+            let problem = problem(error);
+            assert_eq!((problem.status.code(), problem.code), (status, code));
+        }
     }
 
     #[test]

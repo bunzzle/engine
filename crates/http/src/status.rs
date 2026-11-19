@@ -10,6 +10,7 @@ impl Status {
     pub const NOT_FOUND: Self = Self(404);
     pub const METHOD_NOT_ALLOWED: Self = Self(405);
     pub const REQUEST_TIMEOUT: Self = Self(408);
+    pub const GONE: Self = Self(410);
     pub const LENGTH_REQUIRED: Self = Self(411);
     pub const TOO_LARGE: Self = Self(413);
     pub const URI_TOO_LONG: Self = Self(414);
@@ -37,6 +38,7 @@ impl Status {
             404 => "Not Found",
             405 => "Method Not Allowed",
             408 => "Request Timeout",
+            410 => "Gone",
             411 => "Length Required",
             413 => "Content Too Large",
             414 => "URI Too Long",

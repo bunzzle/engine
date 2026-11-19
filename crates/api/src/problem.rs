@@ -74,6 +74,14 @@ impl Problem {
         )
     }
 
+    pub fn cursor_expired() -> Self {
+        Self::new(
+            Status::GONE,
+            "cursor_expired",
+            "cursor expired, read again without `after`",
+        )
+    }
+
     pub fn unauthorized() -> Self {
         Self::new(Status::UNAUTHORIZED, "unauthorized", "unauthorized")
     }
