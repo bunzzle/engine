@@ -19,11 +19,14 @@ pub const KIND_INDEX: u8 = 5;
 const HEAD: usize = 36;
 const OP_PUT: u8 = 1;
 const OP_DELETE: u8 = 2;
+const SEQUENCED: u32 = 1;
+const STAMP: std::ops::Range<usize> = 4..12;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct IndexRecord {
     pub kind: u8,
     pub partition: u32,
+    pub sequenced: bool,
     pub entry: Entry,
 }
 
@@ -49,6 +52,7 @@ impl IndexRecord {
             8,
             u32::try_from(entry.payload.len()).expect("index payload fits in u32"),
         );
+        fields.put_u32(12, if self.sequenced { SEQUENCED } else { 0 });
         fields.put_bytes(16, &entry.key);
         fields.put_bytes(HEAD, &entry.value);
         fields.put_bytes(HEAD + entry.value.len(), &entry.payload);
@@ -64,7 +68,9 @@ impl IndexRecord {
         };
         let value = usize::from(fields.u16(2));
         let payload = usize::try_from(fields.u32(8)).ok()?;
-        if fields.u32(12) != 0 || HEAD.checked_add(value)?.checked_add(payload)? != bytes.len() {
+        let flags = fields.u32(12);
+        if flags & !SEQUENCED != 0 || HEAD.checked_add(value)?.checked_add(payload)? != bytes.len()
+        {
             return None;
         }
         let entry = Entry {
@@ -81,8 +87,21 @@ impl IndexRecord {
         Some(Self {
             kind: fields.u8(0),
             partition: fields.u32(4),
+            sequenced: flags & SEQUENCED != 0,
             entry,
         })
+    }
+
+    pub fn unstamped(&self) -> bool {
+        !self.sequenced || self.entry.key[STAMP].iter().all(|&b| b == 0)
+    }
+
+    #[must_use]
+    pub fn stamped(mut self, sequence: u64) -> Self {
+        if self.sequenced {
+            self.entry.key[STAMP].copy_from_slice(&sequence.to_be_bytes());
+        }
+        self
     }
 
     pub fn write(&self, shard: u16) -> Write {

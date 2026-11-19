@@ -107,7 +107,10 @@ async fn replay(
         if record.kind() == KIND_INDEX
             && let Some(shard) = rebuilding.get_mut(&record.shard())
         {
-            let found = IndexRecord::decode(record.payload()).ok_or(Error::BadCommit(commit))?;
+            let found = IndexRecord::decode(record.payload())
+                .filter(IndexRecord::unstamped)
+                .ok_or(Error::BadCommit(commit))?
+                .stamped(record.sequence());
             let key = (found.kind, found.partition);
             if commit > shard.index_covered.get(&key).copied().unwrap_or(0) {
                 shard

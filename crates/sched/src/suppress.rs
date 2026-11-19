@@ -573,6 +573,7 @@ impl Suppressions {
             return Err(Refusal::Address);
         }
         let record = IndexRecord {
+            sequenced: false,
             kind: KIND_SUPPRESS,
             partition: PARTITION.1,
             entry: Entry::put(index::key(tenant, hash), value.encode(), sealed),
@@ -593,6 +594,7 @@ impl Suppressions {
     ) -> Result<bool, Refusal> {
         let found = self.found(tenant, generation, shard, hash).await?.is_some();
         let record = IndexRecord {
+            sequenced: false,
             kind: KIND_SUPPRESS,
             partition: PARTITION.1,
             entry: Entry::delete(index::key(tenant, hash), SHAPE),

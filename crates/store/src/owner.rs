@@ -20,8 +20,15 @@ use crate::session::{Event, Owned, Results, Session};
 use crate::shard::{Change, HEAD_ITEM, Index, Item, KIND_STATE, Key};
 use sys::crc32c::checksum;
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Applied {
+    pub locations: Vec<Location>,
+    pub indexed: Vec<Location>,
+}
+
 enum Reply {
     Caller(Sender<Result<Vec<Location>, Error>>),
+    Indexed(Sender<Result<Applied, Error>>),
     Created(Sender<Result<Vec<Vec<Location>>, Error>>),
     Move,
 }
@@ -33,6 +40,9 @@ impl Reply {
                 let _ = reply.send(Err(error));
             }
             Self::Created(reply) => {
+                let _ = reply.send(Err(error));
+            }
+            Self::Indexed(reply) => {
                 let _ = reply.send(Err(error));
             }
             Self::Move => {}
@@ -101,11 +111,13 @@ struct Attached {
     shard: u16,
     records: Vec<IndexRecord>,
     delayed: bool,
+    optional: bool,
 }
 
 struct Request {
     batches: Vec<Batch>,
     index: Option<Attached>,
+    indexed: Vec<Location>,
     reply: Reply,
 }
 
@@ -205,7 +217,33 @@ impl Changes {
         let request = Request {
             batches: vec![batch],
             index: None,
+            indexed: Vec::new(),
             reply: Reply::Caller(reply),
+        };
+        if self.sender.send(Input::Change(request)).is_err() {
+            return Err(Error::Failed);
+        }
+        answer.recv().await.unwrap_or(Err(Error::Failed))
+    }
+
+    pub async fn apply_indexed(
+        &self,
+        batch: Batch,
+        shard: u16,
+        records: Vec<IndexRecord>,
+        optional: bool,
+    ) -> Result<Applied, Error> {
+        let (reply, mut answer) = channel();
+        let request = Request {
+            batches: vec![batch],
+            index: Some(Attached {
+                shard,
+                records,
+                delayed: false,
+                optional,
+            }),
+            indexed: Vec::new(),
+            reply: Reply::Indexed(reply),
         };
         if self.sender.send(Input::Change(request)).is_err() {
             return Err(Error::Failed);
@@ -229,7 +267,9 @@ impl Changes {
                 shard,
                 records,
                 delayed: false,
+                optional: false,
             }),
+            indexed: Vec::new(),
             reply: Reply::Created(reply),
         };
         if self.sender.send(Input::Change(request)).is_err() {
@@ -460,6 +500,12 @@ impl Shards {
                 request.reply.refuse(error);
                 return;
             }
+            if attached.optional && (runs >= REFUSE_RUNS || runs > DELAY_RUNS) {
+                let mut request = request;
+                request.index = None;
+                self.request(request);
+                return;
+            }
             if runs >= REFUSE_RUNS {
                 request.reply.refuse(Error::Busy);
                 return;
@@ -559,6 +605,9 @@ impl Shards {
         }
         let mut shapes = BTreeMap::new();
         for record in records {
+            if !record.unstamped() || (record.sequenced && record.entry.op == index::Op::Delete) {
+                return Err(Error::Invalid("index stamp"));
+            }
             let partition = (record.kind, record.partition);
             let shape = index::Shape {
                 value: u16::try_from(record.entry.value.len())
@@ -787,10 +836,11 @@ impl Shards {
 
     async fn event(&mut self, event: Event) {
         match event {
-            Event::Durable { tag, .. } if self.indexed.contains_key(&tag) => {
+            Event::Durable { tag, locations, .. } if self.indexed.contains_key(&tag) => {
                 let indexing = self.indexed.remove(&tag).expect("indexed");
                 let mut result = Ok(());
-                for record in indexing.records {
+                for (record, location) in indexing.records.into_iter().zip(&locations) {
+                    let record = record.stamped(location.sequence);
                     if let Err(error) = self.keeper.apply_index(indexing.shard, record) {
                         result = Err(error);
                     }
@@ -824,10 +874,12 @@ impl Shards {
                     );
                 }
                 if let Some(attached) = attached {
-                    locations.truncate(locations.len() - attached.records.len());
-                    for record in attached.records {
+                    let indexed = locations.split_off(locations.len() - attached.records.len());
+                    for (record, location) in attached.records.into_iter().zip(&indexed) {
+                        let record = record.stamped(location.sequence);
                         let _ = self.keeper.apply_index(attached.shard, record);
                     }
+                    request.indexed = indexed;
                 }
                 self.finish(request, Ok(locations));
             }
@@ -850,10 +902,18 @@ impl Shards {
 
     fn finish(&mut self, request: Request, result: Result<Vec<Location>, Error>) {
         let keys: Vec<(u16, u64)> = request.keys().collect();
-        let Request { batches, reply, .. } = request;
+        let Request {
+            batches,
+            reply,
+            indexed,
+            ..
+        } = request;
         match reply {
             Reply::Caller(reply) => {
                 let _ = reply.send(result);
+            }
+            Reply::Indexed(reply) => {
+                let _ = reply.send(result.map(|locations| Applied { locations, indexed }));
             }
             Reply::Created(reply) => {
                 let split = result.map(|locations| {
@@ -986,6 +1046,7 @@ impl Shards {
             self.request(Request {
                 batches: vec![batch],
                 index: None,
+                indexed: Vec::new(),
                 reply: Reply::Move,
             });
         }
