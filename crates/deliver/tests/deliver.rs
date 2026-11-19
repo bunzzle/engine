@@ -1652,6 +1652,43 @@ fn report_mails_go_to_mailto_addresses_only() {
 }
 
 #[test]
+fn https_reports_are_posted_and_retried() {
+    for (status, posts, sent, abandoned) in [("204 No Content", 1, 1, 0), ("500 Oops", 3, 0, 1)] {
+        let (requests, stats) = run(async move {
+            drop(serve(MX1, Script::new(&[])));
+            let response = format!("HTTP/1.1 {status}\r\nContent-Length: 0\r\n\r\n");
+            let requests = serve_policy(WEB, Rc::new(RefCell::new(response)));
+            let zone = zone();
+            zone.set("mta-sts.example.com", Type::A, a(&[WEB]));
+            let record = b"v=TLSRPTv1; rua=https://mta-sts.example.com/v1".to_vec();
+            let txt = Found::Records(vec![Record::Txt(record)]);
+            zone.set("_smtp._tls.example.com", Type::Txt, txt);
+            let mut settings = settings();
+            settings.tlsrpt = true;
+            settings.reporter.submitter = "sender.example".into();
+            let deliver = verifying(zone, settings);
+            restored(&deliver, &Rc::new(Memory::default()), [7; 16]).await;
+            deliver.tick().await;
+            simple(&deliver, "example.com").await;
+            sleep(Duration::from_mins(11)).await;
+            deliver.tick().await;
+            sleep(Duration::from_hours(29)).await;
+            for _ in 0..5 {
+                assert_eq!(deliver.reports().await, []);
+                sleep(Duration::from_mins(31)).await;
+            }
+            (requests, deliver.owner_stats())
+        });
+        let requests = requests.borrow();
+        assert_eq!(requests.len(), posts, "{status}");
+        assert!(requests[0].starts_with(
+            "POST /v1 HTTP/1.1\r\nHost: mta-sts.example.com\r\nContent-Type: application/tlsrpt+gzip\r\n"
+        ));
+        assert_eq!((stats.sent, stats.abandoned), (sent, abandoned), "{status}");
+    }
+}
+
+#[test]
 fn failed_reporting_lookups_are_retried_then_dropped() {
     let (found, stats) = run(async move {
         drop(serve(MX1, Script::new(&[])));
