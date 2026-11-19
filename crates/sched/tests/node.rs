@@ -64,6 +64,7 @@ struct World {
     replies: u64,
     restored: u64,
     spools: Vec<Spool>,
+    closing: bool,
 }
 
 type Shared = Rc<RefCell<World>>;
@@ -158,7 +159,10 @@ impl Simulated {
             world.misrouted += 1;
         }
         let owner = usize::from(attempt.message.shard % CORES);
-        let spool = world.spools[owner].clone();
+        let Some(spool) = world.spools.get(owner).cloned() else {
+            assert!(world.closing, "attempt without its spool");
+            return;
+        };
         for c in &attempt.recipients {
             let k = key(attempt.message, c.recipient);
             let state = spool
@@ -549,6 +553,7 @@ fn session(driver: &Rc<SimDriver>, world: &Shared, intake_on: bool, limit: Durat
     let committer = machine.spawn_on(0, booted.committer.run());
     world.borrow_mut().spools.clear();
     world.borrow_mut().in_attempt.clear();
+    world.borrow_mut().closing = false;
     let Some((scheds, meshes, feeds, owners, closers)) =
         start_cores(&machine, booted.starts, driver, world)
     else {
@@ -604,6 +609,7 @@ fn session(driver: &Rc<SimDriver>, world: &Shared, intake_on: bool, limit: Durat
         if power.is_halted() {
             return session;
         }
+        watched.borrow_mut().closing = true;
         let stop = async move {
             ticker.await;
             for sched in &scheds {
