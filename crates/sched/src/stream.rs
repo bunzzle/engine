@@ -9,7 +9,7 @@ use std::time::Duration;
 use control::{HookState, State, tenant_keys};
 use rt::{Instant, JoinHandle, Notify, spawn, timeout};
 
-use crate::cursor::{Cursor, read_cursor, write_cursor};
+use crate::cursor::{Cursor, drop_cursor, read_cursor, write_cursor};
 use crate::events::{KIND_EVENT, sequence};
 use crate::reader::{Read, event_id, kept, open, stamped};
 use crate::start::{Inner, Node};
@@ -71,6 +71,7 @@ struct Shared {
 struct Streams {
     live: BTreeMap<u32, Stream>,
     draining: BTreeMap<u32, u64>,
+    holders: BTreeMap<u32, (u32, u32)>,
     synced: Option<u64>,
     tickets: u64,
 }
@@ -89,6 +90,9 @@ fn live<T>(inner: &Weak<Inner<T>>) -> Option<Node<T>> {
 async fn run<T: Transport + 'static>(inner: Weak<Inner<T>>, deliver: Rc<dyn Deliver>) {
     let shared = Rc::new(Shared::default());
     let mut all = Streams::default();
+    if let Some(node) = live(&inner) {
+        all.holders = std::mem::take(&mut *node.inner.cursored.borrow_mut());
+    }
     let mut flushed = rt::now();
     loop {
         let Some(node) = live(&inner) else {
@@ -241,14 +245,11 @@ async fn sync<T: Transport + 'static>(node: &Node<T>, all: &mut Streams) {
         if stream.sending {
             all.draining.insert(id, stream.ticket);
         }
-        let current = node
-            .hook(stream.tenant, id)
-            .is_ok_and(|h| h.generation == stream.generation);
-        if current {
+        if current(node, id, stream.tenant, stream.generation) {
             write_dirty(node, id, &mut stream).await;
         }
     }
-    let mut complete = true;
+    let mut complete = sweep(node, all).await;
     for (id, (tenant, generation, events)) in wanted {
         if let Some(stream) = all.live.get_mut(&id) {
             stream.events = events;
@@ -258,6 +259,7 @@ async fn sync<T: Transport + 'static>(node: &Node<T>, all: &mut Streams) {
             complete = false;
             continue;
         }
+        all.holders.insert(id, (tenant, generation));
         let Some(cursors) = cursors(node, tenant, generation, id).await else {
             complete = false;
             continue;
@@ -280,6 +282,46 @@ async fn sync<T: Transport + 'static>(node: &Node<T>, all: &mut Streams) {
         );
     }
     all.synced = complete.then_some(version);
+}
+
+fn current<T: Transport + 'static>(
+    node: &Node<T>,
+    hook: u32,
+    tenant: u32,
+    generation: u32,
+) -> bool {
+    let table = node.table();
+    table
+        .hook(tenant, hook)
+        .is_some_and(|h| h.generation == generation)
+        && !table.gone(tenant, generation)
+}
+
+async fn sweep<T: Transport + 'static>(node: &Node<T>, all: &mut Streams) -> bool {
+    let stale: Vec<(u32, u32)> = all
+        .holders
+        .iter()
+        .filter(|&(&hook, &(tenant, generation))| {
+            !all.live.contains_key(&hook)
+                && !all.draining.contains_key(&hook)
+                && !current(node, hook, tenant, generation)
+        })
+        .map(|(&hook, &(tenant, _))| (hook, tenant))
+        .collect();
+    let changes = node.spool().changes();
+    let mut complete = true;
+    for (hook, tenant) in stale {
+        let mut dropped = true;
+        for shard in node.spool().shards() {
+            dropped &= drop_cursor(changes, shard, tenant, hook).await.is_ok();
+        }
+        if dropped {
+            all.holders.remove(&hook);
+        } else {
+            complete = false;
+        }
+    }
+    complete
 }
 
 async fn cursors<T: Transport + 'static>(
