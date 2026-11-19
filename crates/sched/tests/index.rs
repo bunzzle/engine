@@ -24,8 +24,8 @@ use rt::{JoinHandle, Runtime, TcpListener, TcpStream, sleep, spawn, timeout};
 use sched::{
     Answered, Attempt, Batched, Begun, Clock, DAY, Draft, EVENT_DAYS, EVENT_SHAPE, EVENT_VALUE,
     Event, EventBody, EventKind, Hash, KIND_EVENT, KIND_REQUEST, KIND_SUPPRESS, Keyring, Keys,
-    MAX_REPLY, Meshes, Node, Parts, Reason, Recipient, Refusal, Restore, Running, SHAPE, Settings,
-    Suppression, Ticket, Transport, Unsealable, Unwrapped, encode_slice, event_record,
+    MAX_REPLY, Meshes, Node, Parts, ReadError, Reason, Recipient, Refusal, Restore, Running, SHAPE,
+    Settings, Suppression, Ticket, Transport, Unsealable, Unwrapped, encode_slice, event_record,
     event_sealed, event_sequence, normalize, punycode, retain, retain_event, retain_request,
     retired_events,
 };
@@ -1366,6 +1366,87 @@ fn event_days_past_the_retention_are_dropped() {
         }
         let left = changes.partitions(KIND_EVENT).await.expect("partitions");
         assert_eq!(left, []);
+    });
+    cluster.stop();
+}
+
+#[test]
+fn events_read_in_pages_across_cores_without_gaps() {
+    let driver = Rc::new(SimDriver::with_disk(47, Config::default(), created(47)));
+    let cluster = started(&driver, 2);
+    let nodes = cluster.nodes.clone();
+    cluster.run(async move {
+        ready(&nodes).await;
+        configure(&nodes, vec![tenant(2, 1, State::Active)]).await;
+        let mut ids = Vec::new();
+        for (n, node) in [0, 0, 1, 0, 1].into_iter().enumerate() {
+            let node = &nodes[node];
+            let shard = owned_shard(node).await;
+            let address = format!("r{n}@example.org");
+            ids.push((
+                node,
+                accept_listed(node, shard, &[address.as_str()], 1).await.0,
+            ));
+        }
+        for (node, id) in &ids {
+            while node.spool().tenant(*id).is_some() {
+                sleep(Duration::from_millis(50)).await;
+            }
+        }
+        let reader = &nodes[1];
+        let mut seen = Vec::new();
+        let mut cursor: Option<String> = None;
+        loop {
+            let page = reader.events(1, cursor.as_deref(), 2).await.expect("page");
+            assert!(page.events.len() <= 2);
+            for read in &page.events {
+                let body = read.body.as_ref().expect("opened");
+                assert_eq!(read.event.kind, EventKind::Expired);
+                assert!(body.address.ends_with(b"@example.org"));
+                seen.push((read.shard, read.sequence, read.event.message));
+            }
+            cursor = Some(page.next);
+            if !page.more {
+                break;
+            }
+        }
+        let mut unique = seen.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(unique.len(), 5);
+        assert_eq!(seen.len(), 5);
+        let mut messages: Vec<MessageId> = seen.iter().map(|s| s.2).collect();
+        messages.sort_unstable_by_key(MessageId::bytes);
+        let mut expected: Vec<MessageId> = ids.iter().map(|i| i.1).collect();
+        expected.sort_unstable_by_key(MessageId::bytes);
+        assert_eq!(messages, expected);
+        let last = reader
+            .events(1, cursor.as_deref(), 10)
+            .await
+            .expect("empty");
+        assert!(last.events.is_empty() && !last.more);
+        assert_eq!(
+            reader.events(2, cursor.as_deref(), 10).await.err(),
+            Some(ReadError::Cursor)
+        );
+        assert_eq!(
+            reader.events(1, Some("zz"), 10).await.err(),
+            Some(ReadError::Cursor)
+        );
+        assert_eq!(
+            reader.events(1, None, 0).await.err(),
+            Some(ReadError::Limit)
+        );
+        assert_eq!(
+            reader.events(1, None, 1001).await.err(),
+            Some(ReadError::Limit)
+        );
+        assert_eq!(
+            reader.events(9, None, 10).await.err(),
+            Some(ReadError::Tenant)
+        );
+        let other = reader.events(2, None, 10).await.expect("other");
+        assert_eq!(other.events, []);
     });
     cluster.stop();
 }

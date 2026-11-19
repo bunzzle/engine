@@ -564,6 +564,79 @@ fn applies_carry_sequenced_index_records_that_survive_a_crash() {
 }
 
 #[test]
+fn a_kind_scan_merges_every_shard_and_partition_in_commit_order() {
+    let driver = Rc::new(SimDriver::with_disk(11, Config::default(), created(11)));
+    Runtime::new(driver).block_on(async {
+        let node = open(None).await;
+        let other = Batch {
+            shard: 1,
+            ..batch(2)
+        };
+        node.changes
+            .create(vec![batch(1), other.clone()])
+            .await
+            .expect("create");
+        let mut written = Vec::new();
+        for (n, (shard, day)) in [(0u16, 5u32), (1, 3), (0, 3), (1, 5), (0, 4)]
+            .into_iter()
+            .enumerate()
+        {
+            let n = u8::try_from(n).expect("fits");
+            let record = IndexRecord {
+                partition: day,
+                ..event(1, n)
+            };
+            let target = if shard == 0 { batch(1) } else { other.clone() };
+            let applied = node
+                .changes
+                .apply_indexed(target, shard, vec![record], false)
+                .await
+                .expect("apply");
+            written.push((shard, applied.indexed[0].sequence, n));
+        }
+        let elsewhere = IndexRecord {
+            partition: 4,
+            ..event(2, 9)
+        };
+        node.changes
+            .apply_indexed(batch(1), 0, vec![elsewhere], false)
+            .await
+            .expect("apply");
+        let from = index::key(1, [0; 16]);
+        let to = index::key(2, [0; 16]);
+        let all = node
+            .changes
+            .scan_kind(KIND, from..to, usize::MAX)
+            .await
+            .expect("scan");
+        let seen: Vec<(u16, u64, u8)> = all
+            .iter()
+            .map(|(shard, e)| {
+                let stamp = u64::from_be_bytes(e.key[4..12].try_into().expect("stamp"));
+                (*shard, stamp, e.value[0])
+            })
+            .collect();
+        assert_eq!(seen, written);
+        let first = node
+            .changes
+            .scan_kind(KIND, from..to, 2)
+            .await
+            .expect("scan");
+        assert_eq!(first.len(), 2);
+        assert_eq!(first[1].1.key, all[1].1.key);
+        let mut after = all[1].1.key;
+        after[19] = 1;
+        let rest = node
+            .changes
+            .scan_kind(KIND, after..to, usize::MAX)
+            .await
+            .expect("scan");
+        assert_eq!(rest.len(), 3);
+        drop(node.stop().await);
+    });
+}
+
+#[test]
 fn optional_index_records_are_left_out_instead_of_waiting() {
     let driver = Rc::new(SimDriver::with_disk(10, Config::default(), created(10)));
     Runtime::new(driver).block_on(async {
