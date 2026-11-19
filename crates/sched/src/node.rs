@@ -700,7 +700,11 @@ impl<T: Transport + 'static> Sched<T> {
                     }
                 };
                 let (reply, event) = answered.map_or((None, None), |a| {
-                    let event = a.event.map(|record| Event { record, carried: 0 });
+                    let event = a.event.map(|record| Event {
+                        record,
+                        stamp: c.stamp,
+                        carried: 0,
+                    });
                     let reply = (!a.reply.is_empty()).then_some(Reply {
                         stamp: c.stamp,
                         sealed: a.reply,

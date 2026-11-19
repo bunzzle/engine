@@ -152,8 +152,9 @@ const READY: Recipient = Recipient {
     notified: false,
 };
 
-fn event(n: u8) -> Event {
+fn event(n: u8, stamp: Stamp) -> Event {
     Event {
+        stamp,
         record: IndexRecord {
             sequenced: true,
             kind: 3,
@@ -186,7 +187,7 @@ fn events_commit_with_their_reports_and_the_drop() {
         let id = node.accept(0, 2, 500).await;
         spool.claim(id, 0).expect("claim");
         let first = Report {
-            event: Some(event(1)),
+            event: Some(event(1, spool.stamp(0).expect("stamp"))),
             ..deferred(0, 50)
         };
         assert_eq!(
@@ -197,11 +198,11 @@ fn events_commit_with_their_reports_and_the_drop() {
         spool.claim(id, 1).expect("claim");
         let last = vec![
             Report {
-                event: Some(event(2)),
+                event: Some(event(2, spool.stamp(0).expect("stamp"))),
                 ..done(0, Outcome::Delivered)
             },
             Report {
-                event: Some(event(3)),
+                event: Some(event(3, spool.stamp(0).expect("stamp"))),
                 ..done(1, Outcome::Failed)
             },
         ];
@@ -228,23 +229,46 @@ fn refused_events_are_counted_as_lost_with_what_they_carried() {
         let id = node.accept(0, 2, 500).await;
         spool.claim(id, 0).expect("claim");
         let first = Report {
-            event: Some(event(1)),
+            event: Some(event(1, spool.stamp(0).expect("stamp"))),
             ..deferred(0, 50)
         };
         spool.report(id, vec![first]).await.expect("report");
         spool.claim(id, 0).expect("claim");
-        let mut wide = event(2);
+        let mut wide = event(2, spool.stamp(0).expect("stamp"));
         wide.record.entry.value.push(0);
         wide.carried = 4;
-        let refused = Report {
+        let shaped = Report {
             event: Some(wide),
             ..deferred(0, 60)
         };
-        assert!(spool.report(id, vec![refused]).await.is_err());
+        assert_eq!(
+            spool.report(id, vec![shaped]).await.expect("plain"),
+            Done::Kept
+        );
         assert_eq!(spool.lost_events(), 5);
         assert_eq!(spool.take_lost(7), 5);
         assert_eq!(spool.take_lost(7), 0);
         assert_eq!(events(spool).await.len(), 1);
+        let mut unclaimed = event(3, spool.stamp(0).expect("stamp"));
+        unclaimed.carried = 2;
+        let early = Report {
+            event: Some(unclaimed),
+            ..deferred(1, 70)
+        };
+        refused(spool.report(id, vec![early]).await, "not claimed");
+        assert_eq!(spool.take_lost(7), 3);
+        spool.claim(id, 1).expect("claim");
+        let ahead = Stamp {
+            write: spool.stamp(0).expect("stamp").write + 5,
+            ..spool.stamp(0).expect("stamp")
+        };
+        let future = Report {
+            event: Some(event(4, ahead)),
+            ..deferred(1, 70)
+        };
+        refused(spool.report(id, vec![future]).await, "stamp");
+        assert_eq!(spool.take_lost(7), 1);
+        assert_eq!(spool.lost_events(), 9);
         node.close().await;
     });
 }
