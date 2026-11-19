@@ -28,7 +28,7 @@ const EGRESS: IpAddr = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
 const EGRESS2: IpAddr = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2));
 const MX1: IpAddr = IpAddr::V4(Ipv4Addr::new(10, 0, 1, 1));
 const MX2: IpAddr = IpAddr::V4(Ipv4Addr::new(10, 0, 1, 2));
-const WEB: IpAddr = IpAddr::V4(Ipv4Addr::new(10, 0, 2, 1));
+const WEB: IpAddr = IpAddr::V4(Ipv4Addr::new(11, 0, 2, 1));
 const ROOTS: &[u8] = include_bytes!("data/ca.pem");
 const LEAF: &str = "b144595e51e3ade2a723db0ddb2b560ba510fd1da2d9246d45b4618481d8bb01";
 const ROOT: &str = "86ee2f95596152cea98375f669a6e13a72a7de0671efcc61dcde8b5d501e8bc1";
@@ -995,6 +995,25 @@ fn mta_sts_enforce_limits_hosts() {
 }
 
 #[test]
+fn mta_sts_policy_hosts_on_private_addresses_are_not_fetched() {
+    let private = IpAddr::V4(Ipv4Addr::new(10, 0, 2, 9));
+    let (outcomes, requests, policies) = run(async move {
+        drop(serve(MX1, Script::new(&["STARTTLS"])));
+        drop(serve(MX2, Script::new(&["STARTTLS"])));
+        let requests = serve_policy(private, Rc::new(RefCell::new(policy(ENFORCE))));
+        let zone = zone();
+        sts(&zone, "1");
+        zone.set("mta-sts.example.com", Type::A, a(&[private]));
+        let deliver = verifying(zone, strict());
+        let outcomes = simple(&deliver, "example.com").await;
+        (outcomes, requests, deliver.policies())
+    });
+    assert_eq!(answers(&outcomes), [Answer::Delivered]);
+    assert!(requests.borrow().is_empty());
+    assert_eq!(policies, 0);
+}
+
+#[test]
 fn mta_sts_enforce_needs_verified_tls() {
     let cases = [
         ("mx2.example.com", &[][..], "451 4.7.4"),
@@ -1673,13 +1692,18 @@ fn report_mails_go_to_mailto_addresses_only() {
 
 #[test]
 fn https_reports_are_posted_and_retried() {
-    for (status, posts, sent, abandoned) in [("204 No Content", 1, 1, 0), ("500 Oops", 3, 0, 1)] {
+    let private = IpAddr::V4(Ipv4Addr::new(10, 0, 2, 9));
+    for (web, status, posts, sent, abandoned) in [
+        (WEB, "204 No Content", 1, 1, 0),
+        (WEB, "500 Oops", 3, 0, 1),
+        (private, "204 No Content", 0, 0, 1),
+    ] {
         let (requests, stats) = run(async move {
             drop(serve(MX1, Script::new(&[])));
             let response = format!("HTTP/1.1 {status}\r\nContent-Length: 0\r\n\r\n");
-            let requests = serve_policy(WEB, Rc::new(RefCell::new(response)));
+            let requests = serve_policy(web, Rc::new(RefCell::new(response)));
             let zone = zone();
-            zone.set("mta-sts.example.com", Type::A, a(&[WEB]));
+            zone.set("mta-sts.example.com", Type::A, a(&[web]));
             let record = b"v=TLSRPTv1; rua=https://mta-sts.example.com/v1".to_vec();
             let txt = Found::Records(vec![Record::Txt(record)]);
             zone.set("_smtp._tls.example.com", Type::Txt, txt);
@@ -1700,11 +1724,15 @@ fn https_reports_are_posted_and_retried() {
             (requests, deliver.owner_stats())
         });
         let requests = requests.borrow();
-        assert_eq!(requests.len(), posts, "{status}");
-        assert!(requests[0].starts_with(
+        assert_eq!(requests.len(), posts, "{web} {status}");
+        assert!(requests.iter().all(|request| request.starts_with(
             "POST /v1 HTTP/1.1\r\nHost: mta-sts.example.com\r\nContent-Type: application/tlsrpt+gzip\r\n"
-        ));
-        assert_eq!((stats.sent, stats.abandoned), (sent, abandoned), "{status}");
+        )));
+        assert_eq!(
+            (stats.sent, stats.abandoned),
+            (sent, abandoned),
+            "{web} {status}"
+        );
     }
 }
 
