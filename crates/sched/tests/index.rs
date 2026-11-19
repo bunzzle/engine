@@ -24,9 +24,9 @@ use rt::{JoinHandle, Runtime, TcpListener, TcpStream, sleep, spawn, timeout};
 use sched::{
     Answered, Attempt, Batched, Begun, Clock, DAY, Draft, EVENT_VALUE, Event, EventBody, EventKind,
     Hash, KIND_EVENT, KIND_REQUEST, KIND_SUPPRESS, Keyring, Keys, MAX_REPLY, Meshes, Node, Parts,
-    Reason, Refusal, Restore, Running, SHAPE, Settings, Suppression, Ticket, Transport, Unsealable,
-    Unwrapped, event_record, event_sealed, event_sequence, normalize, punycode, retain,
-    retain_request,
+    Reason, Recipient, Refusal, Restore, Running, SHAPE, Settings, Suppression, Ticket, Transport,
+    Unsealable, Unwrapped, encode_slice, event_record, event_sealed, event_sequence, normalize,
+    punycode, retain, retain_request,
 };
 use spool::{Body, Head, HeadClear, Message, MessageId, SLICE, Slice, Stamp};
 use store::{Client, Committer, DataFile, Options, SLOT_SIZE, Setup, Tiering, boot};
@@ -1173,6 +1173,131 @@ fn events_seal_under_their_message_and_open_from_the_record() {
         let clear = reader.open_event(1, next, inner).expect("open");
         assert_eq!(EventBody::decode(&clear), Some(capped.clone()));
         assert_eq!(opener.event(1, next, &capped).err(), Some(Unsealable::Bad));
+    });
+    cluster.stop();
+}
+
+async fn accept_listed(
+    node: &Node<Idle>,
+    shard: u16,
+    addresses: &[&str],
+    expiry: u64,
+) -> (MessageId, [u8; spool::WRAP]) {
+    let mut draft = node.draft(1, None).expect("draft");
+    for address in addresses {
+        node.recipient(&mut draft, address)
+            .await
+            .expect("recipient");
+    }
+    let mut sealing = node.sealing(&mut draft, shard).await.expect("sealing");
+    let clear = HeadClear {
+        recipients: u32::try_from(addresses.len()).expect("fits"),
+        accepted: 5,
+        ..HeadClear::default()
+    };
+    let head = sealing
+        .head(clear, expiry, &[1; 10], b"Subject: hi\r\n")
+        .expect("head");
+    let wrap = head.wrap;
+    let body = sealing.inline_body(&[1; 30]).expect("body");
+    let listed: Vec<Recipient> = addresses
+        .iter()
+        .map(|a| Recipient {
+            address: (*a).to_owned(),
+            orcpt: Vec::new(),
+            notify: 0,
+        })
+        .collect();
+    let plain = encode_slice(&listed).expect("slice");
+    let slice = sealing
+        .slice(0, draft.queues().to_vec(), &plain)
+        .expect("slice");
+    let id = sealing.id();
+    let message = Message {
+        id,
+        tenant: 1,
+        head,
+        body,
+        slices: vec![slice],
+    };
+    node.accept(draft, message).await.expect("accept");
+    (id, wrap)
+}
+
+#[test]
+fn expiry_events_name_each_open_recipient() {
+    let driver = Rc::new(SimDriver::with_disk(44, Config::default(), created(44)));
+    let cluster = started(&driver, 2);
+    let nodes = cluster.nodes.clone();
+    cluster.run(async move {
+        ready(&nodes).await;
+        let node = &nodes[0];
+        let shard = owned_shard(node).await;
+        let addresses = ["x@example.org", "y@example.org"];
+        let (id, wrap) = accept_listed(node, shard, &addresses, u64::MAX / 2).await;
+        let events = node.expiry_events(id, 7 * DAY).await.expect("events");
+        assert_eq!(events.len(), 2);
+        for (event, address) in events.iter().zip(addresses) {
+            let value = Event::decode(&event.record.entry.value).expect("value");
+            assert_eq!(
+                (value.kind, value.time, value.message),
+                (EventKind::Expired, 7 * DAY, id)
+            );
+            assert_eq!(
+                (value.recipient, value.stamp),
+                (event.recipient, event.stamp)
+            );
+            let (kept, inner) = event_sealed(&event.record.entry.payload).expect("payload");
+            assert_eq!(kept, &wrap);
+            let opener = node.event_opener(1, &value, kept).await.expect("opener");
+            let clear = opener
+                .open_event(value.recipient, value.stamp, inner)
+                .expect("open");
+            let body = EventBody::decode(&clear).expect("body");
+            assert!(value.checked(&body));
+            assert_eq!(body.address, address.as_bytes());
+        }
+        assert_ne!(events[0].stamp, events[1].stamp);
+    });
+    cluster.stop();
+}
+
+#[test]
+fn an_expired_message_leaves_an_expired_event() {
+    let driver = Rc::new(SimDriver::with_disk(45, Config::default(), created(45)));
+    let cluster = started(&driver, 2);
+    let nodes = cluster.nodes.clone();
+    cluster.run(async move {
+        ready(&nodes).await;
+        let node = &nodes[0];
+        let shard = owned_shard(node).await;
+        let (gone, _) = accept_listed(node, shard, &["z@example.org"], 1).await;
+        for _ in 0..200 {
+            if node.spool().tenant(gone).is_none() {
+                break;
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(node.spool().tenant(gone), None);
+        let changes = node.spool().changes();
+        let mut found = Vec::new();
+        for (owner, partition) in changes.partitions(KIND_EVENT).await.expect("partitions") {
+            let entries = changes
+                .scan(
+                    owner,
+                    (KIND_EVENT, partition),
+                    [0; 20]..[0xff; 20],
+                    usize::MAX,
+                )
+                .await
+                .expect("scan");
+            found.extend(entries.iter().filter_map(|e| Event::decode(&e.value)));
+        }
+        assert_eq!(found.len(), 1);
+        assert_eq!(
+            (found[0].kind, found[0].message),
+            (EventKind::Expired, gone)
+        );
     });
     cluster.stop();
 }

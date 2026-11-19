@@ -16,7 +16,7 @@ use crate::clock::Clock;
 use crate::lanes::{Entry, Lanes, Limits, QueueId, Take, ranges};
 use crate::policy::{Answer, BACKOFF, Kind, clamp, delay, report_retry};
 use crate::sealing::{Keys, Unsealable};
-use crate::sign::{Outgoing, Signing};
+use crate::sign::{Outgoing, Signing, expiry_events};
 use crate::transport::{Answered, Attempt, Claimed, Destination, Transport};
 use crate::unopened::{Action, Breaker, UnopenedStats, action};
 
@@ -701,6 +701,7 @@ impl<T: Transport + 'static> Sched<T> {
                 };
                 let (reply, event) = answered.map_or((None, None), |a| {
                     let event = a.event.map(|record| Event {
+                        recipient: c.recipient,
                         record,
                         stamp: c.stamp,
                         carried: 0,
@@ -1095,7 +1096,18 @@ impl<T: Transport + 'static> Sched<T> {
                 let sched = self.clone();
                 drop(spawn(async move {
                     let inner = &sched.inner;
-                    if inner.spool.expire(id, now).await.is_ok() {
+                    let events = match inner.keys.get() {
+                        Some(keys) => expiry_events(&inner.spool, &**keys, id, now).await,
+                        None => Err(u32::try_from(inner.spool.open_recipients(id).len())
+                            .unwrap_or(u32::MAX)),
+                    };
+                    let events = events.unwrap_or_else(|lost| {
+                        if let Some(tenant) = inner.spool.tenant(id) {
+                            inner.spool.count_lost(tenant, lost);
+                        }
+                        Vec::new()
+                    });
+                    if inner.spool.expire_with(id, now, events).await.is_ok() {
                         sched.forget_signed(id);
                         inner.expired.set(inner.expired.get() + 1);
                     } else {

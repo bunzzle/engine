@@ -154,6 +154,7 @@ const READY: Recipient = Recipient {
 
 fn event(n: u8, stamp: Stamp) -> Event {
     Event {
+        recipient: 0,
         stamp,
         record: IndexRecord {
             sequenced: true,
@@ -488,6 +489,41 @@ fn cancel_and_expiry_wait_for_open_claims() {
     on(disk, move || async move {
         let node = Node::open().await;
         assert_eq!(node.spool.messages(), vec![kept]);
+        node.close().await;
+    });
+}
+
+#[test]
+fn expiry_events_commit_with_the_drop_for_open_recipients_only() {
+    on(created(), || async {
+        let node = Node::open().await;
+        let spool = &node.spool;
+        let id = node.accept(0, 3, 100).await;
+        spool.claim(id, 0).expect("claim");
+        let first = spool.report(id, vec![done(0, Outcome::Delivered)]).await;
+        assert_eq!(first.expect("report"), Done::Kept);
+        let open: Vec<u32> = spool.open_recipients(id).iter().map(|o| o.0).collect();
+        assert_eq!(open, [1, 2]);
+        assert_eq!(spool.tenant(id), Some(7));
+        spool.claim(id, 1).expect("claim");
+        let closing: Vec<Event> = (0..3u8)
+            .map(|r| Event {
+                recipient: u32::from(r),
+                ..event(10 + r, spool.stamp(0).expect("stamp"))
+            })
+            .collect();
+        let expiry = {
+            let spool = spool.clone();
+            spawn(async move { spool.expire_with(id, 150, closing).await })
+        };
+        rt::sleep(std::time::Duration::from_millis(5)).await;
+        let last = spool.report(id, vec![done(1, Outcome::Failed)]).await;
+        assert_eq!(last.expect("report"), Done::Dropped);
+        expiry.await.expect("expire");
+        let values: Vec<u8> = events(spool).await.into_iter().map(|e| e.1).collect();
+        assert_eq!(values, [12]);
+        assert_eq!(spool.lost_events(), 0);
+        assert_eq!(spool.tenant(id), None);
         node.close().await;
     });
 }

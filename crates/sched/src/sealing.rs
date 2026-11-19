@@ -405,6 +405,10 @@ impl<T: Transport + 'static> Node<T> {
     ) -> Result<Opener, Unsealable> {
         event_opener(self.keys(), tenant, event, wrap).await
     }
+
+    pub async fn expiry_events(&self, id: MessageId, time: u64) -> Result<Vec<spool::Event>, u32> {
+        crate::sign::expiry_events(self.spool(), self.keys(), id, time).await
+    }
 }
 
 pub(crate) async fn opener(
