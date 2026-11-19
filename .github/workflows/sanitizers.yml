@@ -48,6 +48,6 @@ jobs:
           persist-credentials: false
       - run: rustup toolchain install "$NIGHTLY" --profile minimal --component rust-src
       - run: cargo "+$NIGHTLY" test --locked -Zbuild-std --target "$TARGET" -p sys --lib
-      - run: cargo "+$NIGHTLY" test --locked -Zbuild-std --target "$TARGET" -p sys --test sys uring::
-      - run: cargo "+$NIGHTLY" test --locked -Zbuild-std --target "$TARGET" -p rt --test rt native::
-      - run: cargo "+$NIGHTLY" test --locked -Zbuild-std --target "$TARGET" -p store --test store -- native:: threads::
+      - run: 'cargo "+$NIGHTLY" test --locked -Zbuild-std --target "$TARGET" -p sys --test sys uring::'
+      - run: 'cargo "+$NIGHTLY" test --locked -Zbuild-std --target "$TARGET" -p rt --test rt native::'
+      - run: 'cargo "+$NIGHTLY" test --locked -Zbuild-std --target "$TARGET" -p store --test store -- native:: threads::'
