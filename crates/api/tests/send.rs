@@ -1765,6 +1765,7 @@ fn events_are_read_in_pages_over_http() {
                 }
             }
             let mut keys = BTreeSet::new();
+            let mut named = BTreeSet::new();
             for event in &found {
                 let text = |name: &str| {
                     event
@@ -1781,8 +1782,16 @@ fn events_are_read_in_pages_over_http() {
                 assert_eq!(text("reply"), "250 2.0.0 ok");
                 assert_eq!(number("attempts"), 1);
                 assert!(event.get("lost").is_none());
+                let id = text("id");
+                let hex = id.strip_prefix("ev_").expect("prefix");
+                assert!(
+                    hex.len() == 32 && hex.bytes().all(|b| b.is_ascii_hexdigit()),
+                    "{id}"
+                );
+                named.insert(id);
                 keys.insert((text("message_id"), number("recipient")));
             }
+            assert_eq!(named.len(), found.len());
             assert_eq!(found.len(), expected.len());
             assert_eq!(keys, expected);
             let after = format!("?after={cursor}");

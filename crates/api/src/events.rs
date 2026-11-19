@@ -116,7 +116,11 @@ fn body(page: &EventPage, ids: &Ids) -> String {
 
 fn event(read: &EventRead, ids: &Ids, out: &mut String) {
     let event = &read.event;
-    out.push_str("{\"type\":");
+    out.push_str("{\"id\":\"ev_");
+    for byte in read.id {
+        let _ = write!(out, "{byte:02x}");
+    }
+    out.push_str("\",\"type\":");
     json::string(kind(event.kind), out);
     out.push_str(",\"time\":");
     json::string(&rfc3339(event.time), out);

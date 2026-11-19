@@ -2,7 +2,7 @@ use std::cell::{Cell, OnceCell, RefCell};
 use std::collections::BTreeMap;
 use std::rc::Rc;
 
-use control::{State, Table};
+use control::{State, Table, tenant_keys};
 use index::Entry;
 use rt::{Ends, JoinHandle, Peers, Sender, channel, spawn};
 use store::Changes;
@@ -14,6 +14,7 @@ pub const MAX_LIMIT: usize = 1000;
 pub const PAGE_BYTES: usize = 1 << 20;
 const CURSOR_KIND: u8 = 0xc0;
 const CURSOR_FORMAT: u8 = 1;
+const EVENT_ID: &[u8; 5] = b"event";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReadError {
@@ -27,6 +28,7 @@ pub enum ReadError {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Read {
+    pub id: [u8; 16],
     pub shard: u16,
     pub sequence: u64,
     pub event: Event,
@@ -139,10 +141,14 @@ impl Reader {
             parts.push(answer.recv().await.ok_or(ReadError::Failed)??);
         }
         let (taken, next, more) = merge(parts, &positions, limit);
+        let naming = tenant_keys(keys, tenant, generation)
+            .await
+            .map_err(|_| ReadError::Unavailable)?;
         let mut events = Vec::with_capacity(taken.len());
         for (shard, sequence, event, payload) in taken {
             let body = open(keys, tenant, &event, &payload).await;
             events.push(Read {
+                id: event_id(&naming, shard, sequence),
                 shard,
                 sequence,
                 event,
@@ -320,6 +326,14 @@ fn merge(parts: Vec<Part>, positions: &[u64], limit: usize) -> (Taken, Vec<u64>,
     (taken, next, more)
 }
 
+fn event_id(keys: &crypto::TenantKeys, shard: u16, sequence: u64) -> [u8; 16] {
+    let mut data = [0; 15];
+    data[..5].copy_from_slice(EVENT_ID);
+    data[5..7].copy_from_slice(&shard.to_be_bytes());
+    data[7..].copy_from_slice(&sequence.to_be_bytes());
+    index::siphash128(keys.hash_key().expose(), &data)
+}
+
 async fn open(keys: &dyn Keys, tenant: u32, event: &Event, payload: &[u8]) -> Option<Body> {
     let (wrap, inner) = sealed(payload)?;
     let opener = event_opener(keys, tenant, event, wrap).await.ok()?;
@@ -426,6 +440,26 @@ mod tests {
     use super::*;
     use crate::events::Kind;
     use spool::{MessageId, Stamp};
+
+    #[test]
+    fn event_ids_are_keyed_per_tenant() {
+        let keys = |tenant, hash| {
+            crypto::TenantKeys::new(
+                tenant,
+                1,
+                &crypto::Secret::new([1; 32]),
+                1,
+                crypto::Secret::new([hash; 16]),
+            )
+        };
+        let (one, two) = (keys(1, 3), keys(2, 4));
+        let id = event_id(&one, 5, 77);
+        assert_eq!(id, event_id(&keys(1, 3), 5, 77));
+        assert_ne!(id, event_id(&one, 5, 78));
+        assert_ne!(id, event_id(&one, 6, 77));
+        assert_ne!(id, event_id(&two, 5, 77));
+        assert!(!id.windows(8).any(|w| w == 77u64.to_be_bytes()));
+    }
 
     fn event(time: u64) -> Event {
         Event {

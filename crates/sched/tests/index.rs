@@ -1456,6 +1456,7 @@ fn events_read_in_pages_across_cores_without_gaps() {
         }
         let reader = &nodes[1];
         let mut seen = Vec::new();
+        let mut named = Vec::new();
         let mut cursor: Option<String> = None;
         loop {
             let page = reader.events(1, cursor.as_deref(), 2).await.expect("page");
@@ -1465,6 +1466,7 @@ fn events_read_in_pages_across_cores_without_gaps() {
                 assert_eq!(read.event.kind, EventKind::Expired);
                 assert!(body.address.ends_with(b"@example.org"));
                 seen.push((read.shard, read.sequence, read.event.message));
+                named.push(read.id);
             }
             cursor = Some(page.next);
             if !page.more {
@@ -1476,6 +1478,14 @@ fn events_read_in_pages_across_cores_without_gaps() {
         unique.dedup();
         assert_eq!(unique.len(), 5);
         assert_eq!(seen.len(), 5);
+        let again = reader.events(1, None, 10).await.expect("again");
+        let mut ids_again: Vec<[u8; 16]> = again.events.iter().map(|read| read.id).collect();
+        let mut first: Vec<[u8; 16]> = named.clone();
+        first.sort_unstable();
+        first.dedup();
+        assert_eq!(first.len(), 5);
+        ids_again.sort_unstable();
+        assert_eq!(ids_again, first);
         let mut messages: Vec<MessageId> = seen.iter().map(|s| s.2).collect();
         messages.sort_unstable_by_key(MessageId::bytes);
         let mut expected: Vec<MessageId> = ids.iter().map(|i| i.1).collect();
