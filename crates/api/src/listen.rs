@@ -1,3 +1,4 @@
+use std::any::Any;
 use std::cell::RefCell;
 use std::rc::Rc;
 
@@ -20,6 +21,7 @@ pub struct Api {
     stats: Rc<Stats>,
     forward: Rc<Forwarder>,
     drain: std::time::Duration,
+    context: Rc<dyn Any>,
 }
 
 impl Api {
@@ -67,6 +69,7 @@ impl Api {
             closed.await;
         }
         self.forward.close(self.drain).await;
+        drop(self.context);
     }
 }
 
@@ -88,9 +91,14 @@ pub fn start<T: Transport + 'static>(
         forward: Rc::clone(&forward),
         reading: RefCell::default(),
     });
-    let owner = Rc::clone(&context);
+    let owner = Rc::downgrade(&context);
     forward.serve_with(Box::new(move |inbound, open| {
-        spawn(serve(Rc::clone(&owner), inbound, open))
+        let owner = owner.upgrade();
+        spawn(async move {
+            if let Some(owner) = owner {
+                serve(owner, inbound, open).await;
+            }
+        })
     }));
     let listeners = sockets
         .into_iter()
@@ -110,5 +118,6 @@ pub fn start<T: Transport + 'static>(
         stats,
         forward,
         drain,
+        context,
     }
 }
