@@ -10,8 +10,8 @@ use std::time::Duration;
 
 use aws_lc_rs::signature::{ED25519, RSA_PKCS1_2048_8192_SHA256, UnparsedPublicKey};
 use control::{
-    Created, Dkim, Domain, KeyError, KeySource, Naming, Object, Pool, Ready, Scope, Scopes, State,
-    Table, Tenant, Verification,
+    ALL_EVENTS, Created, Dkim, Domain, Hook, HookState, KeyError, KeySource, Naming, Object, Pool,
+    Ready, Scope, Scopes, State, Table, Tenant, Verification,
 };
 use crypto::{BatchKey, DkimAlg, Secret, Tenant as Root, TenantKeys, Wrap, day_public, open_batch};
 use index::{Entry, Op};
@@ -23,11 +23,11 @@ use rt::sim::{Config, Disk, Faults, Machine, SimDriver, Stalls, check};
 use rt::{JoinHandle, Runtime, TcpListener, TcpStream, sleep, spawn, timeout};
 use sched::{
     Answer, Answered, Attempt, Batched, Begun, Clock, DAY, Draft, EVENT_DAYS, EVENT_SHAPE,
-    EVENT_VALUE, Event, EventBody, EventKind, Fault, Hash, KIND_EVENT, KIND_REQUEST, KIND_SUPPRESS,
-    Keyring, Keys, MAX_REPLY, Meshes, Node, Parts, ReadError, Reason, Recipient, Refusal, Restore,
-    Running, SHAPE, Settings, Suppression, Ticket, Transport, Unsealable, Unwrapped, encode_slice,
-    event_record, event_sealed, event_sequence, normalize, punycode, retain, retain_event,
-    retain_request, retired_events,
+    EVENT_VALUE, Event, EventBody, EventKind, Fault, Hash, HookChange, KIND_EVENT, KIND_REQUEST,
+    KIND_SUPPRESS, Keyring, Keys, MAX_HOOKS, MAX_REPLY, Meshes, Node, Parts, ROTATION_MS,
+    ReadError, Reason, Recipient, Refusal, Restore, Running, SHAPE, Settings, Suppression, Ticket,
+    Transport, Unsealable, Unwrapped, encode_slice, event_record, event_sealed, event_sequence,
+    normalize, punycode, retain, retain_event, retain_request, retired_events,
 };
 use spool::{Body, Head, HeadClear, Message, MessageId, SLICE, Slice, Stamp};
 use store::{Client, Committer, DataFile, Options, SLOT_SIZE, Setup, Tiering, boot};
@@ -3181,6 +3181,180 @@ fn sender_domains_pick_their_keys_and_keep_named_keys() {
             assert_eq!(node.sign(1, rsa.id, digest).await, Err(Refusal::Signer));
             node.sign(1, ed.id, digest).await.expect("sign");
         }
+    });
+}
+
+fn hook_refused<T: std::fmt::Debug>(result: Result<T, sched::Error>, what: &str) {
+    match result {
+        Err(sched::Error::Control(control::Error::Invalid(w))) => assert_eq!(w, what),
+        Err(sched::Error::Control(control::Error::Refused)) => assert_eq!("refused", what),
+        Err(sched::Error::Control(control::Error::Full)) => assert_eq!("full", what),
+        other => panic!("{other:?}"),
+    }
+}
+
+async fn old_generation_hidden(nodes: &[Node<Idle>], control: &Node<Idle>, theirs: &Hook) {
+    assert!(matches!(
+        control.write(Object::Hook(theirs.clone())).await,
+        Err(sched::Error::Control(control::Error::Invalid("kind")))
+    ));
+    control.delete_tenant(theirs.tenant).await.expect("delete");
+    assert_eq!(control.table().hook(theirs.tenant, theirs.id), Some(theirs));
+    for node in nodes {
+        while node
+            .table()
+            .tenant(theirs.tenant)
+            .is_some_and(|t| t.state == State::Active)
+        {
+            sleep(Duration::from_millis(1)).await;
+        }
+        assert_eq!(node.hooks(theirs.tenant), Vec::new());
+        hook_refused(node.hook(theirs.tenant, theirs.id), "refused");
+        hook_refused(
+            node.hook_secret(theirs.tenant, theirs.id, 1)
+                .await
+                .map(drop),
+            "refused",
+        );
+    }
+    hook_refused(
+        control.hook_remove(theirs.tenant, theirs.id).await,
+        "refused",
+    );
+    wait_for(nodes, theirs.tenant, theirs.generation, State::Deleted).await;
+    while !control.controls() {
+        sleep(Duration::from_millis(1)).await;
+    }
+    let next = tenant(theirs.tenant, theirs.generation + 1, State::Active);
+    control.write(next).await.expect("write");
+    wait_for(nodes, theirs.tenant, theirs.generation + 1, State::Active).await;
+    let fresh = control
+        .hook_new(theirs.tenant, "https://hooks.example.org/", 0)
+        .await
+        .expect("new");
+    assert_eq!(fresh.generation, theirs.generation + 1);
+    assert_eq!(control.hooks(theirs.tenant), vec![fresh]);
+}
+
+async fn versions_end(control: &Node<Idle>, at: &str) {
+    let next = control.hook_new(1, at, 0).await.expect("new");
+    assert_eq!(next.id, u32::try_from(MAX_HOOKS).expect("small") + 2);
+    for version in 2..=u8::MAX {
+        let hook = control.hook_rotate(1, next.id).await.expect("rotate");
+        assert_eq!(hook.version, version);
+    }
+    hook_refused(control.hook_rotate(1, next.id).await, "full");
+}
+
+async fn hook_everywhere(nodes: &[Node<Idle>], hook: &Hook) {
+    for node in nodes {
+        while node.table().hook(hook.tenant, hook.id) != Some(hook) {
+            sleep(Duration::from_millis(1)).await;
+        }
+    }
+}
+
+#[test]
+fn webhook_endpoints_are_made_changed_rotated_and_removed_on_the_control_core() {
+    let driver = Rc::new(SimDriver::with_disk(47, Config::default(), created(47)));
+    let cluster = started_with_keys(&driver, 2);
+    let nodes = cluster.nodes.clone();
+    cluster.run(async move {
+        keys_listening().await;
+        ready(&nodes).await;
+        let control = nodes.iter().find(|n| n.controls()).expect("control core");
+        let other = nodes.iter().find(|n| !n.controls()).expect("other core");
+        let at = "https://hooks.example.org/in";
+        hook_refused(other.hook_new(1, at, 0).await, "core");
+        hook_refused(control.hook_new(7, at, 0).await, "refused");
+        hook_refused(
+            control.hook_new(1, "http://hooks.example.org/", 0).await,
+            "url",
+        );
+        hook_refused(control.hook_new(1, at, 0x40).await, "events");
+        let made = control.hook_new(1, at, 0).await.expect("new");
+        assert_eq!((made.id, made.events, made.version), (1, ALL_EVENTS, 1));
+        assert_eq!(made.state, HookState::Active);
+        hook_everywhere(&nodes, &made).await;
+        let theirs = control.hook_new(2, at, 1).await.expect("new");
+        hook_refused(
+            control
+                .hook_change(1, theirs.id, HookChange::default())
+                .await,
+            "refused",
+        );
+        hook_refused(control.hook_rotate(1, theirs.id).await, "refused");
+        hook_refused(control.hook_remove(1, theirs.id).await, "refused");
+        hook_refused(
+            other.hook_secret(1, theirs.id, 1).await.map(drop),
+            "refused",
+        );
+        for _ in 1..MAX_HOOKS {
+            control.hook_new(1, at, 0).await.expect("new");
+        }
+        hook_refused(control.hook_new(1, at, 0).await, "full");
+        let paused = control
+            .hook_change(
+                1,
+                made.id,
+                HookChange {
+                    url: Some("https://other.example.org/x".into()),
+                    events: Some(3),
+                    enabled: Some(false),
+                },
+            )
+            .await
+            .expect("change");
+        assert_eq!(
+            (&*paused.url, paused.events),
+            ("https://other.example.org/x", 3)
+        );
+        assert_eq!(paused.state, HookState::Paused);
+        hook_refused(
+            control
+                .hook_change(
+                    1,
+                    made.id,
+                    HookChange {
+                        url: Some("https://10.0.0.1/".into()),
+                        ..HookChange::default()
+                    },
+                )
+                .await,
+            "url",
+        );
+        let enabled = HookChange {
+            enabled: Some(true),
+            ..HookChange::default()
+        };
+        let active = control
+            .hook_change(1, made.id, enabled)
+            .await
+            .expect("change");
+        assert_eq!((active.state, active.events), (HookState::Active, 3));
+        let first = other.hook_secret(1, made.id, 1).await.expect("secret");
+        hook_refused(other.hook_secret(1, made.id, 2).await.map(drop), "refused");
+        let rotated = control.hook_rotate(1, made.id).await.expect("rotate");
+        assert_eq!(rotated.version, 2);
+        hook_everywhere(&nodes, &rotated).await;
+        let (_, previous) = other.hook_versions(1, made.id).expect("versions");
+        assert_eq!(previous, Some(1));
+        let second = other.hook_secret(1, made.id, 2).await.expect("secret");
+        let again = control.hook_secret(1, made.id, 1).await.expect("secret");
+        assert!(*first == *again && *first != *second);
+        hook_refused(other.hook_secret(1, made.id, 3).await.map(drop), "refused");
+        sleep(Duration::from_millis(ROTATION_MS)).await;
+        assert_eq!(other.hook_versions(1, made.id).expect("versions").1, None);
+        hook_refused(other.hook_secret(1, made.id, 1).await.map(drop), "refused");
+        control.hook_remove(1, made.id).await.expect("remove");
+        for node in &nodes {
+            while node.table().hook(1, made.id).is_some() {
+                sleep(Duration::from_millis(1)).await;
+            }
+            hook_refused(node.hook_secret(1, made.id, 2).await.map(drop), "refused");
+        }
+        versions_end(control, at).await;
+        old_generation_hidden(&nodes, control, &theirs).await;
     });
 }
 

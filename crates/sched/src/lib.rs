@@ -6,6 +6,7 @@ mod domain;
 mod envelope;
 mod error;
 mod events;
+mod hook;
 mod intake;
 mod keyring;
 mod lanes;
@@ -30,6 +31,7 @@ pub use events::{
     MAX_REPLY, record as event_record, retain as retain_event, retired as retired_events,
     sealed as event_sealed, sequence as event_sequence,
 };
+pub use hook::{HookChange, MAX_HOOKS, ROTATION_MS};
 pub use intake::{Draft, domain_of};
 pub use keyring::Keyring;
 pub use lanes::{Entry, Lanes, Limits, QueueId, Take, ranges};
@@ -45,8 +47,8 @@ pub use requests::{
     retain_request,
 };
 pub use sealing::{
-    Batched, Deleted, Keys, LABEL_BODY, LABEL_EVENT, LABEL_HEAD, LABEL_REPLY, LABEL_SLICE, Loaded,
-    Made, Oldest, Opener, Sealing, Signed, Unsealable, Unwrapped,
+    Batched, Deleted, HookSecret, Keys, LABEL_BODY, LABEL_EVENT, LABEL_HEAD, LABEL_REPLY,
+    LABEL_SLICE, Loaded, Made, Oldest, Opener, Sealing, Signed, Unsealable, Unwrapped,
 };
 pub use sign::{Body, Fault, KEYS_WAIT, Outgoing, Plain, Prepared, SIGNED_BYTES};
 pub use start::{CONTROL_SHARD, Links, Meshes, Node, Parts, Running, Settings};

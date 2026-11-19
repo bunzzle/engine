@@ -1,6 +1,7 @@
 mod events;
 mod forward;
 mod handler;
+mod hooks;
 pub mod json;
 mod listen;
 pub mod mime;

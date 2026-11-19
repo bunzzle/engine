@@ -1,5 +1,6 @@
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::Write as _;
 use std::future::poll_fn;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::Path;
@@ -1146,12 +1147,19 @@ impl Owners {
 }
 
 fn owners(cluster: &Cluster, forwards: &Mesh<Forward>) -> Rc<Owners> {
+    owners_besides(cluster, forwards, 0)
+}
+
+fn owners_besides(cluster: &Cluster, forwards: &Mesh<Forward>, front: u16) -> Rc<Owners> {
     let mut owners = Owners {
         apis: Vec::new(),
         stops: Vec::new(),
         held: RefCell::new(Vec::new()),
     };
-    for (core, node) in (1u16..).zip(&cluster.nodes[1..]) {
+    for (core, node) in (0u16..)
+        .zip(&cluster.nodes)
+        .filter(|(core, _)| *core != front)
+    {
         let api: Rc<RefCell<Option<Api>>> = Rc::default();
         let stop = Rc::new(Notify::default());
         let ends = forwards.take(core).expect("ends");
@@ -1876,6 +1884,257 @@ fn event_reads_refuse_bad_queries_and_parallel_reads() {
             assert!(ports.count(Route::Events, 200) >= 3);
             ports.close().await;
         });
+        cluster.stop();
+    });
+}
+
+fn hook_call(method: &str, path: &str, token: &str, body: Option<&str>) -> Vec<u8> {
+    let mut request =
+        format!("{method} {path} HTTP/1.1\r\nHost: api.test\r\nAuthorization: Bearer {token}\r\n");
+    match body {
+        Some(body) => {
+            let _ = write!(
+                request,
+                "Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            );
+        }
+        None if method == "GET" => request.push_str("\r\n"),
+        None => request.push_str("Content-Length: 0\r\n\r\n"),
+    }
+    request.into_bytes()
+}
+
+fn text_of(value: &Value, name: &str) -> String {
+    value
+        .get(name)
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| panic!("{name}"))
+        .to_owned()
+}
+
+fn names(value: &Value) -> Vec<String> {
+    value
+        .get("events")
+        .and_then(Value::as_array)
+        .expect("events")
+        .iter()
+        .map(|v| v.as_str().expect("name").to_owned())
+        .collect()
+}
+
+fn listed(reply: &Reply) -> Vec<Value> {
+    assert_eq!(reply.status, 200, "{reply:?}");
+    reply
+        .json()
+        .get("webhooks")
+        .and_then(Value::as_array)
+        .expect("list")
+        .to_vec()
+}
+
+async fn hook_bad_bodies(http: &mut Http, first: &str) {
+    for body in [
+        r#"{"url":"http://hooks.example.org/"}"#,
+        r#"{"url":"https://192.0.2.1/"}"#,
+        r#"{"url":"https://hooks.example.org/","events":["opened"]}"#,
+        r#"{"url":"https://hooks.example.org/","other":1}"#,
+        r#"{"events":[]}"#,
+        r#"{"url":"https://hooks.example.org/","events":[]}"#,
+        "[1]",
+        "{",
+    ] {
+        let reply = http
+            .send_reply(&hook_call("POST", "/v1/webhooks", first, Some(body)))
+            .await;
+        assert_eq!(reply.status, 400, "{body}");
+    }
+    let plain = format!(
+        "POST /v1/webhooks HTTP/1.1\r\nHost: api.test\r\nAuthorization: Bearer {first}\r\n\
+         Content-Type: text/plain\r\nContent-Length: 2\r\n\r\n{{}}"
+    );
+    let mut probe = Http::plain().await;
+    assert_eq!(probe.send_reply(plain.as_bytes()).await.status, 415);
+}
+
+async fn hook_isolation(http: &mut Http, tokens: &Tokens, id: &str) {
+    let (first, second) = (tokens.first.as_str(), tokens.second.as_str());
+    let one = format!("/v1/webhooks/{id}");
+    let ours = listed(
+        &http
+            .send_reply(&hook_call("GET", "/v1/webhooks", first, None))
+            .await,
+    );
+    assert_eq!(ours.len(), 1);
+    assert_eq!(text_of(&ours[0], "id"), id);
+    assert!(ours[0].get("secret").is_none());
+    let theirs = listed(
+        &http
+            .send_reply(&hook_call("GET", "/v1/webhooks", second, None))
+            .await,
+    );
+    assert_eq!(theirs.len(), 0);
+    for (method, path, body) in [
+        ("GET", one.clone(), None),
+        ("PATCH", one.clone(), Some(r#"{"enabled":false}"#)),
+        ("DELETE", one.clone(), None),
+        ("POST", format!("{one}/rotate"), None),
+        ("GET", format!("{one}/secret"), None),
+    ] {
+        let reply = http
+            .send_reply(&hook_call(method, &path, second, body))
+            .await;
+        assert_eq!(
+            (reply.status, reply.code().as_str()),
+            (404, "not_found"),
+            "{method} {path}"
+        );
+    }
+    for path in [
+        "/v1/webhooks/wh_x",
+        "/v1/webhooks/",
+        "/v1/webhooks/a/b/c",
+        "/v1/webhooks/a/rotate/x",
+    ] {
+        let reply = http.send_reply(&hook_call("GET", path, first, None)).await;
+        assert_eq!(reply.status, 404, "{path}");
+    }
+    let reply = http
+        .send_reply(&hook_call("GET", "/v1/webhooks", &tokens.smtp, None))
+        .await;
+    assert_eq!(reply.status, 401);
+    for (method, path, allow) in [
+        ("PUT", "/v1/webhooks".to_owned(), "GET, POST"),
+        ("POST", one.clone(), "GET, PATCH, DELETE"),
+        ("GET", format!("{one}/rotate"), "POST"),
+        ("DELETE", format!("{one}/secret"), "GET"),
+    ] {
+        let reply = http
+            .send_reply(&hook_call(method, &path, first, None))
+            .await;
+        assert_eq!(reply.status, 405, "{method} {path}");
+        assert_eq!(reply.header("allow"), Some(allow));
+    }
+}
+
+async fn hook_changes(http: &mut Http, first: &str, id: &str, secret: &str) {
+    let one = format!("/v1/webhooks/{id}");
+    let patch = r#"{"enabled":false,"events":["delivered","deferred","failed","expired","canceled","suppressed"],"url":"https://other.example.org/"}"#;
+    let paused = http
+        .send_reply(&hook_call("PATCH", &one, first, Some(patch)))
+        .await;
+    assert_eq!(paused.status, 200, "{paused:?}");
+    let paused = paused.json();
+    assert_eq!(text_of(&paused, "state"), "paused");
+    assert_eq!(names(&paused).len(), 6);
+    assert_eq!(text_of(&paused, "url"), "https://other.example.org/");
+    for body in [
+        r#"{"enabled":1}"#,
+        r#"{"events":[]}"#,
+        r#"{"url":"https://x/"}"#,
+    ] {
+        let bad = http
+            .send_reply(&hook_call("PATCH", &one, first, Some(body)))
+            .await;
+        assert_eq!(bad.status, 400, "{body}");
+    }
+    let shown = format!("{one}/secret");
+    let reply = http
+        .send_reply(&hook_call("GET", &shown, first, None))
+        .await;
+    assert_eq!(text_of(&reply.json(), "secret"), secret);
+    let rotated = http
+        .send_reply(&hook_call("POST", &format!("{one}/rotate"), first, None))
+        .await;
+    assert_eq!(rotated.status, 200, "{rotated:?}");
+    let rotated = rotated.json();
+    let fresh = text_of(&rotated, "secret");
+    assert!(fresh.starts_with("whsec_") && fresh != secret);
+    assert_eq!(rotated.get("version").and_then(Value::as_u64), Some(2));
+    let reply = http
+        .send_reply(&hook_call("GET", &shown, first, None))
+        .await;
+    assert_eq!(text_of(&reply.json(), "secret"), fresh);
+}
+
+async fn hook_limit_and_delete(http: &mut Http, tokens: &Tokens, id: &str) {
+    let (first, second) = (tokens.first.as_str(), tokens.second.as_str());
+    let body = r#"{"url":"https://hooks.example.org/"}"#;
+    for _ in 1..sched::MAX_HOOKS {
+        let reply = http
+            .send_reply(&hook_call("POST", "/v1/webhooks", first, Some(body)))
+            .await;
+        assert_eq!(reply.status, 201);
+    }
+    let full = http
+        .send_reply(&hook_call("POST", "/v1/webhooks", first, Some(body)))
+        .await;
+    assert_eq!((full.status, full.code().as_str()), (422, "webhook_limit"));
+    let other = http
+        .send_reply(&hook_call("POST", "/v1/webhooks", second, Some(body)))
+        .await;
+    assert_eq!(other.status, 201);
+    let one = format!("/v1/webhooks/{id}");
+    let deleted = http
+        .send_reply(&hook_call("DELETE", &one, first, None))
+        .await;
+    assert_eq!(deleted.status, 200, "{deleted:?}");
+    assert_eq!(text_of(&deleted.json(), "id"), id);
+    for path in [one.clone(), format!("{one}/secret")] {
+        let reply = http.send_reply(&hook_call("GET", &path, first, None)).await;
+        assert_eq!(reply.status, 404, "{path}");
+    }
+    let again = http
+        .send_reply(&hook_call("DELETE", &one, first, None))
+        .await;
+    assert_eq!(again.status, 404);
+}
+
+#[test]
+fn webhooks_are_managed_through_the_control_core_per_tenant() {
+    check(0..2, |seed| {
+        let cluster = started(seed, 2);
+        let nodes = cluster.nodes.clone();
+        let control = nodes.iter().position(Node::controls).expect("control");
+        let front = u16::from(control == 0);
+        let forwards = Mesh::new(2);
+        let owners = owners_besides(&cluster, &forwards, front);
+        let ends = forwards.take(front).expect("ends");
+        let watched = Rc::clone(&owners);
+        cluster.run(async move {
+            let owners = watched;
+            let tokens = prepare(&nodes).await;
+            let config = ApiConfig::new("mx1.example.net".into());
+            let ports = serve_with(&nodes[usize::from(front)], seed, config, ends).await;
+            let mut http = Http::plain().await;
+            let body =
+                r#"{"url":"https://hooks.example.org/in?t=1","events":["failed","delivered"]}"#;
+            let made = http
+                .send_reply(&hook_call(
+                    "POST",
+                    "/v1/webhooks",
+                    &tokens.first,
+                    Some(body),
+                ))
+                .await;
+            assert_eq!(made.status, 201, "{made:?}");
+            let made = made.json();
+            let id = text_of(&made, "id");
+            let secret = text_of(&made, "secret");
+            assert!(id.starts_with("wh_") && secret.starts_with("whsec_"));
+            assert_eq!(text_of(&made, "url"), "https://hooks.example.org/in?t=1");
+            assert_eq!(names(&made), ["delivered", "failed"]);
+            assert_eq!(text_of(&made, "state"), "active");
+            assert!(owners.served() > 0, "seed {seed}: not forwarded");
+            hook_bad_bodies(&mut http, &tokens.first).await;
+            hook_isolation(&mut http, &tokens, &id).await;
+            hook_changes(&mut http, &tokens.first, &id, &secret).await;
+            hook_limit_and_delete(&mut http, &tokens, &id).await;
+            assert_eq!(owners.serving(), 0);
+            owners.stop();
+            ports.close().await;
+        });
+        owners.join(&cluster.machine);
         cluster.stop();
     });
 }

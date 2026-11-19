@@ -4,6 +4,7 @@ pub struct Status(u16);
 impl Status {
     pub const CONTINUE: Self = Self(100);
     pub const OK: Self = Self(200);
+    pub const CREATED: Self = Self(201);
     pub const BAD_REQUEST: Self = Self(400);
     pub const UNAUTHORIZED: Self = Self(401);
     pub const FORBIDDEN: Self = Self(403);
@@ -32,6 +33,7 @@ impl Status {
         match self.0 {
             100 => "Continue",
             200 => "OK",
+            201 => "Created",
             400 => "Bad Request",
             401 => "Unauthorized",
             403 => "Forbidden",

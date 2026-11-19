@@ -395,7 +395,7 @@ impl<T: Transport + 'static> Node<T> {
     pub async fn write(&self, object: Object) -> Result<Update, Error> {
         if matches!(
             object,
-            Object::Dkim(_) | Object::Access(_) | Object::Domain(_)
+            Object::Dkim(_) | Object::Access(_) | Object::Domain(_) | Object::Hook(_)
         ) {
             return Err(control::Error::Invalid("kind").into());
         }
@@ -715,6 +715,12 @@ fn start_config(
         for (tenant, generation, now) in deleted(&note) {
             keys.forget(tenant, generation);
             let _ = deleting.send((tenant, now));
+        }
+        if let control::Note::Remove(removal) = &note
+            && removal.kind == control::KIND_HOOK
+            && let Some(tenant) = table.borrow().hook_owner(removal.id)
+        {
+            keys.forget_hook(tenant, removal.id);
         }
         table.borrow_mut().take(note);
         applied.notify();
