@@ -5,7 +5,9 @@ use control::{Created, KeyError, KeySource, Ready};
 use crypto::{BatchKey, DkimAlg, Secret, TenantKeys, Wrap};
 use keys::{BatchSettings, BatchStats, Batches, Fault, Ring};
 
-use crate::sealing::{Batched, Deleted, Keys, Loaded, Made, Oldest, Signed, Unsealable, Unwrapped};
+use crate::sealing::{
+    Batched, Deleted, HookSecret, Keys, Loaded, Made, Oldest, Signed, Unsealable, Unwrapped,
+};
 
 pub struct Keyring {
     ring: Ring,
@@ -111,6 +113,19 @@ impl Keys for Keyring {
 
     fn forgotten(&self, tenant: u32, generation: u32) -> bool {
         self.ring.forgotten(tenant, generation)
+    }
+
+    fn forget_hook(&self, tenant: u32, hook: u32) {
+        self.ring.forget_hook(tenant, hook);
+    }
+
+    fn hook_secret(&self, tenant: u32, generation: u32, hook: u32, version: u8) -> HookSecret<'_> {
+        Box::pin(async move {
+            self.ring
+                .hook_secret(tenant, generation, hook, version)
+                .await
+                .map_err(key_error)
+        })
     }
 
     fn delete(&self, tenant: u32, generation: u32) -> Deleted<'_> {

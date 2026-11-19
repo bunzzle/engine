@@ -13,7 +13,7 @@ use crypto::Secret;
 use http::{Event, Framing, Limits, Phase, Request, Response, Server, Status, Timeouts};
 use intake::{Conn, End, Guard, Refused, Slot};
 use rt::{Instant, TcpStream, now, timeout};
-use sched::{Node, Transport};
+use sched::{CONTROL_SHARD, Node, Transport};
 use tls::Acceptor;
 
 use crate::events;
@@ -49,6 +49,7 @@ pub enum Route {
     Messages,
     Raw,
     Events,
+    Hooks,
     Health,
     Other,
 }
@@ -291,6 +292,9 @@ impl<T: Transport + 'static> Session<'_, T> {
                 (Route::Events, self.events(request, &id).await)
             }
             "/v1/events" => (Route::Events, Err(Problem::method("GET, HEAD").into())),
+            path if path == "/v1/webhooks" || path.starts_with("/v1/webhooks/") => {
+                (Route::Hooks, self.hooks(request, &id).await)
+            }
             _ => (Route::Other, Err(Problem::not_found().into())),
         };
         match answer {
@@ -316,6 +320,30 @@ impl<T: Transport + 'static> Session<'_, T> {
     async fn events(&mut self, request: &Request, id: &str) -> Result<Response, Stop> {
         let grant = self.auth(request).await?;
         events::read(self.context, grant.tenant, request, id).await
+    }
+
+    async fn hooks(&mut self, request: &Request, id: &str) -> Result<Response, Stop> {
+        let grant = self.auth(request).await?;
+        let context = self.context;
+        let owner = context.forward.owner(CONTROL_SHARD);
+        if owner != context.forward.index() {
+            let open = Open {
+                route: Route::Hooks,
+                request: request.clone(),
+                grant,
+                id: id.to_owned(),
+                secure: self.secure(),
+                shard: CONTROL_SHARD,
+            };
+            return self.forward(owner, open).await;
+        }
+        let mut handler = Handler {
+            context,
+            source: self,
+            grant,
+            shard: CONTROL_SHARD,
+        };
+        handler.run(Route::Hooks, request, id).await
     }
 
     async fn post(&mut self, route: Route, request: &Request, id: &str) -> Result<Response, Stop> {

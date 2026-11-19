@@ -42,6 +42,7 @@ impl<T: Transport + 'static, S: Source> Handler<'_, T, S> {
         let answer = match route {
             Route::Messages => self.send(request).await?,
             Route::Raw => self.raw(request).await?,
+            Route::Hooks => return crate::hooks::handle(self, request, id).await,
             Route::Events | Route::Health | Route::Other => return Err(Problem::not_found().into()),
         };
         Ok(match answer {
@@ -333,7 +334,7 @@ fn line_fault(lines: &Decoder) -> Result<(), Problem> {
     }
 }
 
-fn media(value: &[u8]) -> String {
+pub(crate) fn media(value: &[u8]) -> String {
     let end = value.iter().position(|&b| b == b';').unwrap_or(value.len());
     String::from_utf8_lossy(value[..end].trim_ascii()).to_ascii_lowercase()
 }

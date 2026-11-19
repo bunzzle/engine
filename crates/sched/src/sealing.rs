@@ -2,6 +2,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
 use std::pin::Pin;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use control::{KeyError, KeySource, Ready};
 use crypto::{
@@ -44,6 +45,7 @@ pub type Made<'a> = Pin<Box<dyn Future<Output = Result<(Vec<u8>, Vec<u8>), KeyEr
 pub type Loaded<'a> = Pin<Box<dyn Future<Output = Result<(), KeyError>> + 'a>>;
 pub type Deleted<'a> = Pin<Box<dyn Future<Output = Result<(), KeyError>> + 'a>>;
 pub type Signed<'a> = Pin<Box<dyn Future<Output = Result<Vec<u8>, KeyError>> + 'a>>;
+pub type HookSecret<'a> = Pin<Box<dyn Future<Output = Result<Arc<Secret<32>>, KeyError>> + 'a>>;
 
 pub trait Keys: KeySource {
     fn tick(&self) {}
@@ -54,6 +56,18 @@ pub trait Keys: KeySource {
 
     fn forgotten(&self, _tenant: u32, _generation: u32) -> bool {
         false
+    }
+
+    fn forget_hook(&self, _tenant: u32, _hook: u32) {}
+
+    fn hook_secret(
+        &self,
+        _tenant: u32,
+        _generation: u32,
+        _hook: u32,
+        _version: u8,
+    ) -> HookSecret<'_> {
+        Box::pin(async { Err(KeyError::Unavailable) })
     }
 
     fn delete(&self, _tenant: u32, _generation: u32) -> Deleted<'_> {
