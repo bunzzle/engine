@@ -542,6 +542,15 @@ fn applies_carry_sequenced_index_records_that_survive_a_crash() {
             .apply_indexed(batch(1), 0, vec![stamped], false)
             .await;
         assert!(matches!(refused, Err(Error::Invalid("index stamp"))));
+        let erase = IndexRecord {
+            entry: Entry::delete(index::key(1, [0; 16]), SHAPE),
+            ..event(1, 7)
+        };
+        let refused = node
+            .changes
+            .apply_indexed(batch(1), 0, vec![erase], false)
+            .await;
+        assert!(matches!(refused, Err(Error::Invalid("index stamp"))));
         let keeper = node.stop().await;
         assert!(keeper.state(0).expect("kept").get(Key::head(2)).is_none());
         written

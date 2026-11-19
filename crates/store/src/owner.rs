@@ -605,7 +605,7 @@ impl Shards {
         }
         let mut shapes = BTreeMap::new();
         for record in records {
-            if !record.unstamped() {
+            if !record.unstamped() || (record.sequenced && record.entry.op == index::Op::Delete) {
                 return Err(Error::Invalid("index stamp"));
             }
             let partition = (record.kind, record.partition);
