@@ -722,17 +722,33 @@ impl Shards {
     async fn scan_kind(&self, scan: ScanKind) {
         let mut found = Vec::new();
         let mut result = Ok(());
+        let mut keys = scan.keys.clone();
         for (shard, partition) in self.kept_partitions(scan.kind) {
-            let keys = scan.keys.clone();
+            if keys.start >= keys.end {
+                break;
+            }
             match self
                 .keeper
-                .range(&self.file, shard, (scan.kind, partition), keys, scan.limit)
+                .range(
+                    &self.file,
+                    shard,
+                    (scan.kind, partition),
+                    keys.clone(),
+                    scan.limit,
+                )
                 .await
             {
                 Ok(entries) => found.extend(entries.into_iter().map(|e| (shard, e))),
                 Err(error) => {
                     result = Err(error);
                     break;
+                }
+            }
+            if found.len() >= scan.limit {
+                found.sort_by_key(|(shard, entry)| (entry.key, *shard));
+                found.truncate(scan.limit);
+                if let Some((_, last)) = found.last() {
+                    keys.end = after(last.key);
                 }
             }
         }
@@ -1233,4 +1249,14 @@ async fn move_body(
     written.ok()?;
     target.offset += length;
     Some(moved)
+}
+
+fn after(mut key: index::Key) -> index::Key {
+    for byte in key.iter_mut().rev() {
+        *byte = byte.wrapping_add(1);
+        if *byte != 0 {
+            return key;
+        }
+    }
+    [0xff; index::KEY]
 }

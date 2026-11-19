@@ -20,6 +20,7 @@ pub enum ReadError {
     Tenant,
     Limit,
     Cursor,
+    Stale,
     Unavailable,
     Failed,
 }
@@ -122,9 +123,10 @@ impl Reader {
             None => vec![0; cores],
             Some(text) => {
                 let sealed = unhex(text).ok_or(ReadError::Cursor)?;
-                let clear = system
-                    .open(&label, &sealed)
-                    .map_err(|_| ReadError::Cursor)?;
+                let clear = system.open(&label, &sealed).map_err(|e| match e {
+                    crypto::Error::Format("key version") => ReadError::Stale,
+                    _ => ReadError::Cursor,
+                })?;
                 positions(&clear, cores).ok_or(ReadError::Cursor)?
             }
         };
@@ -232,13 +234,20 @@ impl Reader {
             .scan_kind(KIND_EVENT, from..to, limit)
             .await
             .map_err(|_| ReadError::Failed)?;
-        let full = found.len() >= limit;
+        let mut full = found.len() >= limit;
         let mut scanned = after;
+        let mut bytes = 0usize;
         let mut entries = Vec::with_capacity(found.len());
         for (shard, entry) in found {
+            let size = entry.payload.len() + 128;
+            if !entries.is_empty() && bytes + size > PAGE_BYTES {
+                full = true;
+                break;
+            }
             let at = sequence(&entry.key);
             scanned = scanned.max(at);
             if let Some(event) = kept(&entry, generation) {
+                bytes += size;
                 entries.push((shard, at, event, entry.payload));
             }
         }
@@ -291,7 +300,7 @@ fn merge(parts: Vec<Part>, positions: &[u64], limit: usize) -> (Taken, Vec<u64>,
             .0
             .peek()
             .map_or(0, |(_, _, _, payload)| payload.len() + 128);
-        if taken.len() >= limit || bytes + size > PAGE_BYTES {
+        if taken.len() >= limit || (!taken.is_empty() && bytes + size > PAGE_BYTES) {
             break;
         }
         let entry = heads[core].0.next().expect("peeked");
@@ -461,6 +470,22 @@ mod tests {
         assert!(!more);
         let parts = vec![part(&[(6, 1)], 6, true)];
         assert!(merge(parts, &[0], 10).2);
+    }
+
+    #[test]
+    fn a_page_always_takes_one_event_even_past_the_byte_budget() {
+        let big = Part {
+            entries: vec![
+                (0, 3, event(1), vec![0; PAGE_BYTES]),
+                (0, 4, event(2), vec![0; 10]),
+            ],
+            scanned: 4,
+            full: false,
+        };
+        let (taken, next, more) = merge(vec![big], &[0], 10);
+        assert_eq!(taken.len(), 1);
+        assert_eq!(next, [3]);
+        assert!(more);
     }
 
     #[test]
