@@ -125,6 +125,7 @@ fn state_is_rebuilt_and_writing_continues() {
     let driver = created(1);
     run(&driver, async {
         let (client, committer) = start().await;
+        client.checkpoint().await.expect("checkpoint");
         let mut acked = Vec::new();
         for step in 0..5 {
             let records = vec![payload(1, step, 40_000)];

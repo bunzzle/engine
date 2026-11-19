@@ -212,7 +212,13 @@ impl Committer {
         let committer = Self {
             data,
             journal,
-            regions: state.regions,
+            regions: {
+                let mut regions = state.regions;
+                if !state.checkpoint.is_empty() {
+                    regions.checkpointed();
+                }
+                regions
+            },
             epochs: state.epochs,
             usage: state.usage,
             open: vec![false; count as usize],
