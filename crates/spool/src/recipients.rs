@@ -73,6 +73,7 @@ pub struct Reply {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Event {
+    pub recipient: u32,
     pub record: IndexRecord,
     pub stamp: Stamp,
     pub carried: u32,
@@ -111,6 +112,7 @@ struct Entry {
     reported: BTreeSet<u32>,
     pending: Vec<Call>,
     ending: Vec<Waiter>,
+    closing: Vec<Event>,
     flushing: bool,
     dropping: bool,
 }
@@ -129,6 +131,7 @@ impl Entry {
             reported: BTreeSet::new(),
             pending: Vec::new(),
             ending: Vec::new(),
+            closing: Vec::new(),
             flushing: false,
             dropping: false,
         }
@@ -145,6 +148,30 @@ impl Entry {
             class: 0,
             notified: false,
         }))
+    }
+
+    fn take_closing(
+        &mut self,
+        finished: &BTreeSet<u32>,
+        events: &mut Vec<IndexRecord>,
+        room: impl Fn(usize) -> bool,
+    ) -> u32 {
+        let mut lost = 0u32;
+        for event in mem::take(&mut self.closing) {
+            let open = !finished.contains(&event.recipient)
+                && self
+                    .recipient(event.recipient)
+                    .is_some_and(|state| !state.status.is_final());
+            if !open {
+                continue;
+            }
+            if room(events.len() + 1) {
+                events.push(event.record);
+            } else {
+                lost = lost.saturating_add(1);
+            }
+        }
+        lost
     }
 
     fn next(&self, report: &Report) -> Recipient {
@@ -173,6 +200,7 @@ struct Merge {
     batch: Batch,
     events: Vec<IndexRecord>,
     carried: u32,
+    lost: u32,
     calls: Vec<Call>,
     ending: Vec<Waiter>,
     completing: bool,
@@ -504,14 +532,46 @@ impl Spool {
     }
 
     pub async fn cancel(&self, id: MessageId) -> Result<(), Error> {
-        self.end(id, None).await
+        self.end(id, None, Vec::new()).await
     }
 
     pub async fn expire(&self, id: MessageId, now: u64) -> Result<(), Error> {
-        self.end(id, Some(now)).await
+        self.end(id, Some(now), Vec::new()).await
     }
 
-    async fn end(&self, id: MessageId, now: Option<u64>) -> Result<(), Error> {
+    pub async fn expire_with(
+        &self,
+        id: MessageId,
+        now: u64,
+        events: Vec<Event>,
+    ) -> Result<(), Error> {
+        self.end(id, Some(now), events).await
+    }
+
+    pub fn open_recipients(&self, id: MessageId) -> Vec<(u32, Recipient)> {
+        let table = self.inner.table.borrow();
+        let Some(entry) = table.messages.get(&(id.shard, id.key)) else {
+            return Vec::new();
+        };
+        (0..entry.recipients)
+            .filter_map(|r| entry.recipient(r).map(|state| (r, state)))
+            .filter(|(_, state)| !state.status.is_final())
+            .collect()
+    }
+
+    pub fn tenant(&self, id: MessageId) -> Option<u32> {
+        let table = self.inner.table.borrow();
+        table.messages.get(&(id.shard, id.key)).map(|e| e.tenant)
+    }
+
+    pub fn count_lost(&self, tenant: u32, lost: u32) {
+        let mut table = self.inner.table.borrow_mut();
+        let count = table.lost.entry(tenant).or_default();
+        *count = count.saturating_add(lost);
+        table.lost_total += u64::from(lost);
+    }
+
+    async fn end(&self, id: MessageId, now: Option<u64>, events: Vec<Event>) -> Result<(), Error> {
         let (waiter, mut answer) = channel();
         {
             let mut table = self.inner.table.borrow_mut();
@@ -522,6 +582,7 @@ impl Spool {
             if now.is_some_and(|now| entry.expiry > now) {
                 return Err(Error::State("not expired"));
             }
+            entry.closing.extend(events);
             entry.ending.push(waiter);
             self.start(entry, id);
         }
@@ -608,9 +669,18 @@ impl Spool {
         } else {
             Vec::new()
         };
-        let events: Vec<IndexRecord> = reports()
+        let mut events: Vec<IndexRecord> = reports()
             .filter_map(|r| r.event.as_ref().map(|e| e.record.clone()))
             .collect();
+        let lost = if completing {
+            let finished: BTreeSet<u32> = reports()
+                .filter(|r| r.outcome.is_final())
+                .map(|r| r.recipient)
+                .collect();
+            entry.take_closing(&finished, &mut events, |n| fits(1, 1, live + n, count))
+        } else {
+            0
+        };
         let carried = reports()
             .filter_map(|r| r.event.as_ref())
             .fold(0u32, |sum, e| sum.saturating_add(e.carried));
@@ -624,6 +694,7 @@ impl Spool {
             batch,
             events,
             carried,
+            lost,
             calls,
             ending,
             completing,
@@ -652,10 +723,12 @@ impl Spool {
                 }
             };
             let mut table = self.inner.table.borrow_mut();
-            if !kept {
-                let lost = u32::try_from(events)
+            if !kept || merge.lost > 0 {
+                let dropped = if kept { 0 } else { events };
+                let lost = u32::try_from(dropped)
                     .unwrap_or(u32::MAX)
-                    .saturating_add(merge.carried);
+                    .saturating_add(if kept { 0 } else { merge.carried })
+                    .saturating_add(merge.lost);
                 let count = table.lost.entry(tenant).or_default();
                 *count = count.saturating_add(lost);
                 table.lost_total += u64::from(lost);

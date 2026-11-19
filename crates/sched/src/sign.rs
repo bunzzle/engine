@@ -4,7 +4,7 @@ use std::rc::Rc;
 
 use control::Table;
 use crypto::{Opener as ChunkOpener, Wrap};
-use spool::{Chunks, MessageId, Opened, Pinned, SLICE, Source, Stored};
+use spool::{Chunks, Event, MessageId, Opened, Pinned, SLICE, Source, Spool, Stored};
 
 use crate::dkim::{sign, signer};
 use crate::envelope::{Envelope, Recipient, decode_slice};
@@ -326,6 +326,57 @@ async fn prepare(
         opener,
         _pins: read.pins,
     })
+}
+
+pub(crate) async fn expiry_events(
+    spool: &Spool,
+    keys: &dyn Keys,
+    id: MessageId,
+    time: u64,
+) -> Result<Vec<Event>, u32> {
+    let open = spool.open_recipients(id);
+    let lost = u32::try_from(open.len()).unwrap_or(u32::MAX);
+    if open.is_empty() {
+        return Ok(Vec::new());
+    }
+    let wanted: Vec<u32> = open.iter().map(|(r, _)| *r).collect();
+    let stored = spool.stored(id, &wanted).await.map_err(|_| lost)?;
+    let read = spool.open_stored(&stored).await.map_err(|_| lost)?;
+    let generation = Wrap::decode(&read.wrap).map_err(|_| lost)?.generation;
+    let opener = opener(
+        keys,
+        stored.tenant,
+        generation,
+        id,
+        &stored.clear,
+        &read.wrap,
+    )
+    .await
+    .map_err(|_| lost)?;
+    let addresses = open_recipients(&opener, &read.slices, stored.clear.recipients, &wanted)
+        .map_err(|_| lost)?;
+    let mut events = Vec::with_capacity(open.len());
+    for ((recipient, state), (_, address)) in open.into_iter().zip(addresses) {
+        let Ok(stamp) = spool.stamp(id.shard) else {
+            return Err(lost);
+        };
+        let body = crate::events::Body {
+            kind: crate::events::Kind::Expired,
+            time,
+            address: address.address.into_bytes(),
+            reply: Vec::new(),
+            attempts: state.attempts,
+            class: state.class,
+        };
+        let record = opener.event(recipient, stamp, &body).map_err(|_| lost)?;
+        events.push(Event {
+            recipient,
+            record,
+            stamp,
+            carried: 0,
+        });
+    }
+    Ok(events)
 }
 
 fn open_recipients(
