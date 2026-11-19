@@ -289,12 +289,12 @@ pub(crate) fn rua(texts: &[&[u8]]) -> Option<Rua> {
     for uri in uris?.split(',').map(str::trim) {
         if let Some(address) = uri.strip_prefix("mailto:") {
             let address = address.split('?').next().unwrap_or_default();
-            let valid = address.split_once('@').is_some_and(|(local, host)| {
-                !local.is_empty() && !host.is_empty() && !address.contains(char::is_whitespace)
-            });
-            if !valid {
+            let atext = |b: u8| b.is_ascii_alphanumeric() || b"!#$%&'*+-/=?^_`{|}~.@".contains(&b);
+            let ats = address.bytes().filter(|&b| b == b'@').count();
+            if ats != 1 || !address.bytes().all(atext) {
                 return None;
             }
+            sched::normalize(address)?;
             if out.mailto.len() < MAILTO {
                 out.mailto.push(address.to_owned());
             }
@@ -445,6 +445,8 @@ mod tests {
             "v=TLSRPTv1; rua=",
             "v=TLSRPTv1; rua=ftp://x.example",
             "v=TLSRPTv1; rua=mailto:nobody",
+            "v=TLSRPTv1; rua=mailto:a<b>@x.example",
+            "v=TLSRPTv1; rua=mailto:a\"@x.example",
             "v=TLSRPTv1; rua=https://",
             "v=TLSRPTv1; rua=mailto:a@x.example; rua=mailto:b@x.example",
             "rua=mailto:a@x.example; v=TLSRPTv1",

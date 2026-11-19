@@ -10,8 +10,8 @@ use control::{KIND_RPT, KIND_STS, Leases};
 use dns::{Found, Name, Record, Type};
 use rt::{Ends, Instant, JoinHandle, now, timeout};
 use sched::{
-    Answer, Answered, Attempt, Body, Destination, Envelope, Kind, Recipient, Required, Restore,
-    Ret, Transport,
+    Answer, Answered, Attempt, Body, Destination, Envelope, Kind, Recipient, ReportMail, Reported,
+    Required, Restore, Ret, Transport,
 };
 use smtp::client::{
     self, Answer as Reply, Capabilities, Dots, Mail, Rcpt, Refused, Response, Step, Transaction,
@@ -21,6 +21,7 @@ use tls::{Connector, Observed, Refusal, Tlsa, Verify};
 use crate::classify;
 use crate::conn::{Conn, Lost, left};
 use crate::dane::{self, Dane};
+use crate::mail::report_mail;
 use crate::mx::{self, Addresses, Dns, Hosts};
 use crate::owners::{OwnerStats, Owners, State};
 use crate::pool::{Key, Level, Link, Pool, Remote, Slot};
@@ -209,7 +210,7 @@ impl<D: Dns> Deliver<D> {
         self.sts.stats()
     }
 
-    pub fn reports(&mut self, ends: Ends<Taken>) -> JoinHandle<()> {
+    pub fn report_mesh(&mut self, ends: Ends<Taken>) -> JoinHandle<()> {
         self.owners.start(ends)
     }
 
@@ -859,6 +860,36 @@ impl<D: Dns> Transport for Deliver<D> {
             _ => {}
         }
         std::future::ready(())
+    }
+
+    async fn reports(&self) -> Vec<ReportMail> {
+        let from = self.settings.reporter.from.clone();
+        let mut mails = Vec::new();
+        for due in self.due_reports().await {
+            let (day, domain) = (due.report.day, due.report.domain.clone());
+            if due.rua.mailto.is_empty() {
+                continue;
+            }
+            match report_mail(&due.report, &from, &due.rua.mailto) {
+                Some(message) => mails.push(ReportMail {
+                    day,
+                    domain,
+                    from: from.clone(),
+                    to: due.rua.mailto,
+                    message,
+                }),
+                None => self.report_dropped(day, &domain),
+            }
+        }
+        mails
+    }
+
+    fn reported(&self, day: u64, domain: &str, done: Reported) {
+        match done {
+            Reported::Sent => self.report_sent(day, domain),
+            Reported::Dropped => self.report_dropped(day, domain),
+            Reported::Failed => self.report_failed(day, domain),
+        }
     }
 
     async fn tick(&self) {

@@ -47,5 +47,5 @@ pub use suppress::{
     Suppressions, keyed_hash, retain,
 };
 pub use system::{Done, RecordStats, Records, Restore, Saved, Unsaved};
-pub use transport::{Answered, Attempt, Claimed, Destination, Transport};
+pub use transport::{Answered, Attempt, Claimed, Destination, ReportMail, Reported, Transport};
 pub use unopened::{Action, DROPS_PER_MINUTE, UnopenedStats, action};

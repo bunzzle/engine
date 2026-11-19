@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use std::net::SocketAddr;
 
-use node::{Delivery, Listen, check, key_file, parse};
+use node::{Delivery, Listen, Tlsrpt, check, key_file, parse};
 
 const CHAIN: &[u8] = include_bytes!("data/a.pem");
 const KEY: &[u8] = include_bytes!("data/a.key");
@@ -252,6 +252,58 @@ cache = 500"#,
         ],
         [10, 60, 120, 180, 4, 240, 300, 360].map(Duration::from_secs)
     );
+}
+
+#[test]
+fn tls_report_settings_are_read() {
+    let roots = |text: String| {
+        text.replace(
+            "key = \"/etc/bunzzle/key.pem\"",
+            "key = \"/etc/bunzzle/key.pem\"\nroots = \"/etc/ssl/roots.pem\"",
+        )
+    };
+    let on = roots(format!(
+        r#"{MINIMAL}[tlsrpt]
+on = true
+tenant = 3
+from = "tlsrpt@Ops.Example"
+organization = "Example Ops"
+contact = "mailto:postmaster@ops.example"
+"#
+    ));
+    let config = parse(&on).expect("config");
+    assert_eq!(
+        config.tlsrpt,
+        Some(Tlsrpt {
+            tenant: 3,
+            from: "tlsrpt@Ops.Example".into(),
+        })
+    );
+    let settings = &config.delivery.settings;
+    assert!(settings.tlsrpt);
+    assert_eq!(settings.report_tenant, Some(3));
+    assert_eq!(
+        settings.reporter,
+        deliver::Reporter {
+            from: "tlsrpt@Ops.Example".into(),
+            organization: "Example Ops".into(),
+            contact: "mailto:postmaster@ops.example".into(),
+            submitter: "ops.example".into(),
+        }
+    );
+    let off = parse(&format!("{MINIMAL}[tlsrpt]\non = false\n")).expect("config");
+    assert_eq!(off.tlsrpt, None);
+    assert!(!off.delivery.settings.tlsrpt);
+    assert_eq!(
+        error(&format!("{MINIMAL}[tlsrpt]\non = true\n")),
+        "line 22, column 1: `on` needs `roots` in [tls]"
+    );
+    let bad = roots(format!(
+        "{MINIMAL}[tlsrpt]\non = true\ntenant = 3\nfrom = \"nobody\"\norganization = \"x\"\ncontact = \"y\"\n"
+    ));
+    assert!(parse(&bad).is_err());
+    let missing = roots(format!("{MINIMAL}[tlsrpt]\non = true\ntenant = 3\n"));
+    assert!(parse(&missing).is_err());
 }
 
 #[test]

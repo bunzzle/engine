@@ -39,6 +39,22 @@ pub struct Answered {
     pub reply: Vec<u8>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReportMail {
+    pub day: u64,
+    pub domain: String,
+    pub from: String,
+    pub to: Vec<String>,
+    pub message: Vec<u8>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Reported {
+    Sent,
+    Dropped,
+    Failed,
+}
+
 pub trait Transport {
     fn send(&self, attempt: Attempt) -> impl Future<Output = Vec<Answered>>;
 
@@ -49,5 +65,13 @@ pub trait Transport {
 
     fn tick(&self) -> impl Future<Output = ()> {
         std::future::ready(())
+    }
+
+    fn reports(&self) -> impl Future<Output = Vec<ReportMail>> {
+        std::future::ready(Vec::new())
+    }
+
+    fn reported(&self, day: u64, domain: &str, done: Reported) {
+        let _ = (day, domain, done);
     }
 }
