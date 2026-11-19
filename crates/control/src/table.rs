@@ -5,8 +5,8 @@ use rt::Peers;
 
 use crate::access::{Grant, Scope, Token};
 use crate::record::{
-    Access, Dkim, Domain, KIND_ACCESS, KIND_DKIM, KIND_DOMAIN, Object, Pool, State, Tenant, Update,
-    Verification,
+    Access, Dkim, Domain, Hook, KIND_ACCESS, KIND_DKIM, KIND_DOMAIN, KIND_HOOK, Object, Pool,
+    State, Tenant, Update, Verification,
 };
 
 const DUMMY: [u8; 32] = [0; 32];
@@ -52,6 +52,7 @@ pub struct Table {
     dkims: BTreeMap<u32, Dkim>,
     accesses: BTreeMap<u32, Access>,
     domains: BTreeMap<u32, Domain>,
+    hooks: BTreeMap<u32, Hook>,
     waiting: BTreeMap<u64, Pending>,
 }
 
@@ -64,6 +65,7 @@ impl Table {
         self.dkims.clear();
         self.accesses.clear();
         self.domains.clear();
+        self.hooks.clear();
         for object in snapshot.objects {
             self.set(object);
         }
@@ -150,6 +152,14 @@ impl Table {
         self.domains.values().filter(move |d| d.tenant == tenant)
     }
 
+    pub fn hook(&self, tenant: u32, id: u32) -> Option<&Hook> {
+        self.hooks.get(&id).filter(|h| h.tenant == tenant)
+    }
+
+    pub fn hooks(&self, tenant: u32) -> impl Iterator<Item = &Hook> {
+        self.hooks.values().filter(move |h| h.tenant == tenant)
+    }
+
     pub fn sender(&self, tenant: u32, domain: &str) -> Option<&Domain> {
         let generation = self.tenants.get(&tenant)?.generation;
         self.domains(tenant)
@@ -225,6 +235,9 @@ impl Table {
             Object::Domain(d) => {
                 self.domains.insert(d.id, d);
             }
+            Object::Hook(h) => {
+                self.hooks.insert(h.id, h);
+            }
         }
     }
 
@@ -238,6 +251,9 @@ impl Table {
             }
             KIND_DOMAIN => {
                 self.domains.remove(&id);
+            }
+            KIND_HOOK => {
+                self.hooks.remove(&id);
             }
             _ => {}
         }
