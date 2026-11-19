@@ -24,6 +24,7 @@ pub const LABEL_HEAD: u8 = 1;
 pub const LABEL_BODY: u8 = 2;
 pub const LABEL_SLICE: u8 = 3;
 pub const LABEL_REPLY: u8 = 4;
+pub const LABEL_EVENT: u8 = 5;
 
 const HEAD_ROOM: usize = MAX_PAYLOAD - INDEX_SIZE - HEAD_CLEAR - WRAP - TAG - 4;
 
@@ -243,6 +244,7 @@ pub struct Opener {
     message: [u8; 16],
     key: Rc<BatchKey>,
     replies: RefCell<BTreeSet<(u32, Stamp)>>,
+    events: RefCell<BTreeSet<(u32, Stamp)>>,
 }
 
 impl Opener {
@@ -297,18 +299,39 @@ impl Opener {
         key.open_one(&aad, sealed).map_err(|_| Unsealable::Bad)
     }
 
+    pub fn seal_event(
+        &self,
+        recipient: u32,
+        stamp: Stamp,
+        body: &[u8],
+    ) -> Result<Vec<u8>, Unsealable> {
+        if !self.events.borrow_mut().insert((recipient, stamp)) {
+            return Err(Unsealable::Bad);
+        }
+        let (key, aad) = self.stamped_key(recipient, stamp, LABEL_EVENT);
+        Ok(key.seal_one(&aad, body))
+    }
+
+    pub fn open_event(
+        &self,
+        recipient: u32,
+        stamp: Stamp,
+        sealed: &[u8],
+    ) -> Result<Vec<u8>, Unsealable> {
+        let (key, aad) = self.stamped_key(recipient, stamp, LABEL_EVENT);
+        key.open_one(&aad, sealed).map_err(|_| Unsealable::Bad)
+    }
+
     fn reply_key(&self, recipient: u32, stamp: Stamp) -> (ChunkKey, [u8; AAD]) {
+        self.stamped_key(recipient, stamp, LABEL_REPLY)
+    }
+
+    fn stamped_key(&self, recipient: u32, stamp: Stamp, label: u8) -> (ChunkKey, [u8; AAD]) {
         let item = state_item(recipient);
         let key = self
             .key
-            .stamped(&self.message, item, LABEL_REPLY, stamp.boot, stamp.write);
-        let aad = aad(
-            self.tenant,
-            self.generation,
-            &self.message,
-            item,
-            LABEL_REPLY,
-        );
+            .stamped(&self.message, item, label, stamp.boot, stamp.write);
+        let aad = aad(self.tenant, self.generation, &self.message, item, label);
         (key, aad)
     }
 
@@ -349,6 +372,15 @@ impl<T: Transport + 'static> Node<T> {
     ) -> Result<Opener, Unsealable> {
         opener(self.keys(), tenant, generation, id, clear, wrap).await
     }
+
+    pub async fn event_opener(
+        &self,
+        tenant: u32,
+        event: &crate::events::Event,
+        wrap: &[u8; WRAP],
+    ) -> Result<Opener, Unsealable> {
+        event_opener(self.keys(), tenant, event, wrap).await
+    }
 }
 
 pub(crate) async fn opener(
@@ -372,5 +404,20 @@ pub(crate) async fn opener(
         message: id.bytes(),
         key,
         replies: RefCell::new(BTreeSet::new()),
+        events: RefCell::new(BTreeSet::new()),
     })
+}
+
+pub(crate) async fn event_opener(
+    keys: &dyn Keys,
+    tenant: u32,
+    event: &crate::events::Event,
+    wrap: &[u8; WRAP],
+) -> Result<Opener, Unsealable> {
+    let clear = HeadClear {
+        batch_key: event.batch,
+        day: event.day,
+        ..HeadClear::default()
+    };
+    opener(keys, tenant, event.generation, event.message, &clear, wrap).await
 }

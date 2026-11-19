@@ -5,6 +5,7 @@ mod dkim;
 mod domain;
 mod envelope;
 mod error;
+mod events;
 mod intake;
 mod keyring;
 mod lanes;
@@ -23,6 +24,10 @@ mod unopened;
 pub use clock::Clock;
 pub use envelope::{Envelope, Recipient, Required, Ret, decode_slice, encode_slice};
 pub use error::{Error, Refusal};
+pub use events::{
+    Body as EventBody, EVENT_SHAPE, EVENT_VALUE, Event, KIND_EVENT, Kind as EventKind, MAX_REPLY,
+    record as event_record, sealed as event_sealed, sequence as event_sequence,
+};
 pub use intake::{Draft, domain_of};
 pub use keyring::Keyring;
 pub use lanes::{Entry, Lanes, Limits, QueueId, Take, ranges};
@@ -37,8 +42,8 @@ pub use requests::{
     retain_request,
 };
 pub use sealing::{
-    Batched, Deleted, Keys, LABEL_BODY, LABEL_HEAD, LABEL_REPLY, LABEL_SLICE, Loaded, Made, Oldest,
-    Opener, Sealing, Signed, Unsealable, Unwrapped,
+    Batched, Deleted, Keys, LABEL_BODY, LABEL_EVENT, LABEL_HEAD, LABEL_REPLY, LABEL_SLICE, Loaded,
+    Made, Oldest, Opener, Sealing, Signed, Unsealable, Unwrapped,
 };
 pub use sign::{Body, Fault, KEYS_WAIT, Outgoing, Plain, Prepared, SIGNED_BYTES};
 pub use start::{CONTROL_SHARD, Links, Meshes, Node, Parts, Running, Settings};
