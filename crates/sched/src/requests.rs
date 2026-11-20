@@ -385,8 +385,8 @@ impl Requests {
             let parts = &inner.parts;
             let counted = inner.tallies.ask(&parts.changes, &parts.table, below).await;
             let upto = if counted { below } else { 0 };
-            let _ = parts.changes.retire(KIND_EVENT, day, upto).await;
-            let next = if counted {
+            let retired = parts.changes.retire(KIND_EVENT, day, upto).await;
+            let next = if counted && retired.is_ok() {
                 parts.clock.instant(u64::from(day + 1) * DAY)
             } else {
                 rt::now() + RECOUNT

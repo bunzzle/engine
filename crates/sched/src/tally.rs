@@ -22,6 +22,7 @@ pub(crate) struct Watched {
 
 #[derive(Default)]
 pub(crate) struct Tallies {
+    claimed: Cell<bool>,
     attached: Cell<bool>,
     busy: Cell<bool>,
     asks: RefCell<Vec<(u32, Sender<bool>)>>,
@@ -43,6 +44,7 @@ pub(crate) struct Attached<'a>(&'a Tallies);
 impl Drop for Attached<'_> {
     fn drop(&mut self) {
         self.0.attached.set(false);
+        self.0.claimed.set(false);
         self.0.asks.borrow_mut().clear();
     }
 }
@@ -59,6 +61,10 @@ impl Tallies {
         let _busy = Busy(self);
         let hooks = targets(&table.borrow());
         stored(changes, hooks, below).await
+    }
+
+    pub fn claim(&self) -> bool {
+        !self.claimed.replace(true)
     }
 
     pub async fn attach(&self) -> Attached<'_> {
@@ -102,13 +108,18 @@ pub(crate) async fn count(
     hooks: &BTreeMap<u32, Watched>,
 ) -> Option<BTreeMap<(u32, u16), u64>> {
     let mut lost = BTreeMap::new();
-    let tenants: BTreeSet<(u32, u32)> = hooks.values().map(|w| (w.tenant, w.generation)).collect();
+    let mut tenants: BTreeMap<(u32, u32), Vec<(u32, &Watched)>> = BTreeMap::new();
+    for (&hook, w) in hooks {
+        tenants
+            .entry((w.tenant, w.generation))
+            .or_default()
+            .push((hook, w));
+    }
     for &(shard, day) in parts {
-        for &(tenant, generation) in &tenants {
-            let due: Vec<(u32, u8, u64)> = hooks
+        for (&(tenant, generation), group) in &tenants {
+            let due: Vec<(u32, u8, u64)> = group
                 .iter()
-                .filter(|(_, w)| (w.tenant, w.generation) == (tenant, generation))
-                .filter_map(|(&hook, w)| {
+                .filter_map(|&(hook, w)| {
                     let &(floor, counted) = w.from.get(&shard)?;
                     (day > counted).then_some((hook, w.events, floor))
                 })

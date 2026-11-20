@@ -79,6 +79,9 @@ struct Streams {
 
 impl<T: Transport + 'static> Node<T> {
     pub fn start_hooks(&self, deliver: Rc<dyn Deliver>) -> JoinHandle<()> {
+        if !self.requests().tallies().claim() {
+            return spawn(async {});
+        }
         spawn(run(Rc::downgrade(&self.inner), deliver))
     }
 }
@@ -132,6 +135,7 @@ async fn run<T: Transport + 'static>(inner: Weak<Inner<T>>, deliver: Rc<dyn Deli
             if stream.held.is_none() && stream.more {
                 fill(&node, hook, stream).await;
             }
+            trim(stream);
             if let Some(held) = &stream.held
                 && stream.until.is_none_or(|until| rt::now() >= until)
             {
@@ -168,6 +172,7 @@ async fn run<T: Transport + 'static>(inner: Weak<Inner<T>>, deliver: Rc<dyn Deli
             .values()
             .filter(|s| !s.sending)
             .filter_map(|s| s.until)
+            .filter(|&until| until > now)
             .chain([flushed + FLUSH, now + TICK])
             .min()
             .unwrap_or(now + TICK);
@@ -202,6 +207,48 @@ fn settle(stream: &mut Stream, outcome: Outcome) {
         }
         Outcome::Retry(pause) => stream.until = Some(rt::now() + pause.max(PAUSE)),
     }
+}
+
+fn trim(stream: &mut Stream) {
+    let cursors = &stream.cursors;
+    let counted = |read: &Read| {
+        cursors
+            .get(&read.shard)
+            .is_some_and(|c| read.event.partition() <= c.counted)
+    };
+    if !stream
+        .held
+        .as_ref()
+        .is_some_and(|held| held.call.events.iter().any(counted))
+    {
+        return;
+    }
+    let Some(held) = stream.held.take() else {
+        return;
+    };
+    let events: Vec<Read> = held
+        .call
+        .events
+        .iter()
+        .filter(|read| !counted(read))
+        .cloned()
+        .collect();
+    if events.is_empty() {
+        advance(stream, &held.ends);
+        stream.until = None;
+        stream.more = true;
+        return;
+    }
+    let call = Call {
+        tenant: held.call.tenant,
+        generation: held.call.generation,
+        hook: held.call.hook,
+        events,
+    };
+    stream.held = Some(Held {
+        call: Rc::new(call),
+        ends: held.ends,
+    });
 }
 
 fn back_off(stream: &mut Stream) {
@@ -330,14 +377,10 @@ async fn tally<T: Transport + 'static>(node: &Node<T>, all: &mut Streams, below:
         .iter()
         .filter_map(|(&id, &(tenant, generation, _))| {
             let stream = all.live.get(&id)?;
-            let ends = stream.held.as_ref().map(|held| &held.ends);
             let from = stream
                 .cursors
                 .iter()
-                .map(|(&shard, cursor)| {
-                    let end = ends.and_then(|e| e.get(&shard)).copied().unwrap_or(0);
-                    (shard, (cursor.acked.max(end), cursor.counted))
-                })
+                .map(|(&shard, cursor)| (shard, (cursor.acked, cursor.counted)))
                 .collect();
             Some((
                 id,
@@ -460,7 +503,8 @@ async fn fill<T: Transport + 'static>(node: &Node<T>, hook: u32, stream: &mut St
                 continue;
             }
             let event = kept(&entry, stream.generation)
-                .filter(|event| stream.events & (1 << event.kind as u8) != 0);
+                .filter(|event| stream.events & (1 << event.kind as u8) != 0)
+                .filter(|event| event.partition() > cursor.counted);
             if let Some(event) = event {
                 let size = entry.payload.len() + 128;
                 if taken.len() >= BATCH_EVENTS || (!taken.is_empty() && bytes + size > BATCH_BYTES)

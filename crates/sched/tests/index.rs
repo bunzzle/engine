@@ -4002,7 +4002,7 @@ fn events_dropped_by_retention_are_counted_lost_for_each_webhook() {
     let driver = Rc::new(SimDriver::with_disk(seed, Config::default(), created(seed)));
     let cluster = started_behind(&driver, 1, 8 * DAY_MS as u64);
     let nodes = cluster.nodes.clone();
-    let (live, paused, total, day) = cluster.run(async move {
+    let (live, paused, total, day, shards) = cluster.run(async move {
         ready(&nodes).await;
         answering(&nodes);
         let node = &nodes[0];
@@ -4018,7 +4018,15 @@ fn events_dropped_by_retention_are_counted_lost_for_each_webhook() {
         drained(&nodes).await;
         let (whole, _, _) = read_all(node, None, 1000).await;
         let total = (whole.len() - before.len()) as u64;
-        (live, paused, total, node.requests().today())
+        let day = node.requests().today();
+        let kept = node.spool().changes().partitions(KIND_EVENT).await;
+        let shards: Vec<u16> = kept
+            .expect("partitions")
+            .into_iter()
+            .filter(|p| p.1 == day)
+            .map(|p| p.0)
+            .collect();
+        (live, paused, total, day, shards)
     });
     cluster.stop();
     assert!(total > 100, "{total} events");
@@ -4033,6 +4041,7 @@ fn events_dropped_by_retention_are_counted_lost_for_each_webhook() {
     let nodes = restarted.nodes.clone();
     restarted.run(async move {
         wait_for(&nodes, 1, 1, State::Active).await;
+        answering(&nodes);
         let node = &nodes[0];
         assert_eq!(node.requests().today(), day + 6);
         let off = HookChange {
@@ -4042,20 +4051,30 @@ fn events_dropped_by_retention_are_counted_lost_for_each_webhook() {
         node.hook_change(1, paused, off).await.expect("pause");
         let caught = refusing();
         let task = node.start_hooks(Rc::new(Catch(Rc::clone(&caught))));
+        let again = node.start_hooks(Rc::new(Catch(Rc::clone(&caught))));
         sleep(Duration::from_secs(120)).await;
         assert_eq!(node.requests().today(), day + 7);
-        let kept = node.spool().changes().partitions(KIND_EVENT).await;
-        for (shard, _) in kept.expect("partitions").into_iter().filter(|p| p.1 == day) {
+        assert_ne!(shards.len(), 0);
+        for &shard in &shards {
             for hook in [live, paused] {
                 let found = read_cursor(node.spool().changes(), shard, 1, hook).await;
                 assert_eq!(found.expect("read").map(|c| c.counted), Some(day));
             }
         }
         assert_eq!(lost_of(node, paused).await, total);
-        let held = caught.tried.get() as u64;
-        assert!(held > 0 && held < total, "{held} held");
-        assert_eq!(lost_of(node, live).await, total - held);
-        drop(task);
+        assert_eq!(lost_of(node, live).await, total);
+        assert!(caught.tried.get() > 0);
+        let (before, _, _) = read_all(node, None, 1000).await;
+        caught.refuse.set(0);
+        accept_some(&nodes, 30, 2).await;
+        drained(&nodes).await;
+        sleep(Duration::from_secs(10)).await;
+        let (whole, _, _) = read_all(node, None, 1000).await;
+        let fresh: Vec<Given> = whole.into_iter().filter(|e| !before.contains(e)).collect();
+        assert_ne!(fresh.len(), 0);
+        check_streamed(seed, &delivered_to(&caught, live), &fresh);
+        assert_eq!(lost_of(node, live).await, total);
+        drop((task, again));
     });
     restarted.stop();
 }
