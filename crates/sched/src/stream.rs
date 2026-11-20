@@ -13,6 +13,7 @@ use crate::cursor::{Cursor, drop_cursor, read_cursor, write_cursor};
 use crate::events::{KIND_EVENT, sequence};
 use crate::reader::{Read, event_id, kept, open, stamped};
 use crate::start::{Inner, Node};
+use crate::tally::{Targets, Watched, count, due, stored, targets};
 use crate::transport::Transport;
 
 pub const BATCH_EVENTS: usize = 100;
@@ -90,9 +91,13 @@ fn live<T>(inner: &Weak<Inner<T>>) -> Option<Node<T>> {
 async fn run<T: Transport + 'static>(inner: Weak<Inner<T>>, deliver: Rc<dyn Deliver>) {
     let shared = Rc::new(Shared::default());
     let mut all = Streams::default();
-    if let Some(node) = live(&inner) {
+    let Some(tallies) = live(&inner).map(|node| {
         all.holders = std::mem::take(&mut *node.inner.cursored.borrow_mut());
-    }
+        Rc::clone(node.requests().tallies())
+    }) else {
+        return;
+    };
+    let _attached = tallies.attach().await;
     let mut flushed = rt::now();
     loop {
         let Some(node) = live(&inner) else {
@@ -113,6 +118,10 @@ async fn run<T: Transport + 'static>(inner: Weak<Inner<T>>, deliver: Rc<dyn Deli
             }
         }
         sync(&node, &mut all).await;
+        for (below, reply) in tallies.take() {
+            let counted = tally(&node, &mut all, below).await;
+            let _ = reply.send(counted);
+        }
         for (&hook, stream) in &mut all.live {
             if fresh.contains(&stream.tenant) {
                 stream.more = true;
@@ -151,7 +160,7 @@ async fn run<T: Transport + 'static>(inner: Weak<Inner<T>>, deliver: Rc<dyn Deli
             s.more && s.held.is_none() && !s.sending && s.until.is_none_or(|u| rt::now() >= u)
         });
         drop(node);
-        if ready {
+        if ready || tallies.waiting() {
             continue;
         }
         let now = rt::now();
@@ -163,7 +172,8 @@ async fn run<T: Transport + 'static>(inner: Weak<Inner<T>>, deliver: Rc<dyn Deli
             .min()
             .unwrap_or(now + TICK);
         let wait = deadline.saturating_duration_since(now);
-        let _ = timeout(wait, first(watch.wait(), shared.wake.wait())).await;
+        let woken = first(watch.wait(), shared.wake.wait());
+        let _ = timeout(wait, first(woken, tallies.wake.wait())).await;
     }
 }
 
@@ -295,6 +305,69 @@ fn current<T: Transport + 'static>(
         .hook(tenant, hook)
         .is_some_and(|h| h.generation == generation)
         && !table.gone(tenant, generation)
+}
+
+async fn tally<T: Transport + 'static>(node: &Node<T>, all: &mut Streams, below: u32) -> bool {
+    let changes = node.spool().changes();
+    let (live, rest): (Targets, Targets) =
+        targets(&node.table())
+            .into_iter()
+            .partition(|(id, (tenant, generation, _))| {
+                all.live
+                    .get(id)
+                    .is_some_and(|s| (s.tenant, s.generation) == (*tenant, *generation))
+            });
+    if !stored(changes, rest, below).await {
+        return false;
+    }
+    let Some(parts) = due(changes, below).await else {
+        return false;
+    };
+    if parts.is_empty() || live.is_empty() {
+        return true;
+    }
+    let watched: BTreeMap<u32, Watched> = live
+        .iter()
+        .filter_map(|(&id, &(tenant, generation, _))| {
+            let stream = all.live.get(&id)?;
+            let ends = stream.held.as_ref().map(|held| &held.ends);
+            let from = stream
+                .cursors
+                .iter()
+                .map(|(&shard, cursor)| {
+                    let end = ends.and_then(|e| e.get(&shard)).copied().unwrap_or(0);
+                    (shard, (cursor.acked.max(end), cursor.counted))
+                })
+                .collect();
+            Some((
+                id,
+                Watched {
+                    tenant,
+                    generation,
+                    events: stream.events,
+                    from,
+                },
+            ))
+        })
+        .collect();
+    let Some(lost) = count(changes, &parts, &watched).await else {
+        return false;
+    };
+    for ((hook, shard), n) in lost {
+        if let Some(stream) = all.live.get_mut(&hook)
+            && let Some(cursor) = stream.cursors.get_mut(&shard)
+        {
+            cursor.lost = cursor.lost.saturating_add(n);
+            cursor.counted = below - 1;
+            stream.dirty.insert(shard);
+        }
+    }
+    let mut clean = true;
+    for (&id, stream) in &mut all.live {
+        write_dirty(node, id, stream).await;
+        clean &= stream.dirty.is_empty();
+    }
+    clean
 }
 
 async fn sweep<T: Transport + 'static>(node: &Node<T>, all: &mut Streams) -> bool {

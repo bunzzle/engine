@@ -4,6 +4,7 @@ use std::future::poll_fn;
 use std::pin::pin;
 use std::rc::Rc;
 use std::task::Poll;
+use std::time::Duration;
 
 use control::{KeySource, Naming, State, Table};
 use index::{Entry, Op, Shape};
@@ -15,11 +16,13 @@ use crate::clock::Clock;
 use crate::error::Refusal;
 use crate::events::KIND_EVENT;
 use crate::suppress::{Hash, keyed_hash, keys_of, owner_shard, refusal};
+use crate::tally::Tallies;
 
 pub const KIND_REQUEST: u8 = 2;
 pub const DAY: u64 = 86_400_000;
 pub const REQUEST_SHAPE: Shape = Shape { value: 61 };
 pub const INLINE_IDS: usize = 2;
+const RECOUNT: Duration = Duration::from_secs(60);
 const DIGEST: &[u8] = b"request digest\0";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -141,6 +144,7 @@ struct Inner {
     day: Cell<u32>,
     closed: Cell<bool>,
     wake: Notify,
+    tallies: Rc<Tallies>,
 }
 
 #[derive(Clone)]
@@ -159,6 +163,7 @@ impl Requests {
                 day: Cell::new(last),
                 closed: Cell::new(false),
                 wake: Notify::default(),
+                tallies: Rc::default(),
             }),
         };
         let retiring = requests.clone();
@@ -172,6 +177,10 @@ impl Requests {
         for (_, flight) in std::mem::take(&mut *self.inner.flights.borrow_mut()) {
             drop(flight.waiters);
         }
+    }
+
+    pub(crate) fn tallies(&self) -> &Rc<Tallies> {
+        &self.inner.tallies
     }
 
     pub fn today(&self) -> u32 {
@@ -372,14 +381,18 @@ impl Requests {
                 .changes
                 .retire(KIND_REQUEST, day, day.saturating_sub(1))
                 .await;
-            let _ = inner
-                .parts
-                .changes
-                .retire(KIND_EVENT, day, crate::events::retired(day))
-                .await;
-            let next = u64::from(day + 1) * DAY;
+            let below = crate::events::retired(day);
+            let parts = &inner.parts;
+            let counted = inner.tallies.ask(&parts.changes, &parts.table, below).await;
+            let upto = if counted { below } else { 0 };
+            let _ = parts.changes.retire(KIND_EVENT, day, upto).await;
+            let next = if counted {
+                parts.clock.instant(u64::from(day + 1) * DAY)
+            } else {
+                rt::now() + RECOUNT
+            };
             let mut wake = pin!(inner.wake.wait());
-            let mut timer = pin!(sleep_until(inner.parts.clock.instant(next)));
+            let mut timer = pin!(sleep_until(next));
             poll_fn(|cx| {
                 if wake.as_mut().poll(cx).is_ready() || timer.as_mut().poll(cx).is_ready() {
                     Poll::Ready(())
