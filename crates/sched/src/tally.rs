@@ -1,5 +1,6 @@
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
+use std::rc::Rc;
 
 use control::Table;
 use rt::{Notify, Sender, channel};
@@ -44,8 +45,15 @@ pub(crate) struct Attached<'a>(&'a Tallies);
 impl Drop for Attached<'_> {
     fn drop(&mut self) {
         self.0.attached.set(false);
-        self.0.claimed.set(false);
         self.0.asks.borrow_mut().clear();
+    }
+}
+
+pub(crate) struct Claim(pub Rc<Tallies>);
+
+impl Drop for Claim {
+    fn drop(&mut self) {
+        self.0.claimed.set(false);
     }
 }
 
@@ -63,8 +71,8 @@ impl Tallies {
         stored(changes, hooks, below).await
     }
 
-    pub fn claim(&self) -> bool {
-        !self.claimed.replace(true)
+    pub fn claim(tallies: &Rc<Self>) -> Option<Claim> {
+        (!tallies.claimed.replace(true)).then(|| Claim(Rc::clone(tallies)))
     }
 
     pub async fn attach(&self) -> Attached<'_> {

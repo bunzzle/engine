@@ -13,7 +13,7 @@ use crate::cursor::{Cursor, drop_cursor, read_cursor, write_cursor};
 use crate::events::{KIND_EVENT, sequence};
 use crate::reader::{Read, event_id, kept, open, stamped};
 use crate::start::{Inner, Node};
-use crate::tally::{Targets, Watched, count, due, stored, targets};
+use crate::tally::{Claim, Tallies, Targets, Watched, count, due, stored, targets};
 use crate::transport::Transport;
 
 pub const BATCH_EVENTS: usize = 100;
@@ -79,10 +79,10 @@ struct Streams {
 
 impl<T: Transport + 'static> Node<T> {
     pub fn start_hooks(&self, deliver: Rc<dyn Deliver>) -> JoinHandle<()> {
-        if !self.requests().tallies().claim() {
+        let Some(claim) = Tallies::claim(self.requests().tallies()) else {
             return spawn(async {});
-        }
-        spawn(run(Rc::downgrade(&self.inner), deliver))
+        };
+        spawn(run(Rc::downgrade(&self.inner), deliver, claim))
     }
 }
 
@@ -91,15 +91,17 @@ fn live<T>(inner: &Weak<Inner<T>>) -> Option<Node<T>> {
     (!inner.ticker.stopped.get()).then_some(Node { inner })
 }
 
-async fn run<T: Transport + 'static>(inner: Weak<Inner<T>>, deliver: Rc<dyn Deliver>) {
+async fn run<T: Transport + 'static>(
+    inner: Weak<Inner<T>>,
+    deliver: Rc<dyn Deliver>,
+    claim: Claim,
+) {
     let shared = Rc::new(Shared::default());
     let mut all = Streams::default();
-    let Some(tallies) = live(&inner).map(|node| {
+    if let Some(node) = live(&inner) {
         all.holders = std::mem::take(&mut *node.inner.cursored.borrow_mut());
-        Rc::clone(node.requests().tallies())
-    }) else {
-        return;
-    };
+    }
+    let tallies = Rc::clone(&claim.0);
     let _attached = tallies.attach().await;
     let mut flushed = rt::now();
     loop {
