@@ -3710,6 +3710,7 @@ type Streamed = (MessageId, u32, EventKind, u16, u64);
 struct Caught {
     calls: RefCell<Vec<(u32, Vec<Streamed>)>>,
     refuse: Cell<u32>,
+    tried: Cell<usize>,
     slow: Cell<bool>,
     flying: Cell<u32>,
     most: Cell<u32>,
@@ -3723,6 +3724,7 @@ impl Deliver for Catch {
         Box::pin(async move {
             if caught.refuse.get() > 0 {
                 caught.refuse.set(caught.refuse.get() - 1);
+                caught.tried.set(caught.tried.get().max(call.events.len()));
                 return Outcome::Retry(Duration::from_secs(2));
             }
             caught.flying.set(caught.flying.get() + 1);
@@ -3977,4 +3979,102 @@ fn webhook_cursors_stay_while_paused_and_go_with_their_endpoint() {
         drop(tasks);
     });
     cluster.stop();
+}
+
+async fn lost_of(node: &Node<Idle>, hook: u32) -> u64 {
+    let mut lost = 0;
+    for shard in node.spool().shards() {
+        let found = read_cursor(node.spool().changes(), shard, 1, hook).await;
+        lost += found.expect("read").map_or(0, |c| c.lost);
+    }
+    lost
+}
+
+#[test]
+fn events_dropped_by_retention_are_counted_lost_for_each_webhook() {
+    ANSWERS.set(None);
+    let seed = 57;
+    let refusing = || {
+        let caught = Caught::default();
+        caught.refuse.set(u32::MAX);
+        Rc::new(caught)
+    };
+    let driver = Rc::new(SimDriver::with_disk(seed, Config::default(), created(seed)));
+    let cluster = started_behind(&driver, 1, 8 * DAY_MS as u64);
+    let nodes = cluster.nodes.clone();
+    let (live, paused, total, day, shards) = cluster.run(async move {
+        ready(&nodes).await;
+        answering(&nodes);
+        let node = &nodes[0];
+        let (before, _, _) = read_all(node, None, 1000).await;
+        let at = "https://hooks.example.org/in";
+        let live = node.hook_new(1, at, 0).await.expect("new").id;
+        let paused = node.hook_new(1, at, 0).await.expect("new").id;
+        let task = node.start_hooks(Rc::new(Catch(refusing())));
+        cursors_everywhere(&nodes, live, true).await;
+        cursors_everywhere(&nodes, paused, true).await;
+        drop(task);
+        accept_some(&nodes, 0, 30).await;
+        drained(&nodes).await;
+        let (whole, _, _) = read_all(node, None, 1000).await;
+        let total = (whole.len() - before.len()) as u64;
+        let day = node.requests().today();
+        let kept = node.spool().changes().partitions(KIND_EVENT).await;
+        let shards: Vec<u16> = kept
+            .expect("partitions")
+            .into_iter()
+            .filter(|p| p.1 == day)
+            .map(|p| p.0)
+            .collect();
+        (live, paused, total, day, shards)
+    });
+    cluster.stop();
+    assert!(total > 100, "{total} events");
+    let wall = Config::default().wall_start_ms;
+    let behind = wall - (u64::from(day + 7) * DAY_MS as u64 - 60_000);
+    let driver = Rc::new(SimDriver::with_disk(
+        seed + 1,
+        Config::default(),
+        driver.crash(),
+    ));
+    let restarted = started_behind(&driver, 1, behind);
+    let nodes = restarted.nodes.clone();
+    restarted.run(async move {
+        wait_for(&nodes, 1, 1, State::Active).await;
+        answering(&nodes);
+        let node = &nodes[0];
+        assert_eq!(node.requests().today(), day + 6);
+        let off = HookChange {
+            enabled: Some(false),
+            ..HookChange::default()
+        };
+        node.hook_change(1, paused, off).await.expect("pause");
+        let caught = refusing();
+        let task = node.start_hooks(Rc::new(Catch(Rc::clone(&caught))));
+        let again = node.start_hooks(Rc::new(Catch(Rc::clone(&caught))));
+        sleep(Duration::from_secs(120)).await;
+        assert_eq!(node.requests().today(), day + 7);
+        assert_ne!(shards.len(), 0);
+        for &shard in &shards {
+            for hook in [live, paused] {
+                let found = read_cursor(node.spool().changes(), shard, 1, hook).await;
+                assert_eq!(found.expect("read").map(|c| c.counted), Some(day));
+            }
+        }
+        assert_eq!(lost_of(node, paused).await, total);
+        assert_eq!(lost_of(node, live).await, total);
+        assert!(caught.tried.get() > 0);
+        let (before, _, _) = read_all(node, None, 1000).await;
+        caught.refuse.set(0);
+        accept_some(&nodes, 30, 2).await;
+        drained(&nodes).await;
+        sleep(Duration::from_secs(10)).await;
+        let (whole, _, _) = read_all(node, None, 1000).await;
+        let fresh: Vec<Given> = whole.into_iter().filter(|e| !before.contains(e)).collect();
+        assert_ne!(fresh.len(), 0);
+        check_streamed(seed, &delivered_to(&caught, live), &fresh);
+        assert_eq!(lost_of(node, live).await, total);
+        drop((task, again));
+    });
+    restarted.stop();
 }

@@ -22,6 +22,7 @@ mod start;
 mod stream;
 mod suppress;
 mod system;
+mod tally;
 mod transport;
 mod unopened;
 
