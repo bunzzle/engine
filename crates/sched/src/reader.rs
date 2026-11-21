@@ -8,7 +8,7 @@ use rt::{Ends, JoinHandle, Peers, Sender, channel, spawn};
 use store::Changes;
 
 use crate::events::{Body, Event, KIND_EVENT, sealed, sequence};
-use crate::sealing::{Keys, event_opener};
+use crate::sealing::{Keys, Unsealable, event_opener};
 
 pub const MAX_LIMIT: usize = 1000;
 pub const PAGE_BYTES: usize = 1 << 20;
@@ -340,12 +340,27 @@ pub(crate) async fn open(
     event: &Event,
     payload: &[u8],
 ) -> Option<Body> {
-    let (wrap, inner) = sealed(payload)?;
-    let opener = event_opener(keys, tenant, event, wrap).await.ok()?;
-    let clear = opener
-        .open_event(event.recipient, event.stamp, inner)
-        .ok()?;
-    Body::decode(&clear).filter(|body| event.checked(body))
+    opened(keys, tenant, event, payload).await.ok().flatten()
+}
+
+pub(crate) async fn opened(
+    keys: &dyn Keys,
+    tenant: u32,
+    event: &Event,
+    payload: &[u8],
+) -> Result<Option<Body>, Unsealable> {
+    let Some((wrap, inner)) = sealed(payload) else {
+        return Ok(None);
+    };
+    let opener = match event_opener(keys, tenant, event, wrap).await {
+        Ok(opener) => opener,
+        Err(fault @ (Unsealable::Unavailable | Unsealable::Failed)) => return Err(fault),
+        Err(_) => return Ok(None),
+    };
+    let Ok(clear) = opener.open_event(event.recipient, event.stamp, inner) else {
+        return Ok(None);
+    };
+    Ok(Body::decode(&clear).filter(|body| event.checked(body)))
 }
 
 fn label(system: &crypto::TenantKeys, tenant: u32, generation: u32) -> Vec<u8> {

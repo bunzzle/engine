@@ -10,8 +10,8 @@ use control::{HookState, State, tenant_keys};
 use rt::{Instant, JoinHandle, Notify, spawn, timeout};
 
 use crate::cursor::{Cursor, drop_cursor, read_cursor, write_cursor};
-use crate::events::{KIND_EVENT, sequence};
-use crate::reader::{Read, event_id, kept, open, stamped};
+use crate::events::{Event, KIND_EVENT, sequence};
+use crate::reader::{Read, event_id, kept, opened, stamped};
 use crate::start::{Inner, Node};
 use crate::tally::{Claim, Tallies, Targets, Watched, count, due, stored, targets};
 use crate::transport::Transport;
@@ -23,12 +23,24 @@ const TICK: Duration = Duration::from_secs(1);
 const PAUSE: Duration = Duration::from_secs(1);
 const PAUSE_MAX: Duration = Duration::from_secs(60);
 const PAGES: usize = 16;
+const DELIVERY_ID: &[u8; 5] = b"WHDEL";
+
+#[derive(Clone)]
+pub struct Sealed {
+    pub id: [u8; 16],
+    pub shard: u16,
+    pub sequence: u64,
+    pub event: Event,
+    payload: Vec<u8>,
+}
 
 pub struct Call {
     pub tenant: u32,
     pub generation: u32,
     pub hook: u32,
-    pub events: Vec<Read>,
+    pub id: [u8; 16],
+    pub lost: u64,
+    pub events: Vec<Sealed>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -46,6 +58,7 @@ pub trait Deliver {
 struct Held {
     call: Rc<Call>,
     ends: BTreeMap<u16, u64>,
+    lost: BTreeMap<u16, u64>,
 }
 
 struct Stream {
@@ -83,6 +96,23 @@ impl<T: Transport + 'static> Node<T> {
             return spawn(async {});
         };
         spawn(run(Rc::downgrade(&self.inner), deliver, claim))
+    }
+
+    pub async fn open_call(&self, call: &Call) -> Option<Vec<Read>> {
+        let keys = self.keys();
+        let mut events = Vec::with_capacity(call.events.len());
+        for sealed in &call.events {
+            events.push(Read {
+                id: sealed.id,
+                shard: sealed.shard,
+                sequence: sealed.sequence,
+                event: sealed.event,
+                body: opened(keys, call.tenant, &sealed.event, &sealed.payload)
+                    .await
+                    .ok()?,
+            });
+        }
+        Some(events)
     }
 }
 
@@ -203,6 +233,7 @@ fn settle(stream: &mut Stream, outcome: Outcome) {
         Outcome::Acked => {
             if let Some(held) = stream.held.take() {
                 advance(stream, &held.ends);
+                report(stream, &held.lost);
             }
             stream.until = None;
             stream.more = true;
@@ -213,7 +244,7 @@ fn settle(stream: &mut Stream, outcome: Outcome) {
 
 fn trim(stream: &mut Stream) {
     let cursors = &stream.cursors;
-    let counted = |read: &Read| {
+    let counted = |read: &Sealed| {
         cursors
             .get(&read.shard)
             .is_some_and(|c| read.event.partition() <= c.counted)
@@ -228,14 +259,14 @@ fn trim(stream: &mut Stream) {
     let Some(held) = stream.held.take() else {
         return;
     };
-    let events: Vec<Read> = held
+    let events: Vec<Sealed> = held
         .call
         .events
         .iter()
         .filter(|read| !counted(read))
         .cloned()
         .collect();
-    if events.is_empty() {
+    if events.is_empty() && held.call.lost == 0 {
         advance(stream, &held.ends);
         stream.until = None;
         stream.more = true;
@@ -245,17 +276,61 @@ fn trim(stream: &mut Stream) {
         tenant: held.call.tenant,
         generation: held.call.generation,
         hook: held.call.hook,
+        id: held.call.id,
+        lost: held.call.lost,
         events,
     };
     stream.held = Some(Held {
         call: Rc::new(call),
         ends: held.ends,
+        lost: held.lost,
     });
 }
 
 fn back_off(stream: &mut Stream) {
     stream.until = Some(rt::now() + stream.pause);
     stream.pause = (stream.pause * 2).min(PAUSE_MAX);
+}
+
+fn report(stream: &mut Stream, lost: &BTreeMap<u16, u64>) {
+    for (&shard, &n) in lost {
+        if let Some(cursor) = stream.cursors.get_mut(&shard) {
+            cursor.lost = cursor.lost.saturating_sub(n);
+            stream.dirty.insert(shard);
+        }
+    }
+}
+
+fn delivery_id(
+    naming: &crypto::TenantKeys,
+    hook: u32,
+    stream: &Stream,
+    lost: &BTreeMap<u16, u64>,
+    ends: &BTreeMap<u16, u64>,
+) -> [u8; 16] {
+    let mut data = Vec::with_capacity(26 + lost.len() * 26 + ends.len() * 18);
+    data.extend_from_slice(DELIVERY_ID);
+    data.extend_from_slice(&hook.to_be_bytes());
+    data.push(stream.events);
+    data.extend_from_slice(&u16::try_from(lost.len()).unwrap_or(u16::MAX).to_be_bytes());
+    for (&shard, &n) in lost {
+        let (acked, counted) = stream
+            .cursors
+            .get(&shard)
+            .map_or((0, 0), |c| (c.acked, c.counted));
+        data.extend_from_slice(&shard.to_be_bytes());
+        data.extend_from_slice(&n.to_be_bytes());
+        data.extend_from_slice(&acked.to_be_bytes());
+        data.extend_from_slice(&counted.to_be_bytes());
+    }
+    data.extend_from_slice(&u16::try_from(ends.len()).unwrap_or(u16::MAX).to_be_bytes());
+    for (&shard, &end) in ends {
+        let from = stream.cursors.get(&shard).map_or(0, |c| c.acked);
+        data.extend_from_slice(&shard.to_be_bytes());
+        data.extend_from_slice(&from.to_be_bytes());
+        data.extend_from_slice(&end.to_be_bytes());
+    }
+    index::siphash128(naming.hash_key().expose(), &data)
 }
 
 fn advance(stream: &mut Stream, ends: &BTreeMap<u16, u64>) {
@@ -523,36 +598,44 @@ async fn fill<T: Transport + 'static>(node: &Node<T>, hook: u32, stream: &mut St
             break;
         }
     }
-    if taken.is_empty() {
+    let lost: BTreeMap<u16, u64> = stream
+        .cursors
+        .iter()
+        .filter(|(_, c)| c.lost > 0)
+        .map(|(&shard, c)| (shard, c.lost))
+        .collect();
+    let total = lost.values().fold(0u64, |sum, &n| sum.saturating_add(n));
+    if taken.is_empty() && total == 0 {
         advance(stream, &ends);
         stream.more = full;
         return;
     }
-    let keys = node.keys();
-    let Ok(naming) = tenant_keys(keys, stream.tenant, stream.generation).await else {
+    let Ok(naming) = tenant_keys(node.keys(), stream.tenant, stream.generation).await else {
         back_off(stream);
         return;
     };
-    let mut events = Vec::with_capacity(taken.len());
-    for (shard, at, event, payload) in taken {
-        let body = open(keys, stream.tenant, &event, &payload).await;
-        events.push(Read {
+    let events = taken
+        .into_iter()
+        .map(|(shard, at, event, payload)| Sealed {
             id: event_id(&naming, shard, at),
             shard,
             sequence: at,
             event,
-            body,
-        });
-    }
+            payload,
+        })
+        .collect();
     let call = Call {
         tenant: stream.tenant,
         generation: stream.generation,
         hook,
+        id: delivery_id(&naming, hook, stream, &lost, &ends),
+        lost: total,
         events,
     };
     stream.held = Some(Held {
         call: Rc::new(call),
         ends,
+        lost,
     });
     stream.more = full;
     stream.pause = PAUSE;

@@ -23,6 +23,7 @@ pub struct Config {
     pub dns: dns::Settings,
     pub delivery: Delivery,
     pub tlsrpt: Option<Tlsrpt>,
+    pub webhooks: deliver::HookSettings,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -112,6 +113,10 @@ pub fn parse(text: &str) -> Result<Config, Error> {
         Some(table) => tlsrpt(table, &mut delivery.settings, tls.roots.is_some())?,
         None => None,
     };
+    let webhooks = match root.table("webhooks") {
+        Some(table) => webhooks(table, tls.roots.is_some())?,
+        None => deliver::HookSettings::default(),
+    };
     root.finish()?;
     Ok(Config {
         id,
@@ -127,7 +132,38 @@ pub fn parse(text: &str) -> Result<Config, Error> {
         dns,
         delivery,
         tlsrpt,
+        webhooks,
     })
+}
+
+fn webhooks(mut table: Table, roots: bool) -> Result<deliver::HookSettings, Error> {
+    if !roots {
+        return Err(Error::at(
+            table.line(),
+            1,
+            "[webhooks] needs `roots` in [tls]",
+        ));
+    }
+    let mut settings = deliver::HookSettings::default();
+    if let Some(entry) = table.take("egress") {
+        let ip = entry
+            .str()?
+            .parse::<IpAddr>()
+            .map_err(|_| entry.error("must be an IP address"))?;
+        if ip.is_unspecified() || ip.is_multicast() {
+            return Err(entry.error("must be a unicast address"));
+        }
+        settings.egress = Some(ip);
+    }
+    if let Some(entry) = table.take("allow") {
+        for text in entry.strs()? {
+            let cidr = deliver::Cidr::parse(text)
+                .ok_or_else(|| entry.error(format!("`{text}` must be an address or CIDR")))?;
+            settings.allow.push(cidr);
+        }
+    }
+    table.finish()?;
+    Ok(settings)
 }
 
 fn tlsrpt(

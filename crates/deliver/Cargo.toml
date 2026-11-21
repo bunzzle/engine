@@ -8,6 +8,7 @@ publish.workspace = true
 
 [dependencies]
 control = { path = "../control" }
+crypto = { path = "../crypto" }
 dkim = { path = "../dkim" }
 dns = { path = "../dns" }
 rt = { path = "../rt" }
@@ -15,6 +16,12 @@ sched = { path = "../sched" }
 smtp = { path = "../smtp" }
 sys = { path = "../sys" }
 tls = { path = "../tls" }
+
+[dev-dependencies]
+aws-lc-rs = "=1.18.2"
+keys = { path = "../keys" }
+spool = { path = "../spool" }
+store = { path = "../store" }
 
 [lints]
 workspace = true

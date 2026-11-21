@@ -3,9 +3,9 @@ use std::collections::BTreeSet;
 use std::fmt::Write as _;
 
 use crypto::Ids;
-use http::{Request, Response, rfc3339};
+use http::{Request, Response};
 use rt::timeout;
-use sched::{EVENTS_LIMIT, EventKind, EventPage, EventRead, ReadError, Transport};
+use sched::{EVENTS_LIMIT, EventPage, ReadError, Transport, event_json};
 
 use crate::handler::ok;
 use crate::json;
@@ -106,51 +106,12 @@ fn body(page: &EventPage, ids: &Ids) -> String {
         if n > 0 {
             out.push(',');
         }
-        event(read, ids, &mut out);
+        event_json(read, ids, &mut out);
     }
     out.push_str("],\"next\":");
     json::string(&page.next, &mut out);
     let _ = write!(out, ",\"more\":{}}}", page.more);
     out
-}
-
-fn event(read: &EventRead, ids: &Ids, out: &mut String) {
-    let event = &read.event;
-    out.push_str("{\"id\":\"ev_");
-    for byte in read.id {
-        let _ = write!(out, "{byte:02x}");
-    }
-    out.push_str("\",\"type\":");
-    json::string(kind(event.kind), out);
-    out.push_str(",\"time\":");
-    json::string(&rfc3339(event.time), out);
-    out.push_str(",\"message_id\":");
-    json::string(&ids.encode(&event.message.bytes()), out);
-    let _ = write!(out, ",\"recipient\":{}", event.recipient);
-    if let Some(body) = &read.body {
-        out.push_str(",\"address\":");
-        json::string(&String::from_utf8_lossy(&body.address), out);
-        if !body.reply.is_empty() {
-            out.push_str(",\"reply\":");
-            json::string(&String::from_utf8_lossy(&body.reply), out);
-        }
-        let _ = write!(out, ",\"attempts\":{}", body.attempts);
-    }
-    if event.lost > 0 {
-        let _ = write!(out, ",\"lost\":{}", event.lost);
-    }
-    out.push('}');
-}
-
-fn kind(kind: EventKind) -> &'static str {
-    match kind {
-        EventKind::Delivered => "delivered",
-        EventKind::Deferred => "deferred",
-        EventKind::Failed => "failed",
-        EventKind::Expired => "expired",
-        EventKind::Canceled => "canceled",
-        EventKind::Suppressed => "suppressed",
-    }
 }
 
 #[cfg(test)]
