@@ -3467,6 +3467,16 @@ async fn accept_some(nodes: &[Node<Idle>], from: usize, count: usize) {
     }
 }
 
+async fn expire_some(nodes: &[Node<Idle>], from: usize, count: usize) {
+    for n in from..from + count {
+        let node = &nodes[n % nodes.len()];
+        let shard = owned_shard(node).await;
+        let addresses: Vec<String> = (0..3).map(|r| format!("x{n}.{r}@example.org")).collect();
+        let addresses: Vec<&str> = addresses.iter().map(String::as_str).collect();
+        accept_listed(node, shard, &addresses, 1).await;
+    }
+}
+
 fn answering(nodes: &[Node<Idle>]) {
     let clock = nodes[0].sched().clock();
     ANSWERS.with_borrow_mut(|a| {
@@ -4081,6 +4091,238 @@ fn events_dropped_by_retention_are_counted_lost_for_each_webhook() {
         assert_eq!(lost_of(node, live).await, 0);
         assert_eq!(lost_of(node, paused).await, total);
         drop((task, again));
+    });
+    restarted.stop();
+}
+
+#[derive(Default)]
+struct Attempts {
+    calls: RefCell<Vec<([u8; 16], u64, usize)>>,
+    retry: Cell<bool>,
+}
+
+struct Attempted(Rc<Attempts>);
+
+impl Deliver for Attempted {
+    fn deliver(&self, call: Rc<Call>) -> Sending {
+        let attempts = Rc::clone(&self.0);
+        Box::pin(async move {
+            attempts
+                .calls
+                .borrow_mut()
+                .push((call.id, call.lost, call.events.len()));
+            if attempts.retry.get() {
+                Outcome::Retry(Duration::from_secs(1))
+            } else {
+                Outcome::Acked
+            }
+        })
+    }
+}
+
+async fn calls_at_least(attempts: &Attempts, n: usize) {
+    for _ in 0..30_000 {
+        if attempts.calls.borrow().len() >= n {
+            return;
+        }
+        sleep(Duration::from_millis(10)).await;
+    }
+    panic!("only {} calls", attempts.calls.borrow().len());
+}
+
+async fn find_call(
+    attempts: &Attempts,
+    matches: impl Fn(&([u8; 16], u64, usize)) -> bool,
+) -> ([u8; 16], u64, usize) {
+    for _ in 0..30_000 {
+        let found = attempts
+            .calls
+            .borrow()
+            .iter()
+            .copied()
+            .find(|call| matches(call));
+        if let Some(call) = found {
+            return call;
+        }
+        sleep(Duration::from_millis(10)).await;
+    }
+    panic!("no matching call");
+}
+
+async fn new_call(attempts: &Attempts, known: &[[u8; 16]]) -> ([u8; 16], u64, usize) {
+    find_call(attempts, |(id, _, _)| !known.contains(id)).await
+}
+
+async fn set_enabled(nodes: &[Node<Idle>], hook: u32, enabled: bool) {
+    let changed = nodes[0]
+        .hook_change(
+            1,
+            hook,
+            HookChange {
+                enabled: Some(enabled),
+                ..HookChange::default()
+            },
+        )
+        .await
+        .expect("change");
+    hook_everywhere(nodes, &changed).await;
+}
+
+async fn lost_is_zero(node: &Node<Idle>, hook: u32) {
+    for _ in 0..30_000 {
+        if lost_of(node, hook).await == 0 {
+            return;
+        }
+        sleep(Duration::from_millis(10)).await;
+    }
+    panic!("lost never settled");
+}
+
+#[test]
+fn call_ids_survive_retries_and_change_with_cursor_and_mask() {
+    ANSWERS.set(None);
+    let driver = Rc::new(SimDriver::with_disk(59, Config::default(), created(59)));
+    let cluster = started(&driver, 1);
+    let nodes = cluster.nodes.clone();
+    cluster.run(async move {
+        ready(&nodes).await;
+        answering(&nodes);
+        let node = &nodes[0];
+        let hook = node
+            .hook_new(1, "https://hooks.example.org/in", 0)
+            .await
+            .expect("new")
+            .id;
+        let attempts = Rc::new(Attempts::default());
+        attempts.retry.set(true);
+        let task = node.start_hooks(Rc::new(Attempted(Rc::clone(&attempts))));
+        accept_some(&nodes, 0, 2).await;
+        drained(&nodes).await;
+        calls_at_least(&attempts, 2).await;
+        let first = attempts.calls.borrow()[0].0;
+        assert!(
+            attempts
+                .calls
+                .borrow()
+                .iter()
+                .all(|(id, lost, _)| *id == first && *lost == 0),
+            "a retry changed the call"
+        );
+        attempts.retry.set(false);
+        accept_some(&nodes, 2, 2).await;
+        drained(&nodes).await;
+        let (second, _, _) = new_call(&attempts, &[first]).await;
+        attempts.retry.set(true);
+        accept_some(&nodes, 4, 3).await;
+        drained(&nodes).await;
+        let (third, _, _) = new_call(&attempts, &[first, second]).await;
+        calls_at_least(&attempts, 2).await;
+        let paused = node
+            .hook_change(
+                1,
+                hook,
+                HookChange {
+                    url: None,
+                    events: Some(1),
+                    enabled: Some(false),
+                },
+            )
+            .await
+            .expect("pause");
+        hook_everywhere(&nodes, &paused).await;
+        set_enabled(&nodes, hook, true).await;
+        let (_, _, events) = new_call(&attempts, &[first, second, third]).await;
+        assert!(events > 0, "the masked refill is empty");
+        attempts.retry.set(false);
+        sleep(Duration::from_secs(5)).await;
+        drop(task);
+    });
+    cluster.stop();
+}
+
+#[test]
+fn a_trimmed_call_keeps_its_id_and_lost_is_reported_once() {
+    ANSWERS.set(None);
+    let seed = 61;
+    let driver = Rc::new(SimDriver::with_disk(seed, Config::default(), created(seed)));
+    let cluster = started_behind(&driver, 1, 8 * DAY_MS as u64);
+    let nodes = cluster.nodes.clone();
+    let attempts = Rc::new(Attempts::default());
+    let watching = Rc::clone(&attempts);
+    let (hook, day, first, batch, events) = cluster.run(async move {
+        ready(&nodes).await;
+        let node = &nodes[0];
+        let hook = node
+            .hook_new(1, "https://hooks.example.org/in", 0)
+            .await
+            .expect("new")
+            .id;
+        watching.retry.set(true);
+        let task = node.start_hooks(Rc::new(Attempted(Rc::clone(&watching))));
+        expire_some(&nodes, 0, 5).await;
+        drained(&nodes).await;
+        calls_at_least(&watching, 2).await;
+        let first = watching.calls.borrow()[0].0;
+        assert!(
+            watching.calls.borrow().iter().all(|(id, ..)| *id == first),
+            "a retry changed the id"
+        );
+        let day = node.requests().today();
+        set_enabled(&nodes, hook, false).await;
+        let now = node.sched().clock().now();
+        sleep(Duration::from_millis(now / DAY * DAY + DAY + 1_000 - now)).await;
+        expire_some(&nodes, 5, 25).await;
+        drained(&nodes).await;
+        set_enabled(&nodes, hook, true).await;
+        let (batch, _, events) = new_call(&watching, &[first]).await;
+        assert_eq!(events, 90, "the refill must stay under the batch cap");
+        drop(task);
+        (hook, day, first, batch, events)
+    });
+    cluster.stop();
+    let wall = Config::default().wall_start_ms;
+    let behind = wall - (u64::from(day + 7) * DAY_MS as u64 - 60_000);
+    let driver = Rc::new(SimDriver::with_disk(
+        seed + 1,
+        Config::default(),
+        driver.crash(),
+    ));
+    let restarted = started_behind(&driver, 1, behind);
+    let nodes = restarted.nodes.clone();
+    let watching = attempts;
+    restarted.run(async move {
+        wait_for(&nodes, 1, 1, State::Active).await;
+        let node = &nodes[0];
+        assert_eq!(node.requests().today(), day + 6);
+        watching.retry.set(true);
+        let task = node.start_hooks(Rc::new(Attempted(Rc::clone(&watching))));
+        let before = watching.calls.borrow().len();
+        calls_at_least(&watching, before + 1).await;
+        assert_eq!(
+            watching.calls.borrow()[before].0,
+            batch,
+            "a crash rebuild of the same range changed the id"
+        );
+        let (_, _, trimmed_events) =
+            find_call(&watching, |(id, _, n)| *id == batch && *n < events).await;
+        watching.retry.set(false);
+        let known = [first, batch];
+        let (lost_id, lost, _) = find_call(&watching, |(id, lost, n)| {
+            !known.contains(id) && *n == 0 && *lost > 0
+        })
+        .await;
+        assert_eq!(
+            lost,
+            u64::try_from(events - trimmed_events).expect("small"),
+            "the trimmed events were not counted lost"
+        );
+        lost_is_zero(node, hook).await;
+        expire_some(&nodes, 30, 1).await;
+        drained(&nodes).await;
+        let (_, quiet, some) = new_call(&watching, &[first, batch, lost_id]).await;
+        assert_eq!(quiet, 0, "lost reported again after the ack");
+        assert!(some > 0);
+        drop(task);
     });
     restarted.stop();
 }

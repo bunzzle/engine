@@ -108,13 +108,17 @@ dependencies = [
 name = "deliver"
 version = "0.0.0"
 dependencies = [
+ "aws-lc-rs",
  "control",
  "crypto",
  "dkim",
  "dns",
+ "keys",
  "rt",
  "sched",
  "smtp",
+ "spool",
+ "store",
  "sys",
  "tls",
 ]

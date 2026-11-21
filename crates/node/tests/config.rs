@@ -564,3 +564,55 @@ fn api_settings_are_read() {
         "line 23, column 1: `max_body` must be between 1024 and 17179869184 bytes"
     );
 }
+
+#[test]
+fn webhook_settings_are_read() {
+    let with_roots = |text: String| {
+        text.replace(
+            "key = \"/etc/bunzzle/key.pem\"",
+            "key = \"/etc/bunzzle/key.pem\"\nroots = \"/etc/ssl/roots.pem\"",
+        )
+    };
+    assert_eq!(
+        parse(MINIMAL).expect("config").webhooks,
+        deliver::HookSettings::default()
+    );
+    assert_eq!(
+        error(&format!("{MINIMAL}[webhooks]\n")),
+        "line 21, column 1: [webhooks] needs `roots` in [tls]"
+    );
+    let config = parse(&with_roots(format!(
+        "{MINIMAL}[webhooks]\negress = \"192.0.2.9\"\nallow = [\"10.0.0.0/8\", \"fd00::/8\", \"192.168.4.1\"]\n"
+    )))
+    .expect("config");
+    assert_eq!(
+        config.webhooks.egress,
+        Some("192.0.2.9".parse().expect("address"))
+    );
+    assert_eq!(
+        config.webhooks.allow,
+        [
+            deliver::Cidr::parse("10.0.0.0/8").expect("cidr"),
+            deliver::Cidr::parse("fd00::/8").expect("cidr"),
+            deliver::Cidr::parse("192.168.4.1").expect("cidr"),
+        ]
+    );
+    assert_eq!(
+        error(&with_roots(format!(
+            "{MINIMAL}[webhooks]\nallow = [\"10.0.0.0/33\"]\n"
+        ))),
+        "line 23, column 1: `allow` `10.0.0.0/33` must be an address or CIDR"
+    );
+    assert_eq!(
+        error(&with_roots(format!(
+            "{MINIMAL}[webhooks]\negress = \"::1x\"\n"
+        ))),
+        "line 23, column 1: `egress` must be an IP address"
+    );
+    assert_eq!(
+        error(&with_roots(format!(
+            "{MINIMAL}[webhooks]\negress = \"0.0.0.0\"\n"
+        ))),
+        "line 23, column 1: `egress` must be a unicast address"
+    );
+}

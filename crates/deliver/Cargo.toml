@@ -17,5 +17,11 @@ smtp = { path = "../smtp" }
 sys = { path = "../sys" }
 tls = { path = "../tls" }
 
+[dev-dependencies]
+aws-lc-rs = "=1.18.2"
+keys = { path = "../keys" }
+spool = { path = "../spool" }
+store = { path = "../store" }
+
 [lints]
 workspace = true
