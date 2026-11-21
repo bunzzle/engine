@@ -4,13 +4,16 @@ use std::sync::Arc;
 
 use api::Forward;
 use control::Naming;
+use crypto::Secret;
+use deliver::Hooks;
+use dns::Resolver;
 use intake::{Ask, Guard, Listener, listen, watch};
 use keys::{BatchSettings, Client, Connect, Ring, RingSettings};
 use rt::{JoinHandle, Mesh, Notify, Signal, Signals, TcpListener, spawn, timeout};
 use sched::{Clock, Keyring, Meshes, Node, Parts, Running, Settings, Transport};
 use store::Core;
 use tls::rustls::crypto::CryptoProvider;
-use tls::{Acceptor, Certs};
+use tls::{Acceptor, Certs, Connector};
 
 use crate::report;
 use crate::{Config, Error};
@@ -32,6 +35,7 @@ pub struct Plan {
     provider: Arc<CryptoProvider>,
     naming: [u8; 16],
     guard: [u8; 16],
+    roots: Option<Vec<u8>>,
     meshes: Meshes,
     guards: Mesh<Ask>,
     orders: Mesh<Order>,
@@ -53,11 +57,18 @@ impl Plan {
             provider,
             naming,
             guard,
+            roots: None,
             meshes: Meshes::new(cores),
             guards: Mesh::new(cores),
             orders: Mesh::new(cores),
             forwards: Mesh::new(cores),
         }
+    }
+
+    #[must_use]
+    pub fn with_roots(mut self, roots: Option<Vec<u8>>) -> Self {
+        self.roots = roots;
+        self
     }
 
     pub fn config(&self) -> &Config {
@@ -125,6 +136,7 @@ struct Up<T> {
     guard: Guard,
     guarding: JoinHandle<()>,
     acceptor: Rc<Acceptor>,
+    hooks: Rc<dyn sched::Deliver>,
     sockets: Vec<(TcpListener, bool)>,
     apis: Vec<(TcpListener, bool, bool)>,
 }
@@ -171,6 +183,7 @@ pub async fn run<T: Transport + 'static>(
     let up = starting.await?;
     orders.until(|o| o.go.get() || o.stop.get()).await;
     report::start(&up.node, &plan.config);
+    let hooking = up.node.start_hooks(Rc::clone(&up.hooks));
     let session = Rc::new(plan.config.session.clone());
     let listeners: Vec<Listener> = up
         .sockets
@@ -228,6 +241,7 @@ pub async fn run<T: Transport + 'static>(
     up.node.close();
     drop(up.running.stop().await);
     drop(up.guarding);
+    drop(hooking);
     peers.close();
     stopped
 }
@@ -264,6 +278,7 @@ async fn start<T: Transport + 'static>(
         .map_err(Error::Start)?;
     let acceptor =
         Acceptor::new(Arc::clone(&plan.provider), Arc::clone(&plan.certs)).map_err(Error::Tls)?;
+    let hooks = hooks(&node, plan)?;
     let ends = plan.guards.take(index).expect("guard of each core");
     let (guard, guarding) = Guard::start(ends, plan.guard, config.limits);
     let mut sockets = Vec::with_capacity(config.listen.len());
@@ -290,7 +305,26 @@ async fn start<T: Transport + 'static>(
         guard,
         guarding,
         acceptor: Rc::new(acceptor),
+        hooks,
         sockets,
         apis,
     })
+}
+
+fn hooks<T: Transport + 'static>(
+    node: &Node<T>,
+    plan: &Plan,
+) -> Result<Rc<dyn sched::Deliver>, Error> {
+    let seed = Secret::<32>::random().map_err(|_| Error::Random)?;
+    let resolver = Resolver::new(plan.config.dns.clone(), &seed);
+    let tls =
+        Connector::new(Arc::clone(&plan.provider), plan.roots.as_deref()).map_err(Error::Tls)?;
+    let turn = Secret::<8>::random().map_err(|_| Error::Random)?;
+    Ok(Rc::new(Hooks::new(
+        node.clone(),
+        resolver,
+        tls,
+        plan.config.webhooks.clone(),
+        u64::from_le_bytes(*turn.expose()),
+    )))
 }

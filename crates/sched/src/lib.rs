@@ -9,6 +9,7 @@ mod error;
 mod events;
 mod hook;
 mod intake;
+mod json;
 mod keyring;
 mod lanes;
 mod node;
@@ -37,6 +38,7 @@ pub use events::{
 };
 pub use hook::{HookChange, MAX_HOOKS, ROTATION_MS};
 pub use intake::{Draft, domain_of};
+pub use json::{event_json, kind_name as event_kind_name};
 pub use keyring::Keyring;
 pub use lanes::{Entry, Lanes, Limits, QueueId, Take, ranges};
 pub use node::{Arrival, Claim, Config, Note, ReportErrors, Route, Sched, queue_core};
@@ -56,7 +58,9 @@ pub use sealing::{
 };
 pub use sign::{Body, Fault, KEYS_WAIT, Outgoing, Plain, Prepared, SIGNED_BYTES};
 pub use start::{CONTROL_SHARD, Links, Meshes, Node, Parts, Running, Settings};
-pub use stream::{BATCH_BYTES, BATCH_EVENTS, Call, Deliver, Outcome, Sending};
+pub use stream::{
+    BATCH_BYTES, BATCH_EVENTS, Call, Deliver, Outcome, Sealed as SealedEvent, Sending,
+};
 pub use suppress::{
     Ask, Hash, Inputs, KIND_SUPPRESS, Listed, Page, Reason, SEAL_SUPPRESS, SHAPE, Suppression,
     Suppressions, keyed_hash, retain,

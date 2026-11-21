@@ -18,8 +18,8 @@ where
     T: Transport + 'static,
     F: Fn(u16) -> Result<T, String> + Send + Sync + 'static,
 {
-    let (config, certs, _) = load(path).map_err(Error::Config)?;
-    launch(config, certs, transport)
+    let (config, certs, roots) = load(path).map_err(Error::Config)?;
+    launch(config, certs, roots, transport)
 }
 
 pub fn deliver(path: &Path) -> Result<(), Error> {
@@ -29,7 +29,8 @@ pub fn deliver(path: &Path) -> Result<(), Error> {
     let key = *Secret::<16>::random().map_err(|_| Error::Random)?.expose();
     let dns = config.dns.clone();
     let delivery = config.delivery.clone();
-    launch(config, certs, move |core| {
+    let pem = roots.clone();
+    launch(config, certs, pem, move |core| {
         let ends = mesh.take(core).ok_or("delivery mesh already taken")?;
         let (leases, limits) = deliver::limits(ends, delivery.connections, key);
         drop(limits);
@@ -52,7 +53,12 @@ pub fn deliver(path: &Path) -> Result<(), Error> {
     })
 }
 
-fn launch<T, F>(config: Config, certs: Certs, transport: F) -> Result<(), Error>
+fn launch<T, F>(
+    config: Config,
+    certs: Certs,
+    roots: Option<Vec<u8>>,
+    transport: F,
+) -> Result<(), Error>
 where
     T: Transport + 'static,
     F: Fn(u16) -> Result<T, String> + Send + Sync + 'static,
@@ -77,7 +83,8 @@ where
         tls::provider(),
         naming,
         *guard.expose(),
-    );
+    )
+    .with_roots(roots);
     let plan = Arc::new(plan);
     let committer = store::launch(store, setup, move |core| {
         let plan = Arc::clone(&plan);

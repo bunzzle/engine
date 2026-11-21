@@ -1,5 +1,4 @@
 use std::collections::HashSet;
-use std::fmt::Write as _;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Limits {
@@ -116,23 +115,7 @@ impl Value {
     }
 }
 
-pub fn string(s: &str, out: &mut String) {
-    out.push('"');
-    for c in s.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if u32::from(c) < 0x20 || c == '\u{7f}' => {
-                let _ = write!(out, "\\u{:04x}", u32::from(c));
-            }
-            c => out.push(c),
-        }
-    }
-    out.push('"');
-}
+pub use http::json_string as string;
 
 pub fn parse(input: &[u8], limits: Limits) -> Result<Value, Error> {
     let text = std::str::from_utf8(input).map_err(|e| Error::Syntax(e.valid_up_to()))?;

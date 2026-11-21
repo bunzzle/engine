@@ -3714,13 +3714,15 @@ struct Caught {
     slow: Cell<bool>,
     flying: Cell<u32>,
     most: Cell<u32>,
+    lost: Cell<u64>,
 }
 
-struct Catch(Rc<Caught>);
+struct Catch(Rc<Caught>, Node<Idle>);
 
 impl Deliver for Catch {
     fn deliver(&self, call: Rc<Call>) -> Sending {
         let caught = Rc::clone(&self.0);
+        let node = self.1.clone();
         Box::pin(async move {
             if caught.refuse.get() > 0 {
                 caught.refuse.set(caught.refuse.get() - 1);
@@ -3733,8 +3735,9 @@ impl Deliver for Catch {
                 sleep(Duration::from_secs(3)).await;
             }
             caught.flying.set(caught.flying.get() - 1);
-            let events = call
-                .events
+            let events = node
+                .open_call(&call)
+                .await
                 .iter()
                 .map(|r| {
                     assert!(r.body.is_some(), "event body opened");
@@ -3748,6 +3751,7 @@ impl Deliver for Catch {
                 })
                 .collect();
             caught.calls.borrow_mut().push((call.hook, events));
+            caught.lost.set(caught.lost.get() + call.lost);
             Outcome::Acked
         })
     }
@@ -3820,7 +3824,7 @@ fn webhook_streams_send_each_matching_event_once_from_the_head() {
         caught.refuse.set(2);
         let tasks: Vec<_> = nodes
             .iter()
-            .map(|n| n.start_hooks(Rc::new(Catch(Rc::clone(&caught)))))
+            .map(|n| n.start_hooks(Rc::new(Catch(Rc::clone(&caught), n.clone()))))
             .collect();
         sleep(Duration::from_secs(2)).await;
         accept_some(&nodes, 2, 6).await;
@@ -3868,7 +3872,7 @@ fn webhook_streams_send_each_matching_event_once_from_the_head() {
         wait_for(&nodes, 1, 1, State::Active).await;
         let tasks: Vec<_> = nodes
             .iter()
-            .map(|n| n.start_hooks(Rc::new(Catch(Rc::clone(&watching)))))
+            .map(|n| n.start_hooks(Rc::new(Catch(Rc::clone(&watching), n.clone()))))
             .collect();
         sleep(Duration::from_secs(5)).await;
         assert_eq!(
@@ -3900,7 +3904,7 @@ fn a_webhook_paused_and_resumed_while_sending_keeps_one_call_and_every_event() {
             .id;
         let caught = Rc::new(Caught::default());
         caught.slow.set(true);
-        let task = control.start_hooks(Rc::new(Catch(Rc::clone(&caught))));
+        let task = control.start_hooks(Rc::new(Catch(Rc::clone(&caught), control.clone())));
         sleep(Duration::from_secs(2)).await;
         accept_some(&nodes, 0, 4).await;
         drained(&nodes).await;
@@ -3963,7 +3967,7 @@ fn webhook_cursors_stay_while_paused_and_go_with_their_endpoint() {
         let caught = Rc::new(Caught::default());
         let tasks: Vec<_> = nodes
             .iter()
-            .map(|n| n.start_hooks(Rc::new(Catch(Rc::clone(&caught)))))
+            .map(|n| n.start_hooks(Rc::new(Catch(Rc::clone(&caught), n.clone()))))
             .collect();
         cursors_everywhere(&nodes, paused, true).await;
         cursors_everywhere(&nodes, removed, true).await;
@@ -4010,7 +4014,7 @@ fn events_dropped_by_retention_are_counted_lost_for_each_webhook() {
         let at = "https://hooks.example.org/in";
         let live = node.hook_new(1, at, 0).await.expect("new").id;
         let paused = node.hook_new(1, at, 0).await.expect("new").id;
-        let task = node.start_hooks(Rc::new(Catch(refusing())));
+        let task = node.start_hooks(Rc::new(Catch(refusing(), node.clone())));
         cursors_everywhere(&nodes, live, true).await;
         cursors_everywhere(&nodes, paused, true).await;
         drop(task);
@@ -4050,8 +4054,8 @@ fn events_dropped_by_retention_are_counted_lost_for_each_webhook() {
         };
         node.hook_change(1, paused, off).await.expect("pause");
         let caught = refusing();
-        let task = node.start_hooks(Rc::new(Catch(Rc::clone(&caught))));
-        let again = node.start_hooks(Rc::new(Catch(Rc::clone(&caught))));
+        let task = node.start_hooks(Rc::new(Catch(Rc::clone(&caught), node.clone())));
+        let again = node.start_hooks(Rc::new(Catch(Rc::clone(&caught), node.clone())));
         sleep(Duration::from_secs(120)).await;
         assert_eq!(node.requests().today(), day + 7);
         assert_ne!(shards.len(), 0);
@@ -4073,7 +4077,9 @@ fn events_dropped_by_retention_are_counted_lost_for_each_webhook() {
         let fresh: Vec<Given> = whole.into_iter().filter(|e| !before.contains(e)).collect();
         assert_ne!(fresh.len(), 0);
         check_streamed(seed, &delivered_to(&caught, live), &fresh);
-        assert_eq!(lost_of(node, live).await, total);
+        assert_eq!(caught.lost.get(), total);
+        assert_eq!(lost_of(node, live).await, 0);
+        assert_eq!(lost_of(node, paused).await, total);
         drop((task, again));
     });
     restarted.stop();

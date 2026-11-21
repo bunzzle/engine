@@ -96,7 +96,21 @@ pub(crate) async fn public<D: Dns>(dns: &D, host: &Name, v6: bool) -> Addresses 
     resolve(dns, host, v6, global).await
 }
 
-async fn resolve<D: Dns>(dns: &D, host: &Name, v6: bool, keep: fn(&IpAddr) -> bool) -> Addresses {
+pub(crate) async fn filtered<D: Dns>(
+    dns: &D,
+    host: &Name,
+    v6: bool,
+    keep: impl Fn(&IpAddr) -> bool,
+) -> Addresses {
+    resolve(dns, host, v6, keep).await
+}
+
+async fn resolve<D: Dns>(
+    dns: &D,
+    host: &Name,
+    v6: bool,
+    keep: impl Fn(&IpAddr) -> bool,
+) -> Addresses {
     let kind = if v6 { Type::Aaaa } else { Type::A };
     let Ok(lookup) = dns.lookup(host, kind).await else {
         return Addresses::Failed;
@@ -115,7 +129,7 @@ async fn resolve<D: Dns>(dns: &D, host: &Name, v6: bool, keep: fn(&IpAddr) -> bo
             Record::Aaaa(ip) if v6 => Some(IpAddr::V6(*ip)),
             _ => None,
         })
-        .filter(keep)
+        .filter(|ip| keep(ip))
         .take(PER_HOST)
         .collect();
     Addresses::Found {
@@ -125,11 +139,12 @@ async fn resolve<D: Dns>(dns: &D, host: &Name, v6: bool, keep: fn(&IpAddr) -> bo
     }
 }
 
-fn usable(ip: &IpAddr) -> bool {
+pub(crate) fn usable(ip: &IpAddr) -> bool {
     !(ip.is_unspecified()
         || ip.is_loopback()
         || ip.is_multicast()
-        || matches!(ip, IpAddr::V4(v4) if v4.is_broadcast()))
+        || matches!(ip, IpAddr::V4(v4) if v4.is_broadcast())
+        || matches!(ip, IpAddr::V6(v6) if v6.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback())))
 }
 
 pub(crate) fn global(ip: &IpAddr) -> bool {
