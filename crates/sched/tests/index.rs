@@ -4242,6 +4242,71 @@ fn call_ids_survive_retries_and_change_with_cursor_and_mask() {
 }
 
 #[test]
+fn lost_only_calls_with_the_same_total_get_different_ids_after_a_cursor_move() {
+    ANSWERS.set(None);
+    let seed = 63;
+    let driver = Rc::new(SimDriver::with_disk(seed, Config::default(), created(seed)));
+    let cluster = started(&driver, 1);
+    let nodes = cluster.nodes.clone();
+    let attempts = Rc::new(Attempts::default());
+    let watching = Rc::clone(&attempts);
+    let (hook, first, one) = cluster.run(async move {
+        ready(&nodes).await;
+        let node = &nodes[0];
+        let hook = node
+            .hook_new(1, "https://hooks.example.org/in", 0)
+            .await
+            .expect("new")
+            .id;
+        let changes = node.spool().changes();
+        let shard = node.spool().shards()[0];
+        let one = Cursor {
+            generation: 1,
+            acked: changes.watch().head(),
+            lost: 5,
+            counted: 0,
+        };
+        write_cursor(changes, shard, 1, hook, &one)
+            .await
+            .expect("cursor");
+        let task = node.start_hooks(Rc::new(Attempted(Rc::clone(&watching))));
+        let (first, lost, events) = new_call(&watching, &[]).await;
+        assert_eq!((lost, events), (5, 0));
+        lost_is_zero(node, hook).await;
+        drop(task);
+        (hook, first, one)
+    });
+    cluster.stop();
+    let driver = Rc::new(SimDriver::with_disk(
+        seed + 1,
+        Config::default(),
+        driver.crash(),
+    ));
+    let restarted = started(&driver, 1);
+    let nodes = restarted.nodes.clone();
+    restarted.run(async move {
+        wait_for(&nodes, 1, 1, State::Active).await;
+        let node = &nodes[0];
+        let changes = node.spool().changes();
+        let shard = node.spool().shards()[0];
+        let two = Cursor {
+            acked: changes.watch().head(),
+            ..one
+        };
+        assert_ne!(two.acked, one.acked, "the cursor did not move");
+        write_cursor(changes, shard, 1, hook, &two)
+            .await
+            .expect("cursor");
+        let task = node.start_hooks(Rc::new(Attempted(Rc::clone(&attempts))));
+        let (second, lost, events) = new_call(&attempts, &[first]).await;
+        assert_eq!((lost, events), (5, 0));
+        assert_ne!(first, second, "two lost-only calls shared an id");
+        drop(task);
+    });
+    restarted.stop();
+}
+
+#[test]
 fn a_trimmed_call_keeps_its_id_and_lost_is_reported_once() {
     ANSWERS.set(None);
     let seed = 61;

@@ -1,9 +1,11 @@
 mod common;
 
 use std::cell::{Cell, RefCell};
+use std::collections::BTreeMap;
 use std::net::{IpAddr, SocketAddr};
 use std::rc::Rc;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use aws_lc_rs::hmac;
@@ -16,9 +18,9 @@ use keys::{BatchSettings, Batches, Working};
 use rt::sim::{Config, Disk, Machine, SimDriver, Stalls};
 use rt::{Instant, JoinHandle, Runtime, TcpListener, TcpStream, now, sleep, spawn};
 use sched::{
-    Answered, Attempt, Batched, Clock, Cursor, HookChange, HookSecret, Keys, Meshes, Node, Parts,
-    ROTATION_MS, Recipient, Restore, Running, Settings, Transport, Unsealable, Unwrapped,
-    encode_slice, read_cursor, write_cursor,
+    Answered, Attempt, Batched, Clock, Cursor, HookChange, HookSecret, KIND_EVENT, Keys, Meshes,
+    Node, Parts, ROTATION_MS, Recipient, Restore, Running, Settings, Transport, Unsealable,
+    Unwrapped, encode_slice, event_sequence, read_cursor, write_cursor,
 };
 use spool::{HeadClear, Message};
 use store::{Committer, DataFile, Options, SLOT_SIZE, Setup, boot};
@@ -101,12 +103,14 @@ fn signed(id: &str, stamp: &str, body: &[u8], secret: &Secret<32>) -> String {
 
 struct Toy {
     batches: RefCell<Batches>,
+    down: Arc<AtomicBool>,
 }
 
-impl Default for Toy {
-    fn default() -> Self {
+impl Toy {
+    fn new(down: Arc<AtomicBool>) -> Self {
         Self {
             batches: RefCell::new(Batches::new(BatchSettings::default())),
+            down,
         }
     }
 }
@@ -179,7 +183,9 @@ impl Keys for Toy {
         id: u64,
         wrap: Wrap,
     ) -> Unwrapped<'_> {
-        let key = if (wrap.generation, wrap.shard) == (generation, shard) {
+        let key = if self.down.load(Ordering::SeqCst) {
+            Err(Unsealable::Unavailable)
+        } else if (wrap.generation, wrap.shard) == (generation, shard) {
             open_batch(&toy_day_secret(tenant, wrap.day), tenant, id, &wrap)
                 .map(|secret| Rc::new(BatchKey::new(&secret)))
                 .map_err(|_| Unsealable::Bad)
@@ -279,6 +285,10 @@ fn settings_named(key: [u8; 16]) -> Settings {
 }
 
 fn started(seed: u64) -> Cluster {
+    started_with(seed, &Arc::default())
+}
+
+fn started_with(seed: u64, down: &Arc<AtomicBool>) -> Cluster {
     let driver = Rc::new(SimDriver::with_disk(seed, Config::default(), created(seed)));
     let cores = 1;
     let machine = Machine::new(Rc::clone(&driver), cores + 1, Stalls::default());
@@ -301,13 +311,14 @@ fn started(seed: u64) -> Cluster {
     for start in booted.starts {
         let index = start.index();
         let links = meshes.take(index).expect("links");
+        let down = Arc::clone(down);
         tasks.push(machine.spawn_on(usize::from(index) + 1, async move {
             let core = rt::timeout(Duration::from_secs(60), start.open())
                 .await
                 .expect("timeout")
                 .expect("open");
             let parts = Parts {
-                keys: Rc::new(Toy::default()),
+                keys: Rc::new(Toy::new(down)),
                 transport: Idle,
                 clock: Clock::at(rt::wall_ms(), now()),
             };
@@ -445,15 +456,88 @@ async fn expire_one(node: &Node<Idle>, tenant: u32, n: u8) {
     panic!("message not swept");
 }
 
-async fn acked_sum(node: &Node<Idle>, tenant: u32, hook: u32) -> u64 {
-    let mut sum = 0;
+async fn acked(node: &Node<Idle>, tenant: u32, hook: u32) -> BTreeMap<u16, u64> {
+    let mut found = BTreeMap::new();
     for shard in node.spool().shards() {
-        let found = read_cursor(node.spool().changes(), shard, tenant, hook)
+        let cursor = read_cursor(node.spool().changes(), shard, tenant, hook)
             .await
             .expect("read");
-        sum += found.map_or(0, |c| c.acked);
+        found.insert(shard, cursor.map_or(0, |c| c.acked));
     }
-    sum
+    found
+}
+
+fn event_key(tenant: u32, sequence: u64) -> [u8; 20] {
+    let mut key = [0; 20];
+    key[..4].copy_from_slice(&tenant.to_be_bytes());
+    key[4..12].copy_from_slice(&sequence.to_be_bytes());
+    key
+}
+
+async fn event_ends(node: &Node<Idle>, tenant: u32) -> BTreeMap<u16, u64> {
+    let range = event_key(tenant, 0)..event_key(tenant, u64::MAX);
+    let found = node
+        .spool()
+        .changes()
+        .scan_kind(KIND_EVENT, range, 1000)
+        .await
+        .expect("scan");
+    let mut ends = BTreeMap::new();
+    for (shard, entry) in found {
+        let end = ends.entry(shard).or_insert(0);
+        *end = (*end).max(event_sequence(&entry.key));
+    }
+    ends
+}
+
+async fn acked_through_events(
+    node: &Node<Idle>,
+    tenant: u32,
+    hook: u32,
+    before: &BTreeMap<u16, u64>,
+) {
+    let mut want = before.clone();
+    let ends = event_ends(node, tenant).await;
+    assert!(!ends.is_empty(), "no events were stored");
+    for (shard, end) in ends {
+        want.insert(shard, end);
+    }
+    assert_ne!(&want, before, "the events are not past the cursor");
+    for _ in 0..30_000 {
+        if acked(node, tenant, hook).await == want {
+            return;
+        }
+        sleep(Duration::from_millis(10)).await;
+    }
+    let found = acked(node, tenant, hook).await;
+    panic!("cursor is {found:?}, want {want:?}");
+}
+
+fn http_date(ms: u64) -> String {
+    const DAYS: [&str; 7] = ["Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed"];
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    let secs = ms / 1000;
+    let days = secs / 86_400;
+    let rest = secs % 86_400;
+    let z = days + 719_468;
+    let era = z / 146_097;
+    let doe = z % 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + u64::from(month <= 2);
+    format!(
+        "{}, {day:02} {} {year} {:02}:{:02}:{:02} GMT",
+        DAYS[usize::try_from(days % 7).expect("small")],
+        MONTHS[usize::try_from(month - 1).expect("small")],
+        rest / 3600,
+        rest % 3600 / 60,
+        rest % 60,
+    )
 }
 
 #[derive(Default)]
@@ -549,6 +633,7 @@ struct Server {
     open: Cell<u32>,
     live: Cell<u32>,
     most: Cell<u32>,
+    hangups: Cell<u32>,
 }
 
 impl Server {
@@ -612,9 +697,7 @@ async fn session(
 ) {
     let _guard = Guard(Rc::clone(&server));
     sleep(tls_delay).await;
-    let accepted = acceptor.accept(io).await;
-    let Ok(mut stream) = accepted else {
-        eprintln!("hook test server: tls accept failed: {:?}", accepted.err());
+    let Ok(mut stream) = acceptor.accept(io).await else {
         return;
     };
     let mut buf = Vec::new();
@@ -628,7 +711,7 @@ async fn session(
         }
         let n = stream.read(&mut chunk).await.unwrap_or(0);
         if n == 0 {
-            eprintln!("hook test server: closed before head, {} bytes", buf.len());
+            server.hangups.set(server.hangups.get() + 1);
             return;
         }
         buf.extend_from_slice(&chunk[..n]);
@@ -761,6 +844,7 @@ fn posts_a_signed_batch_and_acks() {
             .id;
         let task = node.start_hooks(Rc::new(sender(node, &zone, HookSettings::default(), 11)));
         hooks_ready(node, 1, &[hook]).await;
+        let before_cursor = acked(node, 1, hook).await;
         let before = node.sched().clock().now() / 1000;
         expire_one(node, 1, 1).await;
         got(&server, 1).await;
@@ -800,16 +884,7 @@ fn posts_a_signed_batch_and_acks() {
             signature,
             format!("v1,{}", signed(&id, &stamp, &body, &secret))
         );
-        for _ in 0..30_000 {
-            if acked_sum(node, 1, hook).await > 0 {
-                break;
-            }
-            sleep(Duration::from_millis(10)).await;
-        }
-        assert!(
-            acked_sum(node, 1, hook).await > 0,
-            "the cursor did not move"
-        );
+        acked_through_events(node, 1, hook, &before_cursor).await;
         drop(task);
     });
     cluster.stop();
@@ -995,6 +1070,14 @@ fn retry_after_is_honored_only_as_clamped_delta_seconds() {
                 headers: vec!["Retry-After: 99999".to_owned()],
                 ..Answer::ok()
             },
+            4 => Answer {
+                status: 503,
+                headers: vec![format!(
+                    "Retry-After: {}",
+                    http_date(rt::wall_ms() + 2 * 3600 * 1000)
+                )],
+                ..Answer::ok()
+            },
             _ => Answer::ok(),
         });
         let server = serve(IpAddr::from([1, 1, 1, 1]), 443, script);
@@ -1006,11 +1089,16 @@ fn retry_after_is_honored_only_as_clamped_delta_seconds() {
         let task = node.start_hooks(Rc::new(sender(node, &zone, HookSettings::default(), 15)));
         hooks_ready(node, 1, &[hook]).await;
         expire_one(node, 1, 1).await;
-        got(&server, 5).await;
+        got(&server, 6).await;
         pause_is(&server, 0, Duration::from_secs(10));
         pause_is(&server, 1, Duration::from_secs(120));
         pause_is(&server, 2, Duration::from_secs(10));
         pause_is(&server, 3, Duration::from_secs(3600));
+        let future = server.gap(4);
+        assert!(
+            future >= Duration::from_secs(10) && future <= Duration::from_secs(160 + 2),
+            "a future http date was honored: {future:?}"
+        );
         drop(task);
     });
     cluster.stop();
@@ -1078,19 +1166,11 @@ fn interim_replies_are_skipped() {
             .id;
         let task = node.start_hooks(Rc::new(sender(node, &zone, HookSettings::default(), 17)));
         hooks_ready(node, 1, &[hook]).await;
+        let before_cursor = acked(node, 1, hook).await;
         expire_one(node, 1, 1).await;
         got(&server, 1).await;
-        for _ in 0..30_000 {
-            if acked_sum(node, 1, hook).await > 0 {
-                break;
-            }
-            sleep(Duration::from_millis(10)).await;
-        }
-        assert!(
-            acked_sum(node, 1, hook).await > 0,
-            "the batch was not acked"
-        );
-        sleep(Duration::from_secs(5)).await;
+        acked_through_events(node, 1, hook, &before_cursor).await;
+        sleep(Duration::from_secs(10 + 2)).await;
         assert_eq!(
             server.got.borrow().len(),
             1,
@@ -1320,19 +1400,80 @@ fn a_not_found_status_retries() {
             .id;
         let task = node.start_hooks(Rc::new(sender(node, &zone, HookSettings::default(), 31)));
         hooks_ready(node, 1, &[hook]).await;
+        let before_cursor = acked(node, 1, hook).await;
         expire_one(node, 1, 1).await;
         got(&server, 2).await;
         pause_is(&server, 0, Duration::from_secs(10));
-        for _ in 0..30_000 {
-            if acked_sum(node, 1, hook).await > 0 {
-                break;
-            }
-            sleep(Duration::from_millis(10)).await;
+        acked_through_events(node, 1, hook, &before_cursor).await;
+        drop(task);
+    });
+    cluster.stop();
+}
+
+async fn hangups(server: &Server, n: u32) {
+    for _ in 0..1_200 {
+        if server.hangups.get() >= n {
+            return;
         }
-        assert!(
-            acked_sum(node, 1, hook).await > 0,
-            "the batch was not acked"
+        sleep(Duration::from_secs(1)).await;
+    }
+    panic!(
+        "only {} attempts without a request, {} connections",
+        server.hangups.get(),
+        server.open.get()
+    );
+}
+
+#[test]
+fn an_unavailable_key_retries_without_acking_and_the_batch_arrives_later() {
+    let down = Arc::new(AtomicBool::new(false));
+    let cluster = started_with(32, &down);
+    let nodes = cluster.nodes.clone();
+    cluster.run(async move {
+        ready(&nodes).await;
+        let node = &nodes[0];
+        let zone = Zone::default();
+        zone.set(
+            "hooks.example.org",
+            Type::A,
+            a(&[IpAddr::from([1, 1, 1, 1])]),
         );
+        let server = serve(IpAddr::from([1, 1, 1, 1]), 443, Rc::new(|_| Answer::ok()));
+        let hook = node
+            .hook_new(1, "https://hooks.example.org/in", 0)
+            .await
+            .expect("new")
+            .id;
+        let task = node.start_hooks(Rc::new(sender(node, &zone, HookSettings::default(), 32)));
+        hooks_ready(node, 1, &[hook]).await;
+        let before = acked(node, 1, hook).await;
+        let enabled = |on| HookChange {
+            enabled: Some(on),
+            ..HookChange::default()
+        };
+        node.hook_change(1, hook, enabled(false))
+            .await
+            .expect("pause");
+        expire_one(node, 1, 1).await;
+        down.store(true, Ordering::SeqCst);
+        node.hook_change(1, hook, enabled(true))
+            .await
+            .expect("resume");
+        hangups(&server, 1).await;
+        sleep(Duration::from_secs(3)).await;
+        assert_eq!(acked(node, 1, hook).await, before, "acked without bodies");
+        hangups(&server, 2).await;
+        sleep(Duration::from_secs(3)).await;
+        assert_eq!(acked(node, 1, hook).await, before, "acked without bodies");
+        assert!(server.got.borrow().is_empty(), "a request went out");
+        down.store(false, Ordering::SeqCst);
+        got(&server, 1).await;
+        {
+            let got = server.got.borrow();
+            let body = String::from_utf8_lossy(&got[0].body).into_owned();
+            assert!(body.contains("\"address\":\"x1@example.org\""), "{body}");
+        }
+        acked_through_events(node, 1, hook, &before).await;
         drop(task);
     });
     cluster.stop();
