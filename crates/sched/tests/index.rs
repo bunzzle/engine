@@ -3748,6 +3748,7 @@ impl Deliver for Catch {
             let events = node
                 .open_call(&call)
                 .await
+                .expect("opened")
                 .iter()
                 .map(|r| {
                     assert!(r.body.is_some(), "event body opened");

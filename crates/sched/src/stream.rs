@@ -11,7 +11,7 @@ use rt::{Instant, JoinHandle, Notify, spawn, timeout};
 
 use crate::cursor::{Cursor, drop_cursor, read_cursor, write_cursor};
 use crate::events::{Event, KIND_EVENT, sequence};
-use crate::reader::{Read, event_id, kept, open, stamped};
+use crate::reader::{Read, event_id, kept, opened, stamped};
 use crate::start::{Inner, Node};
 use crate::tally::{Claim, Tallies, Targets, Watched, count, due, stored, targets};
 use crate::transport::Transport;
@@ -98,7 +98,7 @@ impl<T: Transport + 'static> Node<T> {
         spawn(run(Rc::downgrade(&self.inner), deliver, claim))
     }
 
-    pub async fn open_call(&self, call: &Call) -> Vec<Read> {
+    pub async fn open_call(&self, call: &Call) -> Option<Vec<Read>> {
         let keys = self.keys();
         let mut events = Vec::with_capacity(call.events.len());
         for sealed in &call.events {
@@ -107,10 +107,12 @@ impl<T: Transport + 'static> Node<T> {
                 shard: sealed.shard,
                 sequence: sealed.sequence,
                 event: sealed.event,
-                body: open(keys, call.tenant, &sealed.event, &sealed.payload).await,
+                body: opened(keys, call.tenant, &sealed.event, &sealed.payload)
+                    .await
+                    .ok()?,
             });
         }
-        events
+        Some(events)
     }
 }
 
@@ -303,14 +305,25 @@ fn delivery_id(
     naming: &crypto::TenantKeys,
     hook: u32,
     stream: &Stream,
-    lost: u64,
+    lost: &BTreeMap<u16, u64>,
     ends: &BTreeMap<u16, u64>,
 ) -> [u8; 16] {
-    let mut data = Vec::with_capacity(22 + ends.len() * 18);
+    let mut data = Vec::with_capacity(26 + lost.len() * 22 + ends.len() * 18);
     data.extend_from_slice(DELIVERY_ID);
     data.extend_from_slice(&hook.to_be_bytes());
     data.push(stream.events);
-    data.extend_from_slice(&lost.to_be_bytes());
+    data.extend_from_slice(&u16::try_from(lost.len()).unwrap_or(u16::MAX).to_be_bytes());
+    for (&shard, &n) in lost {
+        let (acked, counted) = stream
+            .cursors
+            .get(&shard)
+            .map_or((0, 0), |c| (c.acked, c.counted));
+        data.extend_from_slice(&shard.to_be_bytes());
+        data.extend_from_slice(&n.to_be_bytes());
+        data.extend_from_slice(&acked.to_be_bytes());
+        data.extend_from_slice(&counted.to_be_bytes());
+    }
+    data.extend_from_slice(&u16::try_from(ends.len()).unwrap_or(u16::MAX).to_be_bytes());
     for (&shard, &end) in ends {
         let from = stream.cursors.get(&shard).map_or(0, |c| c.acked);
         data.extend_from_slice(&shard.to_be_bytes());
@@ -615,7 +628,7 @@ async fn fill<T: Transport + 'static>(node: &Node<T>, hook: u32, stream: &mut St
         tenant: stream.tenant,
         generation: stream.generation,
         hook,
-        id: delivery_id(&naming, hook, stream, total, &ends),
+        id: delivery_id(&naming, hook, stream, &lost, &ends),
         lost: total,
         events,
     };

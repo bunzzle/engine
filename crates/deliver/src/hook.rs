@@ -23,6 +23,7 @@ const CORE_CALLS: usize = 64;
 const TENANT_CALLS: usize = 4;
 const CALL: Duration = Duration::from_secs(30);
 const CONNECT: Duration = Duration::from_secs(10);
+const CLOSE: Duration = Duration::from_secs(5);
 const ADDRESSES: usize = 4;
 const HEAD: usize = 8 * 1024;
 const READ: usize = 4096;
@@ -168,9 +169,14 @@ impl<T: Transport + 'static, D: Dns + 'static, L: Local + 'static> Inner<T, D, L
         let sent = {
             let _tenant = Gate::enter(&gate).await;
             let _core = Gate::enter(&self.core).await;
-            timeout(CALL, self.attempt(call))
+            let mut open = None;
+            let sent = timeout(CALL, self.attempt(call, &mut open))
                 .await
-                .unwrap_or(Sent::Failed)
+                .unwrap_or(Sent::Failed);
+            if let Some(mut stream) = open {
+                let _ = timeout(CLOSE, stream.shutdown()).await;
+            }
+            sent
         };
         if gate.idle() && Rc::strong_count(&gate) == 2 {
             self.tenants.borrow_mut().remove(&call.tenant);
@@ -254,7 +260,7 @@ impl<T: Transport + 'static, D: Dns + 'static, L: Local + 'static> Inner<T, D, L
         })
     }
 
-    async fn attempt(&self, call: &Call) -> Sent {
+    async fn attempt(&self, call: &Call, open: &mut Option<tls::Stream>) -> Sent {
         let Some(first) = self.snapshot(call) else {
             return Sent::Refused;
         };
@@ -277,9 +283,6 @@ impl<T: Transport + 'static, D: Dns + 'static, L: Local + 'static> Inner<T, D, L
             if !self.same(call, &first) {
                 return Sent::Refused;
             }
-            if self.own(ip).await {
-                continue;
-            }
             let Ok(Ok(io)) = timeout(CONNECT, self.connect(ip, &target)).await else {
                 continue;
             };
@@ -288,16 +291,18 @@ impl<T: Transport + 'static, D: Dns + 'static, L: Local + 'static> Inner<T, D, L
             else {
                 continue;
             };
+            let Some(request) = self.request(call, &target, &ids, &secrets).await else {
+                return Sent::Failed;
+            };
             if !self.same(call, &first) {
                 return Sent::Refused;
             }
-            let request = self.request(call, &target, &ids, &secrets).await;
             if stream.write_all(&request).await.is_err() {
                 return Sent::Failed;
             }
             drop(request);
             let sent = read_status(&mut stream).await;
-            let _ = stream.shutdown().await;
+            *open = Some(stream);
             return sent;
         }
         Sent::Failed
@@ -328,8 +333,16 @@ impl<T: Transport + 'static, D: Dns + 'static, L: Local + 'static> Inner<T, D, L
                 out.extend(ips);
             }
         }
-        out.truncate(ADDRESSES);
-        out
+        let mut kept = Vec::with_capacity(ADDRESSES);
+        for ip in out {
+            if kept.len() == ADDRESSES {
+                break;
+            }
+            if !self.own(ip).await {
+                kept.push(ip);
+            }
+        }
+        kept
     }
 
     async fn connect(&self, ip: IpAddr, target: &Target) -> std::io::Result<TcpStream> {
@@ -367,8 +380,8 @@ impl<T: Transport + 'static, D: Dns + 'static, L: Local + 'static> Inner<T, D, L
         target: &Target,
         ids: &Ids,
         secrets: &[Arc<Secret<32>>],
-    ) -> Vec<u8> {
-        let events = self.node.open_call(call).await;
+    ) -> Option<Vec<u8>> {
+        let events = self.node.open_call(call).await?;
         let mut body = String::from("{\"events\":[");
         for (n, read) in events.iter().enumerate() {
             if n > 0 {
@@ -399,7 +412,7 @@ impl<T: Transport + 'static, D: Dns + 'static, L: Local + 'static> Inner<T, D, L
         )
         .into_bytes();
         out.extend_from_slice(body.as_bytes());
-        out
+        Some(out)
     }
 }
 
@@ -443,6 +456,9 @@ async fn read_status(stream: &mut tls::Stream) -> Sent {
                 Ok(n) => bytes.extend_from_slice(&buf[..n]),
             }
         };
+        if end > HEAD {
+            return Sent::Failed;
+        }
         let Some(code) = crate::https::status(&bytes[..end]) else {
             return Sent::Failed;
         };
