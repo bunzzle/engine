@@ -308,7 +308,7 @@ fn delivery_id(
     lost: &BTreeMap<u16, u64>,
     ends: &BTreeMap<u16, u64>,
 ) -> [u8; 16] {
-    let mut data = Vec::with_capacity(26 + lost.len() * 22 + ends.len() * 18);
+    let mut data = Vec::with_capacity(26 + lost.len() * 26 + ends.len() * 18);
     data.extend_from_slice(DELIVERY_ID);
     data.extend_from_slice(&hook.to_be_bytes());
     data.push(stream.events);
