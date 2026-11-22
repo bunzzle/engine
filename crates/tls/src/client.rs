@@ -143,6 +143,10 @@ impl Connector {
         })
     }
 
+    pub fn webpki(&self) -> bool {
+        self.webpki.is_some()
+    }
+
     pub async fn connect(&self, io: TcpStream, name: &str, verify: Verify) -> io::Result<Stream> {
         let config = match verify {
             Verify::Any => Arc::clone(&self.any),
@@ -439,5 +443,20 @@ impl ServerCertVerifier for Dane {
         self.provider
             .signature_verification_algorithms
             .supported_schemes()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn webpki_reports_loaded_roots() {
+        let provider = crate::simulated(1);
+        let without = Connector::new(Arc::clone(&provider), None).expect("connector");
+        assert!(!without.webpki());
+        let roots: &[u8] = include_bytes!("../tests/data/ca.pem");
+        let with = Connector::new(provider, Some(roots)).expect("connector");
+        assert!(with.webpki());
     }
 }
