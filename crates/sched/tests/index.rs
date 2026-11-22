@@ -19,7 +19,7 @@ use keys::{
     Audit, BatchSettings, Batches, Client as KeyClient, Connect, Ring, RingSettings, Server,
     Settings as KeySettings, Vault, Working,
 };
-use rt::sim::{Config, Disk, Faults, Machine, SimDriver, Stalls, check};
+use rt::sim::{Config, Disk, Faults, Machine, Rng, SimDriver, Stalls, check};
 use rt::{JoinHandle, Runtime, TcpListener, TcpStream, sleep, spawn, timeout};
 use sched::{
     Answer, Answered, Attempt, Batched, Begun, Call, Clock, Cursor, DAY, Deliver, Draft,
@@ -4685,4 +4685,406 @@ fn hook_status_reports_are_chunked_and_pruned_on_delete() {
         drop(task);
     });
     cluster.stop();
+}
+
+#[derive(Clone, Copy)]
+enum Endpoint {
+    Healthy,
+    Flapping,
+    Slow,
+    Failing,
+}
+
+struct Sim {
+    modes: RefCell<BTreeMap<u32, Endpoint>>,
+    calls: RefCell<Vec<(u32, Vec<Streamed>)>>,
+    lost: RefCell<BTreeMap<u32, u64>>,
+    flying: RefCell<BTreeSet<(u32, usize)>>,
+    rng: RefCell<Rng>,
+}
+
+struct Flying(Rc<Sim>, (u32, usize));
+
+impl Drop for Flying {
+    fn drop(&mut self) {
+        self.0.flying.borrow_mut().remove(&self.1);
+    }
+}
+
+struct SimEndpoint(Rc<Sim>, Node<Idle>, usize);
+
+impl Deliver for SimEndpoint {
+    fn deliver(&self, call: Rc<Call>) -> Sending {
+        let (sim, node, core) = (Rc::clone(&self.0), self.1.clone(), self.2);
+        Box::pin(async move {
+            let current =
+                node.table().hook(call.tenant, call.hook).is_some_and(|h| {
+                    h.state == HookState::Active && h.generation == call.generation
+                }) && node
+                    .table()
+                    .tenant(call.tenant)
+                    .is_some_and(|t| t.state == State::Active && t.generation == call.generation);
+            if !current {
+                return Outcome::Refused(Duration::from_secs(1));
+            }
+            let key = (call.hook, core);
+            assert!(sim.flying.borrow_mut().insert(key), "two calls in flight");
+            let _flying = Flying(Rc::clone(&sim), key);
+            let mode = sim
+                .modes
+                .borrow()
+                .get(&call.hook)
+                .copied()
+                .unwrap_or(Endpoint::Healthy);
+            let (wait, ok) = {
+                let mut rng = sim.rng.borrow_mut();
+                match mode {
+                    Endpoint::Healthy => (Duration::ZERO, true),
+                    Endpoint::Flapping => (
+                        Duration::from_millis(rng.below(200)),
+                        rng.chance(MILLION / 2),
+                    ),
+                    Endpoint::Slow => (
+                        rng.between(Duration::from_secs(1), Duration::from_secs(5)),
+                        true,
+                    ),
+                    Endpoint::Failing => (Duration::from_millis(rng.below(100)), false),
+                }
+            };
+            sleep(wait).await;
+            if !ok {
+                return Outcome::Retry {
+                    after: Duration::from_secs(1),
+                    status: Some(503),
+                };
+            }
+            let events: Vec<Streamed> = node
+                .open_call(&call)
+                .await
+                .expect("opened")
+                .iter()
+                .map(|r| {
+                    (
+                        r.event.message,
+                        r.event.recipient,
+                        r.event.kind,
+                        r.shard,
+                        r.sequence,
+                    )
+                })
+                .collect();
+            sim.calls.borrow_mut().push((call.hook, events));
+            *sim.lost.borrow_mut().entry(call.hook).or_default() += call.lost;
+            Outcome::Acked { status: 200 }
+        })
+    }
+}
+
+fn sim_hooks(sim: &Rc<Sim>, nodes: &[Node<Idle>]) -> Vec<JoinHandle<()>> {
+    nodes
+        .iter()
+        .enumerate()
+        .map(|(core, n)| n.start_hooks(Rc::new(SimEndpoint(Rc::clone(sim), n.clone(), core))))
+        .collect()
+}
+
+fn first_seen(sim: &Sim, hook: u32) -> Vec<Streamed> {
+    let mut seen = BTreeSet::new();
+    let mut last: BTreeMap<(MessageId, u32), u64> = BTreeMap::new();
+    let mut first = Vec::new();
+    for (h, events) in sim.calls.borrow().iter() {
+        if *h != hook {
+            continue;
+        }
+        let mut inside: BTreeMap<(MessageId, u32), u64> = BTreeMap::new();
+        for event in events {
+            let before = inside.insert((event.0, event.1), event.4);
+            assert!(
+                before.is_none_or(|b| b < event.4),
+                "out of order in one call {event:?}"
+            );
+            if seen.insert((event.3, event.4)) {
+                let before = last.insert((event.0, event.1), event.4);
+                assert!(before.is_none_or(|b| b < event.4), "out of order {event:?}");
+                first.push(*event);
+            }
+        }
+    }
+    first
+}
+
+fn missing(sim: &Sim, hook: u32, want: &[Given], only: Option<EventKind>) -> usize {
+    let mut got: Vec<_> = first_seen(sim, hook)
+        .iter()
+        .map(|e| (e.0.bytes(), e.1, e.2 as u8))
+        .collect();
+    got.sort_unstable();
+    let mut absent = 0;
+    for e in want.iter().filter(|e| only.is_none_or(|k| e.3 == k)) {
+        match got.binary_search(&(e.0.bytes(), e.1, e.3 as u8)) {
+            Ok(i) => drop(got.remove(i)),
+            Err(_) => absent += 1,
+        }
+    }
+    assert_eq!(got.len(), 0, "events streamed that were never given");
+    absent
+}
+
+async fn delivered_all(sim: &Sim, nodes: &[Node<Idle>], hook: u32, only: Option<EventKind>) {
+    for _ in 0..600 {
+        let (whole, _, _) = read_all(&nodes[0], None, 1000).await;
+        if missing(sim, hook, &whole, only) == 0 {
+            return;
+        }
+        sleep(Duration::from_secs(1)).await;
+    }
+    let (whole, _, _) = read_all(&nodes[0], None, 1000).await;
+    panic!(
+        "hook {hook}: {} events missing",
+        missing(sim, hook, &whole, only)
+    );
+}
+
+async fn cursors_of(nodes: &[Node<Idle>], tenant: u32, hook: u32) -> usize {
+    let mut found = 0;
+    for node in nodes {
+        for shard in node.spool().shards() {
+            let cursor = read_cursor(node.spool().changes(), shard, tenant, hook).await;
+            found += usize::from(cursor.expect("read").is_some());
+        }
+    }
+    found
+}
+
+async fn lost_everywhere(nodes: &[Node<Idle>], hook: u32) -> u64 {
+    let mut lost = 0;
+    for node in nodes {
+        lost += lost_of(node, hook).await;
+    }
+    lost
+}
+
+fn webhooks_sim(seed: u64) {
+    ANSWERS.set(None);
+    let (first_cores, second_cores) =
+        [(1, 2), (2, 4), (4, 1), (2, 1)][usize::try_from(seed % 4).expect("small")];
+    let mut rng = Rng::new(seed);
+    let sim = Rc::new(Sim {
+        modes: RefCell::default(),
+        calls: RefCell::default(),
+        lost: RefCell::default(),
+        flying: RefCell::default(),
+        rng: RefCell::new(Rng::new(seed ^ 0x5157)),
+    });
+    let first_count = 4 + rng.index(4);
+    let cut = rng.between(Duration::ZERO, Duration::from_secs(3));
+    let driver = Rc::new(SimDriver::with_disk(seed, Config::default(), created(seed)));
+    let cluster = started_behind(&driver, first_cores, 8 * DAY_MS as u64);
+    let nodes = cluster.nodes.clone();
+    let shared = Rc::clone(&sim);
+    let (hooks, day) = cluster.run(async move {
+        let sim = shared;
+        ready(&nodes).await;
+        answering(&nodes);
+        let (before, _, _) = read_all(&nodes[0], None, 1000).await;
+        assert_eq!(before.len(), 0);
+        let control = control_of(&nodes);
+        let at = "https://hooks.example.org/in";
+        let mut hooks = Vec::new();
+        for (tenant, events, mode) in [
+            (1, 0, Endpoint::Flapping),
+            (1, 1, Endpoint::Slow),
+            (1, 0, Endpoint::Healthy),
+            (2, 0, Endpoint::Failing),
+        ] {
+            let id = control.hook_new(tenant, at, events).await.expect("new").id;
+            sim.modes.borrow_mut().insert(id, mode);
+            hooks.push(id);
+        }
+        let tasks = sim_hooks(&sim, &nodes);
+        for &hook in &hooks[..3] {
+            cursors_everywhere(&nodes, hook, true).await;
+        }
+        accept_some(&nodes, 0, first_count).await;
+        sleep(cut).await;
+        drop(tasks);
+        (hooks, nodes[0].requests().today())
+    });
+    cluster.stop();
+    let [all, some, late, other] = hooks[..] else {
+        panic!("four hooks");
+    };
+    let driver = Rc::new(SimDriver::with_disk(
+        seed + 1,
+        Config::default(),
+        driver.crash(),
+    ));
+    let cluster = started_behind(&driver, second_cores, 8 * DAY_MS as u64);
+    let nodes = cluster.nodes.clone();
+    let total = cluster.run(webhooks_second(
+        Rc::clone(&sim),
+        nodes,
+        seed,
+        [all, some, late, other],
+        first_count,
+    ));
+    cluster.stop();
+    let undelivered = u64::try_from(missing(&sim, late, &total, None)).expect("fits");
+    assert_ne!(undelivered, 0, "seed {seed}");
+    let wall = Config::default().wall_start_ms;
+    let behind = wall - (u64::from(day + 7) * DAY_MS as u64 - 60_000);
+    let driver = Rc::new(SimDriver::with_disk(
+        seed + 2,
+        Config::default(),
+        driver.crash(),
+    ));
+    let cluster = started_behind(&driver, first_cores, behind);
+    let nodes = cluster.nodes.clone();
+    cluster.run(webhooks_third(
+        Rc::clone(&sim),
+        nodes,
+        seed,
+        [all, late],
+        first_count,
+        day,
+        (total.len(), undelivered),
+    ));
+    cluster.stop();
+}
+
+#[test]
+fn webhooks_reach_every_endpoint_through_crashes_core_changes_deletes_and_retention() {
+    check(0..4, webhooks_sim);
+}
+
+async fn webhooks_second(
+    sim: Rc<Sim>,
+    nodes: Vec<Node<Idle>>,
+    seed: u64,
+    [all, some, late, other]: [u32; 4],
+    first_count: usize,
+) -> Vec<Given> {
+    wait_for(&nodes, 1, 1, State::Active).await;
+    answering(&nodes);
+    let control = control_of(&nodes).clone();
+    let tasks = sim_hooks(&sim, &nodes);
+    accept_some(&nodes, first_count, 4).await;
+    assert!(cursors_of(&nodes, 2, other).await > 0, "seed {seed}");
+    control.delete_tenant(2).await.expect("delete");
+    wait_for(&nodes, 2, 1, State::Deleted).await;
+    while control.write(tenant(2, 2, State::Active)).await.is_err() {
+        sleep(Duration::from_millis(50)).await;
+    }
+    for _ in 0..200 {
+        if cursors_of(&nodes, 2, other).await == 0 {
+            break;
+        }
+        sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(cursors_of(&nodes, 2, other).await, 0, "seed {seed}");
+    for node in &nodes {
+        assert_eq!(node.hooks(2), Vec::new(), "seed {seed}");
+    }
+    let fresh = control
+        .hook_new(2, "https://hooks.example.org/in", 0)
+        .await
+        .expect("new")
+        .id;
+    assert!(fresh > other, "seed {seed}");
+    drained(&nodes).await;
+    sim.modes.borrow_mut().insert(all, Endpoint::Healthy);
+    delivered_all(&sim, &nodes, all, None).await;
+    delivered_all(&sim, &nodes, some, Some(EventKind::Delivered)).await;
+    let off = HookChange {
+        enabled: Some(false),
+        ..HookChange::default()
+    };
+    control.hook_change(1, late, off).await.expect("pause");
+    accept_some(&nodes, first_count + 4, 3).await;
+    drained(&nodes).await;
+    delivered_all(&sim, &nodes, all, None).await;
+    sleep(Duration::from_secs(3)).await;
+    let (whole, _, _) = read_all(&nodes[0], None, 1000).await;
+    drop(tasks);
+    whole
+}
+
+async fn webhooks_third(
+    sim: Rc<Sim>,
+    nodes: Vec<Node<Idle>>,
+    seed: u64,
+    [all, late]: [u32; 2],
+    first_count: usize,
+    day: u32,
+    (total, undelivered): (usize, u64),
+) {
+    wait_for(&nodes, 1, 1, State::Active).await;
+    answering(&nodes);
+    let control = control_of(&nodes).clone();
+    let tasks = sim_hooks(&sim, &nodes);
+    sleep(Duration::from_secs(120)).await;
+    assert_eq!(nodes[0].requests().today(), day + 7, "seed {seed}");
+    assert_eq!(lost_everywhere(&nodes, all).await, 0, "seed {seed}");
+    let lost = lost_everywhere(&nodes, late).await;
+    let total = u64::try_from(total).expect("fits");
+    assert!(
+        lost >= undelivered && lost <= total,
+        "seed {seed}: lost {lost}, undelivered {undelivered}, total {total}"
+    );
+    let on = HookChange {
+        enabled: Some(true),
+        ..HookChange::default()
+    };
+    control.hook_change(1, late, on).await.expect("resume");
+    let (before, _, _) = read_all(&nodes[0], None, 1000).await;
+    accept_some(&nodes, first_count + 7, 2).await;
+    drained(&nodes).await;
+    let (whole, _, _) = read_all(&nodes[0], None, 1000).await;
+    let fresh: Vec<Given> = whole.into_iter().filter(|e| !before.contains(e)).collect();
+    assert_ne!(fresh.len(), 0, "seed {seed}");
+    for hook in [late, all] {
+        for _ in 0..600 {
+            let got: BTreeSet<_> = first_seen(&sim, hook)
+                .iter()
+                .map(|e| (e.0.bytes(), e.1, e.2 as u8))
+                .collect();
+            if fresh
+                .iter()
+                .all(|e| got.contains(&(e.0.bytes(), e.1, e.3 as u8)))
+            {
+                break;
+            }
+            sleep(Duration::from_secs(1)).await;
+        }
+    }
+    for hook in [late, all] {
+        let got: BTreeSet<_> = first_seen(&sim, hook)
+            .iter()
+            .map(|e| (e.0.bytes(), e.1, e.2 as u8))
+            .collect();
+        for e in &fresh {
+            assert!(
+                got.contains(&(e.0.bytes(), e.1, e.3 as u8)),
+                "seed {seed}: hook {hook} missed {e:?}"
+            );
+        }
+    }
+    for _ in 0..60 {
+        if lost_everywhere(&nodes, late).await == 0 {
+            break;
+        }
+        sleep(Duration::from_secs(1)).await;
+    }
+    assert_eq!(lost_everywhere(&nodes, late).await, 0, "seed {seed}");
+    assert_eq!(
+        sim.lost.borrow().get(&late).copied(),
+        Some(lost),
+        "seed {seed}"
+    );
+    assert_eq!(
+        sim.lost.borrow().get(&all).copied().unwrap_or(0),
+        0,
+        "seed {seed}"
+    );
+    drop(tasks);
 }
