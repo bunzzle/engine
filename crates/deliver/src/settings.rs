@@ -1,6 +1,8 @@
 use std::net::IpAddr;
 use std::time::Duration;
 
+use crate::address::Cidr;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EightBit {
     Send,
@@ -56,6 +58,7 @@ pub struct Settings {
     pub dead: Duration,
     pub mta_sts: bool,
     pub egress: Option<IpAddr>,
+    pub allow: Vec<Cidr>,
     pub tlsrpt: bool,
     pub report_tenant: Option<u32>,
     pub reporter: Reporter,
@@ -76,6 +79,7 @@ impl Settings {
             dead: Duration::from_secs(60),
             mta_sts: false,
             egress: None,
+            allow: Vec::new(),
             tlsrpt: false,
             report_tenant: None,
             reporter: Reporter::default(),

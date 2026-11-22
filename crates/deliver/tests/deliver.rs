@@ -12,8 +12,8 @@ use std::time::Duration;
 use common::{Script, Seen, Zone, policy, policy_server, serve, serve_policy};
 use control::Leases;
 use deliver::{
-    Applied, Applies, Deliver, Detail, EightBit, Message, Outcome, Remote, ResultType, Settings,
-    Taken, limits,
+    Applied, Applies, Cidr, Deliver, Detail, EightBit, Local, Message, Outcome, Remote, ResultType,
+    Settings, Taken, limits,
 };
 use dns::{Found, Name, Record, Type};
 use rt::sim::{Config, SimDriver};
@@ -78,18 +78,18 @@ fn zone() -> Zone {
     zone
 }
 
-fn deliverer(zone: Zone, settings: Settings) -> Deliver<Zone> {
+fn deliverer(zone: Zone, settings: Settings) -> Deliver<Zone, Owns> {
     limited(zone, settings, None)
 }
 
-fn limited(zone: Zone, settings: Settings, leases: Option<Leases<Remote>>) -> Deliver<Zone> {
+fn limited(zone: Zone, settings: Settings, leases: Option<Leases<Remote>>) -> Deliver<Zone, Owns> {
     let connector = Connector::new(simulated(2), None).expect("connector");
-    Deliver::new(zone, connector, settings, leases, 9).expect("deliver")
+    Deliver::with_local(zone, connector, settings, leases, 9, Owns(Vec::new())).expect("deliver")
 }
 
-fn verifying(zone: Zone, settings: Settings) -> Deliver<Zone> {
+fn verifying(zone: Zone, settings: Settings) -> Deliver<Zone, Owns> {
     let connector = Connector::new(simulated(2), Some(ROOTS)).expect("connector");
-    Deliver::new(zone, connector, settings, None, 9).expect("deliver")
+    Deliver::with_local(zone, connector, settings, None, 9, Owns(Vec::new())).expect("deliver")
 }
 
 fn signed(only: bool) -> Zone {
@@ -141,7 +141,54 @@ fn mailed(seen: &Rc<RefCell<Seen>>) -> bool {
 }
 
 fn settings() -> Settings {
-    Settings::new("out.sender.example")
+    let mut settings = Settings::new("out.sender.example");
+    settings
+        .allow
+        .push(Cidr::parse("10.0.0.0/8").expect("cidr"));
+    settings
+}
+
+struct Owns(Vec<IpAddr>);
+
+impl Local for Owns {
+    fn bound(&self, ip: IpAddr) -> impl Future<Output = Option<bool>> {
+        std::future::ready(Some(self.0.contains(&ip)))
+    }
+}
+
+struct Everything;
+
+impl Local for Everything {
+    fn bound(&self, _ip: IpAddr) -> impl Future<Output = Option<bool>> {
+        std::future::ready(Some(true))
+    }
+}
+
+struct NonLocal;
+
+impl Local for NonLocal {
+    fn bound(&self, ip: IpAddr) -> impl Future<Output = Option<bool>> {
+        let probe = match ip {
+            IpAddr::V4(ip) => ip == Ipv4Addr::new(192, 0, 2, 1),
+            IpAddr::V6(ip) => ip == "2001:db8::1".parse::<std::net::Ipv6Addr>().expect("probe"),
+        };
+        std::future::ready(Some(probe))
+    }
+}
+
+struct Unclear {
+    ip: IpAddr,
+    calls: Rc<Cell<usize>>,
+}
+
+impl Local for Unclear {
+    fn bound(&self, ip: IpAddr) -> impl Future<Output = Option<bool>> {
+        if ip != self.ip {
+            return std::future::ready(Some(false));
+        }
+        self.calls.set(self.calls.get() + 1);
+        std::future::ready(None)
+    }
 }
 
 fn envelope() -> Envelope {
@@ -152,15 +199,19 @@ fn envelope() -> Envelope {
 }
 
 fn destination(domain: &str) -> Destination {
+    destination_from(domain, EGRESS)
+}
+
+fn destination_from(domain: &str, egress: IpAddr) -> Destination {
     Destination {
         domain: domain.into(),
         pool: 1,
-        egress: vec![(EGRESS, 1)],
+        egress: vec![(egress, 1)],
     }
 }
 
-async fn send(
-    deliver: &Deliver<Zone>,
+async fn send<L: Local>(
+    deliver: &Deliver<Zone, L>,
     envelope: &Envelope,
     destination: &Destination,
     addresses: &[&str],
@@ -188,7 +239,7 @@ async fn send(
     deliver.deliver(destination, message).await
 }
 
-async fn simple(deliver: &Deliver<Zone>, domain: &str) -> Vec<Outcome> {
+async fn simple<L: Local>(deliver: &Deliver<Zone, L>, domain: &str) -> Vec<Outcome> {
     send(
         deliver,
         &envelope(),
@@ -555,8 +606,297 @@ fn skips_literal_and_local_addresses() {
         assert_eq!(asked.borrow().len(), 2);
         outcomes
     });
+    assert_eq!(answers(&outcomes), [Answer::Failed]);
+    assert!(reply(&outcomes[0]).starts_with("550 5.4.4"));
+}
+
+fn one_mx(ip: IpAddr) -> Zone {
+    let zone = Zone::default();
+    zone.set("example.com", Type::Mx, mx(&[(10, "mx.example.com")]));
+    let kind = if ip.is_ipv4() { Type::A } else { Type::Aaaa };
+    zone.set("mx.example.com", kind, a(&[ip]));
+    zone
+}
+
+fn refused_delivery(ip: IpAddr, settings: Settings) -> (Vec<Outcome>, Rc<RefCell<Seen>>, bool) {
+    run(async move {
+        let seen = serve(ip, Script::new(&[]));
+        let zone = one_mx(ip);
+        let kind = if ip.is_ipv4() { Type::A } else { Type::Aaaa };
+        zone.sign("example.com", Type::Mx);
+        zone.sign("mx.example.com", kind);
+        tlsa(&zone, "mx.example.com", &[(3, 1, 1, "00")]);
+        let deliver = deliverer(zone.clone(), settings);
+        let outcomes = send(
+            &deliver,
+            &envelope(),
+            &destination_from(
+                "example.com",
+                if ip.is_ipv4() {
+                    EGRESS
+                } else {
+                    "fd00::1".parse().expect("egress")
+                },
+            ),
+            &["a@example.com", "b@example.com"],
+            b"hello\r\n",
+        )
+        .await;
+        let tlsa = zone
+            .asked
+            .borrow()
+            .iter()
+            .any(|(_, kind)| *kind == Type::Tlsa);
+        (outcomes, seen, tlsa)
+    })
+}
+
+#[test]
+fn refuses_non_global_mx_addresses_by_default() {
+    for text in [
+        "10.0.0.1",
+        "127.0.0.1",
+        "169.254.169.254",
+        "::ffff:10.0.0.1",
+        "64:ff9b::10.0.0.1",
+    ] {
+        let (outcomes, seen, tlsa) = refused_delivery(
+            text.parse().expect("address"),
+            Settings::new("out.sender.example"),
+        );
+        assert_eq!(
+            answers(&outcomes),
+            [Answer::Failed, Answer::Failed],
+            "{text}"
+        );
+        for outcome in &outcomes {
+            assert_eq!(reply(outcome), "550 5.4.4 No allowed mail server address");
+        }
+        assert_eq!(seen.borrow().connections, 0, "{text}");
+        assert!(!tlsa, "{text}");
+    }
+}
+
+#[test]
+fn falls_back_after_a_refused_mx() {
+    let global: IpAddr = "11.0.1.1".parse().expect("address");
+    let (outcomes, refused, allowed) = run(async move {
+        let refused = serve(MX1, Script::new(&[]));
+        let allowed = serve(global, Script::new(&[]));
+        let zone = zone();
+        zone.set("mx2.example.com", Type::A, a(&[global]));
+        let deliver = deliverer(zone, Settings::new("out.sender.example"));
+        (simple(&deliver, "example.com").await, refused, allowed)
+    });
+    assert_eq!(answers(&outcomes), [Answer::Delivered]);
+    assert_eq!(refused.borrow().connections, 0);
+    assert_eq!(allowed.borrow().connections, 1);
+}
+
+#[test]
+fn refused_mx_and_lookup_failure_stays_temporary() {
+    let (outcomes, seen) = run(async {
+        let seen = serve(MX1, Script::new(&[]));
+        let zone = zone();
+        zone.fail("mx2.example.com", Type::A);
+        let deliver = deliverer(zone, Settings::new("out.sender.example"));
+        (simple(&deliver, "example.com").await, seen)
+    });
     assert_eq!(answers(&outcomes), [TEMPORARY]);
-    assert!(reply(&outcomes[0]).starts_with("451 4.4.4"));
+    assert!(reply(&outcomes[0]).starts_with("451 4.4.3 Mail"));
+    assert_eq!(seen.borrow().connections, 0);
+}
+
+#[test]
+fn deliver_allow_keeps_the_address_floor() {
+    let mut settings = Settings::new("out.sender.example");
+    for cidr in ["10.0.1.0/24", "127.0.0.0/8", "169.254.0.0/16", "::/0"] {
+        settings.allow.push(Cidr::parse(cidr).expect("cidr"));
+    }
+    let (outcomes, seen) = run({
+        let settings = settings.clone();
+        async move {
+            let seen = serve(MX1, Script::new(&[]));
+            let deliver = deliverer(one_mx(MX1), settings);
+            (simple(&deliver, "example.com").await, seen)
+        }
+    });
+    assert_eq!(answers(&outcomes), [Answer::Delivered]);
+    assert_eq!(seen.borrow().connections, 1);
+    for text in ["127.0.0.1", "169.254.1.1", "::ffff:10.0.1.1"] {
+        let (outcomes, seen, _) =
+            refused_delivery(text.parse().expect("address"), settings.clone());
+        assert_eq!(
+            answers(&outcomes),
+            [Answer::Failed, Answer::Failed],
+            "{text}"
+        );
+        assert_eq!(seen.borrow().connections, 0, "{text}");
+    }
+}
+
+#[test]
+fn own_mx_address_is_refused_even_when_allowed() {
+    let ip: IpAddr = "11.0.1.1".parse().expect("address");
+    let (outcomes, seen) = run(async move {
+        let seen = serve(ip, Script::new(&[]));
+        let mut settings = Settings::new("out.sender.example");
+        settings
+            .allow
+            .push(Cidr::parse("11.0.0.0/8").expect("cidr"));
+        let connector = Connector::new(simulated(2), None).expect("connector");
+        let deliver = Deliver::with_local(one_mx(ip), connector, settings, None, 9, Owns(vec![ip]))
+            .expect("deliver");
+        (simple(&deliver, "example.com").await, seen)
+    });
+    assert_eq!(answers(&outcomes), [TEMPORARY]);
+    assert!(reply(&outcomes[0]).starts_with("451"));
+    assert_eq!(seen.borrow().connections, 0);
+}
+
+#[test]
+fn non_local_bind_disables_own_probing() {
+    let ip: IpAddr = "11.0.1.1".parse().expect("address");
+    let (outcomes, seen, stats) = run(async move {
+        let seen = serve(ip, Script::new(&[]));
+        let connector = Connector::new(simulated(2), None).expect("connector");
+        let settings = Settings::new("out.sender.example");
+        let deliver = Deliver::with_local(one_mx(ip), connector, settings, None, 9, Everything)
+            .expect("deliver");
+        let outcomes = simple(&deliver, "example.com").await;
+        (outcomes, seen, deliver.own_stats())
+    });
+    assert_eq!(answers(&outcomes), [Answer::Delivered]);
+    assert_eq!(seen.borrow().connections, 1);
+    assert!(stats.ipv4_off);
+    assert!(!stats.ipv6_off);
+    assert_eq!(stats.unclear, 0);
+}
+
+#[test]
+fn unclear_bind_answers_refuse_without_caching() {
+    let ip: IpAddr = "11.0.1.1".parse().expect("address");
+    let (outcomes, seen, calls, stats) = run(async move {
+        let seen = serve(ip, Script::new(&[]));
+        let local = Unclear {
+            ip,
+            calls: Rc::new(Cell::new(0)),
+        };
+        let calls = Rc::clone(&local.calls);
+        let connector = Connector::new(simulated(2), None).expect("connector");
+        let settings = Settings::new("out.sender.example");
+        let deliver =
+            Deliver::with_local(one_mx(ip), connector, settings, None, 9, local).expect("deliver");
+        let first = simple(&deliver, "example.com").await;
+        let second = simple(&deliver, "example.com").await;
+        (vec![first, second], seen, calls, deliver.own_stats())
+    });
+    assert_eq!(answers(&outcomes[0]), [TEMPORARY]);
+    assert_eq!(answers(&outcomes[1]), [TEMPORARY]);
+    assert_eq!(seen.borrow().connections, 0);
+    assert_eq!(calls.get(), 2);
+    assert_eq!(stats.unclear, 2);
+}
+
+#[test]
+fn pool_egress_is_own_when_probing_is_off() {
+    let (outcomes, seen, stats) = run(async move {
+        let seen = serve(EGRESS, Script::new(&[]));
+        let connector = Connector::new(simulated(2), None).expect("connector");
+        let deliver = Deliver::with_local(one_mx(EGRESS), connector, settings(), None, 9, NonLocal)
+            .expect("deliver");
+        let outcomes = simple(&deliver, "example.com").await;
+        (outcomes, seen, deliver.own_stats())
+    });
+    assert_eq!(answers(&outcomes), [TEMPORARY]);
+    assert!(reply(&outcomes[0]).starts_with("451"));
+    assert_eq!(seen.borrow().connections, 0);
+    assert!(stats.ipv4_off);
+}
+
+#[test]
+fn mixed_family_pool_keeps_refusals_temporary() {
+    let (outcomes, seen) = run(async move {
+        let seen = serve(MX1, Script::new(&[]));
+        let zone = one_mx(MX1);
+        zone.set(
+            "mx.example.com",
+            Type::Aaaa,
+            a(&["2606:4700::1111".parse().expect("address")]),
+        );
+        let deliver = deliverer(zone, Settings::new("out.sender.example"));
+        let mut destination = destination("example.com");
+        destination
+            .egress
+            .push(("fd00::1".parse().expect("egress"), 1));
+        let outcomes = send(
+            &deliver,
+            &envelope(),
+            &destination,
+            &["a@example.com"],
+            b"hello\r\n",
+        )
+        .await;
+        (outcomes, seen)
+    });
+    assert_eq!(answers(&outcomes), [TEMPORARY]);
+    assert!(reply(&outcomes[0]).starts_with("451"));
+    assert_eq!(seen.borrow().connections, 0);
+}
+
+#[test]
+fn refused_addresses_do_not_consume_address_limit() {
+    let global: IpAddr = "11.0.1.1".parse().expect("address");
+    let (outcomes, seen) = run(async move {
+        let seen = serve(global, Script::new(&[]));
+        let mut ips: Vec<IpAddr> = (1..=10)
+            .map(|last| IpAddr::V4(Ipv4Addr::new(10, 0, 0, last)))
+            .collect();
+        ips.push(global);
+        let zone = Zone::default();
+        zone.set("example.com", Type::Mx, mx(&[(10, "mx.example.com")]));
+        zone.set("mx.example.com", Type::A, a(&ips));
+        let deliver = deliverer(zone, Settings::new("out.sender.example"));
+        (simple(&deliver, "example.com").await, seen)
+    });
+    assert_eq!(answers(&outcomes), [Answer::Delivered]);
+    assert_eq!(seen.borrow().connections, 1);
+}
+
+#[test]
+fn own_addresses_across_hosts_do_not_consume_address_limit() {
+    let global: IpAddr = "11.4.0.1".parse().expect("address");
+    let (outcomes, allowed, refused) = run(async move {
+        let allowed = serve(global, Script::new(&[]));
+        let names = ["mx1.example.com", "mx2.example.com", "mx3.example.com"];
+        let zone = Zone::default();
+        let mut records = Vec::new();
+        let mut own = Vec::new();
+        let mut refused = Vec::new();
+        for (index, name) in names.iter().enumerate() {
+            let third = u8::try_from(index + 1).expect("octet");
+            let ips: Vec<IpAddr> = (1..=4)
+                .map(|last| IpAddr::V4(Ipv4Addr::new(11, third, 0, last)))
+                .collect();
+            for &ip in &ips {
+                refused.push(serve(ip, Script::new(&[])));
+            }
+            own.extend(ips.iter().copied());
+            zone.set(name, Type::A, a(&ips));
+            records.push((u16::try_from(index + 1).expect("preference") * 10, *name));
+        }
+        records.push((40, "mx4.example.com"));
+        zone.set("example.com", Type::Mx, mx(&records));
+        zone.set("mx4.example.com", Type::A, a(&[global]));
+        let connector = Connector::new(simulated(2), None).expect("connector");
+        let settings = Settings::new("out.sender.example");
+        let deliver =
+            Deliver::with_local(zone, connector, settings, None, 9, Owns(own)).expect("deliver");
+        (simple(&deliver, "example.com").await, allowed, refused)
+    });
+    assert_eq!(answers(&outcomes), [Answer::Delivered]);
+    assert_eq!(allowed.borrow().connections, 1);
+    assert!(refused.iter().all(|seen| seen.borrow().connections == 0));
 }
 
 #[test]
@@ -656,6 +996,21 @@ fn deadline_bounds_the_attempt() {
     assert!(elapsed >= Duration::from_secs(20), "{elapsed:?}");
     assert!(elapsed < Duration::from_secs(21), "{elapsed:?}");
     assert_eq!(seen.borrow().bodies.len(), 1);
+}
+
+#[test]
+fn refused_hosts_stay_permanent_after_the_deadline() {
+    let outcomes = run(async {
+        let mut settings = Settings::new("out.sender.example");
+        settings.deadline = Duration::ZERO;
+        let deliver = deliverer(one_mx(MX1), settings);
+        simple(&deliver, "example.com").await
+    });
+    assert_eq!(answers(&outcomes), [Answer::Failed]);
+    assert_eq!(
+        reply(&outcomes[0]),
+        "550 5.4.4 No allowed mail server address"
+    );
 }
 
 #[test]
@@ -1190,7 +1545,7 @@ async fn both<A: Future, B: Future>(a: A, b: B) -> (A::Output, B::Output) {
     (x.expect("first"), y.expect("second"))
 }
 
-async fn ticks(deliver: &Deliver<Zone>, every: Duration, count: u32) {
+async fn ticks(deliver: &Deliver<Zone, Owns>, every: Duration, count: u32) {
     for _ in 0..count {
         deliver.tick().await;
         sleep(every).await;
@@ -1501,13 +1856,13 @@ fn testing_mode_observes_certificates_and_mx_names_without_blocking() {
     }
 }
 
-fn reporting(zone: Zone) -> Deliver<Zone> {
+fn reporting(zone: Zone) -> Deliver<Zone, Owns> {
     let mut settings = settings();
     settings.tlsrpt = true;
     deliverer(zone, settings)
 }
 
-async fn restored(deliver: &Deliver<Zone>, memory: &Rc<Memory>, naming: [u8; 16]) {
+async fn restored(deliver: &Deliver<Zone, Owns>, memory: &Rc<Memory>, naming: [u8; 16]) {
     let mut sts = restore(&Rc::new(Memory::default()));
     sts.naming = naming;
     deliver.restore(sts).await;

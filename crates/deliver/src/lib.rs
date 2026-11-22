@@ -1,3 +1,4 @@
+mod address;
 mod classify;
 mod conn;
 mod dane;
@@ -16,10 +17,11 @@ mod settings;
 mod sts;
 mod upload;
 
+pub use address::{Bind, Cidr, Local, OwnStats};
 pub use classify::{answer, kind};
 pub use deliver::{Deliver, Due, Message, Outcome};
 pub use gzip::gzip;
-pub use hook::{Bind, Cidr, HookSettings, Hooks, Local, delivery_id, signature};
+pub use hook::{HookSettings, Hooks, delivery_id, signature};
 pub use mx::Dns;
 pub use owners::OwnerStats;
 pub use pool::{Remote, limits};

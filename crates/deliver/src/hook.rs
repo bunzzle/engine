@@ -1,7 +1,7 @@
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt::Write as _;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::IpAddr;
 use std::pin::Pin;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -12,10 +12,11 @@ use control::{Hook, HookState};
 use crypto::{Ids, Secret, hmac_sha256};
 use dkim::base64;
 use dns::Name;
-use rt::{Instant, TcpStream, UdpSocket, timeout};
+use rt::{Instant, TcpStream, timeout};
 use sched::{Call, Deliver, Node, Outcome, Sending, Transport, event_json};
 use tls::{Connector, Verify};
 
+use crate::address::{Bind, Cidr, Local, Own};
 use crate::mx::{self, Addresses, Dns};
 use crate::upload::{Target, target};
 
@@ -32,63 +33,11 @@ const PAUSE_MAX: Duration = Duration::from_hours(1);
 const DOUBLINGS: u32 = 9;
 const IDLE: Duration = Duration::from_hours(2);
 const PRUNE: Duration = Duration::from_secs(60);
-const OWN: usize = 1024;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Cidr {
-    pub ip: IpAddr,
-    pub prefix: u8,
-}
-
-impl Cidr {
-    pub fn parse(text: &str) -> Option<Self> {
-        let (ip, prefix) = match text.split_once('/') {
-            Some((ip, prefix))
-                if !prefix.is_empty() && prefix.bytes().all(|b| b.is_ascii_digit()) =>
-            {
-                (ip.parse::<IpAddr>().ok()?, prefix.parse::<u8>().ok()?)
-            }
-            Some(_) => return None,
-            None => {
-                let ip = text.parse::<IpAddr>().ok()?;
-                (ip, if ip.is_ipv4() { 32 } else { 128 })
-            }
-        };
-        let most = if ip.is_ipv4() { 32 } else { 128 };
-        (prefix <= most).then_some(Self { ip, prefix })
-    }
-
-    pub fn contains(&self, ip: &IpAddr) -> bool {
-        let (net, ip, bits) = match (self.ip, ip) {
-            (IpAddr::V4(net), IpAddr::V4(ip)) => (
-                u128::from(u32::from(net)) << 96,
-                u128::from(u32::from(*ip)) << 96,
-                self.prefix,
-            ),
-            (IpAddr::V6(net), IpAddr::V6(ip)) => (u128::from(net), u128::from(*ip), self.prefix),
-            _ => return false,
-        };
-        let mask = u128::MAX.checked_shl(128 - u32::from(bits)).unwrap_or(0);
-        net & mask == ip & mask
-    }
-}
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct HookSettings {
     pub egress: Option<IpAddr>,
     pub allow: Vec<Cidr>,
-}
-
-pub trait Local {
-    fn bound(&self, ip: IpAddr) -> impl Future<Output = bool>;
-}
-
-pub struct Bind;
-
-impl Local for Bind {
-    async fn bound(&self, ip: IpAddr) -> bool {
-        UdpSocket::bind(SocketAddr::new(ip, 0)).await.is_ok()
-    }
 }
 
 pub struct Hooks<T, D, L = Bind> {
@@ -100,12 +49,11 @@ struct Inner<T, D, L> {
     dns: D,
     tls: Connector,
     settings: HookSettings,
-    local: L,
     core: Rc<Gate>,
     tenants: RefCell<BTreeMap<u32, Rc<Gate>>>,
     failures: RefCell<BTreeMap<Key, (u32, Instant)>>,
     pruned: Cell<Instant>,
-    own: RefCell<BTreeMap<IpAddr, bool>>,
+    own: Own<L>,
     random: Cell<u64>,
 }
 
@@ -130,15 +78,18 @@ impl<T: Transport + 'static, D: Dns + 'static, L: Local + 'static> Hooks<T, D, L
                 dns,
                 tls,
                 settings,
-                local,
                 core: Gate::new(CORE_CALLS),
                 tenants: RefCell::default(),
                 failures: RefCell::default(),
                 pruned: Cell::new(rt::now()),
-                own: RefCell::default(),
+                own: Own::new(local),
                 random: Cell::new(seed | 1),
             }),
         }
+    }
+
+    pub fn own_stats(&self) -> crate::address::OwnStats {
+        self.inner.own.stats()
     }
 }
 
@@ -343,7 +294,7 @@ impl<T: Transport + 'static, D: Dns + 'static, L: Local + 'static> Inner<T, D, L
         };
         let mut out = Vec::new();
         for &v6 in families {
-            let keep = |ip: &IpAddr| keep(ip, &self.settings.allow);
+            let keep = |ip: &IpAddr| crate::address::keep(ip, &self.settings.allow);
             if let Addresses::Found { ips, .. } = mx::filtered(&self.dns, name, v6, keep).await {
                 out.extend(ips);
             }
@@ -353,7 +304,7 @@ impl<T: Transport + 'static, D: Dns + 'static, L: Local + 'static> Inner<T, D, L
             if kept.len() == ADDRESSES {
                 break;
             }
-            if !self.own(ip).await {
+            if !self.own.own(ip).await {
                 kept.push(ip);
             }
         }
@@ -361,32 +312,11 @@ impl<T: Transport + 'static, D: Dns + 'static, L: Local + 'static> Inner<T, D, L
     }
 
     async fn connect(&self, ip: IpAddr, target: &Target) -> std::io::Result<TcpStream> {
-        let to = SocketAddr::new(ip, target.port);
+        let to = std::net::SocketAddr::new(ip, target.port);
         match self.settings.egress {
             Some(egress) => TcpStream::connect_from(egress, to).await,
             None => TcpStream::connect(to).await,
         }
-    }
-
-    async fn own(&self, ip: IpAddr) -> bool {
-        for ip in std::iter::once(ip).chain(embedded(ip).map(IpAddr::V4)) {
-            let known = self.own.borrow().get(&ip).copied();
-            let own = if let Some(own) = known {
-                own
-            } else {
-                let own = self.local.bound(ip).await;
-                let mut cache = self.own.borrow_mut();
-                if cache.len() >= OWN {
-                    cache.clear();
-                }
-                cache.insert(ip, own);
-                own
-            };
-            if own {
-                return true;
-            }
-        }
-        false
     }
 
     async fn request(
@@ -500,47 +430,6 @@ fn retry_after(head: &[u8]) -> Option<Duration> {
     })
 }
 
-pub(crate) fn keep(ip: &IpAddr, allow: &[Cidr]) -> bool {
-    if floor(ip) {
-        return false;
-    }
-    mx::global(ip) || (embedded(*ip).is_none() && allow.iter().any(|cidr| cidr.contains(ip)))
-}
-
-fn floor(ip: &IpAddr) -> bool {
-    let v4 = match ip {
-        IpAddr::V4(v4) => Some(*v4),
-        IpAddr::V6(v6) => embedded(IpAddr::V6(*v6)),
-    };
-    let link = match ip {
-        IpAddr::V4(v4) => v4.is_link_local(),
-        IpAddr::V6(v6) => v6.segments()[0] & 0xffc0 == 0xfe80,
-    };
-    !mx::usable(ip)
-        || link
-        || v4.is_some_and(|v4| !mx::usable(&IpAddr::V4(v4)) || v4.is_link_local())
-}
-
-fn embedded(ip: IpAddr) -> Option<Ipv4Addr> {
-    let IpAddr::V6(v6) = ip else {
-        return None;
-    };
-    let segments = v6.segments();
-    let pair = match segments {
-        [0, 0, 0, 0, 0, 0 | 0xffff, ..]
-            if v6 != Ipv6Addr::UNSPECIFIED && v6 != Ipv6Addr::LOCALHOST =>
-        {
-            (segments[6], segments[7])
-        }
-        [0x64, 0xff9b, 0, 0, 0, 0, ..] | [0x64, 0xff9b, 1, ..] => (segments[6], segments[7]),
-        [0x2002, high, low, ..] => (high, low),
-        _ => return None,
-    };
-    let [first, second] = pair.0.to_be_bytes();
-    let [third, fourth] = pair.1.to_be_bytes();
-    Some(Ipv4Addr::new(first, second, third, fourth))
-}
-
 struct Gate {
     cap: usize,
     used: Cell<usize>,
@@ -637,61 +526,6 @@ impl Drop for Permit {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn ip(text: &str) -> IpAddr {
-        text.parse().expect("address")
-    }
-
-    #[test]
-    fn allowed_addresses_never_pass_the_floor() {
-        let allow = [
-            Cidr::parse("10.0.0.0/8").expect("cidr"),
-            Cidr::parse("fd00::/8").expect("cidr"),
-            Cidr::parse("127.0.0.0/8").expect("cidr"),
-            Cidr::parse("169.254.0.0/16").expect("cidr"),
-            Cidr::parse("::/0").expect("cidr"),
-        ];
-        for good in ["8.8.8.8", "10.1.2.3", "fd00::1", "64:ff9b::8.8.8.8"] {
-            assert!(keep(&ip(good), &allow), "{good}");
-        }
-        for bad in [
-            "127.0.0.1",
-            "169.254.169.254",
-            "0.0.0.0",
-            "::1",
-            "::",
-            "fe80::1",
-            "::ffff:127.0.0.1",
-            "::ffff:10.1.2.3",
-            "::ffff:169.254.169.254",
-            "64:ff9b::10.0.0.1",
-            "64:ff9b::127.0.0.1",
-            "2002:7f00:0001::1",
-            "224.0.0.1",
-            "255.255.255.255",
-        ] {
-            assert!(!keep(&ip(bad), &allow), "{bad}");
-        }
-        assert!(!keep(&ip("10.1.2.3"), &[]));
-        assert!(!keep(&ip("fd00::1"), &[]));
-    }
-
-    #[test]
-    fn cidrs_match_by_prefix() {
-        let net = Cidr::parse("192.168.4.0/22").expect("cidr");
-        assert!(net.contains(&ip("192.168.7.255")));
-        assert!(!net.contains(&ip("192.168.8.0")));
-        assert!(!net.contains(&ip("::ffff:192.168.4.1")));
-        assert!(
-            Cidr::parse("0.0.0.0/0")
-                .expect("all")
-                .contains(&ip("1.2.3.4"))
-        );
-        assert_eq!(Cidr::parse("10.0.0.1").map(|c| c.prefix), Some(32));
-        for bad in ["10.0.0.0/33", "::/129", "x/8", "10.0.0.0/", "10.0.0.0/+8"] {
-            assert!(Cidr::parse(bad).is_none(), "{bad}");
-        }
-    }
 
     #[test]
     fn retry_after_takes_only_delta_seconds() {

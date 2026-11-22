@@ -155,15 +155,20 @@ fn webhooks(mut table: Table, roots: bool) -> Result<deliver::HookSettings, Erro
         }
         settings.egress = Some(ip);
     }
+    allow(&mut table, &mut settings.allow)?;
+    table.finish()?;
+    Ok(settings)
+}
+
+fn allow(table: &mut Table, allow: &mut Vec<deliver::Cidr>) -> Result<(), Error> {
     if let Some(entry) = table.take("allow") {
         for text in entry.strs()? {
             let cidr = deliver::Cidr::parse(text)
                 .ok_or_else(|| entry.error(format!("`{text}` must be an address or CIDR")))?;
-            settings.allow.push(cidr);
+            allow.push(cidr);
         }
     }
-    table.finish()?;
-    Ok(settings)
+    Ok(())
 }
 
 fn tlsrpt(
@@ -325,6 +330,7 @@ fn deliver(mut table: Table, delivery: &mut Delivery, roots: bool) -> Result<(),
             _ => return Err(entry.error("must be \"send\" or \"fail\"")),
         };
     }
+    allow(&mut table, &mut settings.allow)?;
     let t = &mut settings.timeouts;
     t.connect = duration(&mut table, "connect_timeout", t.connect)?;
     t.banner = duration(&mut table, "banner_timeout", t.banner)?;

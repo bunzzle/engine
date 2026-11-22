@@ -18,6 +18,7 @@ use smtp::client::{
 };
 use tls::{Connector, Observed, Refusal, Tlsa, Verify};
 
+use crate::address::{Bind, Local, Own};
 use crate::classify;
 use crate::conn::{Conn, Lost, left};
 use crate::dane::{self, Dane};
@@ -45,6 +46,7 @@ const NULL_MX: &[u8] = b"556 5.1.10 Recipient domain does not accept mail";
 const MX_FAILED: &[u8] = b"451 4.4.3 MX lookup failed";
 const HOST_FAILED: &[u8] = b"451 4.4.3 Mail server address lookup failed";
 const NO_HOST: &[u8] = b"451 4.4.4 No mail server address";
+const NOT_ALLOWED: &[u8] = b"550 5.4.4 No allowed mail server address";
 const DEAD: &[u8] = b"451 4.4.1 Mail server recently unreachable";
 const BUSY: &[u8] = b"451 4.4.5 Connection limit reached";
 const REQUIRETLS: &[u8] = b"550 5.7.30 REQUIRETLS not possible";
@@ -78,7 +80,7 @@ pub struct Due {
     pub rua: Rua,
 }
 
-pub struct Deliver<D> {
+pub struct Deliver<D, L = Bind> {
     dns: D,
     tls: Connector,
     settings: Settings,
@@ -87,6 +89,7 @@ pub struct Deliver<D> {
     sts: Sts,
     results: Results,
     owners: Owners,
+    own: Own<L>,
     last: Cell<Option<IpAddr>>,
     dead: RefCell<BTreeMap<(IpAddr, IpAddr), Instant>>,
     ehlo: Vec<u8>,
@@ -163,6 +166,17 @@ impl Need {
     }
 }
 
+enum Kept {
+    Found {
+        ips: Vec<IpAddr>,
+        target: Name,
+        dnssec: bool,
+    },
+    Refused,
+    Failed,
+    Timeout,
+}
+
 enum Tried {
     Next(Vec<u8>),
     Busy,
@@ -177,6 +191,19 @@ impl<D: Dns> Deliver<D> {
         leases: Option<Leases<Remote>>,
         seed: u64,
     ) -> Result<Self, Refused> {
+        Self::with_local(dns, tls, settings, leases, seed, Bind)
+    }
+}
+
+impl<D: Dns, L: Local> Deliver<D, L> {
+    pub fn with_local(
+        dns: D,
+        tls: Connector,
+        settings: Settings,
+        leases: Option<Leases<Remote>>,
+        seed: u64,
+        local: L,
+    ) -> Result<Self, Refused> {
         let ehlo = client::ehlo(&settings.ehlo)?;
         let helo = client::helo(&settings.ehlo)?;
         let pool = Pool::new(settings.idle, settings.pooled);
@@ -189,6 +216,7 @@ impl<D: Dns> Deliver<D> {
             sts: Sts::default(),
             results: Results::default(),
             owners: Owners::default(),
+            own: Own::new(local),
             last: Cell::new(None),
             dead: RefCell::new(BTreeMap::new()),
             ehlo,
@@ -212,6 +240,10 @@ impl<D: Dns> Deliver<D> {
 
     pub fn policy_stats(&self) -> PolicyStats {
         self.sts.stats()
+    }
+
+    pub fn own_stats(&self) -> crate::address::OwnStats {
+        self.own.stats()
     }
 
     pub fn report_mesh(&mut self, ends: Ends<Taken>) -> JoinHandle<()> {
@@ -317,14 +349,10 @@ impl<D: Dns> Deliver<D> {
             return every(Answer::Failed, BAD_DOMAIN);
         };
         let mut pick = |n| self.pick(n);
-        let (mut hosts, secure) =
-            match timeout(deadline, mx::hosts(&self.dns, &domain, &mut pick)).await {
-                Ok(Hosts::Found(hosts, secure)) => (hosts, secure),
-                Ok(Hosts::NullMx) => return every(Answer::Failed, NULL_MX),
-                Ok(Hosts::NoDomain) => return every(Answer::Failed, NO_DOMAIN),
-                Ok(Hosts::Failed) => return every(TEMPORARY, MX_FAILED),
-                Err(_) => return every(TEMPORARY, Lost::Timeout.text()),
-            };
+        let (mut hosts, secure) = match self.hosts(&domain, deadline, &mut pick).await {
+            Ok(hosts) => hosts,
+            Err((answer, reply)) => return every(answer, reply),
+        };
         let enforced = self.enforce(egress, &domain, (&mut hosts, secure), (end, envelope));
         let (sts, scope) = match enforced.await {
             Ok(enforced) => enforced,
@@ -335,27 +363,34 @@ impl<D: Dns> Deliver<D> {
         let mut last = NO_HOST.to_vec();
         let mut tried = 0;
         let mut others = false;
+        let mut refused = 0;
         'hosts: for host in &hosts {
-            let lookup = mx::addresses(&self.dns, host, egress.is_ipv6());
-            let (found, target, dnssec) = match timeout(left(end, deadline), lookup).await {
-                Ok(Addresses::Found {
+            let (kept, target, dnssec) = match self
+                .kept(host, egress, end, deadline, &destination.egress)
+                .await
+            {
+                Kept::Found {
                     ips,
-                    secure: dnssec,
                     target,
-                }) => (ips, target, dnssec),
-                Ok(Addresses::Failed) => {
+                    dnssec,
+                } => (ips, target, dnssec),
+                Kept::Refused => {
+                    refused += 1;
+                    continue;
+                }
+                Kept::Failed => {
                     if tried == 0 {
                         last = HOST_FAILED.to_vec();
                     }
                     others = true;
                     continue;
                 }
-                Err(_) => {
+                Kept::Timeout => {
                     others = true;
                     break;
                 }
             };
-            let dane = secure && dnssec && !found.is_empty() && !scope.muted;
+            let dane = secure && dnssec && !kept.is_empty() && !scope.muted;
             let Some(need) = self.need(end, (egress, host), &target, dane, sts).await else {
                 last = TLSA_FAILED.to_vec();
                 others = true;
@@ -366,7 +401,7 @@ impl<D: Dns> Deliver<D> {
                 last = REQUIRETLS.to_vec();
                 continue;
             }
-            for ip in found {
+            for ip in kept {
                 if tried == ADDRESSES || now() >= end {
                     break 'hosts;
                 }
@@ -391,12 +426,68 @@ impl<D: Dns> Deliver<D> {
                 }
             }
         }
-        if now() >= end {
-            last = Lost::Timeout.text().to_vec();
-        } else if envelope.required.requiretls && !others && last == REQUIRETLS {
-            return every(Answer::Failed, REQUIRETLS);
+        let refused =
+            refused == hosts.len() && !hosts.is_empty() && one_family(egress, &destination.egress);
+        finished(recipients, envelope.required, end, (refused, others, last))
+    }
+
+    async fn hosts(
+        &self,
+        domain: &Name,
+        deadline: Duration,
+        pick: &mut impl FnMut(usize) -> usize,
+    ) -> Result<(Vec<Name>, bool), (Answer, &'static [u8])> {
+        match timeout(deadline, mx::hosts(&self.dns, domain, pick)).await {
+            Ok(Hosts::Found(hosts, secure)) => Ok((hosts, secure)),
+            Ok(Hosts::NullMx) => Err((Answer::Failed, NULL_MX)),
+            Ok(Hosts::NoDomain) => Err((Answer::Failed, NO_DOMAIN)),
+            Ok(Hosts::Failed) => Err((TEMPORARY, MX_FAILED)),
+            Err(_) => Err((TEMPORARY, Lost::Timeout.text())),
         }
-        every(TEMPORARY, &last)
+    }
+
+    async fn kept(
+        &self,
+        host: &Name,
+        egress: IpAddr,
+        end: Instant,
+        deadline: Duration,
+        egresses: &[(IpAddr, u16)],
+    ) -> Kept {
+        let resolved = Cell::new(false);
+        let passed = Cell::new(false);
+        let lookup = mx::filtered(&self.dns, host, egress.is_ipv6(), |ip| {
+            resolved.set(true);
+            let keep = crate::address::keep(ip, &self.settings.allow);
+            passed.set(passed.get() || keep);
+            keep
+        });
+        let (found, target, dnssec) = match timeout(left(end, deadline), lookup).await {
+            Ok(Addresses::Found {
+                ips,
+                secure: dnssec,
+                target,
+            }) => (ips, target, dnssec),
+            Ok(Addresses::Failed) => return Kept::Failed,
+            Err(_) => return Kept::Timeout,
+        };
+        let mut kept = Vec::with_capacity(found.len());
+        for ip in found {
+            if self.own.own(ip).await {
+                continue;
+            }
+            if !egresses.iter().any(|(egress, _)| *egress == ip) {
+                kept.push(ip);
+            }
+        }
+        if resolved.get() && !passed.get() {
+            return Kept::Refused;
+        }
+        Kept::Found {
+            ips: kept,
+            target,
+            dnssec,
+        }
     }
 
     async fn enforce(
@@ -874,7 +965,7 @@ fn refused_type(refused: Refusal) -> Option<ResultType> {
     }
 }
 
-impl<D: Dns> Transport for Deliver<D> {
+impl<D: Dns, L: Local> Transport for Deliver<D, L> {
     fn restore(&self, restore: Restore) -> impl Future<Output = ()> {
         match restore.kind {
             KIND_STS => self.sts.restore(restore),
@@ -1008,6 +1099,31 @@ impl<D: Dns> Transport for Deliver<D> {
             })
             .collect()
     }
+}
+
+fn one_family(egress: IpAddr, egresses: &[(IpAddr, u16)]) -> bool {
+    egresses
+        .iter()
+        .filter(|(_, weight)| *weight > 0)
+        .all(|(ip, _)| ip.is_ipv6() == egress.is_ipv6())
+}
+
+fn finished(
+    recipients: &[(u32, Recipient)],
+    required: Required,
+    end: Instant,
+    (refused, others, last): (bool, bool, Vec<u8>),
+) -> Vec<Outcome> {
+    if refused {
+        return all(recipients, Answer::Failed, NOT_ALLOWED);
+    }
+    if now() >= end {
+        return all(recipients, TEMPORARY, Lost::Timeout.text());
+    }
+    if required.requiretls && !others && last == REQUIRETLS {
+        return all(recipients, Answer::Failed, REQUIRETLS);
+    }
+    all(recipients, TEMPORARY, &last)
 }
 
 fn all(recipients: &[(u32, Recipient)], answer: Answer, reply: &[u8]) -> Vec<Outcome> {

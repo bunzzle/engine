@@ -184,6 +184,7 @@ pooled = 50
 dead = "2m"
 mta_sts = true
 egress = "192.0.2.7"
+allow = ["10.0.0.0/8", "fd00::/8"]
 eight_bit = "fail"
 connect_timeout = "10s"
 banner_timeout = "1m"
@@ -239,6 +240,13 @@ cache = 500"#,
     assert_eq!((settings.reuse, settings.pooled), (20, 50));
     assert!(settings.mta_sts);
     assert_eq!(settings.egress, Some("192.0.2.7".parse().expect("ip")));
+    assert_eq!(
+        settings.allow,
+        [
+            deliver::Cidr::parse("10.0.0.0/8").expect("cidr"),
+            deliver::Cidr::parse("fd00::/8").expect("cidr"),
+        ]
+    );
     assert_eq!(settings.eight_bit, deliver::EightBit::Fail);
     let t = settings.timeouts;
     assert_eq!(
@@ -320,6 +328,14 @@ fn egress_must_be_a_unicast_address() {
             format!("line 22, column 1: {want}")
         );
     }
+}
+
+#[test]
+fn deliver_allow_rejects_a_bad_cidr() {
+    assert_eq!(
+        error(&format!("{MINIMAL}[deliver]\nallow = [\"10.0.0.0/33\"]\n")),
+        "line 22, column 1: `allow` `10.0.0.0/33` must be an address or CIDR"
+    );
 }
 
 #[test]
