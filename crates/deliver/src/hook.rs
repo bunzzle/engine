@@ -107,7 +107,23 @@ enum Sent {
     Status(u16, Option<Duration>),
     Refused,
     Internal,
-    Failed,
+    Failed(&'static str),
+}
+
+fn failure(call: &Call, sent: &Sent) -> Option<String> {
+    let (tenant, hook) = (call.tenant, call.hook);
+    match sent {
+        Sent::Status(status, _) if !(200..=299).contains(status) => Some(format!(
+            "webhook call failed: tenant={tenant} hook={hook} status={status}"
+        )),
+        Sent::Internal => Some(format!(
+            "webhook call failed: tenant={tenant} hook={hook} reason=internal"
+        )),
+        Sent::Failed(reason) => Some(format!(
+            "webhook call failed: tenant={tenant} hook={hook} reason={reason}"
+        )),
+        _ => None,
+    }
 }
 
 impl<T: Transport + 'static, D: Dns + 'static, L: Local + 'static> Inner<T, D, L> {
@@ -124,7 +140,7 @@ impl<T: Transport + 'static, D: Dns + 'static, L: Local + 'static> Inner<T, D, L
             let mut open = None;
             let sent = timeout(CALL, self.attempt(call, &mut open))
                 .await
-                .unwrap_or(Sent::Failed);
+                .unwrap_or(Sent::Failed("timeout"));
             if let Some(mut stream) = open {
                 let _ = timeout(CLOSE, stream.shutdown()).await;
             }
@@ -140,6 +156,9 @@ impl<T: Transport + 'static, D: Dns + 'static, L: Local + 'static> Inner<T, D, L
     fn outcome(&self, call: &Call, sent: Sent) -> Outcome {
         let key = (call.tenant, call.generation, call.hook);
         self.prune();
+        if let Some(line) = failure(call, &sent) {
+            eprintln!("{line}");
+        }
         match sent {
             Sent::Status(status @ 200..=299, _) => {
                 self.failures.borrow_mut().remove(&key);
@@ -168,7 +187,7 @@ impl<T: Transport + 'static, D: Dns + 'static, L: Local + 'static> Inner<T, D, L
                 let n = self.failed(key);
                 Outcome::Refused(self.pause(n))
             }
-            Sent::Failed => {
+            Sent::Failed(_) => {
                 let n = self.failed(key);
                 Outcome::Retry {
                     after: self.pause(n),
@@ -231,10 +250,10 @@ impl<T: Transport + 'static, D: Dns + 'static, L: Local + 'static> Inner<T, D, L
             return Sent::Refused;
         };
         if !self.tls.webpki() {
-            return Sent::Failed;
+            return Sent::Failed("no-roots");
         }
         let Some(target) = target(&first.0.url) else {
-            return Sent::Failed;
+            return Sent::Failed("url");
         };
         let Some(secrets) = self.secrets(call, &first).await else {
             return Sent::Internal;
@@ -246,18 +265,25 @@ impl<T: Transport + 'static, D: Dns + 'static, L: Local + 'static> Inner<T, D, L
             return Sent::Internal;
         };
         let Ok(name) = Name::parse(&target.host) else {
-            return Sent::Failed;
+            return Sent::Failed("name");
         };
-        for ip in self.addresses(&name).await {
+        let (ips, mismatch) = self.addresses(&name).await;
+        if ips.is_empty() && mismatch {
+            return Sent::Failed("egress-family");
+        }
+        let mut failed = "no-address";
+        for ip in ips {
             if !self.same(call, &first) {
                 return Sent::Refused;
             }
             let Ok(Ok(io)) = timeout(CONNECT, self.connect(ip, &target)).await else {
+                failed = "connect";
                 continue;
             };
             let Ok(Ok(mut stream)) =
                 timeout(CONNECT, self.tls.connect(io, &target.host, Verify::WebPki)).await
             else {
+                failed = "tls";
                 continue;
             };
             let Some(request) = self.request(call, &target, &ids, &secrets).await else {
@@ -267,14 +293,14 @@ impl<T: Transport + 'static, D: Dns + 'static, L: Local + 'static> Inner<T, D, L
                 return Sent::Refused;
             }
             if stream.write_all(&request).await.is_err() {
-                return Sent::Failed;
+                return Sent::Failed("write");
             }
             drop(request);
             let sent = read_status(&mut stream).await;
             *open = Some(stream);
             return sent;
         }
-        Sent::Failed
+        Sent::Failed(failed)
     }
 
     async fn secrets(
@@ -290,7 +316,7 @@ impl<T: Transport + 'static, D: Dns + 'static, L: Local + 'static> Inner<T, D, L
         Some(out)
     }
 
-    async fn addresses(&self, name: &Name) -> Vec<IpAddr> {
+    async fn addresses(&self, name: &Name) -> (Vec<IpAddr>, bool) {
         let families: &[bool] = match self.settings.egress {
             Some(egress) => &[egress.is_ipv6()],
             None => &[false, true],
@@ -311,7 +337,18 @@ impl<T: Transport + 'static, D: Dns + 'static, L: Local + 'static> Inner<T, D, L
                 kept.push(ip);
             }
         }
-        kept
+        let mut mismatch = false;
+        if kept.is_empty()
+            && let Some(egress) = self.settings.egress
+        {
+            let keep = |ip: &IpAddr| crate::address::keep(ip, &self.settings.allow);
+            if let Addresses::Found { ips, .. } =
+                mx::filtered(&self.dns, name, !egress.is_ipv6(), keep).await
+            {
+                mismatch = !ips.is_empty();
+            }
+        }
+        (kept, mismatch)
     }
 
     async fn connect(&self, ip: IpAddr, target: &Target) -> std::io::Result<TcpStream> {
@@ -397,18 +434,18 @@ async fn read_status(stream: &mut tls::Stream) -> Sent {
                 break at + 4;
             }
             if bytes.len() >= HEAD {
-                return Sent::Failed;
+                return Sent::Failed("answer");
             }
             match stream.read(&mut buf).await {
-                Ok(0) | Err(_) => return Sent::Failed,
+                Ok(0) | Err(_) => return Sent::Failed("answer"),
                 Ok(n) => bytes.extend_from_slice(&buf[..n]),
             }
         };
         if end > HEAD {
-            return Sent::Failed;
+            return Sent::Failed("answer");
         }
         let Some(code) = crate::https::status(&bytes[..end]) else {
-            return Sent::Failed;
+            return Sent::Failed("answer");
         };
         if (100..200).contains(&code) {
             bytes.drain(..end);
@@ -529,6 +566,36 @@ impl Drop for Permit {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failure_lines_carry_tenant_hook_and_a_status_or_reason() {
+        let call = Call {
+            tenant: 7,
+            generation: 1,
+            hook: 9,
+            id: [0; 16],
+            lost: 0,
+            events: Vec::new(),
+        };
+        assert_eq!(failure(&call, &Sent::Status(200, None)), None);
+        assert_eq!(failure(&call, &Sent::Refused), None);
+        assert_eq!(
+            failure(&call, &Sent::Status(500, None)).as_deref(),
+            Some("webhook call failed: tenant=7 hook=9 status=500")
+        );
+        assert_eq!(
+            failure(&call, &Sent::Status(410, None)).as_deref(),
+            Some("webhook call failed: tenant=7 hook=9 status=410")
+        );
+        assert_eq!(
+            failure(&call, &Sent::Failed("egress-family")).as_deref(),
+            Some("webhook call failed: tenant=7 hook=9 reason=egress-family")
+        );
+        assert_eq!(
+            failure(&call, &Sent::Internal).as_deref(),
+            Some("webhook call failed: tenant=7 hook=9 reason=internal")
+        );
+    }
 
     #[test]
     fn retry_after_takes_only_delta_seconds() {
