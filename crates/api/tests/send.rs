@@ -2347,7 +2347,10 @@ async fn check_hook_status(http: &mut Http, token: &str, first_id: &str, second_
         .await
         .json();
     assert_eq!(text_of(&paused, "state"), "paused");
-    assert_eq!(paused.get("failing_since"), Some(&Value::Null));
-    assert_eq!(paused.get("last_status"), Some(&Value::Null));
+    assert_eq!(
+        text_of(&paused, "failing_since"),
+        text_of(&failed, "failing_since")
+    );
+    assert_eq!(paused.get("last_status").and_then(Value::as_u64), Some(503));
     assert_eq!(paused.get("lost").and_then(Value::as_u64), Some(7));
 }
