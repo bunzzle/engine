@@ -323,6 +323,7 @@ struct Tokens {
     second: String,
     smtp: String,
     send: String,
+    hooks: String,
     third: String,
     publics: BTreeMap<String, Vec<u8>>,
 }
@@ -388,6 +389,11 @@ async fn prepare(nodes: &[Node<Idle>]) -> Tokens {
         hooks: false,
         ..api
     };
+    let hooks = Scopes {
+        smtp: false,
+        api: false,
+        hooks: true,
+    };
     let smtp = Scopes {
         smtp: true,
         api: false,
@@ -398,10 +404,11 @@ async fn prepare(nodes: &[Node<Idle>]) -> Tokens {
     let (third, smtp_token) = control.access_new(1, smtp, 0).await.expect("access");
     let (fourth, third_token) = control.access_new(3, api, 0).await.expect("access");
     let (fifth, send_token) = control.access_new(1, send, 0).await.expect("access");
+    let (sixth, hooks_token) = control.access_new(1, hooks, 0).await.expect("access");
     until("records", || {
         nodes.iter().all(|n| {
             let table = n.table();
-            [first.id, second.id, third.id, fourth.id, fifth.id]
+            [first.id, second.id, third.id, fourth.id, fifth.id, sixth.id]
                 .iter()
                 .all(|id| table.access(*id).is_some())
                 && table.sender(1, "example.org").is_some_and(|d| d.rsa != 0)
@@ -420,6 +427,7 @@ async fn prepare(nodes: &[Node<Idle>]) -> Tokens {
         second: text(&second_token),
         smtp: text(&smtp_token),
         send: text(&send_token),
+        hooks: text(&hooks_token),
         third: text(&third_token),
         publics: [
             ("e1".into(), ed.public),
@@ -808,6 +816,7 @@ fn refusals_answer_stable_codes_and_store_nothing() {
             let cases: Vec<(&str, String, u16, &str)> = vec![
                 ("nobody", ok.into(), 401, "unauthorized"),
                 (&tokens.smtp, ok.into(), 403, "scope_not_allowed"),
+                (&tokens.hooks, ok.into(), 403, "scope_not_allowed"),
                 (first, "{".into(), 400, "bad_request"),
                 (first, "[]".into(), 400, "bad_request"),
                 (first, r#"{"from":"ann@example.org","to":"a@example.com","text":"x","tags":[]}"#.into(), 400, "bad_request"),
@@ -843,7 +852,7 @@ fn refusals_answer_stable_codes_and_store_nothing() {
                     assert_eq!(refused[0].get("code").and_then(Value::as_str), Some("suppressed"));
                 }
                 let close = reply.header("connection") == Some("close");
-                assert_eq!(close, status == 401, "{body}");
+                assert_eq!(close, status == 401 || code == "scope_not_allowed", "{body}");
             }
 
             let mut http = Http::tls(&tls).await;
@@ -887,7 +896,7 @@ fn refusals_answer_stable_codes_and_store_nothing() {
 
             assert!(stored(&nodes).is_empty());
             assert_eq!(ports.count(Route::Messages, 200), 0);
-            assert_eq!(ports.count(Route::Messages, 401), 2);
+            assert_eq!(ports.count(Route::Messages, 401), 1);
             ports.close().await;
         });
         cluster.stop();
@@ -1868,11 +1877,13 @@ fn event_reads_refuse_bad_queries_and_parallel_reads() {
             }
             let reply = http.send_reply(&get(&tokens.first, "?")).await;
             assert_eq!(reply.status, 200);
-            let reply = http.send_reply(&get(&tokens.smtp, "")).await;
-            assert_eq!(
-                (reply.status, reply.code().as_str()),
-                (403, "scope_not_allowed")
-            );
+            for token in [&tokens.smtp, &tokens.hooks] {
+                let reply = http.send_reply(&get(token, "")).await;
+                assert_eq!(
+                    (reply.status, reply.code().as_str()),
+                    (403, "scope_not_allowed")
+                );
+            }
             for method in ["POST", "OPTIONS", "DELETE"] {
                 let request = format!(
                     "{method} /v1/events HTTP/1.1\r\nHost: api.test\r\nContent-Length: 0\r\n\r\n"
@@ -2011,19 +2022,18 @@ async fn hook_isolation(http: &mut Http, tokens: &Tokens, id: &str) {
         let reply = http.send_reply(&hook_call("GET", path, first, None)).await;
         assert_eq!(reply.status, 404, "{path}");
     }
-    let create = r#"{"url":"https://hooks.example.com/in"}"#;
     for token in [&tokens.smtp, &tokens.send] {
-        for (method, path, body) in [
-            ("GET", "/v1/webhooks".to_owned(), None),
-            ("POST", "/v1/webhooks".to_owned(), Some(create)),
-            ("GET", one.clone(), None),
-            ("PATCH", one.clone(), Some(r#"{"enabled":false}"#)),
-            ("DELETE", one.clone(), None),
-            ("POST", format!("{one}/rotate"), None),
-            ("GET", format!("{one}/secret"), None),
+        for (method, path) in [
+            ("GET", "/v1/webhooks".to_owned()),
+            ("POST", "/v1/webhooks".to_owned()),
+            ("GET", one.clone()),
+            ("PATCH", one.clone()),
+            ("DELETE", one.clone()),
+            ("POST", format!("{one}/rotate")),
+            ("GET", format!("{one}/secret")),
         ] {
             let reply = http
-                .send_reply(&hook_call(method, &path, token, body))
+                .send_reply(&hook_call(method, &path, token, None))
                 .await;
             assert_eq!(
                 (reply.status, reply.code().as_str()),
@@ -2032,8 +2042,10 @@ async fn hook_isolation(http: &mut Http, tokens: &Tokens, id: &str) {
             );
         }
     }
-    let reply = http.send_reply(&hook_call("GET", &one, first, None)).await;
-    assert_eq!(reply.status, 200);
+    for token in [first, &tokens.hooks] {
+        let reply = http.send_reply(&hook_call("GET", &one, token, None)).await;
+        assert_eq!(reply.status, 200);
+    }
     for (method, path, allow) in [
         ("PUT", "/v1/webhooks".to_owned(), "GET, POST"),
         ("POST", one.clone(), "GET, PATCH, DELETE"),
