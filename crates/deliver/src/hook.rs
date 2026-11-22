@@ -33,6 +33,12 @@ const PAUSE_MAX: Duration = Duration::from_hours(1);
 const DOUBLINGS: u32 = 9;
 const IDLE: Duration = Duration::from_hours(2);
 const PRUNE: Duration = Duration::from_secs(60);
+const KEEP: Duration = Duration::from_secs(15);
+const KEEP_AGE: Duration = Duration::from_mins(10);
+const KEEP_MAX: usize = 256;
+const DRAIN: usize = 16 * 1024;
+const DRAIN_TIME: Duration = Duration::from_secs(5);
+const LINE: usize = 4096;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct HookSettings {
@@ -52,6 +58,7 @@ struct Inner<T, D, L> {
     core: Rc<Gate>,
     tenants: RefCell<BTreeMap<u32, Rc<Gate>>>,
     failures: RefCell<BTreeMap<Key, (u32, Instant)>>,
+    idle: RefCell<BTreeMap<Key, Kept>>,
     pruned: Cell<Instant>,
     own: Own<L>,
     random: Cell<u64>,
@@ -81,6 +88,7 @@ impl<T: Transport + 'static, D: Dns + 'static, L: Local + 'static> Hooks<T, D, L
                 core: Gate::new(CORE_CALLS),
                 tenants: RefCell::default(),
                 failures: RefCell::default(),
+                idle: RefCell::default(),
                 pruned: Cell::new(rt::now()),
                 own: Own::new(local),
                 random: Cell::new(seed | 1),
@@ -101,6 +109,39 @@ impl<T: Transport + 'static, D: Dns + 'static, L: Local + 'static> Deliver for H
 }
 
 type Key = (u32, u32, u32);
+
+struct Kept {
+    stream: tls::Stream,
+    url: Box<str>,
+    born: Instant,
+    since: Instant,
+}
+
+struct Open {
+    stream: tls::Stream,
+    url: Box<str>,
+    born: Instant,
+    rest: Option<(Frame, Vec<u8>)>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Frame {
+    Empty,
+    Length(usize),
+    Chunked,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum End {
+    More,
+    At(usize),
+    Bad,
+}
+
+enum Read {
+    Got(Sent, Option<(Frame, Vec<u8>)>),
+    Nothing,
+}
 
 #[derive(Clone, Copy)]
 enum Sent {
@@ -141,8 +182,8 @@ impl<T: Transport + 'static, D: Dns + 'static, L: Local + 'static> Inner<T, D, L
             let sent = timeout(CALL, self.attempt(call, &mut open))
                 .await
                 .unwrap_or(Sent::Failed("timeout"));
-            if let Some(mut stream) = open {
-                let _ = timeout(CLOSE, stream.shutdown()).await;
+            if let Some(open) = open {
+                self.finish(call, open).await;
             }
             sent
         };
@@ -153,9 +194,54 @@ impl<T: Transport + 'static, D: Dns + 'static, L: Local + 'static> Inner<T, D, L
         self.outcome(call, sent)
     }
 
+    async fn finish(&self, call: &Call, mut open: Open) {
+        let kept = match open.rest.take() {
+            Some((frame, rest)) => matches!(
+                timeout(DRAIN_TIME, drain(&mut open.stream, frame, rest)).await,
+                Ok(true)
+            ),
+            None => false,
+        };
+        let now = rt::now();
+        if !kept || now.saturating_duration_since(open.born) >= KEEP_AGE {
+            let _ = timeout(CLOSE, open.stream.shutdown()).await;
+            return;
+        }
+        let mut idle = self.idle.borrow_mut();
+        idle.insert(
+            (call.tenant, call.generation, call.hook),
+            Kept {
+                stream: open.stream,
+                url: open.url,
+                born: open.born,
+                since: now,
+            },
+        );
+        if idle.len() > KEEP_MAX
+            && let Some(oldest) = idle
+                .iter()
+                .min_by_key(|(_, k)| k.since)
+                .map(|(key, _)| *key)
+        {
+            idle.remove(&oldest);
+        }
+    }
+
+    fn take(&self, key: &Key, url: &str) -> Option<Kept> {
+        let kept = self.idle.borrow_mut().remove(key)?;
+        let now = rt::now();
+        (kept.url.as_ref() == url
+            && now.saturating_duration_since(kept.since) < KEEP
+            && now.saturating_duration_since(kept.born) < KEEP_AGE)
+            .then_some(kept)
+    }
+
     fn outcome(&self, call: &Call, sent: Sent) -> Outcome {
         let key = (call.tenant, call.generation, call.hook);
         self.prune();
+        if matches!(sent, Sent::Refused | Sent::Status(410, _)) {
+            self.idle.borrow_mut().remove(&key);
+        }
         if let Some(line) = failure(call, &sent) {
             eprintln!("{line}");
         }
@@ -229,6 +315,9 @@ impl<T: Transport + 'static, D: Dns + 'static, L: Local + 'static> Inner<T, D, L
         self.failures
             .borrow_mut()
             .retain(|_, (_, at)| now.saturating_duration_since(*at) < IDLE);
+        self.idle
+            .borrow_mut()
+            .retain(|_, kept| now.saturating_duration_since(kept.since) < KEEP);
     }
 
     fn snapshot(&self, call: &Call) -> Option<(Hook, Option<u8>)> {
@@ -245,7 +334,7 @@ impl<T: Transport + 'static, D: Dns + 'static, L: Local + 'static> Inner<T, D, L
         })
     }
 
-    async fn attempt(&self, call: &Call, open: &mut Option<tls::Stream>) -> Sent {
+    async fn attempt(&self, call: &Call, open: &mut Option<Open>) -> Sent {
         let Some(first) = self.snapshot(call) else {
             return Sent::Refused;
         };
@@ -264,6 +353,28 @@ impl<T: Transport + 'static, D: Dns + 'static, L: Local + 'static> Inner<T, D, L
         let Ok(ids) = Ids::new(&ids) else {
             return Sent::Internal;
         };
+        let key = (call.tenant, call.generation, call.hook);
+        let mut request = None;
+        if let Some(mut kept) = self.take(&key, &first.0.url) {
+            let Some(bytes) = self.request(call, &target, &ids, &secrets).await else {
+                return Sent::Internal;
+            };
+            if !self.same(call, &first) {
+                return Sent::Refused;
+            }
+            if kept.stream.write_all(&bytes).await.is_ok()
+                && let Read::Got(sent, rest) = read_status(&mut kept.stream).await
+            {
+                *open = Some(Open {
+                    stream: kept.stream,
+                    url: kept.url,
+                    born: kept.born,
+                    rest,
+                });
+                return sent;
+            }
+            request = Some(bytes);
+        }
         let Ok(name) = Name::parse(&target.host) else {
             return Sent::Failed("name");
         };
@@ -286,18 +397,30 @@ impl<T: Transport + 'static, D: Dns + 'static, L: Local + 'static> Inner<T, D, L
                 failed = "tls";
                 continue;
             };
-            let Some(request) = self.request(call, &target, &ids, &secrets).await else {
-                return Sent::Internal;
+            let bytes = match request.take() {
+                Some(bytes) => bytes,
+                None => match self.request(call, &target, &ids, &secrets).await {
+                    Some(bytes) => bytes,
+                    None => return Sent::Internal,
+                },
             };
             if !self.same(call, &first) {
                 return Sent::Refused;
             }
-            if stream.write_all(&request).await.is_err() {
+            if stream.write_all(&bytes).await.is_err() {
                 return Sent::Failed("write");
             }
-            drop(request);
-            let sent = read_status(&mut stream).await;
-            *open = Some(stream);
+            drop(bytes);
+            let (sent, rest) = match read_status(&mut stream).await {
+                Read::Got(sent, rest) => (sent, rest),
+                Read::Nothing => (Sent::Failed("answer"), None),
+            };
+            *open = Some(Open {
+                stream,
+                url: first.0.url.clone(),
+                born: rt::now(),
+                rest,
+            });
             return sent;
         }
         Sent::Failed(failed)
@@ -390,7 +513,7 @@ impl<T: Transport + 'static, D: Dns + 'static, L: Local + 'static> Inner<T, D, L
         };
         let mut out = format!(
             "POST {} HTTP/1.1\r\nHost: {host}\r\nContent-Type: application/json\r\n\
-             Content-Length: {}\r\nUser-Agent: webhooks\r\nConnection: close\r\n\
+             Content-Length: {}\r\nUser-Agent: webhooks\r\n\
              webhook-id: {id}\r\nwebhook-timestamp: {stamp}\r\nwebhook-signature: {signature}\r\n\r\n",
             target.path,
             body.len(),
@@ -425,33 +548,167 @@ pub fn signature(id: &str, stamp: &str, body: &[u8], secrets: &[Arc<Secret<32>>]
     out
 }
 
-async fn read_status(stream: &mut tls::Stream) -> Sent {
+async fn read_status(stream: &mut tls::Stream) -> Read {
     let mut bytes = Vec::new();
     let mut buf = [0; READ];
+    let mut any = false;
     loop {
         let end = loop {
             if let Some(at) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
                 break at + 4;
             }
             if bytes.len() >= HEAD {
-                return Sent::Failed("answer");
+                return Read::Got(Sent::Failed("answer"), None);
             }
             match stream.read(&mut buf).await {
-                Ok(0) | Err(_) => return Sent::Failed("answer"),
-                Ok(n) => bytes.extend_from_slice(&buf[..n]),
+                Ok(0) | Err(_) if !any => return Read::Nothing,
+                Ok(0) | Err(_) => return Read::Got(Sent::Failed("answer"), None),
+                Ok(n) => {
+                    any = true;
+                    bytes.extend_from_slice(&buf[..n]);
+                }
             }
         };
         if end > HEAD {
-            return Sent::Failed("answer");
+            return Read::Got(Sent::Failed("answer"), None);
         }
         let Some(code) = crate::https::status(&bytes[..end]) else {
-            return Sent::Failed("answer");
+            return Read::Got(Sent::Failed("answer"), None);
         };
         if (100..200).contains(&code) {
             bytes.drain(..end);
             continue;
         }
-        return Sent::Status(code, retry_after(&bytes[..end]));
+        let sent = Sent::Status(code, retry_after(&bytes[..end]));
+        let rest = frame(&bytes[..end], code).map(|f| (f, bytes[end..].to_vec()));
+        return Read::Got(sent, rest);
+    }
+}
+
+fn frame(head: &[u8], status: u16) -> Option<Frame> {
+    let text = std::str::from_utf8(head).ok()?;
+    let mut lines = text.split("\r\n");
+    if !lines.next()?.starts_with("HTTP/1.1 ") {
+        return None;
+    }
+    let (mut length, mut chunked) = (None, false);
+    for line in lines {
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        let value = value.trim_matches([' ', '\t']);
+        if name.eq_ignore_ascii_case("connection") {
+            let close = value
+                .split(',')
+                .any(|t| t.trim_matches([' ', '\t']).eq_ignore_ascii_case("close"));
+            if close {
+                return None;
+            }
+        } else if name.eq_ignore_ascii_case("transfer-encoding") {
+            if chunked || !value.eq_ignore_ascii_case("chunked") {
+                return None;
+            }
+            chunked = true;
+        } else if name.eq_ignore_ascii_case("content-length") {
+            if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            let n = value.parse().ok()?;
+            if length.is_some_and(|l| l != n) {
+                return None;
+            }
+            length = Some(n);
+        }
+    }
+    if status == 204 || status == 304 {
+        return Some(Frame::Empty);
+    }
+    match (chunked, length) {
+        (true, None) => Some(Frame::Chunked),
+        (false, Some(n)) if n <= DRAIN => Some(Frame::Length(n)),
+        _ => None,
+    }
+}
+
+fn framed(bytes: &[u8], frame: Frame) -> End {
+    match frame {
+        Frame::Empty => End::At(0),
+        Frame::Length(n) if bytes.len() >= n => End::At(n),
+        Frame::Length(_) => End::More,
+        Frame::Chunked => chunked(bytes),
+    }
+}
+
+fn line(bytes: &[u8]) -> Result<Option<usize>, ()> {
+    match bytes.windows(2).position(|w| w == b"\r\n") {
+        Some(at) if at <= LINE => Ok(Some(at)),
+        Some(_) => Err(()),
+        None if bytes.len() > LINE => Err(()),
+        None => Ok(None),
+    }
+}
+
+fn chunked(bytes: &[u8]) -> End {
+    let mut at = 0;
+    let mut body = 0;
+    loop {
+        let size = match line(&bytes[at..]) {
+            Ok(Some(n)) => n,
+            Ok(None) => return End::More,
+            Err(()) => return End::Bad,
+        };
+        let digits = bytes[at..at + size]
+            .split(|&b| b == b';')
+            .next()
+            .unwrap_or_default()
+            .trim_ascii();
+        if digits.is_empty() || digits.len() > 8 || !digits.iter().all(u8::is_ascii_hexdigit) {
+            return End::Bad;
+        }
+        let Some(n) = std::str::from_utf8(digits)
+            .ok()
+            .and_then(|d| usize::from_str_radix(d, 16).ok())
+        else {
+            return End::Bad;
+        };
+        at += size + 2;
+        if n == 0 {
+            loop {
+                match line(&bytes[at..]) {
+                    Ok(Some(0)) => return End::At(at + 2),
+                    Ok(Some(n)) => at += n + 2,
+                    Ok(None) => return End::More,
+                    Err(()) => return End::Bad,
+                }
+            }
+        }
+        body += n;
+        if body > DRAIN {
+            return End::Bad;
+        }
+        if bytes.len() < at + n + 2 {
+            return End::More;
+        }
+        if &bytes[at + n..at + n + 2] != b"\r\n" {
+            return End::Bad;
+        }
+        at += n + 2;
+    }
+}
+
+async fn drain(stream: &mut tls::Stream, frame: Frame, mut bytes: Vec<u8>) -> bool {
+    let mut buf = [0; READ];
+    loop {
+        match framed(&bytes, frame) {
+            End::At(end) => return end == bytes.len(),
+            End::Bad => return false,
+            End::More if bytes.len() > 2 * DRAIN => return false,
+            End::More => {}
+        }
+        match stream.read(&mut buf).await {
+            Ok(0) | Err(_) => return false,
+            Ok(n) => bytes.extend_from_slice(&buf[..n]),
+        }
     }
 }
 
@@ -595,6 +852,53 @@ mod tests {
             failure(&call, &Sent::Internal).as_deref(),
             Some("webhook call failed: tenant=7 hook=9 reason=internal")
         );
+    }
+
+    #[test]
+    fn only_framed_keep_alive_answers_are_kept() {
+        let ok = |extra: &str| format!("HTTP/1.1 200 OK\r\n{extra}\r\n").into_bytes();
+        assert_eq!(
+            frame(&ok("Content-Length: 2\r\n"), 200),
+            Some(Frame::Length(2))
+        );
+        assert_eq!(
+            frame(&ok("transfer-encoding: Chunked\r\n"), 202),
+            Some(Frame::Chunked)
+        );
+        assert_eq!(frame(&ok(""), 204), Some(Frame::Empty));
+        let refused = [
+            ok(""),
+            ok("Connection: keep-alive, Close\r\nContent-Length: 0\r\n"),
+            ok("Content-Length: 1\r\nContent-Length: 2\r\n"),
+            ok("Content-Length: +1\r\n"),
+            ok(&format!("Content-Length: {}\r\n", DRAIN + 1)),
+            ok("Transfer-Encoding: gzip, chunked\r\n"),
+            ok("Transfer-Encoding: chunked\r\nContent-Length: 2\r\n"),
+            b"HTTP/1.0 200 OK\r\nContent-Length: 0\r\n\r\n".to_vec(),
+        ];
+        for head in &refused {
+            assert_eq!(frame(head, 200), None, "{}", String::from_utf8_lossy(head));
+        }
+    }
+
+    #[test]
+    fn chunked_bodies_end_exactly() {
+        assert_eq!(chunked(b"2\r\nok\r\n0\r\n\r\n"), End::At(12));
+        assert_eq!(
+            chunked(b"2;x=1\r\nok\r\n0\r\nT: 1\r\n\r\nmore"),
+            End::At(22)
+        );
+        assert_eq!(chunked(b"2\r\nok\r\n0\r\n"), End::More);
+        assert_eq!(chunked(b"2\r\no"), End::More);
+        assert_eq!(chunked(b""), End::More);
+        assert_eq!(chunked(b"2\r\nokxx"), End::Bad);
+        assert_eq!(chunked(b"zz\r\n"), End::Bad);
+        assert_eq!(chunked(b"+2\r\nok\r\n"), End::Bad);
+        assert_eq!(chunked(format!("{:x}\r\n", DRAIN + 1).as_bytes()), End::Bad);
+        assert_eq!(chunked(&vec![b'1'; LINE + 1]), End::Bad);
+        assert_eq!(framed(b"okmore", Frame::Length(2)), End::At(2));
+        assert_eq!(framed(b"o", Frame::Length(2)), End::More);
+        assert_eq!(framed(b"", Frame::Empty), End::At(0));
     }
 
     #[test]
