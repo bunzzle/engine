@@ -12,12 +12,14 @@ const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwx
 pub enum Scope {
     Smtp,
     Api,
+    Hooks,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Scopes {
     pub smtp: bool,
     pub api: bool,
+    pub hooks: bool,
 }
 
 impl Scopes {
@@ -25,17 +27,19 @@ impl Scopes {
         match scope {
             Scope::Smtp => self.smtp,
             Scope::Api => self.api,
+            Scope::Hooks => self.hooks,
         }
     }
 
     pub(crate) fn code(self) -> u8 {
-        u8::from(self.smtp) | u8::from(self.api) << 1
+        u8::from(self.smtp) | u8::from(self.api) << 1 | u8::from(self.hooks) << 2
     }
 
     pub(crate) fn from_code(code: u8) -> Option<Self> {
-        (code & !3 == 0).then_some(Self {
+        (code & !7 == 0).then_some(Self {
             smtp: code & 1 != 0,
             api: code & 2 != 0,
+            hooks: code & 4 != 0,
         })
     }
 }

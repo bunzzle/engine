@@ -396,7 +396,7 @@ impl Object {
                 if a.tenant == SYSTEM {
                     return Err(Error::Invalid("tenant id"));
                 }
-                if a.scopes == Scopes::default() {
+                if a.scopes == Scopes::default() || a.scopes.hooks && a.pool != 0 {
                     return Err(Error::Invalid("scopes"));
                 }
             }

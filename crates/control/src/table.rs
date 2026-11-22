@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use crypto::{Secret, sha256};
 use rt::Peers;
 
-use crate::access::{Grant, Scope, Token};
+use crate::access::{Grant, Scope, Scopes, Token};
 use crate::record::{
     Access, Dkim, Domain, Hook, KIND_ACCESS, KIND_DKIM, KIND_DOMAIN, KIND_HOOK, Object, Pool,
     State, Tenant, Update, Verification,
@@ -178,23 +178,25 @@ impl Table {
     }
 
     pub fn check(&self, token: &[u8], scope: Scope) -> Option<Grant> {
+        self.authenticate(token)
+            .filter(|(_, scopes)| scopes.has(scope))
+            .map(|(grant, _)| grant)
+    }
+
+    pub fn authenticate(&self, token: &[u8]) -> Option<(Grant, Scopes)> {
         let token = Token::parse(token);
         let (id, presented) = match &token {
             Some(token) => (token.id(), token.hash()),
             None => (0, sha256(&DUMMY)),
         };
-        let found = self
-            .accesses
-            .get(&id)
-            .filter(|a| a.scopes.has(scope))
-            .and_then(|a| {
-                let tenant = self.tenants.get(&a.tenant)?;
-                (tenant.generation == a.generation).then_some((a, tenant))
-            });
+        let found = self.accesses.get(&id).and_then(|a| {
+            let tenant = self.tenants.get(&a.tenant)?;
+            (tenant.generation == a.generation).then_some((a, tenant))
+        });
         let expected = found.map_or(DUMMY, |(a, _)| a.hash);
         let same = Secret::new(presented) == Secret::new(expected);
         let (access, tenant) = found.filter(|_| same)?;
-        (tenant.state == State::Active).then_some(Grant {
+        let grant = Grant {
             access: access.id,
             tenant: access.tenant,
             generation: access.generation,
@@ -202,7 +204,8 @@ impl Table {
                 0 => tenant.default_pool,
                 pool => pool,
             },
-        })
+        };
+        (tenant.state == State::Active).then_some((grant, access.scopes))
     }
 
     pub fn tenants(&self) -> impl Iterator<Item = &Tenant> {

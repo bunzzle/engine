@@ -33,7 +33,7 @@ impl<T: Transport + 'static> Node<T> {
             }
             current.generation
         };
-        if scopes == Scopes::default() {
+        if scopes == Scopes::default() || scopes.hooks && pool != 0 {
             return Err(control::Error::Invalid("scopes").into());
         }
         let mut held = self.hold()?;

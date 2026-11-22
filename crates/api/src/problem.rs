@@ -86,6 +86,14 @@ impl Problem {
         Self::new(Status::UNAUTHORIZED, "unauthorized", "unauthorized")
     }
 
+    pub fn scope() -> Self {
+        Self::new(
+            Status::FORBIDDEN,
+            "scope_not_allowed",
+            "key scope not allowed",
+        )
+    }
+
     pub fn sender() -> Self {
         Self::new(
             Status::FORBIDDEN,

@@ -6,6 +6,7 @@ use control::{
 const SMTP: Scopes = Scopes {
     smtp: true,
     api: false,
+    hooks: false,
 };
 
 fn tenant(id: u32, generation: u32, state: State) -> Object {
@@ -47,15 +48,28 @@ fn access_records_round_trip_and_are_checked() {
         Scopes {
             smtp: false,
             api: true,
+            hooks: false,
         },
         Scopes {
             smtp: true,
             api: true,
+            hooks: false,
+        },
+        Scopes {
+            smtp: false,
+            api: false,
+            hooks: true,
+        },
+        Scopes {
+            smtp: true,
+            api: true,
+            hooks: true,
         },
     ] {
+        let pool = if scopes.hooks { 0 } else { 4 };
         let update = Update {
             version: 12,
-            object: Object::Access(access(&token, 3, scopes, 4)),
+            object: Object::Access(access(&token, 3, scopes, pool)),
         };
         assert_eq!(update.secret(), Vec::<u8>::new());
         let encoded = update.encode();
@@ -64,8 +78,13 @@ fn access_records_round_trip_and_are_checked() {
         assert_eq!(Update::decode_sealed(&encoded, b"x"), None);
         assert_eq!(Update::decode(&encoded[..63]), None);
         let mut bad = encoded.clone();
-        bad[16 + 4] |= 4;
+        bad[16 + 4] |= 8;
         assert_eq!(Update::decode(&bad), None);
+        if !scopes.hooks {
+            let mut pooled = encoded.clone();
+            pooled[16 + 4] |= 4;
+            assert_eq!(Update::decode(&pooled), None);
+        }
         let mut bad = encoded;
         bad[16 + 6] = 1;
         assert_eq!(Update::decode(&bad), None);
@@ -77,6 +96,17 @@ fn access_records_round_trip_and_are_checked() {
         (
             Access {
                 scopes: Scopes::default(),
+                ..good
+            },
+            "scopes",
+        ),
+        (
+            Access {
+                scopes: Scopes {
+                    hooks: true,
+                    ..SMTP
+                },
+                pool: 4,
                 ..good
             },
             "scopes",
@@ -130,6 +160,7 @@ fn only_a_matching_secret_scope_generation_and_active_tenant_pass() {
     let token = Token::new(5).expect("token");
     let api = Token::new(6).expect("token");
     let pooled = Token::new(8).expect("token");
+    let hooks = Token::new(10).expect("token");
     let table = table(vec![
         tenant(3, 1, State::Active),
         Object::Access(access(&token, 3, SMTP, 0)),
@@ -139,10 +170,21 @@ fn only_a_matching_secret_scope_generation_and_active_tenant_pass() {
             Scopes {
                 smtp: false,
                 api: true,
+                hooks: false,
             },
             0,
         )),
         Object::Access(access(&pooled, 3, SMTP, 4)),
+        Object::Access(access(
+            &hooks,
+            3,
+            Scopes {
+                smtp: false,
+                api: false,
+                hooks: true,
+            },
+            0,
+        )),
     ]);
     let grant = |token: &Token, scope| table.check(&token.text(), scope);
     assert_eq!(
@@ -158,6 +200,20 @@ fn only_a_matching_secret_scope_generation_and_active_tenant_pass() {
     assert_eq!(grant(&token, Scope::Api), None);
     assert_eq!(grant(&api, Scope::Smtp), None);
     assert_eq!(grant(&api, Scope::Api).map(|g| g.access), Some(6));
+    assert_eq!(grant(&api, Scope::Hooks), None);
+    assert_eq!(grant(&token, Scope::Hooks), None);
+    assert_eq!(grant(&hooks, Scope::Api), None);
+    assert_eq!(grant(&hooks, Scope::Hooks).map(|g| g.access), Some(10));
+    assert_eq!(
+        table
+            .authenticate(&api.text())
+            .map(|(g, s)| (g.access, s.api, s.hooks)),
+        Some((6, true, false))
+    );
+    assert_eq!(
+        table.authenticate(&Token::new(6).expect("token").text()),
+        None
+    );
 
     let mut forged = token.text().to_vec();
     forged[3 + 8] = if forged[3 + 8] == b'A' { b'B' } else { b'A' };

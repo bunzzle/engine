@@ -2840,6 +2840,7 @@ fn a_deleted_tenant_loses_its_control_records_and_queues_on_every_core() {
     let smtp = Scopes {
         smtp: true,
         api: false,
+        hooks: false,
     };
     let driver = Rc::new(SimDriver::with_disk(47, Config::default(), created(47)));
     let cluster = started_with_keys(&driver, 2);
@@ -2910,6 +2911,7 @@ fn a_sweep_cut_by_a_crash(seed: u64) {
     let smtp = Scopes {
         smtp: true,
         api: false,
+        hooks: false,
     };
     let driver = Rc::new(SimDriver::with_disk(seed, Config::default(), created(seed)));
     let cluster = started_with_keys(&driver, 2);
@@ -2964,6 +2966,7 @@ fn access_keys_check_on_every_core_until_revoked_across_restarts() {
     let smtp = Scopes {
         smtp: true,
         api: false,
+        hooks: false,
     };
     let driver = Rc::new(SimDriver::with_disk(43, Config::default(), created(43)));
     let cluster = started(&driver, 2);
@@ -2991,6 +2994,19 @@ fn access_keys_check_on_every_core_until_revoked_across_restarts() {
         let (first, kept) = control.access_new(1, smtp, 0).await.expect("new");
         let (second, revoked) = control.access_new(1, smtp, 1).await.expect("new");
         assert_eq!((first.id, second.id), (1, 2));
+        assert!(matches!(
+            control
+                .access_new(
+                    1,
+                    Scopes {
+                        hooks: true,
+                        ..smtp
+                    },
+                    1
+                )
+                .await,
+            Err(sched::Error::Control(control::Error::Invalid("scopes")))
+        ));
         assert!(matches!(
             control.write(Object::Access(first.clone())).await,
             Err(sched::Error::Control(control::Error::Invalid("kind")))
