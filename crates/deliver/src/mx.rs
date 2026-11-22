@@ -88,10 +88,6 @@ pub(crate) enum Addresses {
     Failed,
 }
 
-pub(crate) async fn addresses<D: Dns>(dns: &D, host: &Name, v6: bool) -> Addresses {
-    resolve(dns, host, v6, usable).await
-}
-
 pub(crate) async fn public<D: Dns>(dns: &D, host: &Name, v6: bool) -> Addresses {
     resolve(dns, host, v6, global).await
 }

@@ -544,8 +544,8 @@ fn http_date(ms: u64) -> String {
 struct Owns(Vec<IpAddr>);
 
 impl Local for Owns {
-    fn bound(&self, ip: IpAddr) -> impl Future<Output = bool> {
-        std::future::ready(self.0.contains(&ip))
+    fn bound(&self, ip: IpAddr) -> impl Future<Output = Option<bool>> {
+        std::future::ready(Some(self.0.contains(&ip)))
     }
 }
 
