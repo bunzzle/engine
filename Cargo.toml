@@ -22,6 +22,10 @@ missing_errors_doc = "allow"
 missing_panics_doc = "allow"
 must_use_candidate = "allow"
 
+[profile.dev]
+debug = "line-tables-only"
+split-debuginfo = "packed"
+
 [profile.release]
 lto = "fat"
 codegen-units = 1
