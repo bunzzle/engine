@@ -1266,6 +1266,87 @@ fn without_tls_roots_a_call_fails_before_dns() {
 }
 
 #[test]
+fn an_egress_family_mismatch_retries_and_probes_the_other_family() {
+    let cluster = started(35);
+    let nodes = cluster.nodes.clone();
+    cluster.run(async move {
+        ready(&nodes).await;
+        let node = &nodes[0];
+        let zone = Zone::default();
+        zone.set(
+            "v6only.example.org",
+            Type::Aaaa,
+            a(&["2606:4700::1".parse().expect("ip")]),
+        );
+        zone.set(
+            "v4only.example.org",
+            Type::A,
+            a(&[IpAddr::from([1, 1, 1, 1])]),
+        );
+        let v6only = node
+            .hook_new(1, "https://v6only.example.org/in", 0)
+            .await
+            .expect("new")
+            .id;
+        let v4only = node
+            .hook_new(1, "https://v4only.example.org/in", 0)
+            .await
+            .expect("new")
+            .id;
+        let absent = node
+            .hook_new(1, "https://absent.example.org/in", 0)
+            .await
+            .expect("new")
+            .id;
+        let sender = |egress: IpAddr| {
+            Hooks::with_local(
+                node.clone(),
+                zone.clone(),
+                connector(),
+                HookSettings {
+                    egress: Some(egress),
+                    allow: Vec::new(),
+                },
+                35,
+                Owns::default(),
+            )
+        };
+        let call = |hook| {
+            Rc::new(Call {
+                tenant: 1,
+                generation: 1,
+                hook,
+                id: [u8::try_from(hook).expect("small"); 16],
+                lost: 0,
+                events: Vec::new(),
+            })
+        };
+        let v4 = sender(IpAddr::from([9, 9, 9, 9]));
+        let v6 = sender("2001:4860::1".parse().expect("ip"));
+        for (hooks, hook) in [(&v4, v6only), (&v6, v4only), (&v4, absent)] {
+            match hooks.deliver(call(hook)).await {
+                Outcome::Retry { status, .. } => assert_eq!(status, None),
+                other => panic!("{other:?}"),
+            }
+        }
+        let asked = zone.asked.borrow();
+        for name in [
+            "v6only.example.org",
+            "v4only.example.org",
+            "absent.example.org",
+        ] {
+            for kind in [Type::A, Type::Aaaa] {
+                assert!(
+                    asked.iter().any(|(n, k)| n == name && *k == kind),
+                    "{name} {kind:?} was not asked: {asked:?}"
+                );
+            }
+        }
+    });
+    cluster.stop();
+}
+
+#[test]
 fn interim_replies_are_skipped() {
     let cluster = started(7);
     let nodes = cluster.nodes.clone();
