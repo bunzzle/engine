@@ -20,6 +20,7 @@ use crate::node::{Config, Note, Sched};
 use crate::reader::{self, EventPage, ReadError, Reader};
 use crate::requests::{KIND_REQUEST, RequestInputs, Requests, retain_request};
 use crate::sealing::{Holds, Keys};
+use crate::status::Reports;
 use crate::suppress::{self, Inputs, KIND_SUPPRESS, Suppressions};
 use crate::system::{self, RecordStats, Stored};
 use crate::transport::Transport;
@@ -108,6 +109,7 @@ pub(crate) struct Inner<T> {
     pub(crate) dropped: Cell<u64>,
     pub(crate) delete_retries: Cell<u64>,
     pub(crate) cursored: RefCell<BTreeMap<u32, (u32, u32)>>,
+    pub(crate) hook_reports: Rc<RefCell<Reports>>,
     records: Vec<Rc<Stored>>,
 }
 
@@ -171,10 +173,9 @@ impl<T: Transport + 'static> Node<T> {
         let table = Rc::new(RefCell::new(Table::default()));
         let clock = parts.clock;
         retain_current(&mut core, &table, clock);
-
         let applied = Rc::new(Notify::default());
-        let (config, config_done, deletions) =
-            start_config(links.config, &table, &applied, &parts.keys);
+        let (hook_reports, (config, config_done, deletions)) =
+            start_config(links.config, &table, &applied, &parts.keys, clock);
         let control = control.map(|(loaded, snapshot)| {
             broadcast(&config, cores, &control::Note::Snapshot(snapshot));
             loaded
@@ -227,9 +228,7 @@ impl<T: Transport + 'static> Node<T> {
             parts.clock,
             settings.sched,
         );
-        sched.use_keys(Rc::clone(&parts.keys));
-        sched.use_table(Rc::clone(&table));
-        let restored = restore_live(&sched, pending, &table);
+        let restored = sched.use_node_config(&parts.keys, &table, &hook_reports, pending);
 
         leases.opened().await;
         barrier(links.steps).await;
@@ -256,8 +255,10 @@ impl<T: Transport + 'static> Node<T> {
             dropped: Cell::new(0),
             delete_retries: Cell::new(0),
             cursored: RefCell::new(cursored),
+            hook_reports,
             records,
         });
+        inner.sched.use_node(Rc::downgrade(&inner));
         let ticks = maintain(Rc::downgrade(&inner), ticker);
         let drops = drop_deleted(Rc::downgrade(&inner), deletions);
         index_done.extend([config_done, names_done, leases_done, sched_done]);
@@ -387,11 +388,20 @@ impl<T: Transport + 'static> Node<T> {
     }
 
     pub(crate) fn apply(&self, update: &Update) {
-        self.inner.table.borrow_mut().apply(update.clone());
+        self.note(control::Note::Update(update.clone()));
     }
 
     pub(crate) fn note(&self, note: control::Note) {
+        let now = self.inner.sched.clock().now();
+        self.inner
+            .hook_reports
+            .borrow_mut()
+            .change(&note, &self.inner.table.borrow(), now);
         self.inner.table.borrow_mut().take(note);
+        self.inner
+            .hook_reports
+            .borrow_mut()
+            .prune(&self.inner.table.borrow(), now);
     }
 
     pub async fn write(&self, object: Object) -> Result<Update, Error> {
@@ -693,7 +703,7 @@ fn naming(control: Option<&control::Loaded>, settings: &Settings) -> Result<u64,
     Ok(check)
 }
 
-fn restore_live<T: Transport + 'static>(
+pub(crate) fn restore_live<T: Transport + 'static>(
     sched: &Sched<T>,
     pending: Vec<Pending>,
     table: &Rc<RefCell<Table>>,
@@ -719,11 +729,14 @@ fn start_config(
     table: &Rc<RefCell<Table>>,
     applied: &Rc<Notify>,
     keys: &Rc<dyn Keys>,
-) -> Started {
+    clock: Clock,
+) -> (Rc<RefCell<Reports>>, Started) {
     let (deleting, deletions) = rt::channel();
     let table = Rc::clone(table);
     let applied = Rc::clone(applied);
     let keys = Rc::clone(keys);
+    let reports = Rc::new(RefCell::new(Reports::new(ends.cores())));
+    let tracking = Rc::clone(&reports);
     let (config, done) = ends.start(move |_, note| {
         for (tenant, generation, now) in deleted(&note) {
             keys.forget(tenant, generation);
@@ -735,10 +748,13 @@ fn start_config(
         {
             keys.forget_hook(tenant, removal.id);
         }
+        let now = clock.now();
+        tracking.borrow_mut().change(&note, &table.borrow(), now);
         table.borrow_mut().take(note);
+        tracking.borrow_mut().prune(&table.borrow(), now);
         applied.notify();
     });
-    (config, done, deletions)
+    (reports, (config, done, deletions))
 }
 
 fn deleted(note: &control::Note) -> Vec<(u32, u32, bool)> {

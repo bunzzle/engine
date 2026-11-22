@@ -13,6 +13,7 @@ use crate::cursor::{Cursor, drop_cursor, read_cursor, write_cursor};
 use crate::events::{Event, KIND_EVENT, sequence};
 use crate::reader::{Read, event_id, kept, opened, stamped};
 use crate::start::{Inner, Node};
+use crate::status::{HookReport, REPORT_PERIOD, StreamReport};
 use crate::tally::{Claim, Tallies, Targets, Watched, count, due, stored, targets};
 use crate::transport::Transport;
 
@@ -45,8 +46,15 @@ pub struct Call {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Outcome {
-    Acked,
-    Retry(Duration),
+    Acked {
+        status: u16,
+    },
+    Retry {
+        after: Duration,
+        status: Option<u16>,
+    },
+    Refused(Duration),
+    Gone,
 }
 
 pub type Sending = Pin<Box<dyn Future<Output = Outcome>>>;
@@ -73,6 +81,12 @@ struct Stream {
     sending: bool,
     ticket: u64,
     more: bool,
+    started: u64,
+    last_ok: Option<u64>,
+    failing_since: Option<u64>,
+    last_status: Option<u16>,
+    last_at: Option<u64>,
+    gone: bool,
 }
 
 #[derive(Default)]
@@ -88,6 +102,7 @@ struct Streams {
     holders: BTreeMap<u32, (u32, u32)>,
     synced: Option<u64>,
     tickets: u64,
+    report_errors: u64,
 }
 
 impl<T: Transport + 'static> Node<T> {
@@ -134,6 +149,7 @@ async fn run<T: Transport + 'static>(
     let tallies = Rc::clone(&claim.0);
     let _attached = tallies.attach().await;
     let mut flushed = rt::now();
+    let mut reported = None;
     loop {
         let Some(node) = live(&inner) else {
             return;
@@ -141,6 +157,7 @@ async fn run<T: Transport + 'static>(
         let watch = Rc::clone(node.spool().changes().watch());
         let fresh = watch.take(KIND_EVENT);
         let done: Vec<_> = shared.done.borrow_mut().drain(..).collect();
+        let mut report_now = false;
         for (hook, ticket, outcome) in done {
             if all.draining.get(&hook) == Some(&ticket) {
                 all.draining.remove(&hook);
@@ -149,7 +166,8 @@ async fn run<T: Transport + 'static>(
                 && stream.sending
                 && stream.ticket == ticket
             {
-                settle(stream, outcome);
+                report_now |= outcome == Outcome::Gone;
+                settle(stream, outcome, node.sched().clock().now());
             }
         }
         sync(&node, &mut all).await;
@@ -161,7 +179,8 @@ async fn run<T: Transport + 'static>(
             if fresh.contains(&stream.tenant) {
                 stream.more = true;
             }
-            if stream.sending || stream.until.is_some_and(|until| rt::now() < until) {
+            if stream.gone || stream.sending || stream.until.is_some_and(|until| rt::now() < until)
+            {
                 continue;
             }
             if stream.held.is_none() && stream.more {
@@ -191,9 +210,17 @@ async fn run<T: Transport + 'static>(
             flush(&node, &mut all.live).await;
             flushed = rt::now();
         }
+        if report_now || report_due(reported) {
+            report_hooks(&node, &mut all).await;
+            reported = Some(rt::now());
+        }
         let streams = &all.live;
         let ready = streams.values().any(|s| {
-            s.more && s.held.is_none() && !s.sending && s.until.is_none_or(|u| rt::now() >= u)
+            !s.gone
+                && s.more
+                && s.held.is_none()
+                && !s.sending
+                && s.until.is_none_or(|u| rt::now() >= u)
         });
         drop(node);
         if ready || tallies.waiting() {
@@ -214,6 +241,12 @@ async fn run<T: Transport + 'static>(
     }
 }
 
+fn report_due(reported: Option<Instant>) -> bool {
+    reported.is_none_or(|at| {
+        rt::now().saturating_duration_since(at) >= Duration::from_millis(REPORT_PERIOD)
+    })
+}
+
 async fn first(one: impl Future<Output = ()>, two: impl Future<Output = ()>) {
     let mut one = pin!(one);
     let mut two = pin!(two);
@@ -227,18 +260,37 @@ async fn first(one: impl Future<Output = ()>, two: impl Future<Output = ()>) {
     .await;
 }
 
-fn settle(stream: &mut Stream, outcome: Outcome) {
+fn settle(stream: &mut Stream, outcome: Outcome, now: u64) {
     stream.sending = false;
     match outcome {
-        Outcome::Acked => {
+        Outcome::Acked { status } => {
             if let Some(held) = stream.held.take() {
                 advance(stream, &held.ends);
                 report(stream, &held.lost);
             }
+            stream.last_ok = Some(now);
+            stream.failing_since = None;
+            stream.last_status = Some(status);
+            stream.last_at = Some(now);
             stream.until = None;
             stream.more = true;
         }
-        Outcome::Retry(pause) => stream.until = Some(rt::now() + pause.max(PAUSE)),
+        Outcome::Retry { after, status } => {
+            stream.failing_since.get_or_insert(now);
+            if let Some(status) = status {
+                stream.last_status = Some(status);
+                stream.last_at = Some(now);
+            }
+            stream.until = Some(rt::now() + after.max(PAUSE));
+        }
+        Outcome::Refused(after) => stream.until = Some(rt::now() + after.max(PAUSE)),
+        Outcome::Gone => {
+            stream.failing_since.get_or_insert(now);
+            stream.last_status = Some(410);
+            stream.last_at = Some(now);
+            stream.gone = true;
+            stream.until = None;
+        }
     }
 }
 
@@ -362,16 +414,19 @@ async fn sync<T: Transport + 'static>(node: &Node<T>, all: &mut Streams) {
             .map(|h| (h.id, (h.tenant, h.generation, h.events)))
             .collect()
     };
-    let gone: Vec<u32> = all
-        .live
-        .iter()
-        .filter(|(id, s)| {
-            wanted.get(id).is_none_or(|&(tenant, generation, _)| {
-                (tenant, generation) != (s.tenant, s.generation)
+    let gone: Vec<u32> = {
+        let reports = node.inner.hook_reports.borrow();
+        all.live
+            .iter()
+            .filter(|(id, s)| {
+                reports.since(**id).is_some_and(|since| since > s.started)
+                    || wanted.get(id).is_none_or(|&(tenant, generation, _)| {
+                        (tenant, generation) != (s.tenant, s.generation)
+                    })
             })
-        })
-        .map(|(&id, _)| id)
-        .collect();
+            .map(|(&id, _)| id)
+            .collect()
+    };
     for id in gone {
         let Some(mut stream) = all.live.remove(&id) else {
             continue;
@@ -412,6 +467,12 @@ async fn sync<T: Transport + 'static>(node: &Node<T>, all: &mut Streams) {
                 sending: false,
                 ticket: 0,
                 more: true,
+                started: node.sched().clock().now(),
+                last_ok: None,
+                failing_since: None,
+                last_status: None,
+                last_at: None,
+                gone: false,
             },
         );
     }
@@ -639,6 +700,64 @@ async fn fill<T: Transport + 'static>(node: &Node<T>, hook: u32, stream: &mut St
     });
     stream.more = full;
     stream.pause = PAUSE;
+}
+
+async fn report_hooks<T: Transport + 'static>(node: &Node<T>, all: &mut Streams) {
+    let mut holders = all.holders.clone();
+    for hook in node.table().every_hook() {
+        holders.insert(hook.id, (hook.tenant, hook.generation));
+    }
+    let holders: Vec<(u32, u32, u32)> = holders
+        .into_iter()
+        .map(|(hook, (tenant, generation))| (hook, tenant, generation))
+        .collect();
+    let mut reports = Vec::with_capacity(holders.len());
+    for (hook, tenant, generation) in holders {
+        if !current(node, hook, tenant, generation) {
+            continue;
+        }
+        let mut stream = None;
+        let mut lost = 0_u64;
+        let mut complete = true;
+        if let Some(found) = all.live.get(&hook) {
+            lost = found
+                .cursors
+                .values()
+                .fold(0, |sum, cursor| sum.saturating_add(cursor.lost));
+            stream = Some(StreamReport {
+                started: found.started,
+                last_ok: found.last_ok,
+                failing_since: found.failing_since,
+                last_status: found.last_status,
+                last_at: found.last_at,
+                gone: found.gone,
+            });
+        } else {
+            for shard in node.spool().shards() {
+                match read_cursor(node.spool().changes(), shard, tenant, hook).await {
+                    Ok(Some(cursor)) if cursor.generation == generation => {
+                        lost = lost.saturating_add(cursor.lost);
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        all.report_errors = all.report_errors.saturating_add(1);
+                        eprintln!("webhook status read failed: {error}");
+                        complete = false;
+                    }
+                }
+            }
+        }
+        if complete {
+            reports.push(HookReport {
+                tenant,
+                generation,
+                hook,
+                lost,
+                stream,
+            });
+        }
+    }
+    node.sched().report_hooks(reports);
 }
 
 async fn flush<T: Transport + 'static>(node: &Node<T>, streams: &mut BTreeMap<u32, Stream>) {

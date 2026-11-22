@@ -5,6 +5,7 @@ use crypto::Secret;
 
 use crate::error::Error;
 use crate::start::{Held, Node};
+use crate::status::{Disable, HookStatus};
 use crate::transport::Transport;
 
 pub const MAX_HOOKS: usize = 8;
@@ -171,6 +172,37 @@ impl<T: Transport + 'static> Node<T> {
             .filter(|h| h.generation == generation)
             .cloned()
             .ok_or_else(|| control::Error::Refused.into())
+    }
+
+    pub fn hook_status(&self, hook: &Hook) -> HookStatus {
+        self.inner.hook_reports.borrow().status(hook)
+    }
+
+    pub(crate) async fn disable_hook(&self, disable: Disable) {
+        let node = self.clone();
+        let result = rt::spawn(async move {
+            let mut held = node.hold()?;
+            if !node.inner.hook_reports.borrow().current(&disable) {
+                return Ok(false);
+            }
+            let Some(mut hook) = node
+                .table()
+                .hook(disable.tenant, disable.hook)
+                .filter(|hook| {
+                    hook.generation == disable.generation && hook.state == HookState::Active
+                })
+                .cloned()
+            else {
+                return Ok(false);
+            };
+            hook.state = disable.state;
+            node.write_hook(&mut held, hook).await.map(|_| true)
+        })
+        .await;
+        if let Err(error) = result {
+            self.inner.hook_reports.borrow_mut().write_failed();
+            eprintln!("webhook state write failed: {error}");
+        }
     }
 
     async fn write_hook(&self, held: &mut Held<'_>, hook: Hook) -> Result<Hook, Error> {

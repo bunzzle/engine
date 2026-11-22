@@ -18,9 +18,9 @@ use keys::{BatchSettings, Batches, Working};
 use rt::sim::{Config, Disk, Machine, SimDriver, Stalls};
 use rt::{Instant, JoinHandle, Runtime, TcpListener, TcpStream, now, sleep, spawn};
 use sched::{
-    Answered, Attempt, Batched, Clock, Cursor, HookChange, HookSecret, KIND_EVENT, Keys, Meshes,
-    Node, Parts, ROTATION_MS, Recipient, Restore, Running, Settings, Transport, Unsealable,
-    Unwrapped, encode_slice, event_sequence, read_cursor, write_cursor,
+    Answered, Attempt, Batched, Call, Clock, Cursor, Deliver, HookChange, HookSecret, KIND_EVENT,
+    Keys, Meshes, Node, Outcome, Parts, ROTATION_MS, Recipient, Restore, Running, Settings,
+    Transport, Unsealable, Unwrapped, encode_slice, event_sequence, read_cursor, write_cursor,
 };
 use spool::{HeadClear, Message};
 use store::{Committer, DataFile, Options, SLOT_SIZE, Setup, boot};
@@ -1105,7 +1105,7 @@ fn retry_after_is_honored_only_as_clamped_delta_seconds() {
 }
 
 #[test]
-fn a_gone_endpoint_waits_an_hour() {
+fn a_gone_endpoint_is_disabled_without_more_calls() {
     let cluster = started(6);
     let nodes = cluster.nodes.clone();
     cluster.run(async move {
@@ -1117,14 +1117,11 @@ fn a_gone_endpoint_waits_an_hour() {
             Type::A,
             a(&[IpAddr::from([1, 1, 1, 1])]),
         );
-        let script = Rc::new(|n: usize| {
-            if n == 0 {
-                Answer::status(410)
-            } else {
-                Answer::ok()
-            }
-        });
-        let server = serve(IpAddr::from([1, 1, 1, 1]), 443, script);
+        let server = serve(
+            IpAddr::from([1, 1, 1, 1]),
+            443,
+            Rc::new(|_| Answer::status(410)),
+        );
         let hook = node
             .hook_new(1, "https://hooks.example.org/in", 0)
             .await
@@ -1133,9 +1130,90 @@ fn a_gone_endpoint_waits_an_hour() {
         let task = node.start_hooks(Rc::new(sender(node, &zone, HookSettings::default(), 16)));
         hooks_ready(node, 1, &[hook]).await;
         expire_one(node, 1, 1).await;
-        got(&server, 2).await;
-        pause_is(&server, 0, Duration::from_secs(3600));
+        got(&server, 1).await;
+        for _ in 0..120 {
+            if node.hook(1, hook).expect("hook").state == control::HookState::Gone {
+                break;
+            }
+            sleep(Duration::from_secs(1)).await;
+        }
+        assert_eq!(
+            node.hook(1, hook).expect("hook").state,
+            control::HookState::Gone
+        );
+        sleep(Duration::from_secs(3700)).await;
+        assert_eq!(server.got.borrow().len(), 1);
         drop(task);
+    });
+    cluster.stop();
+}
+
+#[test]
+fn delivery_outcomes_carry_status_refusal_and_gone() {
+    let cluster = started(60);
+    let nodes = cluster.nodes.clone();
+    cluster.run(async move {
+        ready(&nodes).await;
+        let node = &nodes[0];
+        let zone = Zone::default();
+        zone.set(
+            "hooks.example.org",
+            Type::A,
+            a(&[IpAddr::from([1, 1, 1, 1])]),
+        );
+        let server = serve(
+            IpAddr::from([1, 1, 1, 1]),
+            443,
+            Rc::new(|n| Answer::status(if n == 0 { 500 } else { 410 })),
+        );
+        let hook = node
+            .hook_new(1, "https://hooks.example.org/in", 0)
+            .await
+            .expect("new")
+            .id;
+        let missing = node
+            .hook_new(1, "https://missing.example.org/in", 0)
+            .await
+            .expect("new")
+            .id;
+        let sender = sender(node, &zone, HookSettings::default(), 61);
+        let call = |hook| {
+            Rc::new(Call {
+                tenant: 1,
+                generation: 1,
+                hook,
+                id: [u8::try_from(hook).expect("small"); 16],
+                lost: 0,
+                events: Vec::new(),
+            })
+        };
+        match sender.deliver(call(hook)).await {
+            Outcome::Retry { after, status } => {
+                assert_eq!(status, Some(500));
+                assert!(after >= Duration::from_secs(10));
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(sender.deliver(call(hook)).await, Outcome::Gone);
+        node.hook_change(
+            1,
+            hook,
+            HookChange {
+                enabled: Some(false),
+                ..HookChange::default()
+            },
+        )
+        .await
+        .expect("pause");
+        assert_eq!(
+            sender.deliver(call(hook)).await,
+            Outcome::Refused(Duration::from_secs(10))
+        );
+        match sender.deliver(call(missing)).await {
+            Outcome::Retry { status, .. } => assert_eq!(status, None),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(server.got.borrow().len(), 2);
     });
     cluster.stop();
 }
