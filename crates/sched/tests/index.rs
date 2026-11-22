@@ -60,7 +60,7 @@ const NO_CREATE: u32 = 198;
 
 impl KeySource for Toy {
     fn get(&self, tenant: u32, generation: u32) -> Option<TenantKeys> {
-        if tenant == KEYLESS {
+        if tenant == KEYLESS || HOOK_KEYS_DOWN.with(Cell::get) {
             return None;
         }
         let root = Root::new(&Secret::new(
@@ -156,6 +156,8 @@ thread_local! {
     static RESTORED: RefCell<Option<Vec<Restore>>> = const { RefCell::new(None) };
     static TICKS: Cell<u32> = const { Cell::new(0) };
     static ANSWERS: RefCell<Option<Answers>> = const { RefCell::new(None) };
+    static HOOK_KEYS_DOWN: Cell<bool> = const { Cell::new(false) };
+    static KEYS_DOWN_ON_GONE: Cell<bool> = const { Cell::new(false) };
 }
 
 type Given = (MessageId, u32, u16, EventKind);
@@ -3753,7 +3755,10 @@ impl Deliver for Catch {
             if caught.refuse.get() > 0 {
                 caught.refuse.set(caught.refuse.get() - 1);
                 caught.tried.set(caught.tried.get().max(call.events.len()));
-                return Outcome::Retry(Duration::from_secs(2));
+                return Outcome::Retry {
+                    after: Duration::from_secs(2),
+                    status: Some(500),
+                };
             }
             caught.flying.set(caught.flying.get() + 1);
             caught.most.set(caught.most.get().max(caught.flying.get()));
@@ -3779,7 +3784,7 @@ impl Deliver for Catch {
                 .collect();
             caught.calls.borrow_mut().push((call.hook, events));
             caught.lost.set(caught.lost.get() + call.lost);
-            Outcome::Acked
+            Outcome::Acked { status: 200 }
         })
     }
 }
@@ -4129,9 +4134,12 @@ impl Deliver for Attempted {
                 .borrow_mut()
                 .push((call.id, call.lost, call.events.len()));
             if attempts.retry.get() {
-                Outcome::Retry(Duration::from_secs(1))
+                Outcome::Retry {
+                    after: Duration::from_secs(1),
+                    status: Some(500),
+                }
             } else {
-                Outcome::Acked
+                Outcome::Acked { status: 200 }
             }
         })
     }
@@ -4407,4 +4415,274 @@ fn a_trimmed_call_keeps_its_id_and_lost_is_reported_once() {
         drop(task);
     });
     restarted.stop();
+}
+
+struct HookAnswers {
+    calls: RefCell<Vec<usize>>,
+}
+
+struct HookAnswer(Rc<HookAnswers>, usize, Outcome);
+
+impl Deliver for HookAnswer {
+    fn deliver(&self, _call: Rc<Call>) -> Sending {
+        self.0.calls.borrow_mut()[self.1] += 1;
+        if self.2 == Outcome::Gone && KEYS_DOWN_ON_GONE.with(Cell::get) {
+            HOOK_KEYS_DOWN.set(true);
+        }
+        Box::pin(std::future::ready(self.2))
+    }
+}
+
+async fn status_hook(nodes: &[Node<Idle>]) -> Hook {
+    let control = nodes.iter().find(|n| n.controls()).expect("control core");
+    let hook = control
+        .hook_new(1, "https://hooks.example.org/in", 0)
+        .await
+        .expect("new");
+    hook_everywhere(nodes, &hook).await;
+    for node in nodes {
+        let changes = node.spool().changes();
+        for shard in node.spool().shards() {
+            let cursor = Cursor {
+                generation: 1,
+                acked: changes.watch().head(),
+                lost: 1,
+                counted: 0,
+            };
+            write_cursor(changes, shard, 1, hook.id, &cursor)
+                .await
+                .expect("cursor");
+        }
+    }
+    hook
+}
+
+fn start_hook_answers(
+    nodes: &[Node<Idle>],
+    answers: &Rc<HookAnswers>,
+    outcomes: Vec<Outcome>,
+) -> Vec<JoinHandle<()>> {
+    nodes
+        .iter()
+        .zip(outcomes)
+        .enumerate()
+        .map(|(core, (node, outcome))| {
+            node.start_hooks(Rc::new(HookAnswer(Rc::clone(answers), core, outcome)))
+        })
+        .collect()
+}
+
+async fn wait_hook_state(nodes: &[Node<Idle>], id: u32, state: HookState) {
+    for _ in 0..120 {
+        if nodes.iter().all(|node| {
+            node.table()
+                .hook(1, id)
+                .is_some_and(|hook| hook.state == state)
+        }) {
+            return;
+        }
+        sleep(Duration::from_secs(1)).await;
+    }
+    panic!("hook did not become {state:?}");
+}
+
+fn retry_status() -> Outcome {
+    Outcome::Retry {
+        after: Duration::from_secs(3600),
+        status: Some(500),
+    }
+}
+
+#[test]
+fn a_gone_stream_disables_the_hook_on_every_core_without_retrying() {
+    let seed = 70;
+    let driver = Rc::new(SimDriver::with_disk(seed, Config::default(), created(seed)));
+    let cluster = started(&driver, 2);
+    let nodes = cluster.nodes.clone();
+    cluster.run(async move {
+        ready(&nodes).await;
+        let hook = status_hook(&nodes).await;
+        let answers = Rc::new(HookAnswers {
+            calls: RefCell::new(vec![0; nodes.len()]),
+        });
+        let tasks = start_hook_answers(&nodes, &answers, vec![Outcome::Gone, retry_status()]);
+        wait_hook_state(&nodes, hook.id, HookState::Gone).await;
+        sleep(Duration::from_secs(3700)).await;
+        assert_eq!(answers.calls.borrow()[0], 1);
+        drop(tasks);
+    });
+    cluster.stop();
+}
+
+#[test]
+fn three_days_of_failures_on_every_core_disable_the_hook() {
+    let seed = 71;
+    let driver = Rc::new(SimDriver::with_disk(seed, Config::default(), created(seed)));
+    let cluster = started(&driver, 2);
+    let nodes = cluster.nodes.clone();
+    cluster.run(async move {
+        ready(&nodes).await;
+        let hook = status_hook(&nodes).await;
+        let answers = Rc::new(HookAnswers {
+            calls: RefCell::new(vec![0; nodes.len()]),
+        });
+        let tasks = start_hook_answers(&nodes, &answers, vec![retry_status(), retry_status()]);
+        sleep(Duration::from_millis(3 * DAY + 1_000)).await;
+        wait_hook_state(&nodes, hook.id, HookState::Failing).await;
+        let control = nodes.iter().find(|n| n.controls()).expect("control core");
+        let status = control.hook_status(control.hook(1, hook.id).as_ref().expect("hook"));
+        assert_eq!(status.last_status, Some(500));
+        assert!(status.failing_since.is_some());
+        assert_eq!(status.lost, u64::from(SHARDS));
+        drop(tasks);
+    });
+    cluster.stop();
+}
+
+#[test]
+fn a_recent_success_on_one_core_prevents_failing_disable() {
+    ANSWERS.set(None);
+    let seed = 72;
+    let driver = Rc::new(SimDriver::with_disk(seed, Config::default(), created(seed)));
+    let cluster = started(&driver, 2);
+    let nodes = cluster.nodes.clone();
+    cluster.run(async move {
+        ready(&nodes).await;
+        let hook = status_hook(&nodes).await;
+        let answers = Rc::new(HookAnswers {
+            calls: RefCell::new(vec![0; nodes.len()]),
+        });
+        let tasks = start_hook_answers(
+            &nodes,
+            &answers,
+            vec![Outcome::Acked { status: 204 }, retry_status()],
+        );
+        sleep(Duration::from_millis(2 * DAY)).await;
+        answering(&nodes);
+        accept_some(&nodes, 0, 1).await;
+        drained(&nodes).await;
+        sleep(Duration::from_millis(DAY + 120_000)).await;
+        let control = nodes.iter().find(|n| n.controls()).expect("control core");
+        let hook = control.hook(1, hook.id).expect("hook");
+        assert_eq!(hook.state, HookState::Active);
+        assert_eq!(control.hook_status(&hook).last_status, Some(500));
+        drop(tasks);
+    });
+    cluster.stop();
+}
+
+#[test]
+fn a_core_that_does_not_report_blocks_the_failing_decision() {
+    let seed = 73;
+    let driver = Rc::new(SimDriver::with_disk(seed, Config::default(), created(seed)));
+    let cluster = started(&driver, 2);
+    let nodes = cluster.nodes.clone();
+    cluster.run(async move {
+        ready(&nodes).await;
+        let hook = status_hook(&nodes).await;
+        let answers = Rc::new(HookAnswers {
+            calls: RefCell::new(vec![0; nodes.len()]),
+        });
+        let task =
+            nodes[0].start_hooks(Rc::new(HookAnswer(Rc::clone(&answers), 0, retry_status())));
+        sleep(Duration::from_millis(3 * DAY + 120_000)).await;
+        assert_eq!(
+            nodes[0].table().hook(1, hook.id).map(|hook| hook.state),
+            Some(HookState::Active)
+        );
+        drop(task);
+    });
+    cluster.stop();
+}
+
+#[test]
+fn a_failed_gone_write_is_retried_on_the_next_round() {
+    let seed = 74;
+    let driver = Rc::new(SimDriver::with_disk(seed, Config::default(), created(seed)));
+    let cluster = started(&driver, 1);
+    let nodes = cluster.nodes.clone();
+    cluster.run(async move {
+        ready(&nodes).await;
+        let hook = status_hook(&nodes).await;
+        let answers = Rc::new(HookAnswers {
+            calls: RefCell::new(vec![0; nodes.len()]),
+        });
+        KEYS_DOWN_ON_GONE.set(true);
+        let tasks = start_hook_answers(&nodes, &answers, vec![Outcome::Gone]);
+        sleep(Duration::from_secs(120)).await;
+        assert_eq!(answers.calls.borrow()[0], 1);
+        assert_eq!(
+            nodes[0].table().hook(1, hook.id).map(|hook| hook.state),
+            Some(HookState::Active)
+        );
+        KEYS_DOWN_ON_GONE.set(false);
+        HOOK_KEYS_DOWN.set(false);
+        wait_hook_state(&nodes, hook.id, HookState::Gone).await;
+        assert_eq!(answers.calls.borrow()[0], 1);
+        drop(tasks);
+    });
+    cluster.stop();
+}
+
+#[test]
+fn hook_status_reports_are_chunked_and_pruned_on_delete() {
+    let seed = 75;
+    let driver = Rc::new(SimDriver::with_disk(seed, Config::default(), created(seed)));
+    let cluster = started(&driver, 1);
+    let nodes = cluster.nodes.clone();
+    cluster.run(async move {
+        ready(&nodes).await;
+        let node = &nodes[0];
+        let missing: Vec<Object> = (3..=9).map(|id| tenant(id, 1, State::Active)).collect();
+        configure(&nodes, missing).await;
+        let mut hooks = Vec::new();
+        for id in 1..=65_u32 {
+            let tenant = (id - 1) / u32::try_from(MAX_HOOKS).expect("small") + 1;
+            let hook = node
+                .hook_new(tenant, "https://hooks.example.org/in", 0)
+                .await
+                .expect("new");
+            let hook = node
+                .hook_change(
+                    tenant,
+                    hook.id,
+                    HookChange {
+                        enabled: Some(false),
+                        ..HookChange::default()
+                    },
+                )
+                .await
+                .expect("pause");
+            let shard = node.spool().shards()[0];
+            let cursor = Cursor {
+                generation: 1,
+                acked: node.spool().changes().watch().head(),
+                lost: u64::from(id),
+                counted: 0,
+            };
+            write_cursor(node.spool().changes(), shard, tenant, hook.id, &cursor)
+                .await
+                .expect("cursor");
+            hooks.push(hook);
+        }
+        let task = node.start_hooks(Rc::new(Catch(Rc::new(Caught::default()), node.clone())));
+        for _ in 0..120 {
+            if node.hook_status(&hooks[64]).lost == 65 {
+                break;
+            }
+            sleep(Duration::from_secs(1)).await;
+        }
+        for (id, hook) in hooks.iter().enumerate() {
+            assert_eq!(node.hook_status(hook).lost, id as u64 + 1);
+        }
+        node.hook_remove(hooks[0].tenant, hooks[0].id)
+            .await
+            .expect("remove");
+        assert_eq!(node.hook_status(&hooks[0]).lost, 0);
+        node.delete_tenant(hooks[8].tenant).await.expect("delete");
+        wait_for(&nodes, hooks[8].tenant, 1, State::Deleted).await;
+        assert_eq!(node.hook_status(&hooks[8]).lost, 0);
+        drop(task);
+    });
+    cluster.stop();
 }

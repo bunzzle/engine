@@ -155,6 +155,7 @@ type Key = (u32, u32, u32);
 enum Sent {
     Status(u16, Option<Duration>),
     Refused,
+    Internal,
     Failed,
 }
 
@@ -189,25 +190,39 @@ impl<T: Transport + 'static, D: Dns + 'static, L: Local + 'static> Inner<T, D, L
         let key = (call.tenant, call.generation, call.hook);
         self.prune();
         match sent {
-            Sent::Status(200..=299, _) => {
+            Sent::Status(status @ 200..=299, _) => {
                 self.failures.borrow_mut().remove(&key);
-                Outcome::Acked
+                Outcome::Acked { status }
             }
             Sent::Refused => {
                 self.failures.borrow_mut().remove(&key);
-                Outcome::Retry(PAUSE_MIN)
+                Outcome::Refused(PAUSE_MIN)
             }
-            Sent::Status(410, _) => {
+            Sent::Status(410, _) => Outcome::Gone,
+            Sent::Status(status @ (429 | 503), Some(after)) => {
                 self.failed(key);
-                Outcome::Retry(PAUSE_MAX)
+                Outcome::Retry {
+                    after: after.clamp(PAUSE_MIN, PAUSE_MAX),
+                    status: Some(status),
+                }
             }
-            Sent::Status(429 | 503, Some(after)) => {
-                self.failed(key);
-                Outcome::Retry(after.clamp(PAUSE_MIN, PAUSE_MAX))
-            }
-            Sent::Status(..) | Sent::Failed => {
+            Sent::Status(status, _) => {
                 let n = self.failed(key);
-                Outcome::Retry(self.pause(n))
+                Outcome::Retry {
+                    after: self.pause(n),
+                    status: Some(status),
+                }
+            }
+            Sent::Internal => {
+                let n = self.failed(key);
+                Outcome::Refused(self.pause(n))
+            }
+            Sent::Failed => {
+                let n = self.failed(key);
+                Outcome::Retry {
+                    after: self.pause(n),
+                    status: None,
+                }
             }
         }
     }
@@ -268,13 +283,13 @@ impl<T: Transport + 'static, D: Dns + 'static, L: Local + 'static> Inner<T, D, L
             return Sent::Failed;
         };
         let Some(secrets) = self.secrets(call, &first).await else {
-            return Sent::Failed;
+            return Sent::Internal;
         };
         let Some(ids) = self.node.ids() else {
-            return Sent::Failed;
+            return Sent::Internal;
         };
         let Ok(ids) = Ids::new(&ids) else {
-            return Sent::Failed;
+            return Sent::Internal;
         };
         let Ok(name) = Name::parse(&target.host) else {
             return Sent::Failed;
@@ -292,7 +307,7 @@ impl<T: Transport + 'static, D: Dns + 'static, L: Local + 'static> Inner<T, D, L
                 continue;
             };
             let Some(request) = self.request(call, &target, &ids, &secrets).await else {
-                return Sent::Failed;
+                return Sent::Internal;
             };
             if !self.same(call, &first) {
                 return Sent::Refused;

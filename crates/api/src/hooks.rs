@@ -2,7 +2,7 @@ use std::fmt::Write as _;
 
 use control::{ALL_EVENTS, Hook, HookState};
 use crypto::Ids;
-use http::{Request, Response, Status};
+use http::{Request, Response, Status, rfc3339};
 use sched::{HookChange, Transport};
 
 use crate::handler::{Handler, Source, ok};
@@ -64,7 +64,7 @@ pub(crate) async fn handle<T: Transport + 'static, S: Source>(
                     if n > 0 {
                         out.push(',');
                     }
-                    write(hook, &ids, None, &mut out);
+                    write(node, hook, &ids, None, &mut out);
                 }
                 out.push_str("]}");
                 Ok(ok(id, out))
@@ -78,7 +78,7 @@ pub(crate) async fn handle<T: Transport + 'static, S: Source>(
                     .map_err(|error| refusal(&error))?;
                 let secret = secret(handler, &hook, hook.version).await.ok();
                 let mut out = String::new();
-                write(&hook, &ids, secret.as_deref(), &mut out);
+                write(node, &hook, &ids, secret.as_deref(), &mut out);
                 Ok(created(id, out))
             }
             _ => Err(Problem::method("GET, POST").into()),
@@ -90,14 +90,14 @@ pub(crate) async fn handle<T: Transport + 'static, S: Source>(
             };
             let hook = known(handler, &ids, text)?;
             match method {
-                "GET" => Ok(ok(id, written(&hook, &ids, None))),
+                "GET" => Ok(ok(id, written(node, &hook, &ids, None))),
                 "PATCH" => {
                     let change = change(body.as_deref().unwrap_or_default())?;
                     let hook = node
                         .hook_change(tenant, hook.id, change)
                         .await
                         .map_err(|error| refusal(&error))?;
-                    Ok(ok(id, written(&hook, &ids, None)))
+                    Ok(ok(id, written(node, &hook, &ids, None)))
                 }
                 "DELETE" => {
                     node.hook_remove(tenant, hook.id)
@@ -121,7 +121,7 @@ pub(crate) async fn handle<T: Transport + 'static, S: Source>(
                 .await
                 .map_err(|error| refusal(&error))?;
             let secret = secret(handler, &hook, hook.version).await?;
-            Ok(ok(id, written(&hook, &ids, Some(&secret))))
+            Ok(ok(id, written(node, &hook, &ids, Some(&secret))))
         }
         Path::Secret(text) => {
             let hook = known(handler, &ids, text)?;
@@ -200,13 +200,24 @@ pub(crate) fn private(ids: &Ids, tenant: u32, text: &str) -> Option<u32> {
     fits.then(|| word(8))
 }
 
-fn written(hook: &Hook, ids: &Ids, secret: Option<&str>) -> String {
+fn written<T: Transport + 'static>(
+    node: &sched::Node<T>,
+    hook: &Hook,
+    ids: &Ids,
+    secret: Option<&str>,
+) -> String {
     let mut out = String::new();
-    write(hook, ids, secret, &mut out);
+    write(node, hook, ids, secret, &mut out);
     out
 }
 
-fn write(hook: &Hook, ids: &Ids, secret: Option<&str>, out: &mut String) {
+fn write<T: Transport + 'static>(
+    node: &sched::Node<T>,
+    hook: &Hook,
+    ids: &Ids,
+    secret: Option<&str>,
+    out: &mut String,
+) {
     out.push_str("{\"id\":");
     json::string(&public(ids, hook.tenant, hook.id), out);
     out.push_str(",\"url\":");
@@ -225,6 +236,20 @@ fn write(hook: &Hook, ids: &Ids, secret: Option<&str>, out: &mut String) {
     out.push_str("],\"state\":");
     json::string(state(hook.state), out);
     let _ = write!(out, ",\"version\":{}", hook.version);
+    let status = node.hook_status(hook);
+    out.push_str(",\"failing_since\":");
+    match status.failing_since {
+        Some(at) => json::string(&rfc3339(at), out),
+        None => out.push_str("null"),
+    }
+    out.push_str(",\"last_status\":");
+    match status.last_status {
+        Some(status) => {
+            let _ = write!(out, "{status}");
+        }
+        None => out.push_str("null"),
+    }
+    let _ = write!(out, ",\"lost\":{}", status.lost);
     if let Some(secret) = secret {
         out.push_str(",\"secret\":");
         json::string(secret, out);

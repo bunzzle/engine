@@ -20,6 +20,7 @@ mod requests;
 mod sealing;
 mod sign;
 mod start;
+mod status;
 mod stream;
 mod suppress;
 mod system;
@@ -58,6 +59,7 @@ pub use sealing::{
 };
 pub use sign::{Body, Fault, KEYS_WAIT, Outgoing, Plain, Prepared, SIGNED_BYTES};
 pub use start::{CONTROL_SHARD, Links, Meshes, Node, Parts, Running, Settings};
+pub use status::{HookReport, HookStatus, StreamReport};
 pub use stream::{
     BATCH_BYTES, BATCH_EVENTS, Call, Deliver, Outcome, Sealed as SealedEvent, Sending,
 };

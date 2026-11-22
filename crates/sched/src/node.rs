@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::future::poll_fn;
 use std::ops::Range;
 use std::pin::pin;
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 use std::task::Poll;
 
 use control::{Table, Tenancy, queue_shard};
@@ -17,6 +17,8 @@ use crate::lanes::{Entry, Lanes, Limits, QueueId, Take, ranges};
 use crate::policy::{Answer, BACKOFF, Kind, clamp, delay, report_retry};
 use crate::sealing::{Keys, Unsealable};
 use crate::sign::{Outgoing, Signing, expiry_events};
+use crate::start::Node;
+use crate::status::{HookReport, REPORT_CHUNK, Reports};
 use crate::transport::{Answered, Attempt, Claimed, Destination, Transport};
 use crate::unopened::{Action, Breaker, UnopenedStats, action};
 
@@ -101,6 +103,12 @@ pub enum Note {
         core: u16,
         day: u32,
     },
+    Hooks {
+        core: u16,
+        at: u64,
+        reports: Vec<HookReport>,
+        last: bool,
+    },
     Released {
         route: Route,
         recipients: Vec<(u32, u64)>,
@@ -170,6 +178,8 @@ struct Inner<T> {
     damaged: RefCell<BTreeMap<MessageId, u8>>,
     signing: OnceCell<Rc<Signing>>,
     table: OnceCell<Rc<RefCell<Table>>>,
+    hook_reports: OnceCell<Rc<RefCell<Reports>>>,
+    node: OnceCell<Weak<crate::start::Inner<T>>>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -246,6 +256,8 @@ impl<T: Transport + 'static> Sched<T> {
             damaged: RefCell::new(BTreeMap::new()),
             signing: OnceCell::new(),
             table: OnceCell::new(),
+            hook_reports: OnceCell::new(),
+            node: OnceCell::new(),
         });
         let sched = Self { inner };
         let handler = sched.clone();
@@ -335,6 +347,61 @@ impl<T: Transport + 'static> Sched<T> {
                 .signing
                 .set(Rc::new(Signing::new(Rc::clone(keys), table)));
         }
+    }
+
+    pub(crate) fn use_hook_reports(&self, reports: Rc<RefCell<Reports>>) {
+        let _ = self.inner.hook_reports.set(reports);
+    }
+
+    pub(crate) fn use_node(&self, node: Weak<crate::start::Inner<T>>) {
+        let _ = self.inner.node.set(node);
+    }
+
+    pub(crate) fn report_hooks(&self, reports: Vec<HookReport>) {
+        let core = self.inner.index;
+        let at = self.inner.clock.now();
+        if reports.is_empty() {
+            let note = Note::Hooks {
+                core,
+                at,
+                reports,
+                last: true,
+            };
+            if core == 0 {
+                self.handle(note);
+            } else {
+                self.send(0, note);
+            }
+            return;
+        }
+        let chunks = reports.chunks(REPORT_CHUNK);
+        let count = chunks.len();
+        for (index, chunk) in chunks.enumerate() {
+            let note = Note::Hooks {
+                core,
+                at,
+                reports: chunk.to_vec(),
+                last: index + 1 == count,
+            };
+            if core == 0 {
+                self.handle(note);
+            } else {
+                self.send(0, note);
+            }
+        }
+    }
+
+    pub(crate) fn use_node_config(
+        &self,
+        keys: &Rc<dyn Keys>,
+        table: &Rc<RefCell<Table>>,
+        reports: &Rc<RefCell<Reports>>,
+        pending: Vec<Pending>,
+    ) -> u64 {
+        self.use_keys(Rc::clone(keys));
+        self.use_table(Rc::clone(table));
+        self.use_hook_reports(Rc::clone(reports));
+        crate::start::restore_live(self, pending, table)
     }
 
     pub fn retry_now(&self, queue: QueueId) {
@@ -506,6 +573,42 @@ impl<T: Transport + 'static> Sched<T> {
                     return;
                 }
                 self.inner.lows.borrow_mut().insert(core, day);
+            }
+            Note::Hooks {
+                core,
+                at,
+                reports,
+                last,
+            } => {
+                if self.inner.index != 0 || core >= self.inner.cores {
+                    self.refuse();
+                    return;
+                }
+                let (Some(all), Some(table), Some(control)) = (
+                    self.inner.hook_reports.get(),
+                    self.inner.table.get(),
+                    self.inner.node.get().and_then(Weak::upgrade),
+                ) else {
+                    self.refuse();
+                    return;
+                };
+                let decisions = all.borrow_mut().ingest(
+                    core,
+                    at,
+                    reports,
+                    last,
+                    &table.borrow(),
+                    self.inner.clock.now(),
+                );
+                if decisions.is_empty() {
+                    return;
+                }
+                let control = Node { inner: control };
+                drop(spawn(async move {
+                    for decision in decisions {
+                        control.disable_hook(decision).await;
+                    }
+                }));
             }
             Note::Released { route, recipients } => self.released(route, recipients),
             Note::Dropped { route, recipients } => self.dropped(route, recipients),

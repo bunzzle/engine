@@ -25,8 +25,9 @@ use keys::{
 use rt::sim::{Config, Disk, Machine, SimDriver, Stalls, check};
 use rt::{Ends, JoinHandle, Mesh, Notify, Runtime, TcpListener, TcpStream, sleep, spawn, timeout};
 use sched::{
-    Answer, Answered, Attempt, Body, Clock, EventBody, EventKind, Keyring, Keys, Meshes, Node,
-    Parts, Reason, Running, Settings, Transport,
+    Answer, Answered, Attempt, Body, Call, Clock, Cursor, Deliver, EventBody, EventKind, Keyring,
+    Keys, Meshes, Node, Outcome, Parts, Reason, Running, Sending, Settings, Transport,
+    write_cursor,
 };
 use spool::MessageId;
 use store::{Client, Committer, DataFile, Options, SLOT_SIZE, Setup, boot};
@@ -1911,6 +1912,24 @@ fn event_reads_refuse_bad_queries_and_parallel_reads() {
     });
 }
 
+struct ApiStatus(u32, u32);
+
+impl Deliver for ApiStatus {
+    fn deliver(&self, call: Rc<Call>) -> Sending {
+        let outcome = if call.hook == self.0 {
+            Outcome::Retry {
+                after: Duration::from_secs(3600),
+                status: Some(503),
+            }
+        } else if call.hook == self.1 {
+            Outcome::Acked { status: 204 }
+        } else {
+            Outcome::Refused(Duration::from_secs(10))
+        };
+        Box::pin(std::future::ready(outcome))
+    }
+}
+
 fn hook_call(method: &str, path: &str, token: &str, body: Option<&str>) -> Vec<u8> {
     let mut request =
         format!("{method} {path} HTTP/1.1\r\nHost: api.test\r\nAuthorization: Bearer {token}\r\n");
@@ -2180,4 +2199,158 @@ fn webhooks_are_managed_through_the_control_core_per_tenant() {
         owners.join(&cluster.machine);
         cluster.stop();
     });
+}
+
+#[test]
+fn webhook_get_and_list_include_reported_status_and_lost() {
+    check(10..12, |seed| {
+        let cluster = started(seed, 2);
+        let nodes = cluster.nodes.clone();
+        let control = nodes.iter().position(Node::controls).expect("control");
+        let front = u16::from(control == 0);
+        let forwards = Mesh::new(2);
+        let owners = owners_besides(&cluster, &forwards, front);
+        let ends = forwards.take(front).expect("ends");
+        let watched = Rc::clone(&owners);
+        cluster.run(async move {
+            let owners = watched;
+            let tokens = prepare(&nodes).await;
+            let ports = serve_with(
+                &nodes[usize::from(front)],
+                seed,
+                ApiConfig::new("mx1.example.net".into()),
+                ends,
+            )
+            .await;
+            let mut http = Http::plain().await;
+            let body = r#"{"url":"https://hooks.example.org/in"}"#;
+            let first = http
+                .send_reply(&hook_call(
+                    "POST",
+                    "/v1/webhooks",
+                    &tokens.first,
+                    Some(body),
+                ))
+                .await;
+            assert_eq!(first.status, 201, "{first:?}");
+            let first_id = text_of(&first.json(), "id");
+            let second = http
+                .send_reply(&hook_call(
+                    "POST",
+                    "/v1/webhooks",
+                    &tokens.first,
+                    Some(body),
+                ))
+                .await;
+            assert_eq!(second.status, 201, "{second:?}");
+            let second_id = text_of(&second.json(), "id");
+            let initial = http
+                .send_reply(&hook_call(
+                    "GET",
+                    &format!("/v1/webhooks/{second_id}"),
+                    &tokens.first,
+                    None,
+                ))
+                .await
+                .json();
+            assert_eq!(initial.get("failing_since"), Some(&Value::Null));
+            assert_eq!(initial.get("last_status"), Some(&Value::Null));
+            assert_eq!(initial.get("lost").and_then(Value::as_u64), Some(0));
+
+            let node = &nodes[control];
+            let hooks = node.hooks(1);
+            let (first_private, second_private) = (hooks[0].id, hooks[1].id);
+            let shard = node.spool().shards()[0];
+            let changes = node.spool().changes();
+            let cursor = Cursor {
+                generation: 1,
+                acked: changes.watch().head(),
+                lost: 7,
+                counted: 0,
+            };
+            write_cursor(changes, shard, 1, first_private, &cursor)
+                .await
+                .expect("cursor");
+            write_cursor(
+                changes,
+                shard,
+                1,
+                second_private,
+                &Cursor { lost: 1, ..cursor },
+            )
+            .await
+            .expect("cursor");
+            let task = node.start_hooks(Rc::new(ApiStatus(first_private, second_private)));
+            check_hook_status(&mut http, &tokens.first, &first_id, &second_id).await;
+            drop(task);
+            owners.stop();
+            ports.close().await;
+        });
+        owners.join(&cluster.machine);
+        cluster.stop();
+    });
+}
+
+async fn check_hook_status(http: &mut Http, token: &str, first_id: &str, second_id: &str) {
+    sleep(Duration::from_secs(61)).await;
+    *http = Http::plain().await;
+    let first_path = format!("/v1/webhooks/{first_id}");
+    let failed = http
+        .send_reply(&hook_call("GET", &first_path, token, None))
+        .await
+        .json();
+    assert!(text_of(&failed, "failing_since").ends_with('Z'));
+    assert_eq!(failed.get("last_status").and_then(Value::as_u64), Some(503));
+    assert_eq!(failed.get("lost").and_then(Value::as_u64), Some(7));
+    let succeeded = http
+        .send_reply(&hook_call(
+            "GET",
+            &format!("/v1/webhooks/{second_id}"),
+            token,
+            None,
+        ))
+        .await
+        .json();
+    assert_eq!(succeeded.get("failing_since"), Some(&Value::Null));
+    assert_eq!(
+        succeeded.get("last_status").and_then(Value::as_u64),
+        Some(204)
+    );
+    let listed = listed(
+        &http
+            .send_reply(&hook_call("GET", "/v1/webhooks", token, None))
+            .await,
+    );
+    let listed_failed = listed
+        .iter()
+        .find(|hook| text_of(hook, "id") == first_id)
+        .expect("failed hook");
+    assert_eq!(
+        listed_failed.get("last_status").and_then(Value::as_u64),
+        Some(503)
+    );
+    assert_eq!(listed_failed.get("lost").and_then(Value::as_u64), Some(7));
+
+    let paused = http
+        .send_reply(&hook_call(
+            "PATCH",
+            &first_path,
+            token,
+            Some(r#"{"enabled":false}"#),
+        ))
+        .await;
+    assert_eq!(paused.status, 200, "{paused:?}");
+    sleep(Duration::from_secs(61)).await;
+    *http = Http::plain().await;
+    let paused = http
+        .send_reply(&hook_call("GET", &first_path, token, None))
+        .await
+        .json();
+    assert_eq!(text_of(&paused, "state"), "paused");
+    assert_eq!(
+        text_of(&paused, "failing_since"),
+        text_of(&failed, "failing_since")
+    );
+    assert_eq!(paused.get("last_status").and_then(Value::as_u64), Some(503));
+    assert_eq!(paused.get("lost").and_then(Value::as_u64), Some(7));
 }
