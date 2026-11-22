@@ -179,11 +179,13 @@ impl<T: Transport + 'static, D: Dns + 'static, L: Local + 'static> Inner<T, D, L
             let _tenant = Gate::enter(&gate).await;
             let _core = Gate::enter(&self.core).await;
             let mut open = None;
+            let started = rt::now();
             let sent = timeout(CALL, self.attempt(call, &mut open))
                 .await
                 .unwrap_or(Sent::Failed("timeout"));
             if let Some(open) = open {
-                self.finish(call, open).await;
+                let left = CALL.saturating_sub(rt::now().saturating_duration_since(started));
+                self.finish(call, open, left.min(DRAIN_TIME)).await;
             }
             sent
         };
@@ -194,10 +196,10 @@ impl<T: Transport + 'static, D: Dns + 'static, L: Local + 'static> Inner<T, D, L
         self.outcome(call, sent)
     }
 
-    async fn finish(&self, call: &Call, mut open: Open) {
+    async fn finish(&self, call: &Call, mut open: Open, budget: Duration) {
         let kept = match open.rest.take() {
             Some((frame, rest)) => matches!(
-                timeout(DRAIN_TIME, drain(&mut open.stream, frame, rest)).await,
+                timeout(budget, drain(&mut open.stream, frame, rest)).await,
                 Ok(true)
             ),
             None => false,
