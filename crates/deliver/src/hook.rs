@@ -230,6 +230,9 @@ impl<T: Transport + 'static, D: Dns + 'static, L: Local + 'static> Inner<T, D, L
         let Some(first) = self.snapshot(call) else {
             return Sent::Refused;
         };
+        if !self.tls.webpki() {
+            return Sent::Failed;
+        }
         let Some(target) = target(&first.0.url) else {
             return Sent::Failed;
         };

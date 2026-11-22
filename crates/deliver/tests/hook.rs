@@ -1219,6 +1219,53 @@ fn delivery_outcomes_carry_status_refusal_and_gone() {
 }
 
 #[test]
+fn without_tls_roots_a_call_fails_before_dns() {
+    let cluster = started(34);
+    let nodes = cluster.nodes.clone();
+    cluster.run(async move {
+        ready(&nodes).await;
+        let node = &nodes[0];
+        let zone = Zone::default();
+        zone.set(
+            "hooks.example.org",
+            Type::A,
+            a(&[IpAddr::from([1, 1, 1, 1])]),
+        );
+        let hook = node
+            .hook_new(1, "https://hooks.example.org/in", 0)
+            .await
+            .expect("new")
+            .id;
+        let tls = Connector::new(simulated(2), None).expect("connector");
+        let sender = Hooks::with_local(
+            node.clone(),
+            zone.clone(),
+            tls,
+            HookSettings::default(),
+            34,
+            Owns::default(),
+        );
+        let call = Rc::new(Call {
+            tenant: 1,
+            generation: 1,
+            hook,
+            id: [9; 16],
+            lost: 0,
+            events: Vec::new(),
+        });
+        match sender.deliver(call).await {
+            Outcome::Retry { after, status } => {
+                assert_eq!(status, None);
+                assert!(after >= Duration::from_secs(10));
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(zone.asked.borrow().is_empty(), "dns was asked");
+    });
+    cluster.stop();
+}
+
+#[test]
 fn interim_replies_are_skipped() {
     let cluster = started(7);
     let nodes = cluster.nodes.clone();
