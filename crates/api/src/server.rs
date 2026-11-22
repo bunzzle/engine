@@ -318,12 +318,12 @@ impl<T: Transport + 'static> Session<'_, T> {
     }
 
     async fn events(&mut self, request: &Request, id: &str) -> Result<Response, Stop> {
-        let grant = self.auth(request).await?;
+        let grant = self.auth(request, Scope::Api).await?;
         events::read(self.context, grant.tenant, request, id).await
     }
 
     async fn hooks(&mut self, request: &Request, id: &str) -> Result<Response, Stop> {
-        let grant = self.auth(request).await?;
+        let grant = self.auth(request, Scope::Hooks).await?;
         let context = self.context;
         let owner = context.forward.owner(CONTROL_SHARD);
         if owner != context.forward.index() {
@@ -347,7 +347,7 @@ impl<T: Transport + 'static> Session<'_, T> {
     }
 
     async fn post(&mut self, route: Route, request: &Request, id: &str) -> Result<Response, Stop> {
-        let grant = self.auth(request).await?;
+        let grant = self.auth(request, Scope::Api).await?;
         let context = self.context;
         let shard = match key(request)? {
             None => self.next_shard()?,
@@ -475,13 +475,13 @@ impl<T: Transport + 'static> Session<'_, T> {
         }
     }
 
-    async fn auth(&mut self, request: &Request) -> Result<Grant, Stop> {
+    async fn auth(&mut self, request: &Request, scope: Scope) -> Result<Grant, Stop> {
         let token = match request.headers.count("authorization") {
             1 => request.headers.get("authorization").and_then(bearer),
             _ => None,
         };
-        let grant = token.and_then(|token| self.context.node.table().check(token, Scope::Api));
-        let Some(grant) = grant else {
+        let found = token.and_then(|token| self.context.node.table().authenticate(token));
+        let Some((grant, scopes)) = found else {
             return Err(match self.context.guard.failed(self.ip).await {
                 Ok(false) => Problem::unauthorized(),
                 Ok(true) => Problem::unauthorized().close(),
@@ -489,6 +489,9 @@ impl<T: Transport + 'static> Session<'_, T> {
             }
             .into());
         };
+        if !scopes.has(scope) {
+            return Err(Problem::scope().into());
+        }
         if self.tenant.as_ref().is_none_or(|(t, _)| *t != grant.tenant) {
             self.tenant = None;
             let limit = self

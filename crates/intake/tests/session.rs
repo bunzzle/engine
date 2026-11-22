@@ -393,6 +393,7 @@ async fn prepare(nodes: &[Node<Idle>]) -> Tokens {
     let smtp = Scopes {
         smtp: true,
         api: false,
+        hooks: false,
     };
     let (first, first_token) = control.access_new(1, smtp, 0).await.expect("access");
     let (second, second_token) = control.access_new(2, smtp, 0).await.expect("access");

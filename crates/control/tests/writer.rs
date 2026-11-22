@@ -473,6 +473,7 @@ fn access(id: u32, tenant: u32) -> Object {
         scopes: Scopes {
             smtp: true,
             api: false,
+            hooks: false,
         },
         pool: 0,
         hash: [id.to_le_bytes()[0]; 32],
