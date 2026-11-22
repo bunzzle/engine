@@ -601,12 +601,21 @@ impl Got {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    Close,
+    Keep,
+    Silent,
+}
+
 #[derive(Clone)]
 struct Answer {
     status: u16,
     headers: Vec<String>,
     early: Vec<String>,
     delay: Duration,
+    mode: Mode,
+    tail: Option<String>,
 }
 
 impl Answer {
@@ -616,6 +625,16 @@ impl Answer {
             headers: Vec::new(),
             early: Vec::new(),
             delay: Duration::ZERO,
+            mode: Mode::Close,
+            tail: None,
+        }
+    }
+
+    fn kept(tail: Option<&str>) -> Self {
+        Self {
+            mode: Mode::Keep,
+            tail: tail.map(str::to_owned),
+            ..Self::ok()
         }
     }
 
@@ -702,70 +721,83 @@ async fn session(
     };
     let mut buf = Vec::new();
     let mut chunk = [0; 4096];
-    let end = loop {
-        if let Some(at) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
-            break at + 4;
-        }
-        if buf.len() > 64 * 1024 {
-            return;
-        }
-        let n = stream.read(&mut chunk).await.unwrap_or(0);
-        if n == 0 {
-            server.hangups.set(server.hangups.get() + 1);
-            return;
-        }
-        buf.extend_from_slice(&chunk[..n]);
-    };
-    let head = String::from_utf8_lossy(&buf[..end]).into_owned();
-    buf.drain(..end);
-    let mut lines = head.split("\r\n");
-    let line = lines.next().unwrap_or_default().to_owned();
-    let mut length = 0;
-    let mut headers = Vec::new();
-    for line in lines {
-        if line.is_empty() {
-            continue;
-        }
-        let Some((name, value)) = line.split_once(':') else {
-            continue;
+    loop {
+        let end = loop {
+            if let Some(at) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                break at + 4;
+            }
+            if buf.len() > 64 * 1024 {
+                return;
+            }
+            let n = stream.read(&mut chunk).await.unwrap_or(0);
+            if n == 0 {
+                server.hangups.set(server.hangups.get() + 1);
+                return;
+            }
+            buf.extend_from_slice(&chunk[..n]);
         };
-        let name = name.trim().to_ascii_lowercase();
-        let value = value.trim().to_owned();
-        if name == "content-length" {
-            length = value.parse().unwrap_or(0);
+        let head = String::from_utf8_lossy(&buf[..end]).into_owned();
+        buf.drain(..end);
+        let mut lines = head.split("\r\n");
+        let line = lines.next().unwrap_or_default().to_owned();
+        let mut length = 0;
+        let mut headers = Vec::new();
+        for line in lines {
+            if line.is_empty() {
+                continue;
+            }
+            let Some((name, value)) = line.split_once(':') else {
+                continue;
+            };
+            let name = name.trim().to_ascii_lowercase();
+            let value = value.trim().to_owned();
+            if name == "content-length" {
+                length = value.parse().unwrap_or(0);
+            }
+            headers.push((name, value));
         }
-        headers.push((name, value));
-    }
-    while buf.len() < length {
-        let n = stream.read(&mut chunk).await.unwrap_or(0);
-        if n == 0 {
+        while buf.len() < length {
+            let n = stream.read(&mut chunk).await.unwrap_or(0);
+            if n == 0 {
+                return;
+            }
+            buf.extend_from_slice(&chunk[..n]);
+        }
+        let n = server.got.borrow().len();
+        server.got.borrow_mut().push(Got {
+            line,
+            headers,
+            body: buf[..length].to_vec(),
+            peer,
+            at: now(),
+        });
+        buf.drain(..length);
+        let answer = script(n);
+        for early in &answer.early {
+            if stream.write_all(early.as_bytes()).await.is_err() {
+                return;
+            }
+        }
+        sleep(answer.delay).await;
+        let mut response = format!("HTTP/1.1 {} x\r\n", answer.status);
+        for header in &answer.headers {
+            response.push_str(header);
+            response.push_str("\r\n");
+        }
+        if answer.mode == Mode::Close {
+            response.push_str("Connection: close\r\n");
+        }
+        response.push_str(
+            answer
+                .tail
+                .as_deref()
+                .unwrap_or("Content-Length: 0\r\n\r\n"),
+        );
+        if stream.write_all(response.as_bytes()).await.is_err() || answer.mode != Mode::Keep {
+            let _ = stream.shutdown().await;
             return;
         }
-        buf.extend_from_slice(&chunk[..n]);
     }
-    let n = server.got.borrow().len();
-    server.got.borrow_mut().push(Got {
-        line,
-        headers,
-        body: buf[..length].to_vec(),
-        peer,
-        at: now(),
-    });
-    let answer = script(n);
-    for early in &answer.early {
-        if stream.write_all(early.as_bytes()).await.is_err() {
-            return;
-        }
-    }
-    sleep(answer.delay).await;
-    let mut response = format!("HTTP/1.1 {} x\r\n", answer.status);
-    for header in &answer.headers {
-        response.push_str(header);
-        response.push_str("\r\n");
-    }
-    response.push_str("Content-Length: 0\r\n\r\n");
-    let _ = stream.write_all(response.as_bytes()).await;
-    let _ = stream.shutdown().await;
 }
 
 fn serve_plain(ip: IpAddr) -> Rc<Cell<u32>> {
@@ -869,7 +901,7 @@ fn posts_a_signed_batch_and_acks() {
         assert_eq!(host, "hooks.example.org");
         assert_eq!(rtype, "application/json");
         assert_eq!(agent, "webhooks");
-        assert_eq!(close, "close");
+        assert_eq!(close, "");
         assert_eq!(length.parse::<usize>(), Ok(body.len()));
         assert!(id.starts_with("wh_") && id.len() == 35, "{id}");
         let seconds = stamp.parse::<u64>().expect("timestamp");
@@ -2322,6 +2354,150 @@ fn lost_events_are_reported_once_in_the_body() {
         assert!(body.contains("\"type\":\"expired\""), "{body}");
         assert!(!body.contains("\"lost\""), "{body}");
         drop(got);
+        drop(task);
+    });
+    cluster.stop();
+}
+
+async fn kept_setup(
+    node: &Node<Idle>,
+    script: Rc<dyn Fn(usize) -> Answer>,
+    hooks: usize,
+    seed: u64,
+) -> (Rc<Server>, Vec<u32>, JoinHandle<()>) {
+    let zone = Zone::default();
+    zone.set(
+        "hooks.example.org",
+        Type::A,
+        a(&[IpAddr::from([1, 1, 1, 1])]),
+    );
+    let server = serve(IpAddr::from([1, 1, 1, 1]), 443, script);
+    let mut ids = Vec::new();
+    for _ in 0..hooks {
+        let hook = node.hook_new(1, "https://hooks.example.org/in", 0).await;
+        ids.push(hook.expect("new").id);
+    }
+    let task = node.start_hooks(Rc::new(sender(node, &zone, HookSettings::default(), seed)));
+    hooks_ready(node, 1, &ids).await;
+    (server, ids, task)
+}
+
+#[test]
+fn each_stream_keeps_its_own_connection_across_calls() {
+    let cluster = started(30);
+    let nodes = cluster.nodes.clone();
+    cluster.run(async move {
+        ready(&nodes).await;
+        let node = &nodes[0];
+        let script = Rc::new(|n: usize| match n % 3 {
+            0 => Answer::kept(Some("Content-Length: 2\r\n\r\nok")),
+            1 => Answer::kept(Some(
+                "Transfer-Encoding: chunked\r\n\r\n2\r\nok\r\n0\r\n\r\n",
+            )),
+            _ => Answer::kept(None),
+        });
+        let (server, _, task) = kept_setup(node, script, 2, 31).await;
+        for n in 1..=3 {
+            expire_one(node, 1, n).await;
+            got(&server, 2 * usize::from(n)).await;
+        }
+        assert_eq!(server.open.get(), 2);
+        assert_eq!(server.live.get(), 2);
+        assert!(
+            server
+                .got
+                .borrow()
+                .iter()
+                .all(|g| g.header("connection").is_empty())
+        );
+        drop(task);
+    });
+    cluster.stop();
+}
+
+#[test]
+fn a_kept_connection_closed_by_the_server_is_replaced_at_once() {
+    let cluster = started(32);
+    let nodes = cluster.nodes.clone();
+    cluster.run(async move {
+        ready(&nodes).await;
+        let node = &nodes[0];
+        let script = Rc::new(|_| Answer {
+            mode: Mode::Silent,
+            ..Answer::ok()
+        });
+        let (server, _, task) = kept_setup(node, script, 1, 33).await;
+        expire_one(node, 1, 1).await;
+        got(&server, 1).await;
+        let before = now();
+        expire_one(node, 1, 2).await;
+        got(&server, 2).await;
+        assert_eq!(server.open.get(), 2);
+        let at = server.got.borrow()[1].at;
+        assert!(
+            at.saturating_duration_since(before) < Duration::from_secs(10),
+            "the second call waited for a retry"
+        );
+        drop(task);
+    });
+    cluster.stop();
+}
+
+#[test]
+fn closing_unframed_or_overlong_answers_are_not_kept() {
+    let cluster = started(34);
+    let nodes = cluster.nodes.clone();
+    cluster.run(async move {
+        ready(&nodes).await;
+        let node = &nodes[0];
+        let script = Rc::new(|n: usize| match n {
+            0 => Answer {
+                headers: vec!["Connection: close".to_owned()],
+                ..Answer::kept(None)
+            },
+            1 => Answer::kept(Some("\r\nbody")),
+            2 => Answer::kept(Some("Content-Length: 2\r\n\r\nokextra")),
+            _ => Answer::kept(None),
+        });
+        let (server, _, task) = kept_setup(node, script, 1, 35).await;
+        for n in 1..=5 {
+            expire_one(node, 1, n).await;
+            got(&server, usize::from(n)).await;
+        }
+        assert_eq!(server.open.get(), 4);
+        drop(task);
+    });
+    cluster.stop();
+}
+
+#[test]
+fn a_changed_url_or_a_long_pause_opens_a_new_connection() {
+    let cluster = started(36);
+    let nodes = cluster.nodes.clone();
+    cluster.run(async move {
+        ready(&nodes).await;
+        let node = &nodes[0];
+        let (server, hooks, task) = kept_setup(node, Rc::new(|_| Answer::kept(None)), 1, 37).await;
+        expire_one(node, 1, 1).await;
+        got(&server, 1).await;
+        node.hook_change(
+            1,
+            hooks[0],
+            HookChange {
+                url: Some("https://hooks.example.org/other".into()),
+                ..HookChange::default()
+            },
+        )
+        .await
+        .expect("change");
+        expire_one(node, 1, 2).await;
+        got(&server, 2).await;
+        assert_eq!(server.got.borrow()[1].line, "POST /other HTTP/1.1");
+        assert_eq!(server.open.get(), 2);
+        sleep(Duration::from_secs(20)).await;
+        expire_one(node, 1, 3).await;
+        got(&server, 3).await;
+        assert_eq!(server.open.get(), 3);
         drop(task);
     });
     cluster.stop();
