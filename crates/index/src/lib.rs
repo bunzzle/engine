@@ -7,7 +7,7 @@ mod memtable;
 mod run;
 mod segment;
 
-pub use bloom::{BITS_PER_KEY, Bloom};
+pub use bloom::{BITS_PER_KEY, Bloom, Probe};
 pub use cursor::{Cursor, Merge, Merged, Source, Step};
 pub use entry::{BLOCK, Entry, Found, KEY, Key, MAX_PAYLOAD, Op, Reference, Shape, key, tenant};
 pub use error::Error;
