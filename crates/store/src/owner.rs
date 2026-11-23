@@ -10,7 +10,7 @@ use crate::committer::{Body, Client, Lease, Location, Submission, Write};
 use crate::core_file::CoreFile;
 use crate::error::Error;
 use crate::ids::is_control;
-use crate::indexes::{IndexRecord, IndexStamp};
+use crate::indexes::{Budget, IndexRecord, IndexStamp, TailPart, Tails, after, scan_tails};
 use crate::journal::{Dead, Range};
 use crate::keeper::Keeper;
 use crate::merge::{DELAY_RUNS, Done, REFUSE_RUNS, merge};
@@ -174,6 +174,13 @@ struct ScanKind {
     reply: Sender<Result<Vec<(u16, index::Entry)>, Error>>,
 }
 
+struct ScanParts {
+    kind: u8,
+    parts: Vec<(u32, Keys<index::Key>)>,
+    budget: Budget,
+    reply: Sender<Result<Tails, Error>>,
+}
+
 struct Retire {
     kind: u8,
     close: u32,
@@ -188,6 +195,7 @@ enum Input {
     Items(Items),
     Scan(Scan),
     ScanKind(ScanKind),
+    ScanParts(ScanParts),
     Partitions(u8, Sender<Vec<(u16, u32)>>),
     Retire(Retire),
     Event(Event),
@@ -380,6 +388,25 @@ impl Changes {
         answer.recv().await.unwrap_or(Err(Error::Failed))
     }
 
+    pub async fn scan_parts(
+        &self,
+        kind: u8,
+        parts: Vec<(u32, Keys<index::Key>)>,
+        budget: Budget,
+    ) -> Result<Tails, Error> {
+        let (reply, mut answer) = channel();
+        let scan = ScanParts {
+            kind,
+            parts,
+            budget,
+            reply,
+        };
+        if self.sender.send(Input::ScanParts(scan)).is_err() {
+            return Err(Error::Failed);
+        }
+        answer.recv().await.unwrap_or(Err(Error::Failed))
+    }
+
     pub async fn partitions(&self, kind: u8) -> Result<Vec<(u16, u32)>, Error> {
         let (reply, mut answer) = channel();
         if self.sender.send(Input::Partitions(kind, reply)).is_err() {
@@ -497,6 +524,7 @@ impl Shards {
                 }
                 Input::Scan(scan) => self.scan(scan).await,
                 Input::ScanKind(scan) => self.scan_kind(scan).await,
+                Input::ScanParts(scan) => self.scan_parts(scan).await,
                 Input::Partitions(kind, reply) => {
                     let _ = reply.send(self.kept_partitions(kind));
                 }
@@ -744,6 +772,26 @@ impl Shards {
         } else {
             Err(Error::Invalid("owner"))
         };
+        let _ = scan.reply.send(result);
+    }
+
+    async fn scan_parts(&self, scan: ScanParts) {
+        let mut parts = Vec::new();
+        for (shard, partition) in self.kept_partitions(scan.kind) {
+            for (part, (wanted, keys)) in scan.parts.iter().enumerate() {
+                if *wanted == partition
+                    && let Some(found) = self.keeper.partition(shard, (scan.kind, partition))
+                {
+                    parts.push(TailPart {
+                        shard,
+                        part,
+                        partition: found,
+                        keys: keys.clone(),
+                    });
+                }
+            }
+        }
+        let result = scan_tails(&self.file, parts, scan.budget).await;
         let _ = scan.reply.send(result);
     }
 
@@ -1304,14 +1352,4 @@ async fn move_body(
     written.ok()?;
     target.offset += length;
     Some(moved)
-}
-
-fn after(mut key: index::Key) -> index::Key {
-    for byte in key.iter_mut().rev() {
-        *byte = byte.wrapping_add(1);
-        if *byte != 0 {
-            return key;
-        }
-    }
-    [0xff; index::KEY]
 }
