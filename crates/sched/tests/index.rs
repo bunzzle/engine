@@ -24,11 +24,11 @@ use rt::{JoinHandle, Runtime, TcpListener, TcpStream, sleep, spawn, timeout};
 use sched::{
     Answer, Answered, Attempt, Batched, Begun, Call, Clock, Cursor, DAY, Deliver, Draft,
     EVENT_DAYS, EVENT_SHAPE, EVENT_VALUE, Event, EventBody, EventKind, Fault, Hash, HookChange,
-    KIND_EVENT, KIND_REQUEST, KIND_SUPPRESS, Keyring, Keys, MAX_HOOKS, MAX_REPLY, Meshes, Node,
-    Outcome, Parts, ROTATION_MS, ReadError, Reason, Recipient, Refusal, Restore, Running, SHAPE,
-    Sending, Settings, Suppression, Ticket, Transport, Unsealable, Unwrapped, drop_cursor,
-    encode_slice, event_record, event_sealed, event_sequence, normalize, punycode, read_cursor,
-    retain, retain_event, retain_request, retired_events, write_cursor,
+    HookStats, KIND_EVENT, KIND_REQUEST, KIND_SUPPRESS, Keyring, Keys, MAX_HOOKS, MAX_REPLY,
+    Meshes, Node, Outcome, Parts, ROTATION_MS, ReadError, Reason, Recipient, Refusal, Restore,
+    Running, SHAPE, Sending, Settings, Suppression, Ticket, Transport, Unsealable, Unwrapped,
+    drop_cursor, encode_slice, event_record, event_sealed, event_sequence, normalize, punycode,
+    read_cursor, retain, retain_event, retain_request, retired_events, write_cursor,
 };
 use spool::{Body, Head, HeadClear, Message, MessageId, SLICE, Slice, Stamp};
 use store::{Client, Committer, DataFile, Options, SLOT_SIZE, Setup, Tiering, boot};
@@ -4509,6 +4509,18 @@ fn a_gone_stream_disables_the_hook_on_every_core_without_retrying() {
         wait_hook_state(&nodes, hook.id, HookState::Gone).await;
         sleep(Duration::from_secs(3700)).await;
         assert_eq!(answers.calls.borrow()[0], 1);
+        let control = nodes.iter().find(|n| n.controls()).expect("control core");
+        assert_eq!(
+            control.hook_stats(),
+            HookStats {
+                gone: 1,
+                failing: 0,
+                write_failed: 0,
+            }
+        );
+        for node in nodes.iter().filter(|n| !n.controls()) {
+            assert_eq!(node.hook_stats(), HookStats::default());
+        }
         drop(tasks);
     });
     cluster.stop();
@@ -4534,6 +4546,14 @@ fn three_days_of_failures_on_every_core_disable_the_hook() {
         assert_eq!(status.last_status, Some(500));
         assert!(status.failing_since.is_some());
         assert_eq!(status.lost, u64::from(SHARDS));
+        assert_eq!(
+            control.hook_stats(),
+            HookStats {
+                gone: 0,
+                failing: 1,
+                write_failed: 0,
+            }
+        );
         drop(tasks);
     });
     cluster.stop();
@@ -4566,6 +4586,7 @@ fn a_recent_success_on_one_core_prevents_failing_disable() {
         let hook = control.hook(1, hook.id).expect("hook");
         assert_eq!(hook.state, HookState::Active);
         assert_eq!(control.hook_status(&hook).last_status, Some(500));
+        assert_eq!(control.hook_stats(), HookStats::default());
         drop(tasks);
     });
     cluster.stop();
@@ -4615,10 +4636,16 @@ fn a_failed_gone_write_is_retried_on_the_next_round() {
             nodes[0].table().hook(1, hook.id).map(|hook| hook.state),
             Some(HookState::Active)
         );
+        let failed = nodes[0].hook_stats();
+        assert!(failed.write_failed >= 1);
+        assert_eq!(failed.gone, 0);
         KEYS_DOWN_ON_GONE.set(false);
         HOOK_KEYS_DOWN.set(false);
         wait_hook_state(&nodes, hook.id, HookState::Gone).await;
         assert_eq!(answers.calls.borrow()[0], 1);
+        let stats = nodes[0].hook_stats();
+        assert_eq!(stats.gone, 1);
+        assert_eq!(stats.write_failed, failed.write_failed);
         drop(tasks);
     });
     cluster.stop();

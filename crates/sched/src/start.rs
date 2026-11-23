@@ -20,7 +20,7 @@ use crate::node::{Config, Note, Sched};
 use crate::reader::{self, EventPage, ReadError, Reader};
 use crate::requests::{KIND_REQUEST, RequestInputs, Requests, retain_request};
 use crate::sealing::{Holds, Keys};
-use crate::status::Reports;
+use crate::status::{HookStats, Reports};
 use crate::suppress::{self, Inputs, KIND_SUPPRESS, Suppressions};
 use crate::system::{self, RecordStats, Stored};
 use crate::transport::{OwnStats, Transport};
@@ -293,6 +293,10 @@ impl<T: Transport + 'static> Node<T> {
 
     pub fn own_stats(&self) -> OwnStats {
         self.inner.sched.transport().own_stats()
+    }
+
+    pub fn hook_stats(&self) -> HookStats {
+        self.inner.hook_reports.borrow().stats()
     }
 
     pub fn queues(&self) -> &Queues {

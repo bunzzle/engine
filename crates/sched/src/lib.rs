@@ -59,7 +59,7 @@ pub use sealing::{
 };
 pub use sign::{Body, Fault, KEYS_WAIT, Outgoing, Plain, Prepared, SIGNED_BYTES};
 pub use start::{CONTROL_SHARD, Links, Meshes, Node, Parts, Running, Settings};
-pub use status::{HookReport, HookStatus, StreamReport};
+pub use status::{HookReport, HookStats, HookStatus, StreamReport};
 pub use stream::{
     BATCH_BYTES, BATCH_EVENTS, Call, Deliver, Outcome, Sealed as SealedEvent, Sending,
 };

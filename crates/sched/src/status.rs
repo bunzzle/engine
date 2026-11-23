@@ -35,6 +35,13 @@ pub struct HookStatus {
     pub lost: u64,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct HookStats {
+    pub gone: u64,
+    pub failing: u64,
+    pub write_failed: u64,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Disable {
     pub tenant: u32,
@@ -63,7 +70,7 @@ pub(crate) struct Reports {
     cores: u16,
     active: BTreeMap<u32, Active>,
     by_core: BTreeMap<u16, CoreReports>,
-    write_errors: u64,
+    stats: HookStats,
 }
 
 impl Reports {
@@ -72,7 +79,7 @@ impl Reports {
             cores,
             active: BTreeMap::new(),
             by_core: BTreeMap::new(),
-            write_errors: 0,
+            stats: HookStats::default(),
         }
     }
 
@@ -315,7 +322,20 @@ impl Reports {
     }
 
     pub(crate) fn write_failed(&mut self) {
-        self.write_errors = self.write_errors.saturating_add(1);
+        self.stats.write_failed = self.stats.write_failed.saturating_add(1);
+    }
+
+    pub(crate) fn disabled(&mut self, state: HookState) {
+        let count = match state {
+            HookState::Gone => &mut self.stats.gone,
+            HookState::Failing => &mut self.stats.failing,
+            HookState::Active | HookState::Paused => return,
+        };
+        *count = count.saturating_add(1);
+    }
+
+    pub(crate) fn stats(&self) -> HookStats {
+        self.stats
     }
 }
 
