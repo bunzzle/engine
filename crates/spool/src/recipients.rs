@@ -590,10 +590,9 @@ impl Spool {
         let mut table = self.inner.table.borrow_mut();
         for event in reports.iter().filter_map(|r| r.event.as_ref()) {
             let tenant = event.record.write(0).tenant;
-            let lost = event.carried.saturating_add(1);
             let count = table.lost.entry(tenant).or_default();
-            *count = count.saturating_add(lost);
-            table.lost_total += u64::from(lost);
+            *count = count.saturating_add(event.carried).saturating_add(1);
+            table.lost_total += 1;
         }
     }
 
@@ -818,12 +817,10 @@ impl Spool {
                 }
             }
             if !kept || merge.lost > 0 {
-                let dropped = if kept { 0 } else { events };
-                let lost = dropped
-                    .saturating_add(if kept { 0 } else { merge.carried })
-                    .saturating_add(merge.lost);
+                let lost = if kept { 0 } else { events }.saturating_add(merge.lost);
+                let carried = if kept { 0 } else { merge.carried };
                 let count = table.lost.entry(tenant).or_default();
-                *count = count.saturating_add(lost);
+                *count = count.saturating_add(lost).saturating_add(carried);
                 table.lost_total += u64::from(lost);
             }
             let key = (shard, message);

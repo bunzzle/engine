@@ -360,6 +360,8 @@ fn refused_events_are_counted_as_lost_with_what_they_carried() {
         spool.claim(id, 0).expect("claim");
         let mut wide = event(2, spool.stamp(0).expect("stamp"));
         wide.record.entry.value.push(0);
+        spool.count_lost(7, 4);
+        assert_eq!(spool.take_lost(7), 4);
         wide.carried = 4;
         let shaped = Report {
             event: Some(wide),
@@ -374,6 +376,8 @@ fn refused_events_are_counted_as_lost_with_what_they_carried() {
         assert_eq!(spool.take_lost(7), 0);
         assert_eq!(events(spool).await.len(), 1);
         let mut unclaimed = event(3, spool.stamp(0).expect("stamp"));
+        spool.count_lost(7, 2);
+        assert_eq!(spool.take_lost(7), 2);
         unclaimed.carried = 2;
         let early = Report {
             event: Some(unclaimed),
