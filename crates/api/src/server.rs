@@ -20,6 +20,7 @@ use crate::events;
 use crate::forward::{Ahead, Back, Forwarder, Inbound, Link, Open, Remote};
 use crate::handler::{Handler, Source, chunk, key, ok, refusal};
 use crate::problem::Problem;
+use crate::search;
 
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -49,6 +50,7 @@ pub enum Route {
     Messages,
     Raw,
     Events,
+    Search,
     Hooks,
     Health,
     Other,
@@ -67,6 +69,7 @@ pub(crate) struct Context<T> {
     pub(crate) stats: Rc<Stats>,
     pub(crate) forward: Rc<Forwarder>,
     pub(crate) reading: RefCell<BTreeSet<u32>>,
+    pub(crate) searching: RefCell<BTreeSet<u32>>,
 }
 
 pub(crate) struct Port {
@@ -292,6 +295,10 @@ impl<T: Transport + 'static> Session<'_, T> {
                 (Route::Events, self.events(request, &id).await)
             }
             "/v1/events" => (Route::Events, Err(Problem::method("GET, HEAD").into())),
+            "/v1/search" if request.method == "GET" || request.method == "HEAD" => {
+                (Route::Search, self.search(request, &id).await)
+            }
+            "/v1/search" => (Route::Search, Err(Problem::method("GET, HEAD").into())),
             path if path == "/v1/webhooks" || path.starts_with("/v1/webhooks/") => {
                 (Route::Hooks, self.hooks(request, &id).await)
             }
@@ -320,6 +327,11 @@ impl<T: Transport + 'static> Session<'_, T> {
     async fn events(&mut self, request: &Request, id: &str) -> Result<Response, Stop> {
         let grant = self.auth(request, Scope::Api).await?;
         events::read(self.context, grant.tenant, request, id).await
+    }
+
+    async fn search(&mut self, request: &Request, id: &str) -> Result<Response, Stop> {
+        let grant = self.auth(request, Scope::Api).await?;
+        search::read(self.context, grant.tenant, request, id).await
     }
 
     async fn hooks(&mut self, request: &Request, id: &str) -> Result<Response, Stop> {

@@ -198,19 +198,7 @@ impl Reader {
         query.label(&mut label);
         let (query, positions) = match after {
             None => (query.clone(), vec![0; cores]),
-            Some(text) => {
-                let sealed = unhex(text).ok_or(ReadError::Cursor)?;
-                let clear = system.open(&label, &sealed).map_err(|e| match e {
-                    crypto::Error::Format("key version") => ReadError::Stale,
-                    _ => ReadError::Cursor,
-                })?;
-                let (from, rest) = clear.split_first_chunk::<8>().ok_or(ReadError::Cursor)?;
-                let (to, rest) = rest.split_first_chunk::<8>().ok_or(ReadError::Cursor)?;
-                let query = query
-                    .ranged(u64::from_le_bytes(*from), u64::from_le_bytes(*to))
-                    .ok_or(ReadError::Cursor)?;
-                (query, positions(rest, cores).ok_or(ReadError::Cursor)?)
-            }
+            Some(text) => resumed(&system, &label, query, text, cores)?,
         };
         let query = &query;
         let day_keys = keys.search(tenant, generation).await.map_err(|e| match e {
@@ -545,6 +533,28 @@ fn cursor(positions: &[u64]) -> Vec<u8> {
         }
     }
     out
+}
+
+fn resumed(
+    system: &crypto::TenantKeys,
+    label: &[u8],
+    query: &Query,
+    text: &str,
+    cores: usize,
+) -> Result<(Query, Vec<u64>), ReadError> {
+    let sealed = unhex(text).ok_or(ReadError::Cursor)?;
+    let clear = system.open(label, &sealed).map_err(|e| match e {
+        crypto::Error::Format("key version") => ReadError::Stale,
+        _ => ReadError::Cursor,
+    })?;
+    let (from, rest) = clear.split_first_chunk::<8>().ok_or(ReadError::Cursor)?;
+    let (to, rest) = rest.split_first_chunk::<8>().ok_or(ReadError::Cursor)?;
+    let (from, to) = (u64::from_le_bytes(*from), u64::from_le_bytes(*to));
+    if !query.fits(from, to) {
+        return Err(ReadError::Cursor);
+    }
+    let query = query.ranged(from, to).ok_or(ReadError::Cursor)?;
+    Ok((query, positions(rest, cores).ok_or(ReadError::Cursor)?))
 }
 
 fn positions(clear: &[u8], cores: usize) -> Option<Vec<u64>> {

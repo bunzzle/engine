@@ -17,6 +17,7 @@ use aws_lc_rs::signature::{ED25519, RSA_PKCS1_2048_8192_SHA256, UnparsedPublicKe
 use control::{Domain, Object, Pool, Scopes, State, Tenant, Verification};
 use crypto::{DkimAlg, Ids};
 use dkim::BodyHash;
+use http::{parse_rfc3339, rfc3339};
 use intake::{Conn, End, Guard, Limits};
 use keys::{
     Audit, BatchSettings, Client as KeyClient, Connect, Ring, RingSettings, Server as KeyServer,
@@ -223,7 +224,7 @@ fn keys_up(machine: &Machine) {
         let dir = Path::new(KEYS_DIR);
         let vault = match Vault::open(dir).await {
             Ok(vault) => vault,
-            Err(_) => Vault::init(dir, 20_000).await.expect("init"),
+            Err(_) => Vault::init(dir, keys::wall_day()).await.expect("init"),
         };
         let audit = Audit::open(dir).await.expect("audit");
         let server = Rc::new(KeyServer::start(vault, audit, KeySettings::default()));
@@ -1906,6 +1907,177 @@ fn event_reads_refuse_bad_queries_and_parallel_reads() {
             assert!(text.starts_with("HTTP/1.1 200"), "{text}");
             assert!(text.ends_with("\r\n\r\n"), "{text}");
             assert!(ports.count(Route::Events, 200) >= 3);
+            ports.close().await;
+        });
+        cluster.stop();
+    });
+}
+
+fn search(token: &str, query: &str) -> Vec<u8> {
+    format!(
+        "GET /v1/search?{query} HTTP/1.1\r\nHost: api.test\r\nAuthorization: Bearer {token}\r\n\r\n"
+    )
+    .into_bytes()
+}
+
+async fn searched_all(http: &mut Http, token: &str, query: &str) -> Vec<Value> {
+    let mut found = Vec::new();
+    let mut cursor = String::new();
+    for _ in 0..100 {
+        let query = if cursor.is_empty() {
+            format!("{query}&limit=1")
+        } else {
+            format!("{query}&limit=1&after={cursor}")
+        };
+        let (events, next, more) = page(&http.send_reply(&search(token, &query)).await);
+        assert!(events.len() <= 1);
+        found.extend(events);
+        cursor = next;
+        if !more {
+            return found;
+        }
+    }
+    panic!("search did not end");
+}
+
+fn event_ids(events: &[Value]) -> BTreeSet<String> {
+    events
+        .iter()
+        .map(|e| e.get("id").and_then(Value::as_str).expect("id").to_owned())
+        .collect()
+}
+
+async fn search_refusals(http: &mut Http, tokens: &Tokens, all: &[Value], ports: &Ports) {
+    let times: BTreeSet<String> = all
+        .iter()
+        .map(|e| {
+            e.get("time")
+                .and_then(Value::as_str)
+                .expect("time")
+                .to_owned()
+        })
+        .collect();
+    let first = times.first().expect("first");
+    let from = format!("domain=example.com&from={first}");
+    let (events, next, more) = page(
+        &http
+            .send_reply(&search(&tokens.first, &format!("{from}&limit=1")))
+            .await,
+    );
+    assert_eq!((events.len(), more), (1, true));
+    let rest = format!("{from}&after={next}");
+    let (events, _, _) = page(&http.send_reply(&search(&tokens.first, &rest)).await);
+    assert_eq!(events.len(), 2);
+    let plain = format!("domain=example.com&after={next}");
+    let (events, _, _) = page(&http.send_reply(&search(&tokens.first, &plain)).await);
+    assert_eq!(events.len(), 2);
+    let earlier = parse_rfc3339(first.as_bytes()).expect("time") - 1;
+    let moved = format!("domain=example.com&from={}&after={next}", rfc3339(earlier));
+    let reply = http.send_reply(&search(&tokens.first, &moved)).await;
+    assert_eq!((reply.status, reply.code().as_str()), (400, "bad_cursor"));
+    let other = format!("domain=example.org&after={next}");
+    let reply = http.send_reply(&search(&tokens.first, &other)).await;
+    assert_eq!((reply.status, reply.code().as_str()), (400, "bad_cursor"));
+    let reply = http.send_reply(&search(&tokens.second, &plain)).await;
+    assert_eq!((reply.status, reply.code().as_str()), (400, "bad_cursor"));
+
+    for query in [
+        "",
+        "type=failed",
+        "recipient=a@example.com&domain=example.com",
+        "domain=example.com&limit=101",
+        "domain=example.com&type=sent",
+        "domain=example.com&from=2000-01-01T00:00:00Z",
+        "domain=example.com&from=yesterday",
+        "message=nope",
+    ] {
+        let reply = http.send_reply(&search(&tokens.first, query)).await;
+        assert_eq!(
+            (reply.status, reply.code().as_str()),
+            (400, "bad_request"),
+            "{query}"
+        );
+    }
+    for token in [&tokens.smtp, &tokens.hooks] {
+        let reply = http.send_reply(&search(token, "domain=example.com")).await;
+        assert_eq!(
+            (reply.status, reply.code().as_str()),
+            (403, "scope_not_allowed")
+        );
+    }
+    let request = "POST /v1/search HTTP/1.1\r\nHost: api.test\r\nContent-Length: 0\r\n\r\n";
+    let reply = http.send_reply(request.as_bytes()).await;
+    assert_eq!(reply.status, 405);
+    assert_eq!(reply.header("allow"), Some("GET, HEAD"));
+    assert!(ports.count(Route::Search, 200) >= 10);
+    assert_eq!(ports.count(Route::Search, 405), 1);
+}
+
+#[test]
+fn events_are_searched_by_recipient_domain_and_message_over_http() {
+    check(0..2, |seed| {
+        let cluster = started(seed, 2);
+        let nodes = cluster.nodes.clone();
+        let seen = Rc::clone(&cluster.seen);
+        cluster.run(async move {
+            let tokens = prepare(&nodes).await;
+            seen.deliver.set(Some(nodes[0].sched().clock()));
+            let ports = serve(&nodes[0], seed, ApiConfig::new("mx1.example.net".into())).await;
+            let mut http = Http::plain().await;
+            let mut sent = Vec::new();
+            for to in [
+                r#"["a@example.com","b@example.com"]"#,
+                r#""a@example.com""#,
+                r#""c@example.org""#,
+            ] {
+                let body = format!(r#"{{"from":"ann@example.org","to":{to},"text":"x"}}"#);
+                sent.push(http.post(&tokens.first, &body).await.id());
+            }
+            let mut all = Vec::new();
+            for _ in 0..2000 {
+                let (events, _, _) = page(&http.send_reply(&get(&tokens.first, "")).await);
+                if events.len() == 4 {
+                    all = events;
+                    break;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+            assert_eq!(all.len(), 4);
+            let with = |name: &str, value: &str| -> BTreeSet<String> {
+                all.iter()
+                    .filter(|e| e.get(name).and_then(Value::as_str) == Some(value))
+                    .map(|e| e.get("id").and_then(Value::as_str).expect("id").to_owned())
+                    .collect()
+            };
+
+            let found = searched_all(&mut http, &tokens.first, "recipient=A@Example.COM").await;
+            assert_eq!(event_ids(&found), with("address", "a@example.com"));
+            assert_eq!(found.len(), 2);
+            let found = searched_all(&mut http, &tokens.first, "domain=EXAMPLE.com").await;
+            assert_eq!(found.len(), 3);
+            assert!(found.iter().all(|e| {
+                e.get("address")
+                    .and_then(Value::as_str)
+                    .is_some_and(|a| a.ends_with("@example.com"))
+            }));
+            for id in &sent {
+                let found = searched_all(&mut http, &tokens.first, &format!("message={id}")).await;
+                assert_eq!(event_ids(&found), with("message_id", id));
+            }
+            for query in ["domain=example.org&type=delivered", "domain=example.org"] {
+                let found = searched_all(&mut http, &tokens.first, query).await;
+                assert_eq!(event_ids(&found), with("address", "c@example.org"));
+            }
+            for query in [
+                "domain=example.org&type=failed,expired",
+                "domain=example.net",
+            ] {
+                assert_eq!(searched_all(&mut http, &tokens.first, query).await, []);
+            }
+            let found = searched_all(&mut http, &tokens.second, "domain=example.com").await;
+            assert_eq!(found, []);
+
+            search_refusals(&mut http, &tokens, &all, &ports).await;
             ports.close().await;
         });
         cluster.stop();

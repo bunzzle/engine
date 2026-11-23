@@ -43,7 +43,9 @@ impl<T: Transport + 'static, S: Source> Handler<'_, T, S> {
             Route::Messages => self.send(request).await?,
             Route::Raw => self.raw(request).await?,
             Route::Hooks => return crate::hooks::handle(self, request, id).await,
-            Route::Events | Route::Health | Route::Other => return Err(Problem::not_found().into()),
+            Route::Events | Route::Search | Route::Health | Route::Other => {
+                return Err(Problem::not_found().into());
+            }
         };
         Ok(match answer {
             Answer::Accepted(message) => accepted(id, &message),
