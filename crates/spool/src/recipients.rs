@@ -75,8 +75,49 @@ pub struct Reply {
 pub struct Event {
     pub recipient: u32,
     pub record: IndexRecord,
+    pub search: Vec<IndexRecord>,
     pub stamp: Stamp,
     pub carried: u32,
+}
+
+impl Event {
+    pub fn records(&self) -> usize {
+        1 + self.search.len()
+    }
+
+    fn all(&self) -> impl Iterator<Item = &IndexRecord> {
+        std::iter::once(&self.record).chain(&self.search)
+    }
+
+    fn bytes(&self) -> u64 {
+        self.all()
+            .map(|r| record_size(r.encode().len()) as u64)
+            .sum()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct EventStats {
+    pub lost: u64,
+    pub busy_event: u64,
+    pub busy_search: u64,
+    pub refused: u64,
+    pub search_skipped: u64,
+}
+
+#[derive(Clone, Copy, Default)]
+struct Units {
+    events: u32,
+    skipped: u32,
+}
+
+impl Units {
+    fn add(&mut self, event: &Event) {
+        self.events = self.events.saturating_add(1);
+        if event.search.is_empty() {
+            self.skipped = self.skipped.saturating_add(1);
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -154,9 +195,11 @@ impl Entry {
         &mut self,
         finished: &BTreeSet<u32>,
         events: &mut Vec<IndexRecord>,
-        room: impl Fn(usize) -> bool,
+        units: &mut Units,
+        room: impl Fn(usize, u64) -> bool,
     ) -> u32 {
         let mut lost = 0u32;
+        let (mut records, mut bytes) = (0, 0);
         for event in mem::take(&mut self.closing) {
             let open = !finished.contains(&event.recipient)
                 && self
@@ -165,8 +208,13 @@ impl Entry {
             if !open {
                 continue;
             }
-            if room(events.len() + 1) {
+            let size = event.bytes();
+            if room(records + event.records(), bytes + size) {
+                records += event.records();
+                bytes += size;
+                units.add(&event);
                 events.push(event.record);
+                events.extend(event.search);
             } else {
                 lost = lost.saturating_add(1);
             }
@@ -199,6 +247,7 @@ impl Entry {
 struct Merge {
     batch: Batch,
     events: Vec<IndexRecord>,
+    units: Units,
     carried: u32,
     lost: u32,
     calls: Vec<Call>,
@@ -215,6 +264,7 @@ pub(crate) struct Table {
     days: BTreeMap<u32, u64>,
     lost: BTreeMap<u32, u32>,
     lost_total: u64,
+    stats: EventStats,
 }
 
 impl Table {
@@ -327,12 +377,20 @@ impl Table {
     }
 }
 
+fn event_records(reports: &[Report]) -> usize {
+    reports
+        .iter()
+        .filter_map(|r| r.event.as_ref())
+        .map(Event::records)
+        .sum()
+}
+
 fn state_bytes(report: &Report) -> usize {
     let sealed = report.reply.as_ref().map_or(0, |r| r.sealed.len());
     let event = report
         .event
         .as_ref()
-        .map_or(0, |e| record_size(e.record.encode().len()));
+        .map_or(0, |e| usize::try_from(e.bytes()).unwrap_or(usize::MAX));
     record_size(INDEX_SIZE + STATE_CLEAR + sealed) + event
 }
 
@@ -348,6 +406,14 @@ impl Spool {
 
     pub fn lost_events(&self) -> u64 {
         self.inner.table.borrow().lost_total
+    }
+
+    pub fn event_stats(&self) -> EventStats {
+        let table = self.inner.table.borrow();
+        EventStats {
+            lost: table.lost_total,
+            ..table.stats
+        }
     }
 
     pub fn stamp(&self, shard: u16) -> Result<Stamp, Error> {
@@ -509,7 +575,7 @@ impl Spool {
             let sealed = report.reply.as_ref().map_or(0, |r| r.sealed.len());
             INDEX_SIZE + STATE_CLEAR + sealed > MAX_PAYLOAD
         });
-        let events = reports.iter().filter(|r| r.event.is_some()).count();
+        let events = event_records(reports);
         if reports.is_empty()
             || large
             || bytes as u64 > self.inner.region_size
@@ -612,9 +678,7 @@ impl Spool {
         while let Some(call) = entry.pending.first() {
             let more: u64 = call.reports.iter().map(|r| state_bytes(r) as u64).sum();
             let n = count + call.reports.len();
-            let l = live
-                + call.reports.len()
-                + call.reports.iter().filter(|r| r.event.is_some()).count();
+            let l = live + call.reports.len() + event_records(&call.reports);
             if !calls.is_empty() && (bytes + more > self.inner.region_size || !fits(1, 1, l, n)) {
                 break;
             }
@@ -669,21 +733,25 @@ impl Spool {
         } else {
             Vec::new()
         };
-        let mut events: Vec<IndexRecord> = reports()
-            .filter_map(|r| r.event.as_ref().map(|e| e.record.clone()))
-            .collect();
+        let (mut units, mut carried) = (Units::default(), 0u32);
+        let mut events: Vec<IndexRecord> = Vec::new();
+        for event in reports().filter_map(|r| r.event.as_ref()) {
+            units.add(event);
+            carried = carried.saturating_add(event.carried);
+            events.extend(event.all().cloned());
+        }
         let lost = if completing {
             let finished: BTreeSet<u32> = reports()
                 .filter(|r| r.outcome.is_final())
                 .map(|r| r.recipient)
                 .collect();
-            entry.take_closing(&finished, &mut events, |n| fits(1, 1, live + n, count))
+            let region = self.inner.region_size;
+            entry.take_closing(&finished, &mut events, &mut units, |n, more| {
+                fits(1, 1, live + n, count) && bytes + more <= region
+            })
         } else {
             0
         };
-        let carried = reports()
-            .filter_map(|r| r.event.as_ref())
-            .fold(0u32, |sum, e| sum.saturating_add(e.carried));
         let batch = Batch {
             shard,
             message,
@@ -693,6 +761,7 @@ impl Spool {
         Some(Merge {
             batch,
             events,
+            units,
             carried,
             lost,
             calls,
@@ -704,7 +773,9 @@ impl Spool {
     async fn flush(&self, shard: u16, message: u64) {
         while let Some(merge) = self.merge(shard, message) {
             let tenant = merge.batch.tenant;
-            let events = merge.events.len();
+            let events = merge.units.events;
+            let first = merge.events.first().map(|r| r.kind);
+            let mut cause = None;
             let (result, kept) = if merge.events.is_empty() {
                 (self.inner.changes.apply(merge.batch).await.map(drop), true)
             } else {
@@ -715,18 +786,40 @@ impl Spool {
                     .apply_indexed(merge.batch, shard, merge.events, true)
                     .await
                 {
-                    Ok(applied) => (Ok(()), !applied.indexed.is_empty()),
+                    Ok(applied) => {
+                        let kept = !applied.indexed.is_empty();
+                        if !kept {
+                            cause = Some(if applied.busy.is_some() && applied.busy == first {
+                                Cause::BusyEvent
+                            } else if applied.busy.is_some() {
+                                Cause::BusySearch
+                            } else {
+                                Cause::Refused
+                            });
+                        }
+                        (Ok(()), kept)
+                    }
                     Err(store::Error::Invalid(_) | store::Error::CommitTooLarge) => {
+                        cause = Some(Cause::Refused);
                         (self.inner.changes.apply(plain).await.map(drop), false)
                     }
                     Err(e) => (Err(e), false),
                 }
             };
             let mut table = self.inner.table.borrow_mut();
+            if result.is_ok() {
+                let stats = &mut table.stats;
+                let units = u64::from(events);
+                match cause {
+                    Some(Cause::BusyEvent) => stats.busy_event += units,
+                    Some(Cause::BusySearch) => stats.busy_search += units,
+                    Some(Cause::Refused) => stats.refused += units,
+                    None => stats.search_skipped += u64::from(merge.units.skipped),
+                }
+            }
             if !kept || merge.lost > 0 {
                 let dropped = if kept { 0 } else { events };
-                let lost = u32::try_from(dropped)
-                    .unwrap_or(u32::MAX)
+                let lost = dropped
                     .saturating_add(if kept { 0 } else { merge.carried })
                     .saturating_add(merge.lost);
                 let count = table.lost.entry(tenant).or_default();
@@ -777,6 +870,13 @@ impl Spool {
             }
         }
     }
+}
+
+#[derive(Clone, Copy)]
+enum Cause {
+    BusyEvent,
+    BusySearch,
+    Refused,
 }
 
 fn clone_answer(answer: &Result<Done, store::Error>) -> Result<Done, Error> {

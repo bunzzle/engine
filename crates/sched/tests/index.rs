@@ -22,13 +22,14 @@ use keys::{
 use rt::sim::{Config, Disk, Faults, Machine, Rng, SimDriver, Stalls, check};
 use rt::{JoinHandle, Runtime, TcpListener, TcpStream, sleep, spawn, timeout};
 use sched::{
-    Answer, Answered, Attempt, Batched, Begun, Call, Clock, Cursor, DAY, Deliver, Draft,
-    EVENT_DAYS, EVENT_SHAPE, EVENT_VALUE, Event, EventBody, EventKind, Fault, Hash, HookChange,
-    HookStats, KIND_EVENT, KIND_REQUEST, KIND_SUPPRESS, Keyring, Keys, MAX_HOOKS, MAX_REPLY,
-    Meshes, Node, Outcome, Parts, ROTATION_MS, ReadError, Reason, Recipient, Refusal, Restore,
-    Running, SHAPE, Sending, Settings, Suppression, Ticket, Transport, Unsealable, Unwrapped,
-    drop_cursor, encode_slice, event_record, event_sealed, event_sequence, normalize, punycode,
-    read_cursor, retain, retain_event, retain_request, retired_events, write_cursor,
+    Answer, Answered, Attempt, Batched, Begun, Call, Clock, Cursor, DAY, DayKeys, Deliver, Draft,
+    EVENT_DAYS, EVENT_SHAPE, EVENT_VALUE, Event, EventBody, EventKind, Fault, Found, Hash,
+    HookChange, HookStats, KIND_EVENT, KIND_REQUEST, KIND_SEARCH, KIND_SUPPRESS, Keyring, Keys,
+    MAX_HOOKS, MAX_REPLY, Meshes, Node, Outcome, Parts, ROTATION_MS, ReadError, Reason, Recipient,
+    Refusal, Restore, Running, SEARCH_VALUE, SHAPE, SearchField, Searched, Sending, Settings,
+    Suppression, Ticket, Transport, Unsealable, Unwrapped, drop_cursor, encode_slice, event_record,
+    event_sealed, event_sequence, normalize, punycode, read_cursor, retain, retain_event,
+    retain_request, retired_events, search_event_key, search_hash, search_key, write_cursor,
 };
 use spool::{Body, Head, HeadClear, Message, MessageId, SLICE, Slice, Stamp};
 use store::{Client, Committer, DataFile, IndexStamp, Options, SLOT_SIZE, Setup, Tiering, boot};
@@ -99,7 +100,54 @@ fn toy_day_secret(tenant: u32, day: u32) -> Secret<32> {
     Secret::new(bytes)
 }
 
+const SEARCH_DAYS: std::ops::RangeInclusive<u32> = 0..=10;
+
+fn search_days() -> impl Iterator<Item = u32> {
+    let wall = keys::wall_day();
+    SEARCH_DAYS.chain(wall.saturating_sub(1)..=wall.saturating_add(1))
+}
+
+fn toy_search_key(tenant: u32, day: u32) -> Secret<16> {
+    let mut bytes = [5; 16];
+    bytes[..4].copy_from_slice(&tenant.to_le_bytes());
+    bytes[4..8].copy_from_slice(&day.to_le_bytes());
+    Secret::new(bytes)
+}
+
+fn search_entries(
+    tenant: u32,
+    message: MessageId,
+    address: &str,
+    day: u32,
+) -> [(SearchField, [u8; 20]); 3] {
+    let key = toy_search_key(tenant, day);
+    let message = message.bytes();
+    let domain = address.rsplit_once('@').expect("domain").1;
+    [
+        (SearchField::Recipient, address.as_bytes()),
+        (SearchField::Domain, domain.as_bytes()),
+        (SearchField::Message, &message[..]),
+    ]
+    .map(|(field, value)| {
+        (
+            field,
+            search_key(tenant, field, &search_hash(&key, field, value)),
+        )
+    })
+}
+
 impl Keys for Toy {
+    fn search(&self, tenant: u32, generation: u32) -> Searched<'_> {
+        let keys = self.get(tenant, generation).map(|_| {
+            DayKeys::new(
+                search_days()
+                    .map(|day| (day, toy_search_key(tenant, day)))
+                    .collect(),
+            )
+        });
+        Box::pin(std::future::ready(keys.ok_or(KeyError::Unavailable)))
+    }
+
     fn system(&self) -> Ready<'_> {
         Box::pin(std::future::ready(Ok(TenantKeys::derive(
             0,
@@ -1260,7 +1308,8 @@ fn events_seal_under_their_message_and_open_from_the_record() {
         assert!(node.event_opener(1, &older, wrap).await.is_err());
         let next = node.spool().stamp(shard).expect("stamp");
         let built = opener.event(1, next, &capped).expect("event");
-        let value = Event::decode(&built.entry.value).expect("value");
+        assert_eq!(built.search, []);
+        let value = Event::decode(&built.record.entry.value).expect("value");
         assert_eq!(
             value,
             Event {
@@ -1270,7 +1319,7 @@ fn events_seal_under_their_message_and_open_from_the_record() {
                 ..event
             }
         );
-        let (wrap, inner) = event_sealed(&built.entry.payload).expect("payload");
+        let (wrap, inner) = event_sealed(&built.record.entry.payload).expect("payload");
         assert_eq!(wrap, &sealed.wrap);
         let clear = reader.open_event(1, next, inner).expect("open");
         assert_eq!(EventBody::decode(&clear), Some(capped.clone()));
@@ -1327,6 +1376,56 @@ async fn accept_listed(
 }
 
 #[test]
+fn events_carry_search_entries_under_their_day_key() {
+    let driver = Rc::new(SimDriver::with_disk(47, Config::default(), created(47)));
+    let cluster = started(&driver, 2);
+    let nodes = cluster.nodes.clone();
+    cluster.run(async move {
+        ready(&nodes).await;
+        let node = &nodes[0];
+        let shard = owned_shard(node).await;
+        let sealed = seal_one(node, shard, 0).await;
+        let opener = node
+            .opener(1, 1, sealed.id, &sealed.clear, &sealed.wrap)
+            .await
+            .expect("opener")
+            .searching(&Toy::default())
+            .await;
+        let body = EventBody {
+            kind: EventKind::Failed,
+            time: 3 * DAY + 5,
+            address: b"A@Example.COM".to_vec(),
+            reply: b"550 no".to_vec(),
+            attempts: 1,
+            class: 0,
+        };
+        let stamp = node.spool().stamp(shard).expect("stamp");
+        let built = opener.event(0, stamp, &body).expect("event");
+        let event = Event::decode(&built.record.entry.value).expect("event");
+        let wanted = search_entries(1, sealed.id, "a@example.com", 3);
+        assert_eq!(built.search.len(), 3);
+        for (n, (record, (_, key))) in built.search.iter().zip(wanted).enumerate() {
+            assert_eq!(record.stamp, IndexStamp::Tail);
+            assert_eq!((record.kind, record.partition), (KIND_SEARCH, 3));
+            assert_eq!(record.entry.key, key);
+            assert_eq!(record.entry.payload, []);
+            assert_eq!(record.entry.value.len(), SEARCH_VALUE);
+            let found = Found::decode(&record.entry.value).expect("value");
+            assert_eq!(usize::from(found.back), n + 1);
+            assert!(found.matches(&event));
+        }
+        let far = EventBody {
+            time: 100 * DAY,
+            ..body
+        };
+        let later = node.spool().stamp(shard).expect("stamp");
+        let alone = opener.event(1, later, &far).expect("event");
+        assert_eq!(alone.search, []);
+    });
+    cluster.stop();
+}
+
+#[test]
 fn expiry_events_name_each_open_recipient() {
     let driver = Rc::new(SimDriver::with_disk(44, Config::default(), created(44)));
     let cluster = started(&driver, 2);
@@ -1341,6 +1440,16 @@ fn expiry_events_name_each_open_recipient() {
         assert_eq!(events.len(), 2);
         for (event, address) in events.iter().zip(addresses) {
             let value = Event::decode(&event.record.entry.value).expect("value");
+            let keys: Vec<[u8; 20]> = event.search.iter().map(|r| r.entry.key).collect();
+            let wanted = search_entries(1, id, address, 7).map(|(_, key)| key);
+            assert_eq!(keys, wanted);
+            for record in &event.search {
+                let found = Found::decode(&record.entry.value).expect("value");
+                assert_eq!(
+                    (found.time, found.kind, found.generation),
+                    (value.time, value.kind, value.generation)
+                );
+            }
             assert_eq!(
                 (value.kind, value.time, value.message),
                 (EventKind::Expired, 7 * DAY, id)
@@ -1400,6 +1509,32 @@ fn an_expired_message_leaves_an_expired_event() {
             (found[0].kind, found[0].message),
             (EventKind::Expired, gone)
         );
+        let day = u32::try_from(found[0].time / DAY).expect("day");
+        let wanted = search_entries(1, gone, "z@example.org", day);
+        let mut hits = 0;
+        for (owner, partition) in changes.partitions(KIND_SEARCH).await.expect("partitions") {
+            assert_eq!(partition, day);
+            for (field, key) in wanted {
+                let mut end = key;
+                end[12..].fill(0xff);
+                let entries = changes
+                    .scan(owner, (KIND_SEARCH, partition), key..end, usize::MAX)
+                    .await
+                    .expect("scan");
+                assert_eq!(entries.len(), 1, "{field:?}");
+                let value = Found::decode(&entries[0].value).expect("value");
+                let event_key = search_event_key(1, &entries[0].key, &value).expect("key");
+                let event = changes
+                    .scan(owner, (KIND_EVENT, partition), event_key..end, 1)
+                    .await
+                    .expect("scan");
+                assert_eq!(event[0].key, event_key);
+                let event = Event::decode(&event[0].value).expect("event");
+                assert!(value.matches(&event));
+                hits += 1;
+            }
+        }
+        assert_eq!(hits, 3);
     });
     cluster.stop();
 }
@@ -1421,15 +1556,21 @@ fn event_days_past_the_retention_are_dropped() {
         let changes = node.spool().changes();
         let first = changes.partitions(KIND_EVENT).await.expect("partitions");
         assert_eq!(first.len(), 1);
+        let searched = changes.partitions(KIND_SEARCH).await.expect("partitions");
+        assert_eq!(searched, first);
         sleep(Duration::from_millis(u64::from(EVENT_DAYS - 1) * DAY)).await;
         client.checkpoint().await.expect("checkpoint");
         let kept = changes.partitions(KIND_EVENT).await.expect("partitions");
+        assert_eq!(kept, first);
+        let kept = changes.partitions(KIND_SEARCH).await.expect("partitions");
         assert_eq!(kept, first);
         sleep(Duration::from_millis(2 * DAY)).await;
         for _ in 0..2 {
             client.checkpoint().await.expect("checkpoint");
         }
         let left = changes.partitions(KIND_EVENT).await.expect("partitions");
+        assert_eq!(left, []);
+        let left = changes.partitions(KIND_SEARCH).await.expect("partitions");
         assert_eq!(left, []);
     });
     cluster.stop();

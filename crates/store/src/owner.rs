@@ -26,6 +26,7 @@ use sys::crc32c::checksum;
 pub struct Applied {
     pub locations: Vec<Location>,
     pub indexed: Vec<Location>,
+    pub busy: Option<u8>,
 }
 
 enum Reply {
@@ -120,6 +121,7 @@ struct Request {
     batches: Vec<Batch>,
     index: Option<Attached>,
     indexed: Vec<Location>,
+    busy: Option<u8>,
     reply: Reply,
 }
 
@@ -229,6 +231,7 @@ impl Changes {
             batches: vec![batch],
             index: None,
             indexed: Vec::new(),
+            busy: None,
             reply: Reply::Caller(reply),
         };
         if self.sender.send(Input::Change(request)).is_err() {
@@ -254,6 +257,7 @@ impl Changes {
                 optional,
             }),
             indexed: Vec::new(),
+            busy: None,
             reply: Reply::Indexed(reply),
         };
         if self.sender.send(Input::Change(request)).is_err() {
@@ -281,6 +285,7 @@ impl Changes {
                 optional: false,
             }),
             indexed: Vec::new(),
+            busy: None,
             reply: Reply::Created(reply),
         };
         if self.sender.send(Input::Change(request)).is_err() {
@@ -540,8 +545,10 @@ impl Shards {
                 return;
             }
             if attached.optional && (runs >= REFUSE_RUNS || runs > DELAY_RUNS) {
+                let busy = self.busiest(attached.shard, &attached.records);
                 let mut request = request;
                 request.index = None;
+                request.busy = busy;
                 self.request(request);
                 return;
             }
@@ -625,6 +632,14 @@ impl Shards {
         self.tag += 1;
         self.indexed.insert(self.tag, indexing);
         self.waiting.push_back((self.tag, submission));
+    }
+
+    fn busiest(&self, shard: u16, records: &[IndexRecord]) -> Option<u8> {
+        records
+            .iter()
+            .rev()
+            .max_by_key(|r| self.keeper.runs(shard, (r.kind, r.partition)))
+            .map(|r| r.kind)
     }
 
     fn most_runs(&self, shard: u16, records: &[IndexRecord]) -> usize {
@@ -1006,6 +1021,7 @@ impl Shards {
             batches,
             reply,
             indexed,
+            busy,
             ..
         } = request;
         match reply {
@@ -1013,7 +1029,11 @@ impl Shards {
                 let _ = reply.send(result);
             }
             Reply::Indexed(reply) => {
-                let _ = reply.send(result.map(|locations| Applied { locations, indexed }));
+                let _ = reply.send(result.map(|locations| Applied {
+                    locations,
+                    indexed,
+                    busy,
+                }));
             }
             Reply::Created(reply) => {
                 let split = result.map(|locations| {
@@ -1147,6 +1167,7 @@ impl Shards {
                 batches: vec![batch],
                 index: None,
                 indexed: Vec::new(),
+                busy: None,
                 reply: Reply::Move,
             });
         }

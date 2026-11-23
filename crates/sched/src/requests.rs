@@ -15,6 +15,7 @@ use store::{Changes, IndexRecord, IndexStamp};
 use crate::clock::Clock;
 use crate::error::Refusal;
 use crate::events::KIND_EVENT;
+use crate::search::KIND_SEARCH;
 use crate::suppress::{Hash, keyed_hash, keys_of, owner_shard, refusal};
 use crate::tally::Tallies;
 
@@ -386,7 +387,8 @@ impl Requests {
             let counted = inner.tallies.ask(&parts.changes, &parts.table, below).await;
             let upto = if counted { below } else { 0 };
             let retired = parts.changes.retire(KIND_EVENT, day, upto).await;
-            let next = if counted && retired.is_ok() {
+            let searched = parts.changes.retire(KIND_SEARCH, day, upto).await;
+            let next = if counted && retired.is_ok() && searched.is_ok() {
                 parts.clock.instant(u64::from(day + 1) * DAY)
             } else {
                 rt::now() + RECOUNT

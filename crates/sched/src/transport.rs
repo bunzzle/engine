@@ -1,8 +1,8 @@
 use std::net::IpAddr;
 
 use spool::{MessageId, Stamp};
-use store::IndexRecord;
 
+use crate::events::Written;
 use crate::lanes::QueueId;
 use crate::policy::Answer;
 use crate::sign::Outgoing;
@@ -46,7 +46,7 @@ pub struct Answered {
     pub recipient: u32,
     pub answer: Answer,
     pub reply: Vec<u8>,
-    pub event: Option<IndexRecord>,
+    pub event: Option<Written>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

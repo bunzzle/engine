@@ -803,9 +803,10 @@ impl<T: Transport + 'static> Sched<T> {
                     }
                 };
                 let (reply, event) = answered.map_or((None, None), |a| {
-                    let event = a.event.map(|record| Event {
+                    let event = a.event.map(|written| Event {
                         recipient: c.recipient,
-                        record,
+                        record: written.record,
+                        search: written.search,
                         stamp: c.stamp,
                         carried: 0,
                     });

@@ -295,6 +295,10 @@ impl<T: Transport + 'static> Node<T> {
         self.inner.sched.transport().own_stats()
     }
 
+    pub fn event_stats(&self) -> spool::EventStats {
+        self.spool().event_stats()
+    }
+
     pub fn hook_stats(&self) -> HookStats {
         self.inner.hook_reports.borrow().stats()
     }
