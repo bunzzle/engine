@@ -173,6 +173,22 @@ impl<L: Local> Own<L> {
     }
 }
 
+pub(crate) struct Rule<'a, L> {
+    pub(crate) allow: &'a [Cidr],
+    pub(crate) nat64: &'a [Cidr],
+    pub(crate) own: &'a Own<L>,
+}
+
+impl<L: Local> Rule<'_, L> {
+    pub(crate) fn keep(&self, ip: &IpAddr) -> bool {
+        keep(ip, self.allow, self.nat64)
+    }
+
+    pub(crate) async fn own(&self, ip: IpAddr) -> bool {
+        self.own.own(ip, self.nat64).await
+    }
+}
+
 pub(crate) fn keep(ip: &IpAddr, allow: &[Cidr], nat64: &[Cidr]) -> bool {
     let inner = embedded(*ip, nat64);
     if floor(ip) || inner.is_some_and(|v4| floor(&IpAddr::V4(v4))) {

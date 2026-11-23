@@ -18,7 +18,7 @@ use smtp::client::{
 };
 use tls::{Connector, Observed, Refusal, Tlsa, Verify};
 
-use crate::address::{Bind, Local, Own};
+use crate::address::{Bind, Local, Own, Rule};
 use crate::classify;
 use crate::conn::{Conn, Lost, left};
 use crate::dane::{self, Dane};
@@ -286,6 +286,14 @@ impl<D: Dns, L: Local> Deliver<D, L> {
         due
     }
 
+    fn rule(&self) -> Rule<'_, L> {
+        Rule {
+            allow: &self.settings.allow,
+            nat64: &self.settings.nat64,
+            own: &self.own,
+        }
+    }
+
     async fn upload(&self, due: &Due) -> bool {
         let fixed = self.settings.egress.or(self.last.get());
         let (Some(egress), false) = (fixed, due.rua.https.is_empty()) else {
@@ -298,7 +306,7 @@ impl<D: Dns, L: Local> Deliver<D, L> {
         let body = gzip(json.as_bytes());
         let mut any = false;
         for uri in &due.rua.https {
-            any |= upload(&self.dns, &self.tls, egress, uri, &body).await;
+            any |= upload(&self.dns, &self.tls, &self.rule(), egress, uri, &body).await;
         }
         any
     }
@@ -527,7 +535,7 @@ impl<D: Dns, L: Local> Deliver<D, L> {
         }
         let got = self
             .sts
-            .policy(&self.dns, &self.tls, egress, domain, end)
+            .policy(&self.dns, &self.tls, &self.rule(), egress, domain, end)
             .await;
         match got {
             Got::Busy => Err((Answer::Later(self.wait()), STS_BUSY)),
@@ -1039,7 +1047,13 @@ impl<D: Dns, L: Local> Transport for Deliver<D, L> {
                 u64::try_from(self.pick(n)).unwrap_or(0)
             };
             self.sts
-                .refresh(&self.dns, &self.tls, self.settings.egress, jitter)
+                .refresh(
+                    &self.dns,
+                    &self.tls,
+                    &self.rule(),
+                    self.settings.egress,
+                    jitter,
+                )
                 .await;
         }
     }

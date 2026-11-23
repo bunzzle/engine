@@ -29,6 +29,7 @@ const EGRESS2: IpAddr = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2));
 const MX1: IpAddr = IpAddr::V4(Ipv4Addr::new(10, 0, 1, 1));
 const MX2: IpAddr = IpAddr::V4(Ipv4Addr::new(10, 0, 1, 2));
 const WEB: IpAddr = IpAddr::V4(Ipv4Addr::new(11, 0, 2, 1));
+const OWN: IpAddr = IpAddr::V4(Ipv4Addr::new(10, 0, 3, 9));
 const ROOTS: &[u8] = include_bytes!("data/ca.pem");
 const LEAF: &str = "b144595e51e3ade2a723db0ddb2b560ba510fd1da2d9246d45b4618481d8bb01";
 const ROOT: &str = "86ee2f95596152cea98375f669a6e13a72a7de0671efcc61dcde8b5d501e8bc1";
@@ -88,8 +89,12 @@ fn limited(zone: Zone, settings: Settings, leases: Option<Leases<Remote>>) -> De
 }
 
 fn verifying(zone: Zone, settings: Settings) -> Deliver<Zone, Owns> {
+    owning(zone, settings, Vec::new())
+}
+
+fn owning(zone: Zone, settings: Settings, owned: Vec<IpAddr>) -> Deliver<Zone, Owns> {
     let connector = Connector::new(simulated(2), Some(ROOTS)).expect("connector");
-    Deliver::with_local(zone, connector, settings, None, 9, Owns(Vec::new())).expect("deliver")
+    Deliver::with_local(zone, connector, settings, None, 9, Owns(owned)).expect("deliver")
 }
 
 fn signed(only: bool) -> Zone {
@@ -1449,22 +1454,49 @@ fn mta_sts_enforce_limits_hosts() {
 }
 
 #[test]
-fn mta_sts_policy_hosts_on_private_addresses_are_not_fetched() {
-    let private = IpAddr::V4(Ipv4Addr::new(10, 0, 2, 9));
-    let (outcomes, requests, policies) = run(async move {
+fn mta_sts_policy_hosts_follow_the_address_rule() {
+    let private = IpAddr::V4(Ipv4Addr::new(192, 168, 2, 9));
+    let allowed = IpAddr::V4(Ipv4Addr::new(10, 0, 2, 9));
+    for (web, owned, fetched) in [
+        (private, Vec::new(), false),
+        (allowed, Vec::new(), true),
+        (WEB, vec![WEB], false),
+    ] {
+        let (outcomes, requests, policies) = run(async move {
+            drop(serve(MX1, Script::new(&["STARTTLS"])));
+            drop(serve(MX2, Script::new(&["STARTTLS"])));
+            let requests = serve_policy(web, Rc::new(RefCell::new(policy(ENFORCE))));
+            let zone = zone();
+            sts(&zone, "1");
+            zone.set("mta-sts.example.com", Type::A, a(&[web]));
+            let deliver = owning(zone, strict(), owned);
+            let outcomes = simple(&deliver, "example.com").await;
+            (outcomes, requests, deliver.policies())
+        });
+        assert_eq!(answers(&outcomes), [Answer::Delivered], "{web}");
+        assert_eq!(requests.borrow().len(), usize::from(fetched), "{web}");
+        assert_eq!(policies, usize::from(fetched), "{web}");
+    }
+}
+
+#[test]
+fn mta_sts_fetch_skips_own_addresses() {
+    let (outcomes, requests, refused, policies) = run(async {
         drop(serve(MX1, Script::new(&["STARTTLS"])));
         drop(serve(MX2, Script::new(&["STARTTLS"])));
-        let requests = serve_policy(private, Rc::new(RefCell::new(policy(ENFORCE))));
+        let refused = serve_policy(OWN, Rc::new(RefCell::new(policy(ENFORCE))));
+        let requests = serve_policy(WEB, Rc::new(RefCell::new(policy(ENFORCE))));
         let zone = zone();
         sts(&zone, "1");
-        zone.set("mta-sts.example.com", Type::A, a(&[private]));
-        let deliver = verifying(zone, strict());
+        zone.set("mta-sts.example.com", Type::A, a(&[OWN, WEB]));
+        let deliver = owning(zone, strict(), vec![OWN]);
         let outcomes = simple(&deliver, "example.com").await;
-        (outcomes, requests, deliver.policies())
+        (outcomes, requests, refused, deliver.policies())
     });
     assert_eq!(answers(&outcomes), [Answer::Delivered]);
-    assert!(requests.borrow().is_empty());
-    assert_eq!(policies, 0);
+    assert!(refused.borrow().is_empty());
+    assert_eq!(requests.borrow().len(), 1);
+    assert_eq!(policies, 1);
 }
 
 #[test]
@@ -1696,6 +1728,35 @@ fn daily_refresh_fetches_a_changed_policy_without_mail() {
     });
     assert_eq!(fetched, 2);
     assert_eq!(after, 2);
+}
+
+#[test]
+fn scheduled_refresh_follows_the_address_rule() {
+    let private = IpAddr::V4(Ipv4Addr::new(192, 168, 2, 9));
+    for (blocked, owned) in [(private, Vec::new()), (OWN, vec![OWN])] {
+        let (fetched, refused, policies) = run(async move {
+            drop(serve(MX2, Script::new(&["STARTTLS"])));
+            let text = policy_for("mx: mx2.example.com\n", 604_800);
+            let requests = serve_policy(WEB, Rc::new(RefCell::new(text.clone())));
+            let refused = serve_policy(blocked, Rc::new(RefCell::new(text)));
+            let zone = zone();
+            sts(&zone, "1");
+            let deliver = owning(zone.clone(), strict(), owned);
+            simple(&deliver, "example.com").await;
+            ticks(&deliver, Duration::from_mins(1), 5).await;
+            assert_eq!(requests.borrow().len(), 1);
+            sts(&zone, "2");
+            zone.set("mta-sts.example.com", Type::A, a(&[blocked]));
+            sleep(Duration::from_hours(24)).await;
+            ticks(&deliver, Duration::from_mins(1), 200).await;
+            (
+                requests.borrow().len(),
+                refused.borrow().len(),
+                deliver.policies(),
+            )
+        });
+        assert_eq!((fetched, refused, policies), (1, 0, 1), "{blocked}");
+    }
 }
 
 #[test]
@@ -2146,11 +2207,14 @@ fn report_mails_go_to_mailto_addresses_only() {
 
 #[test]
 fn https_reports_are_posted_and_retried() {
-    let private = IpAddr::V4(Ipv4Addr::new(10, 0, 2, 9));
-    for (web, status, posts, sent, abandoned) in [
-        (WEB, "204 No Content", 1, 1, 0),
-        (WEB, "500 Oops", 3, 0, 1),
-        (private, "204 No Content", 0, 0, 1),
+    let private = IpAddr::V4(Ipv4Addr::new(192, 168, 2, 9));
+    let allowed = IpAddr::V4(Ipv4Addr::new(10, 0, 2, 9));
+    for (web, owned, status, posts, sent, abandoned) in [
+        (WEB, Vec::new(), "204 No Content", 1, 1, 0),
+        (WEB, Vec::new(), "500 Oops", 3, 0, 1),
+        (private, Vec::new(), "204 No Content", 0, 0, 1),
+        (allowed, Vec::new(), "204 No Content", 1, 1, 0),
+        (WEB, vec![WEB], "204 No Content", 0, 0, 1),
     ] {
         let (requests, stats) = run(async move {
             drop(serve(MX1, Script::new(&[])));
@@ -2164,7 +2228,7 @@ fn https_reports_are_posted_and_retried() {
             let mut settings = settings();
             settings.tlsrpt = true;
             settings.reporter.submitter = "sender.example".into();
-            let deliver = verifying(zone, settings);
+            let deliver = owning(zone, settings, owned);
             restored(&deliver, &Rc::new(Memory::default()), [7; 16]).await;
             deliver.tick().await;
             simple(&deliver, "example.com").await;
@@ -2188,6 +2252,36 @@ fn https_reports_are_posted_and_retried() {
             "{web} {status}"
         );
     }
+}
+
+#[test]
+fn https_reports_skip_own_addresses() {
+    let (requests, refused, stats) = run(async {
+        drop(serve(MX1, Script::new(&[])));
+        let response = "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n".to_owned();
+        let refused = serve_policy(OWN, Rc::new(RefCell::new(response.clone())));
+        let requests = serve_policy(WEB, Rc::new(RefCell::new(response)));
+        let zone = zone();
+        zone.set("mta-sts.example.com", Type::A, a(&[OWN, WEB]));
+        let record = b"v=TLSRPTv1; rua=https://mta-sts.example.com/v1".to_vec();
+        let txt = Found::Records(vec![Record::Txt(record)]);
+        zone.set("_smtp._tls.example.com", Type::Txt, txt);
+        let mut settings = settings();
+        settings.tlsrpt = true;
+        settings.reporter.submitter = "sender.example".into();
+        let deliver = owning(zone, settings, vec![OWN]);
+        restored(&deliver, &Rc::new(Memory::default()), [7; 16]).await;
+        deliver.tick().await;
+        simple(&deliver, "example.com").await;
+        sleep(Duration::from_mins(11)).await;
+        deliver.tick().await;
+        sleep(Duration::from_hours(29)).await;
+        assert_eq!(deliver.reports().await, []);
+        (requests, refused, deliver.owner_stats())
+    });
+    assert!(refused.borrow().is_empty());
+    assert_eq!(requests.borrow().len(), 1);
+    assert_eq!((stats.sent, stats.abandoned), (1, 0));
 }
 
 #[test]
