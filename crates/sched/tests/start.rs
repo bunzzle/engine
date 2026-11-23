@@ -1069,6 +1069,7 @@ fn node_exposes_the_transports_own_stats() {
         ipv4_off: true,
         ipv6_off: false,
         unclear: 3,
+        partly_refused: 0,
     };
     let stated = {
         let start = cores.next().expect("first core");

@@ -52,6 +52,7 @@ impl Transport for Probed {
             ipv4_off: false,
             ipv6_off: true,
             unclear: 5,
+            partly_refused: 0,
         })
     }
 }

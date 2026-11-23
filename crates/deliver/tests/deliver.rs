@@ -710,6 +710,49 @@ fn falls_back_after_a_refused_mx() {
 }
 
 #[test]
+fn counts_a_host_with_partly_refused_addresses() {
+    let public: IpAddr = "11.0.1.1".parse().expect("address");
+    let refused: IpAddr = "10.0.0.1".parse().expect("address");
+    let (outcomes, seen, stats) = run(async move {
+        let seen = serve(public, Script::new(&[]));
+        let zone = Zone::default();
+        zone.set("example.com", Type::Mx, mx(&[(10, "mx.example.com")]));
+        zone.set("mx.example.com", Type::A, a(&[public, refused]));
+        let deliver = deliverer(zone, Settings::new("out.sender.example"));
+        let outcomes = simple(&deliver, "example.com").await;
+        (outcomes, seen, deliver.own_stats())
+    });
+    assert_eq!(answers(&outcomes), [Answer::Delivered]);
+    assert_eq!(seen.borrow().connections, 1);
+    assert_eq!(stats.partly_refused, 1);
+}
+
+#[test]
+fn a_host_with_all_addresses_refused_is_not_partly_refused() {
+    let stats = run(async {
+        let deliver = deliverer(one_mx(MX1), Settings::new("out.sender.example"));
+        let outcomes = simple(&deliver, "example.com").await;
+        assert_eq!(answers(&outcomes), [Answer::Failed]);
+        deliver.own_stats()
+    });
+    assert_eq!(stats.partly_refused, 0);
+}
+
+#[test]
+fn a_host_with_only_public_addresses_is_not_partly_refused() {
+    let public: IpAddr = "11.0.1.1".parse().expect("address");
+    let (outcomes, seen, stats) = run(async move {
+        let seen = serve(public, Script::new(&[]));
+        let deliver = deliverer(one_mx(public), Settings::new("out.sender.example"));
+        let outcomes = simple(&deliver, "example.com").await;
+        (outcomes, seen, deliver.own_stats())
+    });
+    assert_eq!(answers(&outcomes), [Answer::Delivered]);
+    assert_eq!(seen.borrow().connections, 1);
+    assert_eq!(stats.partly_refused, 0);
+}
+
+#[test]
 fn refused_mx_and_lookup_failure_stays_temporary() {
     let (outcomes, seen) = run(async {
         let seen = serve(MX1, Script::new(&[]));
@@ -828,6 +871,7 @@ fn probe_own_reports_each_family_before_any_delivery() {
         ipv4_off: true,
         ipv6_off: false,
         unclear: 0,
+        partly_refused: 0,
     };
     assert_eq!(probed, expected);
     assert_eq!(stats, expected);
@@ -848,6 +892,7 @@ fn probe_own_counts_unclear_sentinel_answers() {
             ipv4_off: false,
             ipv6_off: false,
             unclear: 2,
+            partly_refused: 0,
         }
     );
 }

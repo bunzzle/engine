@@ -83,6 +83,7 @@ pub(crate) struct Own<L> {
     ipv4: Cell<Option<bool>>,
     ipv6: Cell<Option<bool>>,
     unclear: Cell<u64>,
+    partly_refused: Cell<u64>,
 }
 
 impl<L> Own<L> {
@@ -93,6 +94,7 @@ impl<L> Own<L> {
             ipv4: Cell::new(None),
             ipv6: Cell::new(None),
             unclear: Cell::new(0),
+            partly_refused: Cell::new(0),
         }
     }
 
@@ -101,11 +103,17 @@ impl<L> Own<L> {
             ipv4_off: self.ipv4.get() == Some(true),
             ipv6_off: self.ipv6.get() == Some(true),
             unclear: self.unclear.get(),
+            partly_refused: self.partly_refused.get(),
         }
     }
 
     fn unclear(&self) {
         self.unclear.set(self.unclear.get().saturating_add(1));
+    }
+
+    pub(crate) fn partly_refused(&self) {
+        self.partly_refused
+            .set(self.partly_refused.get().saturating_add(1));
     }
 }
 
@@ -291,6 +299,7 @@ mod tests {
                     ipv4_off: true,
                     ipv6_off: true,
                     unclear: 0,
+                    partly_refused: 0,
                 }
             );
             assert!(own.cache.borrow().is_empty());

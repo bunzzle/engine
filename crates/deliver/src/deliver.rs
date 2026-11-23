@@ -456,10 +456,12 @@ impl<D: Dns, L: Local> Deliver<D, L> {
     ) -> Kept {
         let resolved = Cell::new(false);
         let passed = Cell::new(false);
+        let refused = Cell::new(false);
         let lookup = mx::filtered(&self.dns, host, egress.is_ipv6(), |ip| {
             resolved.set(true);
             let keep = crate::address::keep(ip, &self.settings.allow, &self.settings.nat64);
             passed.set(passed.get() || keep);
+            refused.set(refused.get() || !keep);
             keep
         });
         let (found, target, dnssec) = match timeout(left(end, deadline), lookup).await {
@@ -471,6 +473,9 @@ impl<D: Dns, L: Local> Deliver<D, L> {
             Ok(Addresses::Failed) => return Kept::Failed,
             Err(_) => return Kept::Timeout,
         };
+        if passed.get() && refused.get() {
+            self.own.partly_refused();
+        }
         let mut kept = Vec::with_capacity(found.len());
         for ip in found {
             if self.own.own(ip, &self.settings.nat64).await {

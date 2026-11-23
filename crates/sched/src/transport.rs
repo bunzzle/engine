@@ -38,6 +38,7 @@ pub struct OwnStats {
     pub ipv4_off: bool,
     pub ipv6_off: bool,
     pub unclear: u64,
+    pub partly_refused: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
