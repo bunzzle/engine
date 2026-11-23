@@ -196,17 +196,23 @@ impl Reader {
         let mut label = label(&system, tenant, generation);
         label[8] = SEARCH_KIND;
         query.label(&mut label);
-        let positions = match after {
-            None => vec![0; cores],
+        let (query, positions) = match after {
+            None => (query.clone(), vec![0; cores]),
             Some(text) => {
                 let sealed = unhex(text).ok_or(ReadError::Cursor)?;
                 let clear = system.open(&label, &sealed).map_err(|e| match e {
                     crypto::Error::Format("key version") => ReadError::Stale,
                     _ => ReadError::Cursor,
                 })?;
-                positions(&clear, cores).ok_or(ReadError::Cursor)?
+                let (from, rest) = clear.split_first_chunk::<8>().ok_or(ReadError::Cursor)?;
+                let (to, rest) = rest.split_first_chunk::<8>().ok_or(ReadError::Cursor)?;
+                let query = query
+                    .ranged(u64::from_le_bytes(*from), u64::from_le_bytes(*to))
+                    .ok_or(ReadError::Cursor)?;
+                (query, positions(rest, cores).ok_or(ReadError::Cursor)?)
             }
         };
+        let query = &query;
         let day_keys = keys.search(tenant, generation).await.map_err(|e| match e {
             control::KeyError::Failed => ReadError::Failed,
             _ => ReadError::Unavailable,
@@ -258,15 +264,21 @@ impl Reader {
                 continue;
             }
             events.push(Read {
-                id: event_id(&naming, hit.shard, sequence_of(&hit)),
+                id: event_id(&naming, hit.shard, hit.sequence),
                 shard: hit.shard,
-                sequence: sequence_of(&hit),
+                sequence: hit.sequence,
                 event: hit.event,
                 body: Some(body),
             });
         }
         let sealed = system
-            .seal(&label, &cursor(&next))
+            .seal(&label, &{
+                let (from, to) = query.range();
+                let mut clear = from.to_le_bytes().to_vec();
+                clear.extend_from_slice(&to.to_le_bytes());
+                clear.extend_from_slice(&cursor(&next));
+                clear
+            })
             .map_err(|_| ReadError::Failed)?;
         Ok(EventPage {
             events,
@@ -409,10 +421,6 @@ pub(crate) fn kept(entry: &Entry, generation: u32) -> Option<Event> {
         return None;
     }
     Event::decode(&entry.value).filter(|event| event.generation == generation)
-}
-
-fn sequence_of(hit: &finder::Hit) -> u64 {
-    u64::MAX - hit.tail
 }
 
 pub(crate) fn stamped(tenant: u32, sequence: u64) -> index::Key {

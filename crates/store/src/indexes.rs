@@ -346,11 +346,16 @@ impl Partition {
             .ok()
             .map(|at| &self.frozen[at]);
         if let Some(entry) = newer.or(frozen) {
-            let mut entry = entry.clone();
-            if !payload {
-                entry.payload = Vec::new();
-            }
-            return Ok(Some(entry));
+            return Ok(Some(Entry {
+                key: entry.key,
+                op: entry.op,
+                value: entry.value.clone(),
+                payload: if payload {
+                    entry.payload.clone()
+                } else {
+                    Vec::new()
+                },
+            }));
         }
         for stored in self.view().iter().rev() {
             let Some((segment, range)) = stored.run.probe(key) else {

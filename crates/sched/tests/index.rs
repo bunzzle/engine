@@ -1605,6 +1605,67 @@ async fn searched(
     found
 }
 
+async fn search_ids_match(
+    node: &Node<Idle>,
+    all: &sched::EventPage,
+    id: MessageId,
+    (from, to): (u64, u64),
+) {
+    let same = all
+        .events
+        .iter()
+        .find(|e| e.event.message == id)
+        .expect("listed");
+    let address = same
+        .body
+        .as_ref()
+        .expect("opened")
+        .address
+        .to_ascii_lowercase();
+    for (field, value) in [
+        (SearchField::Recipient, address.as_slice()),
+        (SearchField::Message, &id.bytes()[..]),
+    ] {
+        let query = SearchQuery::new(field, value, &[], from, to).expect("query");
+        let found = searched(node, 1, &query, 10).await;
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].id, same.id);
+    }
+}
+
+async fn search_cursors(reader: &Node<Idle>, domain: &SearchQuery, other: &SearchQuery, to: u64) {
+    let page = reader.search(1, domain, None, 1).await.expect("page");
+    assert!(page.more);
+    let moved =
+        SearchQuery::new(SearchField::Domain, b"example.org", &[], to, to + 1).expect("moved");
+    let rest = reader
+        .search(1, &moved, Some(&page.next), 10)
+        .await
+        .expect("rest");
+    assert_eq!(rest.events.len(), 3);
+    assert!(!rest.events.iter().any(|r| r.id == page.events[0].id));
+    assert_eq!(
+        reader.search(1, other, Some(&page.next), 1).await.err(),
+        Some(ReadError::Cursor)
+    );
+    assert_eq!(
+        reader.search(2, domain, Some(&page.next), 1).await.err(),
+        Some(ReadError::Cursor)
+    );
+    assert_eq!(
+        reader.search(1, domain, None, 0).await.err(),
+        Some(ReadError::Limit)
+    );
+    assert_eq!(
+        reader.search(1, domain, None, 101).await.err(),
+        Some(ReadError::Limit)
+    );
+    assert_eq!(
+        reader.search(9, domain, None, 10).await.err(),
+        Some(ReadError::Tenant)
+    );
+}
+
 #[test]
 fn search_finds_events_by_each_field_in_pages_across_cores() {
     let driver = Rc::new(SimDriver::with_disk(48, Config::default(), created(48)));
@@ -1663,6 +1724,18 @@ fn search_finds_events_by_each_field_in_pages_across_cores() {
         named.sort_unstable();
         named.dedup();
         assert_eq!(named.len(), 4);
+        for read in &found {
+            let same = all
+                .events
+                .iter()
+                .find(|e| e.event.message == read.event.message)
+                .expect("listed");
+            assert_eq!(
+                (read.id, read.shard, read.sequence),
+                (same.id, same.shard, same.sequence)
+            );
+        }
+        search_ids_match(&nodes[0], &all, ids[2].1, (from, to)).await;
         let other = query(SearchField::Domain, b"other.net", &[]);
         let found = searched(reader, 1, &other, 10).await;
         assert_eq!(found.len(), 1);
@@ -1681,28 +1754,7 @@ fn search_finds_events_by_each_field_in_pages_across_cores() {
             SearchQuery::new(SearchField::Domain, b"example.org", &[], to, to + 1).expect("later");
         assert_eq!(searched(reader, 1, &later, 10).await, []);
         assert_eq!(searched(reader, 2, &domain, 10).await, []);
-        let page = reader.search(1, &domain, None, 1).await.expect("page");
-        assert!(page.more);
-        assert_eq!(
-            reader.search(1, &other, Some(&page.next), 1).await.err(),
-            Some(ReadError::Cursor)
-        );
-        assert_eq!(
-            reader.search(2, &domain, Some(&page.next), 1).await.err(),
-            Some(ReadError::Cursor)
-        );
-        assert_eq!(
-            reader.search(1, &domain, None, 0).await.err(),
-            Some(ReadError::Limit)
-        );
-        assert_eq!(
-            reader.search(1, &domain, None, 101).await.err(),
-            Some(ReadError::Limit)
-        );
-        assert_eq!(
-            reader.search(9, &domain, None, 10).await.err(),
-            Some(ReadError::Tenant)
-        );
+        search_cursors(reader, &domain, &other, to).await;
     });
     cluster.stop();
 }

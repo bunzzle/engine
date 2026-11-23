@@ -33,8 +33,7 @@ impl Query {
             Field::Message if raw.len() == 16 => raw.to_vec(),
             Field::Message => return None,
         };
-        let days = to.checked_sub(1)? / DAY + 1 - from / DAY;
-        if value.is_empty() || value.len() > 512 || from >= to || days > SEARCH_DAYS {
+        if value.is_empty() || value.len() > 512 {
             return None;
         }
         let kinds = if kinds.is_empty() {
@@ -42,13 +41,29 @@ impl Query {
         } else {
             kinds.iter().fold(0, |mask, kind| mask | bit(*kind))
         };
-        Some(Self {
+        Self {
             field,
             value,
             kinds,
             from,
             to,
+        }
+        .ranged(from, to)
+    }
+
+    pub(crate) fn ranged(&self, from: u64, to: u64) -> Option<Self> {
+        if from >= to || (to - 1) / DAY - from / DAY >= SEARCH_DAYS {
+            return None;
+        }
+        Some(Self {
+            from,
+            to,
+            ..self.clone()
         })
+    }
+
+    pub(crate) fn range(&self) -> (u64, u64) {
+        (self.from, self.to)
     }
 
     pub fn field(&self) -> Field {
@@ -72,8 +87,6 @@ impl Query {
     pub(crate) fn label(&self, out: &mut Vec<u8>) {
         out.push(self.field.code());
         out.push(self.kinds);
-        out.extend_from_slice(&self.from.to_le_bytes());
-        out.extend_from_slice(&self.to.to_le_bytes());
         out.extend_from_slice(&u16::try_from(self.value.len()).unwrap_or(0).to_le_bytes());
         out.extend_from_slice(&self.value);
     }
@@ -109,6 +122,7 @@ pub(crate) struct Scan {
 pub(crate) struct Hit {
     pub shard: u16,
     pub tail: u64,
+    pub sequence: u64,
     pub event: Event,
     pub payload: Vec<u8>,
 }
@@ -191,7 +205,7 @@ pub(crate) async fn serve(changes: &Changes, scan: &Scan) -> Result<Hits, ReadEr
     }
     let mut hits = Vec::with_capacity(wanted.len());
     let mut bytes = 0usize;
-    for ((shard, tail, _, _, found), entry) in wanted.into_iter().zip(events) {
+    for ((shard, tail, _, key, found), entry) in wanted.into_iter().zip(events) {
         let Some(entry) = entry else {
             continue;
         };
@@ -208,6 +222,7 @@ pub(crate) async fn serve(changes: &Changes, scan: &Scan) -> Result<Hits, ReadEr
         hits.push(Hit {
             shard,
             tail,
+            sequence: crate::events::sequence(&key),
             event,
             payload: entry.payload,
         });
@@ -295,6 +310,7 @@ mod tests {
                 .map(|&(tail, time)| Hit {
                     shard: 0,
                     tail,
+                    sequence: u64::MAX - tail,
                     event: event(time),
                     payload: Vec::new(),
                 })
@@ -342,6 +358,14 @@ mod tests {
         assert!(Query::new(Field::Recipient, b"a@b.c", &[], 0, 8 * DAY).is_some());
         assert!(Query::new(Field::Recipient, b"a@b.c", &[], 0, 8 * DAY + 1).is_none());
         assert!(Query::new(Field::Recipient, b"a@b.c", &[], 5, 5).is_none());
+        assert!(Query::new(Field::Recipient, b"a@b.c", &[], 2 * DAY, DAY).is_none());
+        let query = Query::new(Field::Recipient, b"a@b.c", &[], 0, 5).expect("query");
+        assert_eq!(
+            query.ranged(DAY, 3 * DAY).map(|q| q.range()),
+            Some((DAY, 3 * DAY))
+        );
+        assert!(query.ranged(3 * DAY, DAY).is_none());
+        assert!(query.ranged(0, 9 * DAY).is_none());
         assert!(Query::new(Field::Recipient, b"", &[], 0, 5).is_none());
         assert!(Query::new(Field::Message, &[0; 15], &[], 0, 5).is_none());
         let id = MessageId::from_bytes([3; 16]);
