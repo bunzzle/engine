@@ -44,6 +44,7 @@ const LINE: usize = 4096;
 pub struct HookSettings {
     pub egress: Option<IpAddr>,
     pub allow: Vec<Cidr>,
+    pub nat64: Vec<Cidr>,
 }
 
 pub struct Hooks<T, D, L = Bind> {
@@ -448,7 +449,8 @@ impl<T: Transport + 'static, D: Dns + 'static, L: Local + 'static> Inner<T, D, L
         };
         let mut out = Vec::new();
         for &v6 in families {
-            let keep = |ip: &IpAddr| crate::address::keep(ip, &self.settings.allow);
+            let keep =
+                |ip: &IpAddr| crate::address::keep(ip, &self.settings.allow, &self.settings.nat64);
             if let Addresses::Found { ips, .. } = mx::filtered(&self.dns, name, v6, keep).await {
                 out.extend(ips);
             }
@@ -458,7 +460,7 @@ impl<T: Transport + 'static, D: Dns + 'static, L: Local + 'static> Inner<T, D, L
             if kept.len() == ADDRESSES {
                 break;
             }
-            if !self.own.own(ip).await {
+            if !self.own.own(ip, &self.settings.nat64).await {
                 kept.push(ip);
             }
         }
@@ -466,7 +468,8 @@ impl<T: Transport + 'static, D: Dns + 'static, L: Local + 'static> Inner<T, D, L
         if kept.is_empty()
             && let Some(egress) = self.settings.egress
         {
-            let keep = |ip: &IpAddr| crate::address::keep(ip, &self.settings.allow);
+            let keep =
+                |ip: &IpAddr| crate::address::keep(ip, &self.settings.allow, &self.settings.nat64);
             if let Addresses::Found { ips, .. } =
                 mx::filtered(&self.dns, name, !egress.is_ipv6(), keep).await
             {

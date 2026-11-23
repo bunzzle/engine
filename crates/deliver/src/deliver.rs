@@ -458,7 +458,7 @@ impl<D: Dns, L: Local> Deliver<D, L> {
         let passed = Cell::new(false);
         let lookup = mx::filtered(&self.dns, host, egress.is_ipv6(), |ip| {
             resolved.set(true);
-            let keep = crate::address::keep(ip, &self.settings.allow);
+            let keep = crate::address::keep(ip, &self.settings.allow, &self.settings.nat64);
             passed.set(passed.get() || keep);
             keep
         });
@@ -473,7 +473,7 @@ impl<D: Dns, L: Local> Deliver<D, L> {
         };
         let mut kept = Vec::with_capacity(found.len());
         for ip in found {
-            if self.own.own(ip).await {
+            if self.own.own(ip, &self.settings.nat64).await {
                 continue;
             }
             if !egresses.iter().any(|(egress, _)| *egress == ip) {

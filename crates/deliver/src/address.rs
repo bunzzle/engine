@@ -8,6 +8,14 @@ use crate::mx;
 
 const OWN: usize = 1024;
 
+const METADATA: [IpAddr; 5] = [
+    IpAddr::V4(Ipv4Addr::new(100, 100, 100, 200)),
+    IpAddr::V4(Ipv4Addr::new(168, 63, 129, 16)),
+    IpAddr::V4(Ipv4Addr::new(192, 0, 0, 192)),
+    IpAddr::V6(Ipv6Addr::new(0xfd00, 0x0ec2, 0, 0, 0, 0, 0, 0x0254)),
+    IpAddr::V6(Ipv6Addr::new(0xfd20, 0x00ce, 0, 0, 0, 0, 0, 0x0254)),
+];
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct OwnStats {
     pub ipv4_off: bool,
@@ -37,6 +45,11 @@ impl Cidr {
         };
         let most = if ip.is_ipv4() { 32 } else { 128 };
         (prefix <= most).then_some(Self { ip, prefix })
+    }
+
+    pub fn nat64(text: &str) -> Option<Self> {
+        Self::parse(text)
+            .filter(|cidr| cidr.ip.is_ipv6() && matches!(cidr.prefix, 32 | 40 | 48 | 56 | 64 | 96))
     }
 
     pub fn contains(&self, ip: &IpAddr) -> bool {
@@ -103,8 +116,8 @@ impl<L> Own<L> {
 }
 
 impl<L: Local> Own<L> {
-    pub(crate) async fn own(&self, ip: IpAddr) -> bool {
-        for ip in std::iter::once(ip).chain(embedded(ip).map(IpAddr::V4)) {
+    pub(crate) async fn own(&self, ip: IpAddr, nat64: &[Cidr]) -> bool {
+        for ip in std::iter::once(ip).chain(embedded(ip, nat64).map(IpAddr::V4)) {
             match self.probe(ip.is_ipv6()).await {
                 Some(true) => continue,
                 Some(false) => {}
@@ -153,31 +166,37 @@ impl<L: Local> Own<L> {
     }
 }
 
-pub(crate) fn keep(ip: &IpAddr, allow: &[Cidr]) -> bool {
-    if floor(ip) {
+pub(crate) fn keep(ip: &IpAddr, allow: &[Cidr], nat64: &[Cidr]) -> bool {
+    let inner = embedded(*ip, nat64);
+    if floor(ip) || inner.is_some_and(|v4| floor(&IpAddr::V4(v4))) {
         return false;
     }
-    mx::global(ip) || (embedded(*ip).is_none() && allow.iter().any(|cidr| cidr.contains(ip)))
+    match inner {
+        Some(v4) if nat64.iter().any(|net| net.contains(ip)) => mx::global(&IpAddr::V4(v4)),
+        Some(_) => mx::global(ip),
+        None => mx::global(ip) || allow.iter().any(|cidr| cidr.contains(ip)),
+    }
 }
 
 fn floor(ip: &IpAddr) -> bool {
-    let v4 = match ip {
-        IpAddr::V4(v4) => Some(*v4),
-        IpAddr::V6(v6) => embedded(IpAddr::V6(*v6)),
-    };
     let link = match ip {
         IpAddr::V4(v4) => v4.is_link_local(),
         IpAddr::V6(v6) => v6.segments()[0] & 0xffc0 == 0xfe80,
     };
-    !mx::usable(ip)
-        || link
-        || v4.is_some_and(|v4| !mx::usable(&IpAddr::V4(v4)) || v4.is_link_local())
+    !mx::usable(ip) || link || METADATA.contains(ip)
 }
 
-fn embedded(ip: IpAddr) -> Option<Ipv4Addr> {
+fn embedded(ip: IpAddr, nat64: &[Cidr]) -> Option<Ipv4Addr> {
     let IpAddr::V6(v6) = ip else {
         return None;
     };
+    if let Some(net) = nat64
+        .iter()
+        .filter(|net| net.contains(&ip))
+        .max_by_key(|net| net.prefix)
+    {
+        return Some(translated(v6, net.prefix));
+    }
     let segments = v6.segments();
     let pair = match segments {
         [0, 0, 0, 0, 0, 0 | 0xffff, ..]
@@ -185,13 +204,33 @@ fn embedded(ip: IpAddr) -> Option<Ipv4Addr> {
         {
             (segments[6], segments[7])
         }
-        [0x64, 0xff9b, 0, 0, 0, 0, ..] | [0x64, 0xff9b, 1, ..] => (segments[6], segments[7]),
+        [0, 0, 0, 0, 0xffff, 0, ..] | [0x64, 0xff9b, 0, 0, 0, 0, ..] | [0x64, 0xff9b, 1, ..] => {
+            (segments[6], segments[7])
+        }
         [0x2002, high, low, ..] => (high, low),
+        [0x2001, 0, ..] => (!segments[6], !segments[7]),
         _ => return None,
     };
     let [first, second] = pair.0.to_be_bytes();
     let [third, fourth] = pair.1.to_be_bytes();
     Some(Ipv4Addr::new(first, second, third, fourth))
+}
+
+fn translated(v6: Ipv6Addr, prefix: u8) -> Ipv4Addr {
+    let bytes = v6.octets();
+    if prefix < 96 && bytes[8] != 0 {
+        return Ipv4Addr::UNSPECIFIED;
+    }
+    let mut out = [0; 4];
+    let mut at = usize::from(prefix / 8);
+    for byte in &mut out {
+        if at == 8 {
+            at += 1;
+        }
+        *byte = bytes[at];
+        at += 1;
+    }
+    Ipv4Addr::from(out)
 }
 
 #[cfg(test)]
@@ -244,7 +283,7 @@ mod tests {
             let calls = Rc::clone(&local.calls);
             let own = Own::new(local);
             for text in ["11.0.1.1", "11.0.1.2", "2606:4700::1111", "2a00:1450::1"] {
-                assert!(!own.own(ip(text)).await);
+                assert!(!own.own(ip(text), &[]).await);
             }
             assert_eq!(calls.get(), 2);
             assert_eq!(
@@ -270,10 +309,10 @@ mod tests {
                     u8::try_from(n & 0xff).expect("octet"),
                     1,
                 ));
-                assert!(!own.own(ip).await);
+                assert!(!own.own(ip, &[]).await);
             }
             assert_eq!(own.cache.borrow().len(), OWN);
-            own.own(ip("10.255.255.1")).await;
+            own.own(ip("10.255.255.1"), &[]).await;
             assert_eq!(own.cache.borrow().len(), 1);
         });
     }
@@ -288,7 +327,7 @@ mod tests {
             Cidr::parse("::/0").expect("cidr"),
         ];
         for good in ["8.8.8.8", "10.1.2.3", "fd00::1", "64:ff9b::8.8.8.8"] {
-            assert!(keep(&ip(good), &allow), "{good}");
+            assert!(keep(&ip(good), &allow, &[]), "{good}");
         }
         for bad in [
             "127.0.0.1",
@@ -305,11 +344,93 @@ mod tests {
             "2002:7f00:0001::1",
             "224.0.0.1",
             "255.255.255.255",
+            "::ffff:0:127.0.0.1",
+            "::ffff:0:10.1.2.3",
+            "::ffff:0:8.8.8.8",
+            "2001:0:4136:e378:8000:63bf:80ff:fffe",
+            "2001:0:4136:e378:8000:63bf:f7f7:f7f7",
+            "2001::1",
+            "100.100.100.200",
+            "168.63.129.16",
+            "192.0.0.192",
+            "fd00:ec2::254",
+            "fd20:ce::254",
+            "::ffff:168.63.129.16",
+            "64:ff9b::168.63.129.16",
         ] {
-            assert!(!keep(&ip(bad), &allow), "{bad}");
+            assert!(!keep(&ip(bad), &allow, &[]), "{bad}");
         }
-        assert!(!keep(&ip("10.1.2.3"), &[]));
-        assert!(!keep(&ip("fd00::1"), &[]));
+        assert!(!keep(&ip("10.1.2.3"), &[], &[]));
+        assert!(!keep(&ip("fd00::1"), &[], &[]));
+    }
+
+    #[test]
+    fn network_nat64_prefixes_judge_the_embedded_address() {
+        let nat64 = [
+            Cidr::nat64("2001:db8:64::/96").expect("prefix"),
+            Cidr::nat64("2001:db8:100::/40").expect("prefix"),
+            Cidr::nat64("2001:db8:122:300::/56").expect("prefix"),
+            Cidr::nat64("2001:db8:122::/48").expect("prefix"),
+            Cidr::nat64("2001:db8:122:344::/64").expect("prefix"),
+            Cidr::nat64("2001:db9::/32").expect("prefix"),
+        ];
+        let allow = [Cidr::parse("::/0").expect("cidr")];
+        for (text, v4) in [
+            ("2001:db8:64::808:808", "8.8.8.8"),
+            ("2001:db8:64::a00:1", "10.0.0.1"),
+            ("2001:db8:1c0:2:21::", "192.0.2.33"),
+            ("2001:db8:122:3c0:0:221::", "192.0.2.33"),
+            ("2001:db8:122:c000:2:2100::", "192.0.2.33"),
+            ("2001:db8:122:344:c0:2:2100:0", "192.0.2.33"),
+            ("2001:db9:c000:221::", "192.0.2.33"),
+        ] {
+            assert_eq!(
+                embedded(ip(text), &nat64),
+                Some(v4.parse().expect("v4")),
+                "{text}"
+            );
+        }
+        assert!(keep(&ip("2001:db8:64::808:808"), &[], &nat64));
+        assert!(keep(&ip("2001:db9:808:808::"), &[], &nat64));
+        for bad in [
+            "2001:db8:64::a00:1",
+            "2001:db8:64::7f00:1",
+            "2001:db8:64::a9fe:a9fe",
+            "2001:db8:64::a83f:8110",
+            "2001:db8:64::6464:64c8",
+            "2001:db9:7f00:1::",
+            "2001:db9:808:808:100::",
+            "2001:db8:122:344:1c0:2:2100:0",
+            "2001::1",
+            "::ffff:0:127.0.0.1",
+        ] {
+            assert!(!keep(&ip(bad), &allow, &nat64), "{bad}");
+        }
+        for bad in ["2001:db8::/33", "10.0.0.0/8", "64:ff9b::/95", "::/0", "x"] {
+            assert!(Cidr::nat64(bad).is_none(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn own_checks_the_nat64_embedded_address() {
+        struct Only(IpAddr);
+        impl Local for Only {
+            fn bound(&self, ip: IpAddr) -> impl Future<Output = Option<bool>> {
+                std::future::ready(Some(ip == self.0))
+            }
+        }
+        run(async {
+            let nat64 = [Cidr::nat64("2001:db8:64::/96").expect("prefix")];
+            let own = Own::new(Only(ip("8.8.4.4")));
+            assert!(own.own(ip("2001:db8:64::808:404"), &nat64).await);
+            assert!(!own.own(ip("2001:db8:64::808:808"), &nat64).await);
+            assert!(!own.own(ip("2001:db8:64::808:404"), &[]).await);
+            assert!(own.own(ip("::ffff:0:8.8.4.4"), &[]).await);
+            assert!(
+                own.own(ip("2001:0:4136:e378:8000:63bf:f7f7:fbfb"), &[])
+                    .await
+            );
+        });
     }
 
     #[test]

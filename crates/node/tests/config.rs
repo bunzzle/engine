@@ -331,6 +331,27 @@ fn egress_must_be_a_unicast_address() {
 }
 
 #[test]
+fn deliver_nat64_prefixes_parse() {
+    let config = parse(&format!(
+        "{MINIMAL}[deliver]\nnat64 = [\"2001:db8:64::/96\", \"2001:db8:100::/40\"]\n"
+    ))
+    .expect("config");
+    assert_eq!(
+        config.delivery.settings.nat64,
+        [
+            deliver::Cidr::nat64("2001:db8:64::/96").expect("prefix"),
+            deliver::Cidr::nat64("2001:db8:100::/40").expect("prefix"),
+        ]
+    );
+    assert_eq!(
+        error(&format!(
+            "{MINIMAL}[deliver]\nnat64 = [\"2001:db8::/33\"]\n"
+        )),
+        "line 22, column 1: `nat64` `2001:db8::/33` must be an IPv6 prefix of length 32, 40, 48, 56, 64 or 96"
+    );
+}
+
+#[test]
 fn deliver_allow_rejects_a_bad_cidr() {
     assert_eq!(
         error(&format!("{MINIMAL}[deliver]\nallow = [\"10.0.0.0/33\"]\n")),
@@ -598,7 +619,7 @@ fn webhook_settings_are_read() {
         "line 21, column 1: [webhooks] needs `roots` in [tls]"
     );
     let config = parse(&with_roots(format!(
-        "{MINIMAL}[webhooks]\negress = \"192.0.2.9\"\nallow = [\"10.0.0.0/8\", \"fd00::/8\", \"192.168.4.1\"]\n"
+        "{MINIMAL}[webhooks]\negress = \"192.0.2.9\"\nallow = [\"10.0.0.0/8\", \"fd00::/8\", \"192.168.4.1\"]\nnat64 = [\"2001:db8:64::/96\"]\n"
     )))
     .expect("config");
     assert_eq!(
@@ -612,6 +633,10 @@ fn webhook_settings_are_read() {
             deliver::Cidr::parse("fd00::/8").expect("cidr"),
             deliver::Cidr::parse("192.168.4.1").expect("cidr"),
         ]
+    );
+    assert_eq!(
+        config.webhooks.nat64,
+        [deliver::Cidr::nat64("2001:db8:64::/96").expect("prefix")]
     );
     assert_eq!(
         error(&with_roots(format!(

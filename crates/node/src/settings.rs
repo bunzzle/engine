@@ -156,6 +156,7 @@ fn webhooks(mut table: Table, roots: bool) -> Result<deliver::HookSettings, Erro
         settings.egress = Some(ip);
     }
     allow(&mut table, &mut settings.allow)?;
+    nat64(&mut table, &mut settings.nat64)?;
     table.finish()?;
     Ok(settings)
 }
@@ -166,6 +167,20 @@ fn allow(table: &mut Table, allow: &mut Vec<deliver::Cidr>) -> Result<(), Error>
             let cidr = deliver::Cidr::parse(text)
                 .ok_or_else(|| entry.error(format!("`{text}` must be an address or CIDR")))?;
             allow.push(cidr);
+        }
+    }
+    Ok(())
+}
+
+fn nat64(table: &mut Table, nat64: &mut Vec<deliver::Cidr>) -> Result<(), Error> {
+    if let Some(entry) = table.take("nat64") {
+        for text in entry.strs()? {
+            let cidr = deliver::Cidr::nat64(text).ok_or_else(|| {
+                entry.error(format!(
+                    "`{text}` must be an IPv6 prefix of length 32, 40, 48, 56, 64 or 96"
+                ))
+            })?;
+            nat64.push(cidr);
         }
     }
     Ok(())
@@ -331,6 +346,7 @@ fn deliver(mut table: Table, delivery: &mut Delivery, roots: bool) -> Result<(),
         };
     }
     allow(&mut table, &mut settings.allow)?;
+    nat64(&mut table, &mut settings.nat64)?;
     let t = &mut settings.timeouts;
     t.connect = duration(&mut table, "connect_timeout", t.connect)?;
     t.banner = duration(&mut table, "banner_timeout", t.banner)?;
