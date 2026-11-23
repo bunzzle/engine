@@ -16,8 +16,8 @@ use keys::{BatchSettings, Batches, Working};
 use rt::sim::{Config, Disk, Faults, Machine, SimDriver, Stalls, check};
 use rt::{JoinHandle, Runtime, sleep, spawn, timeout};
 use sched::{
-    Answer, Answered, Attempt, Batched, Clock, Draft, Keys, Kind, Limits, Meshes, Node, Parts,
-    Reason, Refusal, Running, Settings, Transport, Unsealable, Unwrapped,
+    Answer, Answered, Attempt, Batched, Clock, Draft, Keys, Kind, Limits, Meshes, Node, OwnStats,
+    Parts, Reason, Refusal, Running, Settings, Transport, Unsealable, Unwrapped,
 };
 use spool::{Body, Head, HeadClear, Message, MessageId, SLICE, Slice};
 use store::{Client, DataFile, Options, SLOT_SIZE, Setup, boot};
@@ -1033,6 +1033,108 @@ async fn refusals(nodes: Vec<Node<Simulated>>, shard: u16) {
     );
     assert_eq!(node.draft(3, None).err(), Some(Refusal::Tenant));
     assert!(!Refusal::Tenant.temporary() && Refusal::Busy.temporary());
+}
+
+#[test]
+fn node_exposes_the_transports_own_stats() {
+    struct Stated {
+        stats: OwnStats,
+    }
+
+    impl Transport for Stated {
+        fn send(&self, _: Attempt) -> impl Future<Output = Vec<Answered>> {
+            std::future::ready(Vec::new())
+        }
+
+        fn own_stats(&self) -> OwnStats {
+            self.stats
+        }
+    }
+
+    let seed = 5;
+    let driver = Rc::new(SimDriver::with_disk(seed, Config::default(), created(seed)));
+    let machine = Machine::new(Rc::clone(&driver), 3, Stalls::default());
+    let setup_store = Setup {
+        cores: 2,
+        credits: 4,
+        reserve: 4,
+        flush: 0,
+    };
+    let booted = machine.block_on(0, boot(PATH, setup_store)).expect("boot");
+    let committer = machine.spawn_on(0, booted.committer.run());
+    let client = booted.client;
+    let meshes = std::sync::Arc::new(Meshes::new(2));
+    let mut cores = booted.starts.into_iter();
+    let stats = OwnStats {
+        ipv4_off: true,
+        ipv6_off: false,
+        unclear: 3,
+    };
+    let stated = {
+        let start = cores.next().expect("first core");
+        let links = meshes.take(0).expect("links");
+        machine.spawn_on(1, async move {
+            let core = timeout(Duration::from_secs(60), start.open())
+                .await
+                .ok()?
+                .ok()?;
+            let parts = Parts {
+                keys: Rc::new(Toy::default()),
+                transport: Stated { stats },
+                clock: Clock::start(),
+            };
+            timeout(
+                Duration::from_secs(60),
+                Node::start(core, links, settings(), parts),
+            )
+            .await
+            .ok()?
+            .ok()
+        })
+    };
+    let plain = {
+        let start = cores.next().expect("second core");
+        let links = meshes.take(1).expect("links");
+        let world: Shared = Rc::default();
+        let transport_driver = Rc::clone(&driver);
+        machine.spawn_on(2, async move {
+            let core = timeout(Duration::from_secs(60), start.open())
+                .await
+                .ok()?
+                .ok()?;
+            let parts = Parts {
+                keys: Rc::new(Toy::default()),
+                transport: Simulated {
+                    world,
+                    driver: transport_driver,
+                    core: 1,
+                },
+                clock: Clock::start(),
+            };
+            timeout(
+                Duration::from_secs(60),
+                Node::start(core, links, settings(), parts),
+            )
+            .await
+            .ok()?
+            .ok()
+        })
+    };
+    let (stated, plain) = machine.block_on(0, async move { (stated.await, plain.await) });
+    let (stated_node, stated_running) = stated.expect("stated node");
+    let (plain_node, plain_running) = plain.expect("plain node");
+    assert_eq!(stated_node.own_stats(), stats);
+    assert_eq!(plain_node.own_stats(), OwnStats::default());
+    machine.block_on(0, async move {
+        stated_node.close();
+        plain_node.close();
+        drop(stated_running.stop().await);
+        drop(plain_running.stop().await);
+        drop(stated_node);
+        drop(plain_node);
+        drop(client);
+        drop(committer.await);
+    });
 }
 
 #[test]

@@ -12,8 +12,8 @@ use std::time::Duration;
 use common::{Script, Seen, Zone, policy, policy_server, serve, serve_policy};
 use control::Leases;
 use deliver::{
-    Applied, Applies, Cidr, Deliver, Detail, EightBit, Local, Message, Outcome, Remote, ResultType,
-    Settings, Taken, limits,
+    Applied, Applies, Cidr, Deliver, Detail, EightBit, Local, Message, Outcome, OwnStats, Remote,
+    ResultType, Settings, Taken, limits,
 };
 use dns::{Found, Name, Record, Type};
 use rt::sim::{Config, SimDriver};
@@ -187,6 +187,22 @@ impl Local for Unclear {
             return std::future::ready(Some(false));
         }
         self.calls.set(self.calls.get() + 1);
+        std::future::ready(None)
+    }
+}
+
+struct V4Sentinel;
+
+impl Local for V4Sentinel {
+    fn bound(&self, ip: IpAddr) -> impl Future<Output = Option<bool>> {
+        std::future::ready(Some(ip.is_ipv4()))
+    }
+}
+
+struct Unknown;
+
+impl Local for Unknown {
+    fn bound(&self, _ip: IpAddr) -> impl Future<Output = Option<bool>> {
         std::future::ready(None)
     }
 }
@@ -796,6 +812,44 @@ fn unclear_bind_answers_refuse_without_caching() {
     assert_eq!(seen.borrow().connections, 0);
     assert_eq!(calls.get(), 2);
     assert_eq!(stats.unclear, 2);
+}
+
+#[test]
+fn probe_own_reports_each_family_before_any_delivery() {
+    let (probed, stats) = run(async {
+        let connector = Connector::new(simulated(2), None).expect("connector");
+        let settings = Settings::new("out.sender.example");
+        let deliver =
+            Deliver::with_local(zone(), connector, settings, None, 9, V4Sentinel).expect("deliver");
+        let probed = deliver.probe_own().await;
+        (probed, deliver.own_stats())
+    });
+    let expected = OwnStats {
+        ipv4_off: true,
+        ipv6_off: false,
+        unclear: 0,
+    };
+    assert_eq!(probed, expected);
+    assert_eq!(stats, expected);
+}
+
+#[test]
+fn probe_own_counts_unclear_sentinel_answers() {
+    let probed = run(async {
+        let connector = Connector::new(simulated(2), None).expect("connector");
+        let settings = Settings::new("out.sender.example");
+        let deliver =
+            Deliver::with_local(zone(), connector, settings, None, 9, Unknown).expect("deliver");
+        deliver.probe_own().await
+    });
+    assert_eq!(
+        probed,
+        OwnStats {
+            ipv4_off: false,
+            ipv6_off: false,
+            unclear: 2,
+        }
+    );
 }
 
 #[test]

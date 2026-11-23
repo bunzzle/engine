@@ -97,7 +97,7 @@ impl<T: Transport + 'static, D: Dns + 'static, L: Local + 'static> Hooks<T, D, L
         }
     }
 
-    pub fn own_stats(&self) -> crate::address::OwnStats {
+    pub fn own_stats(&self) -> sched::OwnStats {
         self.inner.own.stats()
     }
 }
