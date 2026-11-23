@@ -8,10 +8,10 @@ publish.workspace = true
 autotests = false
 
 [dependencies]
-aws-lc-rs = "=1.18.2"
+aws-lc-rs = "=1.19.0"
 rt = { path = "../rt" }
 rustls = { version = "=0.23.46", default-features = false, features = ["std", "tls12", "aws_lc_rs", "prefer-post-quantum"] }
-zeroize = "=1.9.1"
+zeroize = "=1.9.2"
 
 [dev-dependencies]
 dkim = { path = "../dkim" }
