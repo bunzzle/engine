@@ -6,7 +6,7 @@ use index::{Entry, Op, Shape};
 use rt::sim::{Config, SimDriver};
 use rt::{Runtime, now, spawn};
 use store::{
-    Batch, Change, Changes, Claim, Client, Committer, DataFile, Delivery, Error, HEAD_ITEM,
+    Batch, Budget, Change, Changes, Claim, Client, Committer, DataFile, Delivery, Error, HEAD_ITEM,
     IndexRecord, IndexStamp, Keeper, Key, Op as StoreOp, Options, SLOT_SIZE, Setup, Shards,
     Tiering, boot,
 };
@@ -963,6 +963,182 @@ fn the_watch_follows_durable_sequences_and_tenants_with_new_records_across_a_res
             .expect("apply");
         assert!(applied.indexed[0].sequence > head);
         assert_eq!(watch.head(), applied.indexed[0].sequence);
+        drop(node.stop().await);
+    });
+}
+
+fn day_tail(day: u32, hash: u8, n: u8) -> IndexRecord {
+    let mut record = tail(1, n);
+    record.partition = day;
+    record.entry.key[4..12].fill(hash);
+    record
+}
+
+fn day_range(hash: u8, below: u64) -> std::ops::Range<[u8; 20]> {
+    let mut from = index::key(1, [0; 16]);
+    from[4..12].fill(hash);
+    let mut to = from;
+    from[12..].copy_from_slice(&below.to_be_bytes());
+    to[12..].fill(0xff);
+    from..to
+}
+
+fn sequence(key: &[u8; 20]) -> u64 {
+    u64::MAX - u64::from_be_bytes(key[12..].try_into().expect("tail"))
+}
+
+const PLAN: [(u16, u32, u8); 8] = [
+    (0, 3, 3),
+    (1, 5, 5),
+    (0, 5, 5),
+    (1, 3, 9),
+    (1, 3, 3),
+    (0, 3, 3),
+    (0, 5, 9),
+    (1, 5, 5),
+];
+
+async fn write_days(node: &Node) -> Vec<(u16, u64, u8)> {
+    let other = Batch {
+        shard: 1,
+        ..batch(2)
+    };
+    node.changes
+        .create(vec![batch(1), other.clone()])
+        .await
+        .expect("create");
+    let mut wanted = Vec::new();
+    for (n, (shard, day, hash)) in PLAN.into_iter().enumerate() {
+        if n == 4 {
+            node.client.checkpoint().await.expect("checkpoint");
+        }
+        let n = u8::try_from(n).expect("fits");
+        let target = if shard == 0 { batch(1) } else { other.clone() };
+        let applied = node
+            .changes
+            .apply_indexed(target, shard, vec![day_tail(day, hash, n)], false)
+            .await
+            .expect("apply");
+        if hash != 9 {
+            wanted.push((shard, applied.indexed[0].sequence, n));
+        }
+    }
+    wanted
+}
+
+#[test]
+fn part_scans_merge_days_and_shards_newest_first_within_a_budget() {
+    let driver = Rc::new(SimDriver::with_disk(13, Config::default(), created(13)));
+    Runtime::new(driver).block_on(async {
+        let node = open(None).await;
+        let mut wanted = write_days(&node).await;
+        wanted.sort_by_key(|&(_, sequence, _)| std::cmp::Reverse(sequence));
+        let parts = |below| vec![(3, day_range(3, below)), (5, day_range(5, below))];
+        let wide = Budget {
+            entries: 100,
+            blocks: 100,
+        };
+        let all = node
+            .changes
+            .scan_parts(KIND, parts(0), wide)
+            .await
+            .expect("scan");
+        let seen: Vec<(u16, u64, u8)> = all
+            .entries
+            .iter()
+            .map(|(shard, _, e)| (*shard, sequence(&e.key), e.value[0]))
+            .collect();
+        assert_eq!(seen, wanted);
+        assert!(!all.more);
+        assert!(all.blocks > 0);
+        for (shard, part, entry) in &all.entries {
+            let (at, day, _) = PLAN[usize::from(entry.value[0])];
+            assert_eq!((*shard, *part), (at, usize::from(day != 3)));
+        }
+        let small = Budget {
+            entries: 2,
+            blocks: 100,
+        };
+        let first = node
+            .changes
+            .scan_parts(KIND, parts(0), small)
+            .await
+            .expect("scan");
+        assert_eq!(first.entries.len(), 2);
+        assert!(first.more);
+        let last = &first.entries[1].2.key;
+        let below = u64::from_be_bytes(last[12..].try_into().expect("tail")) + 1;
+        let rest = node
+            .changes
+            .scan_parts(KIND, parts(below), wide)
+            .await
+            .expect("scan");
+        let joined: Vec<[u8; 20]> = first
+            .entries
+            .iter()
+            .chain(&rest.entries)
+            .map(|(_, _, e)| e.key)
+            .collect();
+        let expected: Vec<[u8; 20]> = all.entries.iter().map(|(_, _, e)| e.key).collect();
+        assert_eq!(joined, expected);
+        let blind = Budget {
+            entries: 100,
+            blocks: 0,
+        };
+        let stopped = node
+            .changes
+            .scan_parts(KIND, parts(0), blind)
+            .await
+            .expect("scan");
+        assert!(stopped.more);
+        assert_eq!(stopped.entries.len(), 1);
+        assert_eq!(stopped.entries[0].2.key, all.entries[0].2.key);
+        drop(node.stop().await);
+    });
+}
+
+#[test]
+fn part_scans_page_through_a_cut_memtable_and_refuse_mixed_prefixes() {
+    let driver = Rc::new(SimDriver::with_disk(14, Config::default(), created(14)));
+    Runtime::new(driver).block_on(async {
+        let node = open(None).await;
+        node.changes.create(vec![batch(1)]).await.expect("create");
+        for n in 0..5 {
+            node.changes
+                .apply_indexed(batch(1), 0, vec![day_tail(3, 3, n)], false)
+                .await
+                .expect("apply");
+        }
+        let budget = Budget {
+            entries: 2,
+            blocks: 100,
+        };
+        let mut below = 0;
+        let mut seen = Vec::new();
+        loop {
+            let page = node
+                .changes
+                .scan_parts(KIND, vec![(3, day_range(3, below))], budget)
+                .await
+                .expect("scan");
+            assert!(page.entries.len() <= 2);
+            for (_, _, entry) in &page.entries {
+                seen.push(entry.value[0]);
+                below = u64::from_be_bytes(entry.key[12..].try_into().expect("tail")) + 1;
+            }
+            if !page.more {
+                break;
+            }
+        }
+        assert_eq!(seen, vec![4, 3, 2, 1, 0]);
+        let mut mixed = day_range(3, 0);
+        mixed.end[11] = 4;
+        assert!(matches!(
+            node.changes
+                .scan_parts(KIND, vec![(3, mixed)], budget)
+                .await,
+            Err(Error::Invalid(_))
+        ));
         drop(node.stop().await);
     });
 }

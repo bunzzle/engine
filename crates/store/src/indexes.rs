@@ -269,7 +269,7 @@ impl Partition {
         runs
     }
 
-    fn view(&self) -> Vec<Stored> {
+    pub(crate) fn view(&self) -> Vec<Stored> {
         if self.dropped == Dropped::InCut {
             return Vec::new();
         }
@@ -432,6 +432,197 @@ impl Partition {
                 Merged::Done => return Ok(out),
             }
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Budget {
+    pub entries: usize,
+    pub blocks: usize,
+}
+
+pub const MAX_PART_ENTRIES: usize = 4096;
+pub const MAX_PART_BLOCKS: usize = 1024;
+
+impl Budget {
+    pub(crate) fn clamped(self) -> Self {
+        Self {
+            entries: self.entries.clamp(1, MAX_PART_ENTRIES),
+            blocks: self.blocks.min(MAX_PART_BLOCKS),
+        }
+    }
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Tails {
+    pub entries: Vec<(u16, usize, Entry)>,
+    pub blocks: usize,
+    pub more: bool,
+}
+
+pub(crate) struct TailPart<'a> {
+    pub(crate) shard: u16,
+    pub(crate) part: usize,
+    pub(crate) partition: &'a Partition,
+    pub(crate) keys: std::ops::Range<Key>,
+}
+
+struct Stream<'a> {
+    shard: u16,
+    part: usize,
+    to: Key,
+    runs: &'a [Stored],
+    merge: Merge<'a>,
+    head: Option<Entry>,
+    done: bool,
+    cut: bool,
+}
+
+pub(crate) fn after(mut key: Key) -> Key {
+    for byte in key.iter_mut().rev() {
+        *byte = byte.wrapping_add(1);
+        if *byte != 0 {
+            return key;
+        }
+    }
+    [0xff; index::KEY]
+}
+
+fn tail(key: &Key) -> u64 {
+    u64::from_be_bytes(key[TAIL_STAMP].try_into().expect("8 bytes"))
+}
+
+impl<'a> Stream<'a> {
+    fn open(p: &TailPart<'_>, view: &'a [Stored], budget: Budget) -> Self {
+        let (from, mut to) = (p.keys.start, p.keys.end);
+        let mut live: Vec<Entry> = p
+            .partition
+            .live
+            .as_ref()
+            .map(|l| {
+                l.range(from)
+                    .take_while(|e| e.key < to)
+                    .take(budget.entries + 1)
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
+        let start = p.partition.frozen.partition_point(|e| e.key < from);
+        let mut frozen: Vec<Entry> = p.partition.frozen[start..]
+            .iter()
+            .take_while(|e| e.key < to)
+            .take(budget.entries + 1)
+            .cloned()
+            .collect();
+        let mut cut = false;
+        for taken in [&mut live, &mut frozen] {
+            if taken.len() > budget.entries
+                && let Some(over) = taken.pop()
+            {
+                to = to.min(over.key);
+                cut = true;
+            }
+        }
+        let mut sources = vec![
+            Source::Entries(live.into_iter()),
+            Source::Entries(frozen.into_iter()),
+        ];
+        sources.extend(
+            view.iter()
+                .rev()
+                .map(|s| Source::Run(Cursor::seek(&s.run, from))),
+        );
+        Self {
+            shard: p.shard,
+            part: p.part,
+            to,
+            runs: view,
+            merge: Merge::new(sources, false),
+            head: None,
+            done: from >= to,
+            cut,
+        }
+    }
+
+    async fn fill(
+        &mut self,
+        data: &CoreFile,
+        out: &mut Tails,
+        budget: Budget,
+    ) -> Result<bool, Error> {
+        while self.head.is_none() && !self.done {
+            if out.blocks >= budget.blocks && !out.entries.is_empty() {
+                return Ok(false);
+            }
+            match self
+                .merge
+                .step()
+                .map_err(|_| Error::Invalid("index order"))?
+            {
+                Merged::Entry(entry) if entry.key < self.to => self.head = Some(entry),
+                Merged::Entry(_) | Merged::Done => {
+                    self.done = true;
+                    if self.cut {
+                        return Ok(false);
+                    }
+                }
+                Merged::Need(source, segment, range) => {
+                    let stored = &self.runs[self.runs.len() - 1 - (source - 2)];
+                    let place = &stored.places[segment];
+                    let bytes = read(data, place, range).await?;
+                    out.blocks += 1;
+                    self.merge
+                        .feed(source, bytes)
+                        .map_err(|_| damaged(place, range))?;
+                }
+            }
+        }
+        Ok(true)
+    }
+}
+
+pub(crate) async fn scan_tails(
+    data: &CoreFile,
+    parts: Vec<TailPart<'_>>,
+    budget: Budget,
+) -> Result<Tails, Error> {
+    let views: Vec<(TailPart<'_>, Vec<Stored>)> = parts
+        .into_iter()
+        .map(|p| {
+            let view = p.partition.view();
+            (p, view)
+        })
+        .collect();
+    let mut streams: Vec<Stream<'_>> = views
+        .iter()
+        .map(|(p, view)| Stream::open(p, view, budget))
+        .collect();
+    let mut out = Tails::default();
+    loop {
+        for stream in &mut streams {
+            if !stream.fill(data, &mut out, budget).await? {
+                out.more = true;
+                return Ok(out);
+            }
+        }
+        let next = streams
+            .iter()
+            .enumerate()
+            .filter_map(|(at, s)| {
+                s.head
+                    .as_ref()
+                    .map(|e| ((tail(&e.key), s.shard, s.part), at))
+            })
+            .min();
+        let Some(((_, shard, part), at)) = next else {
+            return Ok(out);
+        };
+        if out.entries.len() >= budget.entries {
+            out.more = true;
+            return Ok(out);
+        }
+        let entry = streams[at].head.take().expect("head");
+        out.entries.push((shard, part, entry));
     }
 }
 

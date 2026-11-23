@@ -143,7 +143,7 @@ impl Keeper {
         self.partition(shard, partition)?.shape()
     }
 
-    fn partition(&self, shard: u16, partition: (u8, u32)) -> Option<&Partition> {
+    pub(crate) fn partition(&self, shard: u16, partition: (u8, u32)) -> Option<&Partition> {
         self.shards.get(&shard)?.indexes.get(&partition)
     }
 
