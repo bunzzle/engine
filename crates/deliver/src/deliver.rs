@@ -10,8 +10,8 @@ use control::{KIND_RPT, KIND_STS, Leases};
 use dns::{Found, Name, Record, Type};
 use rt::{Ends, Instant, JoinHandle, now, timeout, wall_ms};
 use sched::{
-    Answer, Answered, Attempt, Body, Destination, Envelope, EventBody, EventKind, Kind, Recipient,
-    ReportMail, Reported, Required, Restore, Ret, Transport,
+    Answer, Answered, Attempt, Body, Destination, Envelope, EventBody, EventKind, Kind, OwnStats,
+    Recipient, ReportMail, Reported, Required, Restore, Ret, Transport,
 };
 use smtp::client::{
     self, Answer as Reply, Capabilities, Dots, Mail, Rcpt, Refused, Response, Step, Transaction,
@@ -242,7 +242,7 @@ impl<D: Dns, L: Local> Deliver<D, L> {
         self.sts.stats()
     }
 
-    pub fn own_stats(&self) -> crate::address::OwnStats {
+    pub fn own_stats(&self) -> OwnStats {
         self.own.stats()
     }
 
@@ -966,6 +966,15 @@ fn refused_type(refused: Refusal) -> Option<ResultType> {
 }
 
 impl<D: Dns, L: Local> Transport for Deliver<D, L> {
+    async fn probe_own(&self) -> OwnStats {
+        self.own.probe_families().await;
+        self.own.stats()
+    }
+
+    fn own_stats(&self) -> OwnStats {
+        self.own.stats()
+    }
+
     fn restore(&self, restore: Restore) -> impl Future<Output = ()> {
         match restore.kind {
             KIND_STS => self.sts.restore(restore),

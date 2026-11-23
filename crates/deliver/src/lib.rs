@@ -17,7 +17,7 @@ mod settings;
 mod sts;
 mod upload;
 
-pub use address::{Bind, Cidr, Local, OwnStats};
+pub use address::{Bind, Cidr, Local};
 pub use classify::{answer, kind};
 pub use deliver::{Deliver, Due, Message, Outcome};
 pub use gzip::gzip;
@@ -27,5 +27,6 @@ pub use owners::OwnerStats;
 pub use pool::{Remote, limits};
 pub use report::{Applied, Applies, Detail, MAILTO, Report, ResultType, Rua};
 pub use results::{ResultStats, Taken};
+pub use sched::OwnStats;
 pub use settings::{EightBit, Reporter, Settings, Timeouts};
 pub use sts::PolicyStats;

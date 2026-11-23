@@ -23,7 +23,7 @@ use crate::sealing::{Holds, Keys};
 use crate::status::Reports;
 use crate::suppress::{self, Inputs, KIND_SUPPRESS, Suppressions};
 use crate::system::{self, RecordStats, Stored};
-use crate::transport::Transport;
+use crate::transport::{OwnStats, Transport};
 
 pub const CONTROL_SHARD: u16 = 0;
 
@@ -289,6 +289,10 @@ impl<T: Transport + 'static> Node<T> {
 
     pub fn sched(&self) -> &Sched<T> {
         &self.inner.sched
+    }
+
+    pub fn own_stats(&self) -> OwnStats {
+        self.inner.sched.transport().own_stats()
     }
 
     pub fn queues(&self) -> &Queues {

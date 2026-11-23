@@ -33,6 +33,13 @@ pub struct Attempt {
     pub outgoing: Outgoing,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct OwnStats {
+    pub ipv4_off: bool,
+    pub ipv6_off: bool,
+    pub unclear: u64,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Answered {
     pub recipient: u32,
@@ -75,5 +82,13 @@ pub trait Transport {
 
     fn reported(&self, day: u64, domain: &str, done: Reported) {
         let _ = (day, domain, done);
+    }
+
+    fn probe_own(&self) -> impl Future<Output = OwnStats> {
+        std::future::ready(OwnStats::default())
+    }
+
+    fn own_stats(&self) -> OwnStats {
+        OwnStats::default()
     }
 }

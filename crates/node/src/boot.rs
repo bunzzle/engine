@@ -276,6 +276,15 @@ async fn start<T: Transport + 'static>(
     let (node, running) = Node::start(core, links, settings, parts)
         .await
         .map_err(Error::Start)?;
+    let own = node.sched().transport().probe_own().await;
+    if index == 0 {
+        eprintln!(
+            "bunzzle: own-address probing ipv4 {}, ipv6 {}, unclear {}",
+            if own.ipv4_off { "off" } else { "on" },
+            if own.ipv6_off { "off" } else { "on" },
+            own.unclear,
+        );
+    }
     let acceptor =
         Acceptor::new(Arc::clone(&plan.provider), Arc::clone(&plan.certs)).map_err(Error::Tls)?;
     let hooks = hooks(&node, plan)?;

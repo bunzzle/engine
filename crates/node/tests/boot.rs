@@ -2,13 +2,14 @@ use std::net::SocketAddr;
 use std::path::Path;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use keys::{Audit, Server, Settings, Vault};
 use node::{Config, Error, Plan, naming, parse, run};
 use rt::sim::{Config as SimConfig, Machine, SimDriver, Stalls, check};
 use rt::{Buf, JoinHandle, Signal, TcpStream, UnixListener, sleep, spawn, timeout};
-use sched::{Answered, Attempt, Transport};
+use sched::{Answered, Attempt, OwnStats, Transport};
 use store::{Committer, DataFile, Options, SLOT_SIZE, Setup, boot};
 use tls::{Certs, simulated};
 
@@ -33,6 +34,25 @@ struct Idle;
 impl Transport for Idle {
     fn send(&self, _: Attempt) -> impl Future<Output = Vec<Answered>> {
         std::future::ready(Vec::new())
+    }
+}
+
+struct Probed {
+    calls: Arc<AtomicUsize>,
+}
+
+impl Transport for Probed {
+    fn send(&self, _: Attempt) -> impl Future<Output = Vec<Answered>> {
+        std::future::ready(Vec::new())
+    }
+
+    fn probe_own(&self) -> impl Future<Output = OwnStats> {
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        std::future::ready(OwnStats {
+            ipv4_off: false,
+            ipv6_off: true,
+            unclear: 5,
+        })
     }
 }
 
@@ -115,6 +135,45 @@ fn booted(driver: &Rc<SimDriver>, config: Config, cores: u16) -> Booted {
             machine.spawn_on(core, async move {
                 let core = start.open().await.map_err(Error::Store)?;
                 run(core, plan, Idle).await
+            })
+        })
+        .collect();
+    Booted {
+        machine,
+        cores,
+        committer,
+    }
+}
+
+fn probed(driver: &Rc<SimDriver>, config: Config, cores: u16, calls: &Arc<AtomicUsize>) -> Booted {
+    let machine = Machine::new(Rc::clone(driver), usize::from(CORES) + 1, Stalls::default());
+    keys_up(&machine);
+    let probe = config.clone();
+    let naming = machine
+        .block_on(0, async move { naming(&probe).await })
+        .expect("naming");
+    let setup = Setup {
+        cores: CORES,
+        credits: 4,
+        reserve: 4,
+        flush: 1,
+    };
+    let store = machine.block_on(0, boot(PATH, setup)).expect("boot");
+    let committer = machine.spawn_on(0, store.committer.run());
+    drop(store.client);
+    let certs = Arc::new(Certs::new(CHAIN, KEY).expect("certs"));
+    let plan = Arc::new(Plan::new(config, certs, simulated(5), naming, [7; 16]));
+    let cores = store
+        .starts
+        .into_iter()
+        .take(usize::from(cores))
+        .map(|start| {
+            let plan = Arc::clone(&plan);
+            let calls = Arc::clone(calls);
+            let core = usize::from(start.index()) + 1;
+            machine.spawn_on(core, async move {
+                let core = start.open().await.map_err(Error::Store)?;
+                run(core, plan, Probed { calls }).await
             })
         })
         .collect();
@@ -213,6 +272,27 @@ fn a_node_boots_serves_and_drains_on_sigterm() {
                 .await
                 .is_err()
         );
+    });
+}
+
+#[test]
+fn boot_probes_own_addresses_on_every_core() {
+    let driver = created(11);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let Booted {
+        machine,
+        cores,
+        committer,
+    } = probed(&driver, config(7), CORES, &calls);
+    let signals = Rc::clone(&driver);
+    machine.block_on(0, async move {
+        drop(serving().await);
+        assert_eq!(calls.load(Ordering::Relaxed), usize::from(CORES));
+        signals.raise(Signal::Terminate);
+        for core in cores {
+            core.await.expect("stopped");
+        }
+        drop(committer.await);
     });
 }
 

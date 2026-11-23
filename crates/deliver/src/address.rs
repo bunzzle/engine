@@ -3,6 +3,7 @@ use std::collections::BTreeMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use rt::UdpSocket;
+use sched::OwnStats;
 
 use crate::mx;
 
@@ -15,13 +16,6 @@ const METADATA: [IpAddr; 5] = [
     IpAddr::V6(Ipv6Addr::new(0xfd00, 0x0ec2, 0, 0, 0, 0, 0, 0x0254)),
     IpAddr::V6(Ipv6Addr::new(0xfd20, 0x00ce, 0, 0, 0, 0, 0, 0x0254)),
 ];
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct OwnStats {
-    pub ipv4_off: bool,
-    pub ipv6_off: bool,
-    pub unclear: u64,
-}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Cidr {
@@ -116,6 +110,11 @@ impl<L> Own<L> {
 }
 
 impl<L: Local> Own<L> {
+    pub(crate) async fn probe_families(&self) {
+        self.probe(false).await;
+        self.probe(true).await;
+    }
+
     pub(crate) async fn own(&self, ip: IpAddr, nat64: &[Cidr]) -> bool {
         for ip in std::iter::once(ip).chain(embedded(ip, nat64).map(IpAddr::V4)) {
             match self.probe(ip.is_ipv6()).await {
