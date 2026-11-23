@@ -3,7 +3,6 @@ use std::io::Read;
 use std::net::{SocketAddr, TcpStream};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 use std::rc::Rc;
 use std::sync::mpsc;
 use std::thread;
@@ -15,7 +14,6 @@ use sched::{Answered, Attempt, Transport};
 use store::{DataFile, Options, SLOT_SIZE};
 use sys::signal::{Signal, raise};
 
-const CHILD: &str = "NODE_NATIVE_CHILD";
 const CHAIN: &[u8] = include_bytes!("data/a.pem");
 const KEY: &[u8] = include_bytes!("data/a.key");
 const OPTIONS: Options = Options {
@@ -33,12 +31,9 @@ impl Transport for Idle {
     }
 }
 
-fn scratch_of(pid: u32) -> PathBuf {
-    std::env::temp_dir().join(format!("node-native-{pid}"))
-}
-
-fn scratch() -> PathBuf {
-    let dir = scratch_of(std::process::id());
+fn scratch(name: &str) -> PathBuf {
+    let pid = std::process::id();
+    let dir = std::env::temp_dir().join(format!("node-native-{pid}-{name}"));
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).expect("scratch");
     dir
@@ -104,7 +99,7 @@ fn node_config(dir: &Path, address: SocketAddr) -> PathBuf {
 
 #[test]
 fn serve_boots_on_threads_and_stops_on_sigterm() {
-    let dir = scratch();
+    let dir = scratch("serve");
     let address = SocketAddr::from(([127, 0, 0, 1], free_port()));
     let config = node_config(&dir, address);
 
@@ -131,26 +126,16 @@ fn serve_boots_on_threads_and_stops_on_sigterm() {
 }
 
 #[test]
-fn a_core_failing_to_start_exits_the_process_with_status_one() {
-    let name = "native::a_core_failing_to_start_exits_the_process_with_status_one";
-    if std::env::var_os(CHILD).is_some() {
-        let dir = scratch();
-        let held = std::net::TcpListener::bind("127.0.0.1:0").expect("hold");
-        let config = node_config(&dir, held.local_addr().expect("address"));
-        let ended = node::serve(&config, |_| Ok(Idle));
-        panic!("serve returned {ended:?}");
-    }
-    let child = Command::new(std::env::current_exe().expect("test binary"))
-        .args(["--exact", name, "--nocapture"])
-        .env(CHILD, "1")
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("child");
-    let dir = scratch_of(child.id());
-    let output = child.wait_with_output().expect("exit");
+fn a_core_failing_to_start_stops_every_core_and_returns_its_error() {
+    let dir = scratch("held");
+    let held = std::net::TcpListener::bind("127.0.0.1:0").expect("hold");
+    let address = held.local_addr().expect("address");
+    let config = node_config(&dir, address);
+    let ended = node::serve(&config, |_| Ok(Idle));
     let _ = fs::remove_dir_all(&dir);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert_eq!(output.status.code(), Some(1), "{stderr}");
-    assert!(stderr.contains("listen on 127.0.0.1:"), "{stderr}");
+    let message = ended.expect_err("serve failed").to_string();
+    assert!(
+        message.contains(&format!("listen on {address}")),
+        "{message}"
+    );
 }
