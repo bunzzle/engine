@@ -903,7 +903,7 @@ fn a_dropped_partition_leaves_at_the_next_publish() {
 }
 
 async fn from_disk(file: &CoreFile) -> Keeper {
-    let data = DataFile::open(PATH).await.expect("open");
+    let data = DataFile::inspect(PATH).await.expect("inspect");
     let loaded = load(&data, 0).await.expect("load");
     drop(data);
     Keeper::rebuild(file, &loaded.parts, &[], &ALL)

@@ -648,3 +648,15 @@ fn check_export(after: &Disk, acks: &[Ack], gone: &[u32], seed: u64, halt: u64) 
         }
     }
 }
+
+#[test]
+fn an_open_vault_refuses_a_second_open() {
+    let driver = Rc::new(SimDriver::with_disk(40, quiet(), fresh(40)));
+    run(&driver, async {
+        let first = Vault::open(Path::new(DIR)).await.expect("open");
+        let refused = Vault::open(Path::new(DIR)).await.err().expect("refused");
+        assert_eq!(refused, Error::Io(std::io::ErrorKind::ResourceBusy));
+        drop(first);
+        Vault::open(Path::new(DIR)).await.expect("open after close");
+    });
+}

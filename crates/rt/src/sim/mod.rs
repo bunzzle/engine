@@ -11,7 +11,7 @@ use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::ops::Range;
 use std::panic::{self, AssertUnwindSafe};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::task::Waker;
 use std::time::Duration;
@@ -20,7 +20,7 @@ pub use disk::Disk;
 pub use machine::{Machine, Stalls};
 pub use rng::Rng;
 
-use crate::driver::{Completion, Driver, Handle, Op, OpId, Stat, Unpark};
+use crate::driver::{Completion, Driver, Handle, Op, OpId, OpenOptions, Stat, Unpark};
 use crate::signal::Signal;
 use crate::time::Instant;
 use net::{Delivery, Net, Socket};
@@ -105,6 +105,7 @@ struct State {
     disk: Disk,
     net: Net,
     handles: BTreeMap<Handle, Resource>,
+    locks: BTreeMap<PathBuf, Handle>,
     next_handle: u64,
     next_op: u64,
     next_event: u64,
@@ -252,11 +253,7 @@ impl State {
 
     fn file_op(&mut self, op: Op) -> Completion {
         match op {
-            Op::Open { path, options } => Completion::Handle(
-                self.disk
-                    .open(&path, &options)
-                    .map(|()| self.add(Resource::File(path))),
-            ),
+            Op::Open { path, options } => Completion::Handle(self.open(&path, &options)),
             Op::ReadAt {
                 handle,
                 offset,
@@ -296,7 +293,16 @@ impl State {
                 self.disk.sync_dir(&path);
                 Completion::Unit(Ok(()))
             }
-            Op::Rename { from, to } => Completion::Unit(self.disk.rename(&from, &to)),
+            Op::Rename { from, to } => {
+                let renamed = self.disk.rename(&from, &to);
+                if renamed.is_ok() && from != to {
+                    self.locks.remove(&to);
+                    if let Some(handle) = self.locks.remove(&from) {
+                        self.locks.insert(to, handle);
+                    }
+                }
+                Completion::Unit(renamed)
+            }
             Op::Allocate { handle, len } => Completion::Unit(match self.file(handle) {
                 Some(path) => {
                     self.disk.allocate(&path, len);
@@ -573,7 +579,20 @@ impl State {
             .fold(0, |all, mask| all | mask)
     }
 
+    fn open(&mut self, path: &Path, options: &OpenOptions) -> io::Result<Handle> {
+        self.disk.open(path, options)?;
+        if options.lock && self.locks.contains_key(path) {
+            return Err(crate::driver::locked());
+        }
+        let handle = self.add(Resource::File(path.to_path_buf()));
+        if options.lock {
+            self.locks.insert(path.to_path_buf(), handle);
+        }
+        Ok(handle)
+    }
+
     fn release(&mut self, handle: Handle) {
+        self.locks.retain(|_, held| *held != handle);
         let Some(Resource::Socket(id)) = self.handles.remove(&handle) else {
             return;
         };
@@ -635,6 +654,7 @@ impl SimDriver {
                 disk,
                 net: Net::default(),
                 handles: BTreeMap::new(),
+                locks: BTreeMap::new(),
                 next_handle: 0,
                 next_op: 0,
                 next_event: 0,

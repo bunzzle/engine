@@ -61,6 +61,7 @@ impl DataFile {
                 read: true,
                 write: true,
                 create_new: true,
+                lock: true,
                 ..OpenOptions::default()
             },
         )
@@ -105,16 +106,31 @@ impl DataFile {
     }
 
     pub async fn open(path: impl AsRef<Path>) -> Result<Self, Error> {
-        let path = path.as_ref();
-        let file = File::open(
-            path,
+        Self::open_with(
+            path.as_ref(),
             &OpenOptions {
                 read: true,
                 write: true,
+                lock: true,
                 ..OpenOptions::default()
             },
         )
-        .await?;
+        .await
+    }
+
+    pub async fn inspect(path: impl AsRef<Path>) -> Result<Self, Error> {
+        Self::open_with(
+            path.as_ref(),
+            &OpenOptions {
+                read: true,
+                ..OpenOptions::default()
+            },
+        )
+        .await
+    }
+
+    async fn open_with(path: &Path, options: &OpenOptions) -> Result<Self, Error> {
+        let file = File::open(path, options).await?;
         let stat = file.stat().await?;
         let found = sector_size(stat.sector_size)?;
         let mut copies = [None; COPIES];
