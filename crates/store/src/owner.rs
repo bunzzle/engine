@@ -776,6 +776,14 @@ impl Shards {
     }
 
     async fn scan_parts(&self, scan: ScanParts) {
+        if scan
+            .parts
+            .iter()
+            .any(|(_, keys)| keys.start[..12] != keys.end[..12] || keys.start > keys.end)
+        {
+            let _ = scan.reply.send(Err(Error::Invalid("part range")));
+            return;
+        }
         let mut parts = Vec::new();
         for (shard, partition) in self.kept_partitions(scan.kind) {
             for (part, (wanted, keys)) in scan.parts.iter().enumerate() {
@@ -791,7 +799,7 @@ impl Shards {
                 }
             }
         }
-        let result = scan_tails(&self.file, parts, scan.budget).await;
+        let result = scan_tails(&self.file, parts, scan.budget.clamped()).await;
         let _ = scan.reply.send(result);
     }
 

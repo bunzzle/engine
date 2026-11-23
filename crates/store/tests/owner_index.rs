@@ -1091,7 +1091,54 @@ fn part_scans_merge_days_and_shards_newest_first_within_a_budget() {
             .await
             .expect("scan");
         assert!(stopped.more);
-        assert!(stopped.entries.len() < all.entries.len());
+        assert_eq!(stopped.entries.len(), 1);
+        assert_eq!(stopped.entries[0].2.key, all.entries[0].2.key);
+        drop(node.stop().await);
+    });
+}
+
+#[test]
+fn part_scans_page_through_a_cut_memtable_and_refuse_mixed_prefixes() {
+    let driver = Rc::new(SimDriver::with_disk(14, Config::default(), created(14)));
+    Runtime::new(driver).block_on(async {
+        let node = open(None).await;
+        node.changes.create(vec![batch(1)]).await.expect("create");
+        for n in 0..5 {
+            node.changes
+                .apply_indexed(batch(1), 0, vec![day_tail(3, 3, n)], false)
+                .await
+                .expect("apply");
+        }
+        let budget = Budget {
+            entries: 2,
+            blocks: 100,
+        };
+        let mut below = 0;
+        let mut seen = Vec::new();
+        loop {
+            let page = node
+                .changes
+                .scan_parts(KIND, vec![(3, day_range(3, below))], budget)
+                .await
+                .expect("scan");
+            assert!(page.entries.len() <= 2);
+            for (_, _, entry) in &page.entries {
+                seen.push(entry.value[0]);
+                below = u64::from_be_bytes(entry.key[12..].try_into().expect("tail")) + 1;
+            }
+            if !page.more {
+                break;
+            }
+        }
+        assert_eq!(seen, vec![4, 3, 2, 1, 0]);
+        let mut mixed = day_range(3, 0);
+        mixed.end[11] = 4;
+        assert!(matches!(
+            node.changes
+                .scan_parts(KIND, vec![(3, mixed)], budget)
+                .await,
+            Err(Error::Invalid(_))
+        ));
         drop(node.stop().await);
     });
 }

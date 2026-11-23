@@ -441,6 +441,18 @@ pub struct Budget {
     pub blocks: usize,
 }
 
+pub const MAX_PART_ENTRIES: usize = 4096;
+pub const MAX_PART_BLOCKS: usize = 1024;
+
+impl Budget {
+    pub(crate) fn clamped(self) -> Self {
+        Self {
+            entries: self.entries.clamp(1, MAX_PART_ENTRIES),
+            blocks: self.blocks.min(MAX_PART_BLOCKS),
+        }
+    }
+}
+
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Tails {
     pub entries: Vec<(u16, usize, Entry)>,
@@ -476,38 +488,38 @@ pub(crate) fn after(mut key: Key) -> Key {
     [0xff; index::KEY]
 }
 
-fn tail(key: &Key) -> &[u8] {
-    &key[TAIL_STAMP]
+fn tail(key: &Key) -> u64 {
+    u64::from_be_bytes(key[TAIL_STAMP].try_into().expect("8 bytes"))
 }
 
 impl<'a> Stream<'a> {
     fn open(p: &TailPart<'_>, view: &'a [Stored], budget: Budget) -> Self {
         let (from, mut to) = (p.keys.start, p.keys.end);
-        let live: Vec<Entry> = p
+        let mut live: Vec<Entry> = p
             .partition
             .live
             .as_ref()
             .map(|l| {
                 l.range(from)
                     .take_while(|e| e.key < to)
-                    .take(budget.entries)
+                    .take(budget.entries + 1)
                     .cloned()
                     .collect()
             })
             .unwrap_or_default();
         let start = p.partition.frozen.partition_point(|e| e.key < from);
-        let frozen: Vec<Entry> = p.partition.frozen[start..]
+        let mut frozen: Vec<Entry> = p.partition.frozen[start..]
             .iter()
             .take_while(|e| e.key < to)
-            .take(budget.entries)
+            .take(budget.entries + 1)
             .cloned()
             .collect();
         let mut cut = false;
-        for taken in [&live, &frozen] {
-            if taken.len() == budget.entries
-                && let Some(last) = taken.last()
+        for taken in [&mut live, &mut frozen] {
+            if taken.len() > budget.entries
+                && let Some(over) = taken.pop()
             {
-                to = to.min(after(last.key));
+                to = to.min(over.key);
                 cut = true;
             }
         }
@@ -539,7 +551,7 @@ impl<'a> Stream<'a> {
         budget: Budget,
     ) -> Result<bool, Error> {
         while self.head.is_none() && !self.done {
-            if out.blocks >= budget.blocks {
+            if out.blocks >= budget.blocks && !out.entries.is_empty() {
                 return Ok(false);
             }
             match self
@@ -594,25 +606,22 @@ pub(crate) async fn scan_tails(
             }
         }
         let next = streams
-            .iter_mut()
-            .filter_map(|s| {
+            .iter()
+            .enumerate()
+            .filter_map(|(at, s)| {
                 s.head
                     .as_ref()
-                    .map(|e| (tail(&e.key).to_vec(), s.shard, s.part))
+                    .map(|e| ((tail(&e.key), s.shard, s.part), at))
             })
             .min();
-        let Some((_, shard, part)) = next else {
+        let Some(((_, shard, part), at)) = next else {
             return Ok(out);
         };
         if out.entries.len() >= budget.entries {
             out.more = true;
             return Ok(out);
         }
-        let stream = streams
-            .iter_mut()
-            .find(|s| (s.shard, s.part) == (shard, part) && s.head.is_some())
-            .expect("chosen stream");
-        let entry = stream.head.take().expect("head");
+        let entry = streams[at].head.take().expect("head");
         out.entries.push((shard, part, entry));
     }
 }

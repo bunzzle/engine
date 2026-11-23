@@ -39,7 +39,9 @@ pub use ids::{
     CONTROL_BOOT, CONTROL_KINDS, Ids, LAST_BOOT, control_key, is_control, message_key, next_boot,
     split_key,
 };
-pub use indexes::{Budget, IndexRecord, IndexStamp, KIND_INDEX, Tails};
+pub use indexes::{
+    Budget, IndexRecord, IndexStamp, KIND_INDEX, MAX_PART_BLOCKS, MAX_PART_ENTRIES, Tails,
+};
 pub use journal::{
     Allocation, Commit, Dead, Entry, Journal, KIND_COMMIT, Live, Position, Range, fits,
 };
