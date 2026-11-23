@@ -169,7 +169,25 @@ fn open(path: &Path, options: &OpenOptions) -> io::Result<fs::File> {
     if let Some(mode) = options.mode {
         std::os::unix::fs::OpenOptionsExt::mode(&mut open, mode);
     }
-    open.open(path)
+    #[cfg(target_os = "linux")]
+    if options.lock && is_block_device(path) {
+        std::os::unix::fs::OpenOptionsExt::custom_flags(&mut open, sys::fs::EXCLUSIVE_DEVICE);
+    }
+    let file = open.open(path)?;
+    if options.lock {
+        match file.try_lock() {
+            Ok(()) => {}
+            Err(fs::TryLockError::WouldBlock) => return Err(crate::driver::locked()),
+            Err(fs::TryLockError::Error(e)) => return Err(e),
+        }
+    }
+    Ok(file)
+}
+
+#[cfg(target_os = "linux")]
+fn is_block_device(path: &Path) -> bool {
+    use std::os::unix::fs::FileTypeExt;
+    fs::metadata(path).is_ok_and(|m| m.file_type().is_block_device())
 }
 
 impl Native {

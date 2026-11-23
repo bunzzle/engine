@@ -481,3 +481,28 @@ fn merges_claim_only_what_they_reserved() {
     regions.unreserve_index(1);
     regions.acquire(Claim::Control).expect("control");
 }
+
+#[test]
+fn an_open_data_file_refuses_a_second_open() {
+    let driver = restart(31, created(30), Config::default());
+    run(&driver, async {
+        let first = DataFile::open(PATH).await.expect("open");
+        let refused = DataFile::open(PATH).await.err().expect("refused");
+        assert!(
+            matches!(&refused, Error::Io(e) if e.kind() == std::io::ErrorKind::ResourceBusy),
+            "{refused}"
+        );
+        drop(first);
+        DataFile::open(PATH).await.expect("open after close");
+    });
+}
+
+#[test]
+fn an_open_data_file_can_still_be_inspected() {
+    let driver = restart(33, created(32), Config::default());
+    run(&driver, async {
+        let held = DataFile::open(PATH).await.expect("open");
+        let seen = DataFile::inspect(PATH).await.expect("inspect");
+        assert_eq!(seen.superblock(), held.superblock());
+    });
+}

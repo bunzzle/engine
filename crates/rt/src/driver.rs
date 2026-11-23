@@ -21,6 +21,7 @@ pub struct OpenOptions {
     pub create: bool,
     pub create_new: bool,
     pub truncate: bool,
+    pub lock: bool,
     pub mode: Option<u32>,
 }
 
@@ -144,4 +145,11 @@ pub trait Driver {
     fn release(&self, handle: Handle);
     fn park(&self, deadline: Option<Instant>);
     fn unparker(&self) -> Arc<dyn Unpark>;
+}
+
+pub(crate) fn locked() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::ResourceBusy,
+        "file is locked by another process",
+    )
 }

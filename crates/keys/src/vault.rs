@@ -41,6 +41,7 @@ pub struct Listed {
 
 pub struct Vault {
     dir: PathBuf,
+    marker: File,
     masters: [File; 2],
     slots: [File; 2],
     master: Master,
@@ -69,6 +70,7 @@ fn options(create: Create) -> OpenOptions {
         create_new: create == Create::New,
         create: create == Create::Over,
         truncate: create == Create::Over,
+        lock: false,
         mode: Some(MODE),
     }
 }
@@ -85,6 +87,7 @@ async fn phase(dir: &Path) -> Result<(File, Option<u8>), Error> {
         read: true,
         write: true,
         create: true,
+        lock: true,
         mode: Some(MODE),
         ..OpenOptions::default()
     };
@@ -140,6 +143,7 @@ impl Vault {
         rt::sync_dir(dir).await?;
         let mut vault = Self {
             dir: dir.to_path_buf(),
+            marker,
             masters,
             slots,
             master,
@@ -154,12 +158,16 @@ impl Vault {
             failed: false,
         };
         vault.export().await?;
-        set_phase(dir, &marker, DONE).await?;
+        set_phase(dir, &vault.marker, DONE).await?;
         Ok(vault)
     }
 
     pub async fn open(dir: &Path) -> Result<Self, Error> {
         let (marker, current) = phase(dir).await?;
+        Self::open_held(dir, marker, current).await
+    }
+
+    async fn open_held(dir: &Path, marker: File, current: Option<u8>) -> Result<Self, Error> {
         if current == Some(INIT) || current.is_none() {
             return Err(Error::Interrupted);
         }
@@ -206,6 +214,7 @@ impl Vault {
         }
         let mut vault = Self {
             dir: dir.to_path_buf(),
+            marker,
             masters,
             slots,
             master,
@@ -221,7 +230,7 @@ impl Vault {
         };
         if current == Some(RESTORE) {
             vault.rotate().await?;
-            set_phase(dir, &marker, DONE).await?;
+            set_phase(dir, &vault.marker, DONE).await?;
         } else {
             vault.export().await?;
         }
@@ -242,8 +251,8 @@ impl Vault {
         write(&masters[0], &master.encode()).await?;
         write(&slots[0], export).await?;
         rt::sync_dir(dir).await?;
-        drop((masters, slots, marker));
-        Self::open(dir).await
+        drop((masters, slots));
+        Self::open_held(dir, marker, Some(RESTORE)).await
     }
 
     pub fn day(&self) -> u32 {

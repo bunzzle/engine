@@ -253,7 +253,7 @@ fn runs_hold_the_shard_state_across_checkpoints_and_restarts() {
                 deltas += 1;
             }
             core.check().await;
-            let data = DataFile::open(PATH).await.expect("open");
+            let data = DataFile::inspect(PATH).await.expect("inspect");
             let loaded = load(&data, 0).await.expect("load");
             for part in &loaded.parts {
                 let roots = store::decode_part(&part.bytes).expect("roots").state;

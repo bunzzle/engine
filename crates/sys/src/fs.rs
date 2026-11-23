@@ -5,6 +5,9 @@ use std::os::fd::AsRawFd;
 
 use crate::check;
 
+#[cfg(target_os = "linux")]
+pub const EXCLUSIVE_DEVICE: i32 = libc::O_EXCL;
+
 #[cfg(target_vendor = "apple")]
 #[allow(unsafe_code)]
 pub fn full_sync(file: &File) -> io::Result<()> {

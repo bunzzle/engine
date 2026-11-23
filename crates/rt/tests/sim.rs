@@ -673,3 +673,73 @@ fn shared_listeners_split_connections() {
         assert!(counts[0] > 0 && counts[1] > 0, "{counts:?}");
     });
 }
+
+fn locked() -> OpenOptions {
+    OpenOptions {
+        lock: true,
+        ..create()
+    }
+}
+
+#[test]
+fn a_locked_file_refuses_a_second_lock_until_closed() {
+    let driver = Rc::new(SimDriver::new(12, Config::default()));
+    run(&driver, async {
+        let first = File::open("/data", &locked()).await.expect("first lock");
+        let refused = File::open("/data", &locked()).await.err().expect("refused");
+        assert_eq!(refused.kind(), std::io::ErrorKind::ResourceBusy);
+        File::open("/data", &existing())
+            .await
+            .expect("open without lock");
+        drop(first);
+        File::open("/data", &locked())
+            .await
+            .expect("lock after close");
+    });
+}
+
+#[test]
+fn a_lock_follows_its_file_through_a_rename() {
+    let driver = Rc::new(SimDriver::new(13, Config::default()));
+    run(&driver, async {
+        let held = File::open("/a", &locked()).await.expect("lock");
+        rename("/a", "/b").await.expect("rename");
+        File::open("/a", &locked())
+            .await
+            .expect("new file at old name");
+        let refused = File::open("/b", &locked()).await.err().expect("refused");
+        assert_eq!(refused.kind(), std::io::ErrorKind::ResourceBusy);
+        drop(held);
+    });
+}
+
+#[test]
+fn a_crash_releases_locks() {
+    let first = Rc::new(SimDriver::new(14, faults(|f| f.crash_keep = MILLION)));
+    let file = run(&first, async {
+        let file = File::open("/data", &locked()).await.expect("lock");
+        file.sync_data().await.expect("sync");
+        sync_dir("/").await.expect("sync dir");
+        file
+    });
+    let disk = first.crash();
+    let second = Rc::new(SimDriver::with_disk(15, Config::default(), disk));
+    run(&second, async {
+        File::open("/data", &locked())
+            .await
+            .expect("lock after crash");
+    });
+    drop(file);
+}
+
+#[test]
+fn a_rename_onto_itself_keeps_the_lock() {
+    let driver = Rc::new(SimDriver::new(16, Config::default()));
+    run(&driver, async {
+        let held = File::open("/a", &locked()).await.expect("lock");
+        rename("/a", "/a").await.expect("rename");
+        let refused = File::open("/a", &locked()).await.err().expect("refused");
+        assert_eq!(refused.kind(), std::io::ErrorKind::ResourceBusy);
+        drop(held);
+    });
+}

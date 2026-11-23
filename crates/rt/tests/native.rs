@@ -444,3 +444,44 @@ fn shared_listeners_bind_one_port() {
         }
     });
 }
+
+#[test]
+fn a_locked_file_refuses_a_second_lock_until_closed() {
+    for (name, driver) in drivers() {
+        let path = scratch(&format!("lock-{name}")).join("data");
+        Runtime::new(Rc::new(driver)).block_on(async move {
+            let locked = OpenOptions {
+                lock: true,
+                ..options()
+            };
+            let first = File::open(&path, &locked).await.expect("first lock");
+            let refused = File::open(&path, &locked).await.err().expect("refused");
+            assert_eq!(refused.kind(), io::ErrorKind::ResourceBusy);
+            File::open(&path, &options())
+                .await
+                .expect("open without lock");
+            drop(first);
+            File::open(&path, &locked).await.expect("lock after close");
+        });
+    }
+}
+
+#[test]
+fn a_lock_is_seen_by_a_plain_std_lock() {
+    let path = scratch("lock-std").join("data");
+    let target = path.clone();
+    let held = run(async move {
+        let locked = OpenOptions {
+            lock: true,
+            ..options()
+        };
+        File::open(&target, &locked).await.expect("lock")
+    });
+    let other = fs::File::open(&path).expect("std open");
+    assert!(matches!(
+        other.try_lock(),
+        Err(fs::TryLockError::WouldBlock)
+    ));
+    drop(held);
+    other.try_lock().expect("std lock after close");
+}

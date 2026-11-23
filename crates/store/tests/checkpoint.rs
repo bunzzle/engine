@@ -35,7 +35,14 @@ fn created(seed: u64) -> Rc<SimDriver> {
 }
 
 async fn reopen() -> (DataFile, Result<Recovered, Error>) {
-    let data = DataFile::open(PATH).await.expect("open");
+    recovered(DataFile::open(PATH).await.expect("open")).await
+}
+
+async fn inspect() -> (DataFile, Result<Recovered, Error>) {
+    recovered(DataFile::inspect(PATH).await.expect("inspect")).await
+}
+
+async fn recovered(data: DataFile) -> (DataFile, Result<Recovered, Error>) {
     let recovered = match load(&data, 0).await {
         Ok(loaded) => recover(&data, loaded.position, loaded.state).await,
         Err(e) => Err(e),
@@ -100,6 +107,7 @@ const OPTIONS_RW: OpenOptions = OpenOptions {
     create: false,
     create_new: false,
     truncate: false,
+    lock: false,
     mode: None,
 };
 
@@ -234,7 +242,7 @@ fn allocations_not_yet_committed_stay_out_of_the_checkpoint() {
         client.checkpoint().await.expect("checkpoint");
         let bytes = vec![3u8; 4096];
         let data_offset = {
-            let (data, snapshot) = reopen().await;
+            let (data, snapshot) = inspect().await;
             let snapshot = snapshot.expect("recover at the checkpoint");
             assert!(!snapshot.state.regions.is_used(pending));
             assert!(!snapshot.state.regions.is_used(body));
