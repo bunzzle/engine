@@ -9,7 +9,7 @@ pub const KIND_EVENT: u8 = 3;
 pub const EVENT_SHAPE: Shape = Shape { value: 61 };
 pub const EVENT_VALUE: usize = EVENT_SHAPE.value as usize;
 pub const MAX_REPLY: usize = 1024;
-pub const EVENT_DAYS: u32 = 7;
+pub const EVENT_DAYS: u32 = keys::EVENT_DAYS;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {

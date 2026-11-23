@@ -12,7 +12,7 @@ use control::{
     Tenant,
 };
 use crypto::{BatchKey, Secret, Tenant as Root, TenantKeys, Wrap, day_public, open_batch};
-use keys::{BatchSettings, Batches, Working};
+use keys::{BatchSettings, Batches, SearchKeys, Working};
 use rt::sim::{Config, Disk, Faults, Machine, SimDriver, Stalls, check};
 use rt::{JoinHandle, Runtime, sleep, spawn, timeout};
 use sched::{
@@ -178,6 +178,7 @@ impl Keys for Toy {
                     oldest: TOY_DAY,
                     today: public(TOY_DAY),
                     tomorrow: public(TOY_DAY + 1),
+                    search: SearchKeys::default(),
                     seen: TOY_DAY,
                 };
                 self.batches

@@ -14,7 +14,7 @@ use control::{Created, KeyError, KeySource, Object, Pool, Ready, State, Tenant};
 use crypto::{BatchKey, Secret, Tenant as Root, TenantKeys, Wrap, day_public, open_batch};
 use deliver::{Cidr, Dns, HookSettings, Hooks, Local};
 use dns::{Error, Found, Lookup, Name, Record, Type};
-use keys::{BatchSettings, Batches, Working};
+use keys::{BatchSettings, Batches, SearchKeys, Working};
 use rt::sim::{Config, Disk, Machine, SimDriver, Stalls};
 use rt::{Instant, JoinHandle, Runtime, TcpListener, TcpStream, now, sleep, spawn};
 use sched::{
@@ -163,6 +163,7 @@ impl Keys for Toy {
                     oldest: TOY_DAY,
                     today: public(TOY_DAY),
                     tomorrow: public(TOY_DAY + 1),
+                    search: SearchKeys::default(),
                     seen: TOY_DAY,
                 };
                 self.batches

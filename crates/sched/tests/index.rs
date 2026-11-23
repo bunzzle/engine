@@ -16,8 +16,8 @@ use control::{
 use crypto::{BatchKey, DkimAlg, Secret, Tenant as Root, TenantKeys, Wrap, day_public, open_batch};
 use index::{Entry, Op};
 use keys::{
-    Audit, BatchSettings, Batches, Client as KeyClient, Connect, Ring, RingSettings, Server,
-    Settings as KeySettings, Vault, Working,
+    Audit, BatchSettings, Batches, Client as KeyClient, Connect, Ring, RingSettings, SearchKeys,
+    Server, Settings as KeySettings, Vault, Working,
 };
 use rt::sim::{Config, Disk, Faults, Machine, Rng, SimDriver, Stalls, check};
 use rt::{JoinHandle, Runtime, TcpListener, TcpStream, sleep, spawn, timeout};
@@ -119,6 +119,7 @@ impl Keys for Toy {
                     oldest: TOY_DAY,
                     today: public(TOY_DAY),
                     tomorrow: public(TOY_DAY + 1),
+                    search: SearchKeys::default(),
                     seen: TOY_DAY,
                 };
                 self.batches

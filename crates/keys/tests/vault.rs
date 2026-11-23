@@ -3,9 +3,9 @@ use std::path::Path;
 use std::rc::Rc;
 use std::time::Duration;
 
-use crypto::{Secret, seal_batch};
+use crypto::{Secret, ratchet, seal_batch, search_key};
 use keys::file::{self, Master};
-use keys::{Clock, Error, MIN_GAP, MODE, State, Step, Vault};
+use keys::{Clock, EVENT_DAYS, Error, MIN_GAP, MODE, State, Step, Vault};
 use rt::sim::{Config, Disk, SimDriver, check};
 use rt::{Runtime, sleep, spawn};
 
@@ -189,6 +189,57 @@ fn shred_waits_for_settled_days_and_force_wins() {
     });
     let states = states(&driver.disk());
     assert!(states.iter().all(|s| s.tenants[&1].oldest == 102));
+}
+
+fn search_days(vault: &Vault, tenant: u32) -> Vec<(u32, [u8; 16])> {
+    let keys = vault.keys(tenant, 1).expect("keys");
+    let count = u32::try_from(keys.search.len()).expect("few");
+    (keys.day + 2 - count..=keys.day + 1)
+        .zip(keys.search.iter().map(|key| *key.expose()))
+        .collect()
+}
+
+#[test]
+fn search_keys_cover_kept_event_days_and_follow_the_ratchet() {
+    let driver = Rc::new(SimDriver::with_disk(7, quiet(), fresh(7)));
+    let seen = run(&driver, async {
+        let mut vault = Vault::open(Path::new(DIR)).await.expect("open");
+        vault.create(1, 1, 30).expect("create");
+        vault.create(2, 1, 3).expect("create");
+        vault.flush().await.expect("flush");
+        let first = search_days(&vault, 1);
+        assert_eq!(first.iter().map(|d| d.0).collect::<Vec<_>>(), [100, 101]);
+        let mut all = first.clone();
+        for _ in 0..10 {
+            vault.new_day(None, false).await.expect("new day");
+            let days = search_days(&vault, 1);
+            let expected = (vault.day() + 2 - 100).min(EVENT_DAYS + 1);
+            assert_eq!(days.len(), usize::try_from(expected).expect("small"));
+            assert_eq!(days.last().expect("some").0, vault.day() + 1);
+            all.extend(days);
+        }
+        let other = search_days(&vault, 2);
+        assert_eq!(other.len(), 8);
+        assert!(
+            other
+                .iter()
+                .all(|(day, key)| all.iter().any(|d| d.0 == *day && d.1 != *key))
+        );
+        assert!(vault.shred(None, true).await.expect("shred"));
+        let shredded = search_days(&vault, 2);
+        assert_eq!(
+            shredded.iter().map(|d| d.0).collect::<Vec<_>>(),
+            [107, 108, 109, 110, 111]
+        );
+        assert_eq!(&shredded[..], &other[3..]);
+        all
+    });
+    let state = states(&driver.disk()).pop().expect("state");
+    let entry = &state.tenants[&1];
+    for (day, key) in seen {
+        let at = ratchet(&entry.ratchet, day - entry.oldest);
+        assert_eq!(*search_key(&at, 1, 1, day).expose(), key, "day {day}");
+    }
 }
 
 #[test]

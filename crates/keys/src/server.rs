@@ -200,6 +200,7 @@ fn keys_answer(keys: Keys) -> Answer {
         hash: keys.hash,
         today: keys.today,
         tomorrow: keys.tomorrow,
+        search: keys.search,
     }
 }
 
