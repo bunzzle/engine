@@ -199,9 +199,13 @@ impl<T: Transport + 'static> Node<T> {
             node.write_hook(&mut held, hook).await.map(|_| true)
         })
         .await;
-        if let Err(error) = result {
-            self.inner.hook_reports.borrow_mut().write_failed();
-            eprintln!("webhook state write failed: {error}");
+        match result {
+            Ok(true) => self.inner.hook_reports.borrow_mut().disabled(disable.state),
+            Ok(false) | Err(Error::Control(control::Error::Busy)) => {}
+            Err(error) => {
+                self.inner.hook_reports.borrow_mut().write_failed();
+                eprintln!("webhook state write failed: {error}");
+            }
         }
     }
 
