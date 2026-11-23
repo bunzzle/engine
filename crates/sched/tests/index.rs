@@ -26,10 +26,11 @@ use sched::{
     EVENT_DAYS, EVENT_SHAPE, EVENT_VALUE, Event, EventBody, EventKind, Fault, Found, Hash,
     HookChange, HookStats, KIND_EVENT, KIND_REQUEST, KIND_SEARCH, KIND_SUPPRESS, Keyring, Keys,
     MAX_HOOKS, MAX_REPLY, Meshes, Node, Outcome, Parts, ROTATION_MS, ReadError, Reason, Recipient,
-    Refusal, Restore, Running, SEARCH_VALUE, SHAPE, SearchField, Searched, Sending, Settings,
-    Suppression, Ticket, Transport, Unsealable, Unwrapped, drop_cursor, encode_slice, event_record,
-    event_sealed, event_sequence, normalize, punycode, read_cursor, retain, retain_event,
-    retain_request, retired_events, search_event_key, search_hash, search_key, write_cursor,
+    Refusal, Restore, Running, SEARCH_VALUE, SHAPE, SearchField, SearchQuery, Searched, Sending,
+    Settings, Suppression, Ticket, Transport, Unsealable, Unwrapped, drop_cursor, encode_slice,
+    event_record, event_sealed, event_sequence, normalize, punycode, read_cursor, retain,
+    retain_event, retain_request, retired_events, search_event_key, search_hash, search_key,
+    write_cursor,
 };
 use spool::{Body, Head, HeadClear, Message, MessageId, SLICE, Slice, Stamp};
 use store::{Client, Committer, DataFile, IndexStamp, Options, SLOT_SIZE, Setup, Tiering, boot};
@@ -1572,6 +1573,136 @@ fn event_days_past_the_retention_are_dropped() {
         assert_eq!(left, []);
         let left = changes.partitions(KIND_SEARCH).await.expect("partitions");
         assert_eq!(left, []);
+    });
+    cluster.stop();
+}
+
+async fn searched(
+    node: &Node<Idle>,
+    tenant: u32,
+    query: &SearchQuery,
+    limit: usize,
+) -> Vec<sched::EventRead> {
+    let mut found = Vec::new();
+    let mut cursor: Option<String> = None;
+    loop {
+        let page = node
+            .search(tenant, query, cursor.as_deref(), limit)
+            .await
+            .expect("page");
+        assert!(page.events.len() <= limit);
+        found.extend(page.events);
+        cursor = Some(page.next);
+        if !page.more {
+            break;
+        }
+    }
+    let last = node
+        .search(tenant, query, cursor.as_deref(), limit)
+        .await
+        .expect("last");
+    assert!(last.events.is_empty() && !last.more);
+    found
+}
+
+#[test]
+fn search_finds_events_by_each_field_in_pages_across_cores() {
+    let driver = Rc::new(SimDriver::with_disk(48, Config::default(), created(48)));
+    let cluster = started(&driver, 2);
+    let nodes = cluster.nodes.clone();
+    cluster.run(async move {
+        ready(&nodes).await;
+        configure(&nodes, vec![tenant(2, 1, State::Active)]).await;
+        let sent = [
+            (0, "Same@Example.org"),
+            (1, "same@example.org"),
+            (0, "r2@example.org"),
+            (1, "r3@example.org"),
+            (0, "q@other.net"),
+        ];
+        let mut ids = Vec::new();
+        for (node, address) in sent {
+            let node = &nodes[node];
+            let shard = owned_shard(node).await;
+            ids.push((node, accept_listed(node, shard, &[address], 1).await.0));
+        }
+        for (node, id) in &ids {
+            while node.spool().tenant(*id).is_some() {
+                sleep(Duration::from_millis(50)).await;
+            }
+        }
+        let reader = &nodes[1];
+        let all = reader.events(1, None, 10).await.expect("events");
+        assert_eq!(all.events.len(), 5);
+        let first = all.events.iter().map(|r| r.event.time).min().expect("time");
+        let last = all.events.iter().map(|r| r.event.time).max().expect("time");
+        let (from, to) = (first, last + 1);
+        let query = |field, value: &[u8], kinds: &[EventKind]| {
+            SearchQuery::new(field, value, kinds, from, to).expect("query")
+        };
+        let same = query(SearchField::Recipient, b"SAME@example.ORG", &[]);
+        let found = searched(reader, 1, &same, 1).await;
+        let mut messages: Vec<MessageId> = found.iter().map(|r| r.event.message).collect();
+        messages.sort_unstable_by_key(MessageId::bytes);
+        let mut expected = vec![ids[0].1, ids[1].1];
+        expected.sort_unstable_by_key(MessageId::bytes);
+        assert_eq!(messages, expected);
+        for read in &found {
+            let body = read.body.as_ref().expect("opened");
+            assert!(body.address.eq_ignore_ascii_case(b"same@example.org"));
+            assert_eq!(read.event.kind, EventKind::Expired);
+        }
+        let domain = query(SearchField::Domain, b"EXAMPLE.org", &[]);
+        let found = searched(reader, 1, &domain, 1).await;
+        assert_eq!(found.len(), 4);
+        let times: Vec<u64> = found.iter().map(|r| r.event.time).collect();
+        let mut newest = times.clone();
+        newest.sort_unstable_by(|a, b| b.cmp(a));
+        assert_eq!(times, newest);
+        let mut named: Vec<[u8; 16]> = found.iter().map(|r| r.id).collect();
+        named.sort_unstable();
+        named.dedup();
+        assert_eq!(named.len(), 4);
+        let other = query(SearchField::Domain, b"other.net", &[]);
+        let found = searched(reader, 1, &other, 10).await;
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].event.message, ids[4].1);
+        for (_, id) in &ids {
+            let by_id = query(SearchField::Message, &id.bytes(), &[]);
+            let found = searched(&nodes[0], 1, &by_id, 10).await;
+            assert_eq!(found.len(), 1);
+            assert_eq!(found[0].event.message, *id);
+        }
+        let failed = query(SearchField::Domain, b"example.org", &[EventKind::Failed]);
+        assert_eq!(searched(reader, 1, &failed, 10).await, []);
+        let expired = query(SearchField::Domain, b"example.org", &[EventKind::Expired]);
+        assert_eq!(searched(reader, 1, &expired, 10).await.len(), 4);
+        let later =
+            SearchQuery::new(SearchField::Domain, b"example.org", &[], to, to + 1).expect("later");
+        assert_eq!(searched(reader, 1, &later, 10).await, []);
+        assert_eq!(searched(reader, 2, &domain, 10).await, []);
+        let page = reader.search(1, &domain, None, 1).await.expect("page");
+        assert!(page.more);
+        assert_eq!(
+            reader.search(1, &other, Some(&page.next), 1).await.err(),
+            Some(ReadError::Cursor)
+        );
+        assert_eq!(
+            reader.search(2, &domain, Some(&page.next), 1).await.err(),
+            Some(ReadError::Cursor)
+        );
+        assert_eq!(
+            reader.search(1, &domain, None, 0).await.err(),
+            Some(ReadError::Limit)
+        );
+        assert_eq!(
+            reader.search(1, &domain, None, 101).await.err(),
+            Some(ReadError::Limit)
+        );
+        assert_eq!(
+            reader.search(9, &domain, None, 10).await.err(),
+            Some(ReadError::Tenant)
+        );
     });
     cluster.stop();
 }

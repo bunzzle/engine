@@ -135,6 +135,17 @@ fn remember(model: &mut Model, record: &IndexRecord) {
 
 async fn check(changes: &Changes, model: &Model, keys: u64) {
     let asked: Vec<(u16, [u8; 20])> = (0..keys).map(|n| (0, key(n))).collect();
+    let fetched = changes
+        .fetch(PARTITION, asked.clone())
+        .await
+        .expect("fetch");
+    for (n, entry) in (0..keys).zip(fetched) {
+        let expected = model.get(&key(n)).filter(|(op, _, _)| *op == Op::Put);
+        let entry = entry
+            .filter(|e| e.op == Op::Put)
+            .map(|e| (e.op, e.value, e.payload));
+        assert_eq!(entry.as_ref(), expected, "fetch {n}");
+    }
     let found = changes.lookup(PARTITION, asked).await.expect("lookup");
     for (n, found) in (0..keys).zip(found) {
         let expected = model

@@ -16,6 +16,7 @@ use crate::clock::Clock;
 use crate::delete::sweep_queues;
 use crate::error::Error;
 use crate::events::{self, KIND_EVENT};
+use crate::finder::Query;
 use crate::node::{Config, Note, Sched};
 use crate::reader::{self, EventPage, ReadError, Reader};
 use crate::requests::{KIND_REQUEST, RequestInputs, Requests, retain_request};
@@ -324,6 +325,19 @@ impl<T: Transport + 'static> Node<T> {
         self.inner
             .reader
             .read(self.keys(), tenant, after, limit)
+            .await
+    }
+
+    pub async fn search(
+        &self,
+        tenant: u32,
+        query: &Query,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<EventPage, ReadError> {
+        self.inner
+            .reader
+            .search(self.keys(), tenant, query, after, limit)
             .await
     }
 

@@ -107,8 +107,20 @@ impl Keeper {
         partition: (u8, u32),
         key: &Key,
     ) -> Result<Option<(Op, Vec<u8>)>, Error> {
+        let found = self.fetch(data, shard, partition, key, false).await?;
+        Ok(found.map(|entry| (entry.op, entry.value)))
+    }
+
+    pub async fn fetch(
+        &self,
+        data: &CoreFile,
+        shard: u16,
+        partition: (u8, u32),
+        key: &Key,
+        payload: bool,
+    ) -> Result<Option<index::Entry>, Error> {
         match self.partition(shard, partition) {
-            Some(found) => found.lookup(data, key).await,
+            Some(found) => found.lookup(data, key, payload).await,
             None => Ok(None),
         }
     }
