@@ -1338,6 +1338,7 @@ fn an_egress_family_mismatch_retries_and_probes_the_other_family() {
                 HookSettings {
                     egress: Some(egress),
                     allow: Vec::new(),
+                    nat64: Vec::new(),
                 },
                 35,
                 Owns::default(),
@@ -1764,6 +1765,7 @@ fn the_floor_holds_when_allowed_and_own_addresses_are_refused() {
                 Cidr::parse("0.0.0.0/0").expect("cidr"),
                 Cidr::parse("::/0").expect("cidr"),
             ],
+            nat64: Vec::new(),
         };
         let hooks = Hooks::with_local(
             node.clone(),
@@ -1869,6 +1871,7 @@ fn egress_case(seed: u64, egress: IpAddr, at: IpAddr, wanted: Type, skipped: Typ
         let settings = HookSettings {
             egress: Some(egress),
             allow: Vec::new(),
+            nat64: Vec::new(),
         };
         let task = node.start_hooks(Rc::new(sender(node, &zone, settings, seed)));
         hooks_ready(node, 1, &[hook]).await;
