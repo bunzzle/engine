@@ -337,7 +337,8 @@ impl Partition {
         &self,
         data: &CoreFile,
         key: &Key,
-    ) -> Result<Option<(Op, Vec<u8>)>, Error> {
+        payload: bool,
+    ) -> Result<Option<Entry>, Error> {
         let newer = self.live.as_ref().and_then(|live| live.get(key));
         let frozen = self
             .frozen
@@ -345,7 +346,16 @@ impl Partition {
             .ok()
             .map(|at| &self.frozen[at]);
         if let Some(entry) = newer.or(frozen) {
-            return Ok(Some((entry.op, entry.value.clone())));
+            return Ok(Some(Entry {
+                key: entry.key,
+                op: entry.op,
+                value: entry.value.clone(),
+                payload: if payload {
+                    entry.payload.clone()
+                } else {
+                    Vec::new()
+                },
+            }));
         }
         for stored in self.view().iter().rev() {
             let Some((segment, range)) = stored.run.probe(key) else {
@@ -353,11 +363,25 @@ impl Partition {
             };
             let place = &stored.places[segment];
             let block = read(data, place, range).await?;
-            if let Some(found) =
+            let Some(found) =
                 find(stored.run.shape(), &block, key).map_err(|_| damaged(place, range))?
-            {
-                return Ok(Some((found.op, found.value)));
+            else {
+                continue;
+            };
+            let mut bytes = Vec::new();
+            if payload && found.payload.length > 0 {
+                let page = stored.run.segments()[segment]
+                    .page(found.payload)
+                    .map_err(|_| damaged(place, range))?;
+                let block = read(data, place, page).await?;
+                bytes = index::payload(&block, found.payload).map_err(|_| damaged(place, page))?;
             }
+            return Ok(Some(Entry {
+                key: found.key,
+                op: found.op,
+                value: found.value,
+                payload: bytes,
+            }));
         }
         Ok(None)
     }

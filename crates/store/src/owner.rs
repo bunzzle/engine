@@ -150,7 +150,8 @@ struct Indexing {
 struct Lookup {
     partition: (u8, u32),
     keys: Vec<(u16, index::Key)>,
-    reply: Sender<Result<Vec<Found>, Error>>,
+    payload: bool,
+    reply: Sender<Result<Vec<Option<index::Entry>>, Error>>,
 }
 
 struct Items {
@@ -327,10 +328,32 @@ impl Changes {
         partition: (u8, u32),
         keys: Vec<(u16, index::Key)>,
     ) -> Result<Vec<Found>, Error> {
+        let found = self.get(partition, keys, false).await?;
+        Ok(found
+            .into_iter()
+            .map(|entry| entry.map(|e| (e.op, e.value)))
+            .collect())
+    }
+
+    pub async fn fetch(
+        &self,
+        partition: (u8, u32),
+        keys: Vec<(u16, index::Key)>,
+    ) -> Result<Vec<Option<index::Entry>>, Error> {
+        self.get(partition, keys, true).await
+    }
+
+    async fn get(
+        &self,
+        partition: (u8, u32),
+        keys: Vec<(u16, index::Key)>,
+        payload: bool,
+    ) -> Result<Vec<Option<index::Entry>>, Error> {
         let (reply, mut answer) = channel();
         let lookup = Lookup {
             partition,
             keys,
+            payload,
             reply,
         };
         if self.sender.send(Input::Lookup(lookup)).is_err() {
@@ -715,7 +738,7 @@ impl Shards {
             }
             match self
                 .keeper
-                .lookup(&self.file, *shard, lookup.partition, key)
+                .fetch(&self.file, *shard, lookup.partition, key, lookup.payload)
                 .await
             {
                 Ok(entry) => found.push(entry),

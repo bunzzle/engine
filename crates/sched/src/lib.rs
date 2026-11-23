@@ -7,6 +7,7 @@ mod domain;
 mod envelope;
 mod error;
 mod events;
+mod finder;
 mod hook;
 mod intake;
 mod json;
@@ -38,6 +39,7 @@ pub use events::{
     MAX_REPLY, Written as WrittenEvent, record as event_record, retain as retain_event,
     retired as retired_events, sealed as event_sealed, sequence as event_sequence,
 };
+pub use finder::{Query as SearchQuery, SEARCH_DAYS, SEARCH_LIMIT};
 pub use hook::{HookChange, MAX_HOOKS, ROTATION_MS};
 pub use intake::{Draft, domain_of};
 pub use json::{event_json, kind_name as event_kind_name};

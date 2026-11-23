@@ -8,12 +8,15 @@ use rt::{Ends, JoinHandle, Peers, Sender, channel, spawn};
 use store::Changes;
 
 use crate::events::{Body, Event, KIND_EVENT, sealed, sequence};
+use crate::finder::{self, Hits, Query, SEARCH_LIMIT, Scan};
 use crate::sealing::{Keys, Unsealable, event_opener};
+use crate::search;
 
 pub const MAX_LIMIT: usize = 1000;
 pub const PAGE_BYTES: usize = 1 << 20;
 const CURSOR_KIND: u8 = 0xc0;
 const CURSOR_FORMAT: u8 = 1;
+const SEARCH_KIND: u8 = 0xc1;
 const EVENT_ID: &[u8; 5] = b"event";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -56,6 +59,14 @@ enum Message {
         ticket: u64,
         part: Result<Part, ReadError>,
     },
+    Search {
+        ticket: u64,
+        scan: Box<Scan>,
+    },
+    Found {
+        ticket: u64,
+        hits: Result<Hits, ReadError>,
+    },
 }
 
 struct Part {
@@ -70,6 +81,7 @@ struct Inner {
     cores: u16,
     peers: OnceCell<Peers<Ask>>,
     waiting: RefCell<BTreeMap<u64, Sender<Result<Part, ReadError>>>>,
+    searching: RefCell<BTreeMap<u64, Sender<Result<Hits, ReadError>>>>,
     tickets: Cell<u64>,
 }
 
@@ -91,6 +103,7 @@ impl Reader {
                 cores: ends.cores(),
                 peers: OnceCell::new(),
                 waiting: RefCell::new(BTreeMap::new()),
+                searching: RefCell::new(BTreeMap::new()),
                 tickets: Cell::new(0),
             }),
         };
@@ -102,6 +115,7 @@ impl Reader {
 
     pub fn close(&self) {
         self.inner.waiting.borrow_mut().clear();
+        self.inner.searching.borrow_mut().clear();
         if let Some(peers) = self.inner.peers.get() {
             peers.close();
         }
@@ -165,6 +179,129 @@ impl Reader {
         })
     }
 
+    pub async fn search(
+        &self,
+        keys: &dyn Keys,
+        tenant: u32,
+        query: &Query,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<EventPage, ReadError> {
+        if limit == 0 || limit > SEARCH_LIMIT {
+            return Err(ReadError::Limit);
+        }
+        let generation = self.generation(tenant)?;
+        let system = keys.system().await.map_err(|_| ReadError::Unavailable)?;
+        let cores = usize::from(self.inner.cores);
+        let mut label = label(&system, tenant, generation);
+        label[8] = SEARCH_KIND;
+        query.label(&mut label);
+        let (query, positions) = match after {
+            None => (query.clone(), vec![0; cores]),
+            Some(text) => {
+                let sealed = unhex(text).ok_or(ReadError::Cursor)?;
+                let clear = system.open(&label, &sealed).map_err(|e| match e {
+                    crypto::Error::Format("key version") => ReadError::Stale,
+                    _ => ReadError::Cursor,
+                })?;
+                let (from, rest) = clear.split_first_chunk::<8>().ok_or(ReadError::Cursor)?;
+                let (to, rest) = rest.split_first_chunk::<8>().ok_or(ReadError::Cursor)?;
+                let query = query
+                    .ranged(u64::from_le_bytes(*from), u64::from_le_bytes(*to))
+                    .ok_or(ReadError::Cursor)?;
+                (query, positions(rest, cores).ok_or(ReadError::Cursor)?)
+            }
+        };
+        let query = &query;
+        let day_keys = keys.search(tenant, generation).await.map_err(|e| match e {
+            control::KeyError::Failed => ReadError::Failed,
+            _ => ReadError::Unavailable,
+        })?;
+        let hashes: Vec<_> = query
+            .days()
+            .filter_map(|day| {
+                let key = day_keys.get(day)?;
+                Some((day, search::hash(key, query.field(), query.value())))
+            })
+            .collect();
+        let only = query.shard().map(|shard| shard % self.inner.cores);
+        let mut asked = Vec::with_capacity(cores);
+        for (core, &after) in (0..self.inner.cores).zip(&positions) {
+            if hashes.is_empty() || only.is_some_and(|only| only != core) {
+                asked.push(None);
+                continue;
+            }
+            let scan = Scan {
+                tenant,
+                generation,
+                query: query.clone(),
+                hashes: hashes.clone(),
+                after,
+                limit,
+            };
+            asked.push(Some(self.ask(core, scan)));
+        }
+        let mut parts = Vec::with_capacity(cores);
+        for answer in asked {
+            parts.push(match answer {
+                Some(mut answer) => Some(answer.recv().await.ok_or(ReadError::Failed)??),
+                None => None,
+            });
+        }
+        let (taken, next, more) = finder::merge(parts, &positions, limit);
+        let naming = tenant_keys(keys, tenant, generation)
+            .await
+            .map_err(|_| ReadError::Unavailable)?;
+        let mut events = Vec::with_capacity(taken.len());
+        for hit in taken {
+            let body = match opened(keys, tenant, &hit.event, &hit.payload).await {
+                Ok(Some(body)) => body,
+                Ok(None) => continue,
+                Err(Unsealable::Unavailable) => return Err(ReadError::Unavailable),
+                Err(_) => return Err(ReadError::Failed),
+            };
+            if !query.verified(&hit.event, &body.address) {
+                continue;
+            }
+            events.push(Read {
+                id: event_id(&naming, hit.shard, hit.sequence),
+                shard: hit.shard,
+                sequence: hit.sequence,
+                event: hit.event,
+                body: Some(body),
+            });
+        }
+        let sealed = system
+            .seal(&label, &{
+                let (from, to) = query.range();
+                let mut clear = from.to_le_bytes().to_vec();
+                clear.extend_from_slice(&to.to_le_bytes());
+                clear.extend_from_slice(&cursor(&next));
+                clear
+            })
+            .map_err(|_| ReadError::Failed)?;
+        Ok(EventPage {
+            events,
+            next: hex(&sealed),
+            more,
+        })
+    }
+
+    fn ask(&self, core: u16, scan: Scan) -> rt::Receiver<Result<Hits, ReadError>> {
+        let (reply, answer) = channel();
+        let ticket = self.inner.tickets.get();
+        self.inner.tickets.set(ticket + 1);
+        self.inner.searching.borrow_mut().insert(ticket, reply);
+        if let Some(peers) = self.inner.peers.get() {
+            let message = Message::Search {
+                ticket,
+                scan: Box::new(scan),
+            };
+            peers.send(core, Ask(message));
+        }
+        answer
+    }
+
     fn generation(&self, tenant: u32) -> Result<u32, ReadError> {
         self.inner
             .table
@@ -220,6 +357,20 @@ impl Reader {
             Message::Answer { ticket, part } => {
                 if let Some(reply) = self.inner.waiting.borrow_mut().remove(&ticket) {
                     let _ = reply.send(part);
+                }
+            }
+            Message::Search { ticket, scan } => {
+                let reader = self.clone();
+                drop(spawn(async move {
+                    let hits = finder::serve(&reader.inner.changes, &scan).await;
+                    if let Some(peers) = reader.inner.peers.get() {
+                        peers.send(from, Ask(Message::Found { ticket, hits }));
+                    }
+                }));
+            }
+            Message::Found { ticket, hits } => {
+                if let Some(reply) = self.inner.searching.borrow_mut().remove(&ticket) {
+                    let _ = reply.send(hits);
                 }
             }
         }
