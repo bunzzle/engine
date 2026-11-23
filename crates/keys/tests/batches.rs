@@ -2,7 +2,7 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use crypto::{BatchKey, Secret, Tenant, TenantKeys, Wrap, aad, day_public, open_batch};
-use keys::{BatchSettings, Batches, Working};
+use keys::{BatchSettings, Batches, SearchKeys, Working};
 use rt::sim::{Config, SimDriver};
 use rt::{Runtime, now};
 
@@ -27,6 +27,7 @@ fn working(tenant: u32, generation: u32, day: u32) -> Working {
         oldest: DAY,
         today: day_public(&secret(tenant, day)).expect("public"),
         tomorrow: day_public(&secret(tenant, day + 1)).expect("public"),
+        search: SearchKeys::default(),
         seen: day,
     }
 }

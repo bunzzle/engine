@@ -3,6 +3,9 @@ use crypto::{DkimAlg, Plain, Secret, WRAP, Wrap};
 use crate::Error;
 
 pub const MAX_FRAME: usize = 4096;
+use crate::SEARCH_KEYS;
+const _: () = assert!(SEARCH_KEYS <= u8::MAX as usize);
+const _: () = assert!(HEAD + 122 + 16 * SEARCH_KEYS <= MAX_FRAME);
 const HEAD: usize = 9;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -82,6 +85,7 @@ pub enum Answer {
         hash: Secret<16>,
         today: [u8; 32],
         tomorrow: [u8; 32],
+        search: Vec<Secret<16>>,
     },
     Key(Secret<32>),
     Dkim {
@@ -436,20 +440,23 @@ impl Answer {
                 hash,
                 today,
                 tomorrow,
-            } => frame(
-                out,
-                0x82,
-                id,
-                &[
-                    &day.to_le_bytes(),
-                    &oldest.to_le_bytes(),
-                    &[*version],
+                search,
+            } => {
+                let count = [u8::try_from(search.len()).expect("few search keys")];
+                let (day, oldest) = (day.to_le_bytes(), oldest.to_le_bytes());
+                let mut body: Vec<&[u8]> = vec![
+                    &day,
+                    &oldest,
+                    std::slice::from_ref(version),
                     data.expose(),
                     hash.expose(),
                     today,
                     tomorrow,
-                ],
-            ),
+                    &count,
+                ];
+                body.extend(search.iter().map(|key| &key.expose()[..]));
+                frame(out, 0x82, id, &body);
+            }
             Self::Key(key) => frame(out, 0x83, id, &[key.expose()]),
             Self::Dkim { public, blob } => {
                 frame(
@@ -486,6 +493,17 @@ impl Answer {
                 hash: r.secret()?,
                 today: r.array()?,
                 tomorrow: r.array()?,
+                search: {
+                    let count = usize::from(r.u8()?);
+                    if count > SEARCH_KEYS {
+                        return Err(Error::Bad);
+                    }
+                    let mut keys = Vec::with_capacity(count);
+                    for _ in 0..count {
+                        keys.push(r.secret()?);
+                    }
+                    keys
+                },
             },
             0x83 => Self::Key(r.secret()?),
             0x84 => Self::Dkim {
@@ -504,7 +522,7 @@ impl Answer {
         HEAD + match self {
             Self::Done => 0,
             Self::Hello { .. } => 85,
-            Self::Keys { .. } => 121,
+            Self::Keys { search, .. } => 122 + 16 * search.len(),
             Self::Key(_) => 32,
             Self::Dkim { public, blob } => 4 + public.len() + blob.len(),
             Self::Signature(signature) => 2 + signature.len(),
@@ -665,6 +683,17 @@ mod tests {
                 hash: Secret::new([4; 16]),
                 today: [5; 32],
                 tomorrow: [6; 32],
+                search: Vec::new(),
+            },
+            Answer::Keys {
+                day: 9,
+                oldest: 2,
+                version: 1,
+                data: Secret::new([3; 32]),
+                hash: Secret::new([4; 16]),
+                today: [5; 32],
+                tomorrow: [6; 32],
+                search: (0..8).map(|n| Secret::new([n; 16])).collect(),
             },
             Answer::Key(Secret::new([7; 32])),
             Answer::Dkim {
@@ -688,6 +717,30 @@ mod tests {
             back.encode(7, &mut again);
             assert_eq!(&again[..], &out[..]);
         }
+    }
+
+    #[test]
+    fn keys_with_too_many_search_keys_are_refused() {
+        let answer = Answer::Keys {
+            day: 9,
+            oldest: 1,
+            version: 1,
+            data: Secret::new([3; 32]),
+            hash: Secret::new([4; 16]),
+            today: [5; 32],
+            tomorrow: [6; 32],
+            search: (0..9).map(|n| Secret::new([n; 16])).collect(),
+        };
+        let mut out = Plain::with_capacity(answer.size());
+        answer.encode(7, &mut out);
+        let mut frames = Frames::default();
+        frames.push(&out);
+        let (op, _, body) = frames.pop().expect("frame").expect("whole");
+        assert_eq!(Answer::decode(op, &body).err(), Some(Error::Bad));
+        assert_eq!(
+            Answer::decode(op, &body[..body.len() - 16 * 9 - 1]).err(),
+            Some(Error::Bad)
+        );
     }
 
     #[test]

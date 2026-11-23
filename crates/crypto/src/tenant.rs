@@ -55,6 +55,15 @@ pub fn day_secret(state: &Secret<32>) -> Secret<32> {
     Prk::from_secret(state).expand(&[b"seed"])
 }
 
+pub fn search_key(state: &Secret<32>, tenant: u32, generation: u32, day: u32) -> Secret<16> {
+    Prk::from_secret(state).expand(&[
+        b"search",
+        &tenant.to_le_bytes(),
+        &generation.to_le_bytes(),
+        &day.to_le_bytes(),
+    ])
+}
+
 pub fn day_public(secret: &Secret<32>) -> Result<[u8; 32], Error> {
     let key = PrivateKey::from_private_key(&X25519, secret.expose()).map_err(|_| Error::Key)?;
     let public = key.compute_public_key().map_err(|_| Error::Key)?;
@@ -63,7 +72,7 @@ pub fn day_public(secret: &Secret<32>) -> Result<[u8; 32], Error> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Tenant, day_public, day_secret, next_day, ratchet};
+    use super::{Tenant, day_public, day_secret, next_day, ratchet, search_key};
     use crate::Secret;
 
     #[test]
@@ -118,6 +127,28 @@ mod tests {
             hex(tenant.hook_secret(1, 3, 2).expose()),
             "63ad8d3fdf512fd218ab2222b41a185feff0894e9e8db302888518a43c93335e"
         );
+    }
+
+    #[test]
+    fn search_key_known_answer() {
+        use crate::seal::tests::hex;
+        let state = Secret::new([5; 32]);
+        assert_eq!(
+            hex(search_key(&state, 4, 2, 20_000).expose()),
+            "0ae4b4d6abc65be9327538602db7bb87"
+        );
+    }
+
+    #[test]
+    fn search_keys_differ_by_tenant_generation_day_and_state() {
+        let state = Secret::new([5; 32]);
+        let key = search_key(&state, 4, 2, 20_000);
+        assert!(key == search_key(&state, 4, 2, 20_000));
+        assert!(key != search_key(&state, 5, 2, 20_000));
+        assert!(key != search_key(&state, 4, 3, 20_000));
+        assert!(key != search_key(&state, 4, 2, 20_001));
+        assert!(key != search_key(&next_day(&state), 4, 2, 20_000));
+        assert_ne!(key.expose()[..], day_secret(&state).expose()[..16]);
     }
 
     #[test]

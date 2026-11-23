@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 
 use crypto::{
     DataKey, Secret, Tenant, Wrap, day_public, day_secret, next_day, open_batch, ratchet,
+    search_key,
 };
 use rt::{Buf, File, OpenOptions};
 
@@ -12,6 +13,8 @@ use crate::{Entry, Error, State};
 
 pub const VERSION: u8 = 1;
 pub const MAX_RETENTION: u16 = 3660;
+pub const EVENT_DAYS: u32 = 7;
+pub const SEARCH_KEYS: usize = EVENT_DAYS as usize + 1;
 pub const MODE: u32 = 0o600;
 const MASTERS: [&str; 2] = ["master.0", "master.1"];
 const SLOTS: [&str; 2] = ["keys.0", "keys.1"];
@@ -21,6 +24,10 @@ const DONE: u8 = 0;
 const INIT: u8 = 1;
 const RESTORE: u8 = 2;
 
+pub fn search_floor(oldest: u32, day: u32) -> u32 {
+    oldest.max(day.saturating_sub(EVENT_DAYS - 1))
+}
+
 pub struct Keys {
     pub day: u32,
     pub oldest: u32,
@@ -29,6 +36,7 @@ pub struct Keys {
     pub hash: Secret<16>,
     pub today: [u8; 32],
     pub tomorrow: [u8; 32],
+    pub search: Vec<Secret<16>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -332,8 +340,15 @@ impl Vault {
         let entry = self.durable(tenant, generation)?;
         let day = self.state.day;
         let root = Tenant::new(&entry.key);
-        let today = self.with_day(tenant, entry, day, day_public)?;
-        let tomorrow = self.with_day(tenant, entry, day + 1, day_public)?;
+        let public = |state: &Secret<32>| day_public(&day_secret(state));
+        let today = self.with_day(tenant, entry, day, public)?;
+        let tomorrow = self.with_day(tenant, entry, day + 1, public)?;
+        let mut search = Vec::with_capacity(SEARCH_KEYS);
+        for at in search_floor(entry.oldest, day)..=day + 1 {
+            search.push(self.with_day(tenant, entry, at, |state| {
+                Ok::<_, Error>(search_key(state, tenant, generation, at))
+            })?);
+        }
         Ok(Keys {
             day,
             oldest: entry.oldest,
@@ -342,6 +357,7 @@ impl Vault {
             hash: root.hash_key(generation),
             today,
             tomorrow,
+            search,
         })
     }
 
@@ -367,8 +383,8 @@ impl Vault {
 
     pub fn unwrap(&self, tenant: u32, batch: u64, wrap: &Wrap) -> Result<Secret<32>, Error> {
         let entry = self.durable(tenant, wrap.generation)?;
-        self.with_day(tenant, entry, wrap.day, |secret| {
-            open_batch(secret, tenant, batch, wrap).map_err(|_| Error::Open)
+        self.with_day(tenant, entry, wrap.day, |state| {
+            open_batch(&day_secret(state), tenant, batch, wrap).map_err(|_| Error::Open)
         })
     }
 
@@ -402,8 +418,9 @@ impl Vault {
             let mut state = ratchet(&entry.ratchet, 0);
             let mut chain = Vec::with_capacity(span);
             for _ in 0..span {
-                chain.push(day_secret(&state));
-                state = next_day(&state);
+                let next = next_day(&state);
+                chain.push(state);
+                state = next;
             }
             chains.insert(tenant, chain);
         }

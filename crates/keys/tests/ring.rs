@@ -9,8 +9,8 @@ use aws_lc_rs::signature::{ED25519, UnparsedPublicKey};
 use crypto::{BatchKey, DkimAlg, Plain, Secret, Wrap, seal_batch};
 use keys::proto::{Answer, Frames, Request};
 use keys::{
-    Audit, BatchSettings, Batches, Client, Connect, Error, Fault, Ring, RingSettings, Server,
-    Settings, Vault,
+    Audit, BatchSettings, Batches, Client, Connect, EVENT_DAYS, Error, Fault, Ring, RingSettings,
+    Server, Settings, Vault,
 };
 use rt::sim::{Config, SimDriver};
 use rt::{Buf, Runtime, TcpListener, TcpStream, sleep, spawn};
@@ -96,6 +96,7 @@ fn settings() -> RingSettings {
 enum Fake {
     Silent,
     Closes,
+    Answers(u32, u8),
 }
 
 async fn fake(host: u8, keys: (Secret<16>, Secret<16>), mode: Fake) -> Rc<Cell<u32>> {
@@ -130,22 +131,31 @@ async fn fake(host: u8, keys: (Secret<16>, Secret<16>), mode: Fake) -> Rc<Cell<u
                                     system_hash: Secret::new([4; 16]),
                                 }
                             }
-                            Ok(Request::Open { .. }) if mode == Fake::Closes => Answer::Keys {
+                            Ok(Request::Open { .. }) if mode != Fake::Silent => Answer::Keys {
                                 day: DAY,
-                                oldest: DAY,
+                                oldest: match mode {
+                                    Fake::Answers(oldest, _) => oldest,
+                                    _ => DAY,
+                                },
                                 version: 1,
                                 data: Secret::new([5; 32]),
                                 hash: Secret::new([6; 16]),
                                 today: [7; 32],
                                 tomorrow: [8; 32],
+                                search: (0..match mode {
+                                    Fake::Answers(_, count) => count,
+                                    _ => 2,
+                                })
+                                    .map(|n| Secret::new([n; 16]))
+                                    .collect(),
                             },
                             _ => continue,
                         };
-                        let mut out = Plain::with_capacity(256);
+                        let mut out = Plain::with_capacity(answer.size());
                         answer.encode(id, &mut out);
                         let (written, _) = stream.write_all(Buf::from_slice(&out)).await;
                         written.expect("write");
-                        if matches!(answer, Answer::Keys { .. }) {
+                        if matches!(answer, Answer::Keys { .. }) && mode == Fake::Closes {
                             drop(stream.shutdown().await);
                         }
                     }
@@ -501,6 +511,93 @@ fn sealing_steps_one_day_and_refetches_keys_more_than_a_day_old() {
         assert!(cached.day >= stale.day);
         assert_eq!(cached.seen, stale.seen + 3);
         assert_eq!((fetched.day, fetched.today), (cached.day, cached.today));
+    });
+}
+
+#[test]
+fn search_keys_are_cached_and_evicted_by_the_ring_itself() {
+    let driver = Rc::new(SimDriver::new(13, quiet()));
+    let jumps = Rc::clone(&driver);
+    run(&driver, async move {
+        let _server = serve("/a", 1).await;
+        create(1, 4).await;
+        let (connect, _) = hosts(&[1]);
+        let ring = Ring::new(connect, settings());
+        let opened = ring.open(4, 1).await.expect("open");
+        assert_eq!(opened.search.days(), DAY..DAY + 2);
+        let today = *opened.search_key(DAY, DAY).expect("today").expose();
+        let tomorrow = *opened.search_key(DAY + 1, DAY).expect("tomorrow").expose();
+        assert_ne!(today, tomorrow);
+        assert!(opened.search_key(DAY - 1, DAY).is_none());
+        assert!(opened.search_key(DAY + 2, DAY).is_none());
+        assert!(opened.search_key(DAY, DAY + EVENT_DAYS).is_none());
+        assert!(opened.search_key(DAY + 1, DAY + EVENT_DAYS).is_some());
+
+        jumps.jump_wall_clock(i64::from(EVENT_DAYS - 1) * DAY_MS);
+        let kept = ring.get(4, 1).expect("cached");
+        assert_eq!(kept.search.days(), DAY..DAY + 2);
+        assert_eq!(ring.stats().search_evicted, 0);
+
+        jumps.jump_wall_clock(DAY_MS);
+        let evicted = ring.get(4, 1).expect("cached");
+        assert_eq!(evicted.search.days(), DAY + 1..DAY + 2);
+        assert_eq!(
+            *evicted
+                .search_key(DAY + 1, DAY + EVENT_DAYS)
+                .expect("kept")
+                .expose(),
+            tomorrow
+        );
+        assert_eq!(ring.stats().search_evicted, 1);
+        ring.get(4, 1).expect("cached");
+        assert_eq!(ring.stats().search_evicted, 1);
+
+        jumps.jump_wall_clock(DAY_MS);
+        let empty = ring.get(4, 1).expect("cached");
+        assert!(empty.search.days().is_empty());
+        assert_eq!(ring.stats().search_evicted, 2);
+        ring.get(4, 1).expect("cached");
+        assert_eq!(ring.stats().search_evicted, 2);
+    });
+}
+
+#[test]
+fn keys_with_the_wrong_number_of_search_keys_are_refused() {
+    let driver = Rc::new(SimDriver::new(14, quiet()));
+    run(&driver, async {
+        fake(
+            2,
+            (Secret::new([1; 16]), Secret::new([2; 16])),
+            Fake::Answers(DAY, 1),
+        )
+        .await;
+        let ring = Ring::new(hosts(&[2]).0, settings());
+        assert_eq!(ring.open(4, 1).await.err(), Some(Fault::Unavailable));
+        assert!(ring.get(4, 1).is_none());
+    });
+}
+
+#[test]
+fn search_keys_start_at_oldest_or_seven_days_back() {
+    let driver = Rc::new(SimDriver::new(15, quiet()));
+    run(&driver, async {
+        let keys = || (Secret::new([1; 16]), Secret::new([2; 16]));
+        fake(2, keys(), Fake::Answers(DAY - 10, 8)).await;
+        fake(3, keys(), Fake::Answers(DAY - 3, 5)).await;
+        fake(4, keys(), Fake::Answers(DAY - 3, 8)).await;
+        let full = Ring::new(hosts(&[2]).0, settings());
+        let opened = full.open(4, 1).await.expect("open");
+        assert_eq!(opened.search.days(), DAY - 6..DAY + 2);
+        assert!(opened.search_key(DAY - 6, DAY).is_some());
+        assert!(opened.search_key(DAY - 7, DAY).is_none());
+        let short = Ring::new(hosts(&[3]).0, settings());
+        let opened = short.open(4, 1).await.expect("open");
+        assert_eq!(opened.search.days(), DAY - 3..DAY + 2);
+        assert!(opened.search_key(DAY - 3, DAY).is_some());
+        assert!(opened.search_key(DAY - 4, DAY).is_none());
+        assert_eq!(short.stats().search_evicted, 0);
+        let wrong = Ring::new(hosts(&[4]).0, settings());
+        assert_eq!(wrong.open(4, 1).await.err(), Some(Fault::Unavailable));
     });
 }
 

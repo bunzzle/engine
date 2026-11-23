@@ -1,5 +1,6 @@
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
+use std::ops::Range;
 use std::pin::Pin;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -10,7 +11,7 @@ use rt::{Instant, Sender};
 
 use crate::cache::{Cache, CacheStats};
 use crate::proto::{Answer, Request};
-use crate::{Client, Error};
+use crate::{Client, Error, search_floor};
 
 pub type Connecting = Pin<Box<dyn Future<Output = Result<Client, Error>>>>;
 pub type Connect = Rc<dyn Fn() -> Connecting>;
@@ -54,10 +55,56 @@ pub struct Working {
     pub oldest: u32,
     pub today: [u8; 32],
     pub tomorrow: [u8; 32],
+    pub search: SearchKeys,
     pub seen: u32,
 }
 
+#[derive(Clone, Default)]
+pub struct SearchKeys {
+    first: u32,
+    keys: Arc<Vec<Secret<16>>>,
+}
+
+impl SearchKeys {
+    pub fn new(last: u32, keys: Vec<Secret<16>>) -> Self {
+        let count = u32::try_from(keys.len()).expect("few search keys");
+        Self {
+            first: last.saturating_add(1).saturating_sub(count),
+            keys: Arc::new(keys),
+        }
+    }
+
+    pub fn days(&self) -> Range<u32> {
+        let count = u32::try_from(self.keys.len()).expect("few search keys");
+        self.first..self.first + count
+    }
+
+    fn get(&self, day: u32) -> Option<&Secret<16>> {
+        let at = usize::try_from(day.checked_sub(self.first)?).ok()?;
+        self.keys.get(at)
+    }
+
+    fn kept_from(&self, first: u32) -> Self {
+        let skip = usize::try_from(first.saturating_sub(self.first)).unwrap_or(usize::MAX);
+        Self {
+            first: first.max(self.first),
+            keys: Arc::new({
+                let mut keys = Vec::with_capacity(self.keys.len().saturating_sub(skip));
+                keys.extend(self.keys.iter().skip(skip).map(Secret::copy));
+                keys
+            }),
+        }
+    }
+}
+
 impl Working {
+    pub fn search_key(&self, day: u32, wall: u32) -> Option<&Secret<16>> {
+        if day < search_floor(self.oldest, wall) {
+            return None;
+        }
+        self.search.get(day)
+    }
+
     #[must_use]
     pub fn next_day(&self) -> Self {
         Self {
@@ -102,6 +149,7 @@ pub struct RingStats {
     pub loads: u64,
     pub signs: u64,
     pub hook_secrets: u64,
+    pub search_evicted: u64,
     pub behind: u32,
     pub settled: u32,
     pub tenants: CacheStats,
@@ -298,7 +346,16 @@ impl Ring {
         if self.failed() || self.forgotten(tenant, generation) {
             return None;
         }
-        self.inner.tenants.borrow_mut().get(&(tenant, generation))
+        let mut tenants = self.inner.tenants.borrow_mut();
+        let mut working = tenants.get(&(tenant, generation))?;
+        let floor = search_floor(working.oldest, wall_day());
+        if working.search.days().start < floor && !working.search.days().is_empty() {
+            working.search = working.search.kept_from(floor);
+            tenants.put((tenant, generation), working.clone());
+            drop(tenants);
+            self.count(|s| s.search_evicted += 1);
+        }
+        Some(working)
     }
 
     pub async fn open(&self, tenant: u32, generation: u32) -> Result<Working, Fault> {
@@ -728,7 +785,14 @@ impl Ring {
                 hash,
                 today,
                 tomorrow,
+                search,
             }) => {
+                let expected = day
+                    .saturating_add(2)
+                    .saturating_sub(search_floor(oldest, day));
+                if usize::try_from(expected).ok() != Some(search.len()) {
+                    return Err(self.fault(None, None));
+                }
                 self.saw_day(day);
                 Ok(Working {
                     keys: TenantKeys::new(tenant, generation, &data, version, hash),
@@ -736,6 +800,7 @@ impl Ring {
                     oldest,
                     today,
                     tomorrow,
+                    search: SearchKeys::new(day.saturating_add(1), search),
                     seen: wall_day(),
                 })
             }
