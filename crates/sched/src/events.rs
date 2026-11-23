@@ -31,7 +31,7 @@ impl Kind {
         }
     }
 
-    fn code(self) -> u8 {
+    pub(crate) fn code(self) -> u8 {
         match self {
             Self::Delivered => 1,
             Self::Deferred => 2,
@@ -42,7 +42,7 @@ impl Kind {
         }
     }
 
-    fn from_code(code: u8) -> Option<Self> {
+    pub(crate) fn from_code(code: u8) -> Option<Self> {
         Some(match code {
             1 => Self::Delivered,
             2 => Self::Deferred,
@@ -113,6 +113,12 @@ impl Event {
     pub fn checked(&self, body: &Body) -> bool {
         (self.kind, self.time) == (body.kind, body.time)
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Written {
+    pub record: IndexRecord,
+    pub search: Vec<IndexRecord>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

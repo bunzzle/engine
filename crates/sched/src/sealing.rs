@@ -14,10 +14,12 @@ use spool::{
     BODY_ITEM, Body, HEAD_CLEAR, Head, HeadClear, MessageId, Slice, Stamp, WRAP, slice_item,
     state_item,
 };
-use store::{HEAD_ITEM, INDEX_SIZE, IndexRecord, MAX_PAYLOAD};
+use store::{HEAD_ITEM, INDEX_SIZE, MAX_PAYLOAD};
 
 use crate::error::Refusal;
+use crate::events::Written;
 use crate::intake::Draft;
+use crate::search::{self, DayKeys};
 use crate::start::Node;
 use crate::transport::Transport;
 
@@ -45,6 +47,7 @@ pub type Made<'a> = Pin<Box<dyn Future<Output = Result<(Vec<u8>, Vec<u8>), KeyEr
 pub type Loaded<'a> = Pin<Box<dyn Future<Output = Result<(), KeyError>> + 'a>>;
 pub type Deleted<'a> = Pin<Box<dyn Future<Output = Result<(), KeyError>> + 'a>>;
 pub type Signed<'a> = Pin<Box<dyn Future<Output = Result<Vec<u8>, KeyError>> + 'a>>;
+pub type Searched<'a> = Pin<Box<dyn Future<Output = Result<DayKeys, KeyError>> + 'a>>;
 pub type HookSecret<'a> = Pin<Box<dyn Future<Output = Result<Arc<Secret<32>>, KeyError>> + 'a>>;
 
 pub trait Keys: KeySource {
@@ -95,6 +98,10 @@ pub trait Keys: KeySource {
 
     fn ids(&self) -> Option<Secret<16>> {
         None
+    }
+
+    fn search(&self, _tenant: u32, _generation: u32) -> Searched<'_> {
+        Box::pin(async { Ok(DayKeys::default()) })
     }
 
     fn system(&self) -> Ready<'_> {
@@ -260,11 +267,19 @@ pub struct Opener {
     wrap: Box<[u8; WRAP]>,
     batch: u64,
     day: u32,
-    replies: RefCell<BTreeSet<(u32, Stamp)>>,
-    events: RefCell<BTreeSet<(u32, Stamp)>>,
+    stamped: RefCell<BTreeSet<(u8, u32, Stamp)>>,
+    search: DayKeys,
 }
 
 impl Opener {
+    pub async fn searching(mut self, keys: &dyn Keys) -> Self {
+        self.search = keys
+            .search(self.tenant, self.generation)
+            .await
+            .unwrap_or_default();
+        self
+    }
+
     pub fn head(&self, sealed: &[u8]) -> Result<(Vec<u8>, Vec<u8>), Unsealable> {
         let (key, aad) = self.key(HEAD_ITEM, LABEL_HEAD);
         let mut clear = key.open_one(&aad, sealed).map_err(|_| Unsealable::Bad)?;
@@ -299,7 +314,11 @@ impl Opener {
         stamp: Stamp,
         reply: &[u8],
     ) -> Result<Vec<u8>, Unsealable> {
-        if !self.replies.borrow_mut().insert((recipient, stamp)) {
+        if !self
+            .stamped
+            .borrow_mut()
+            .insert((LABEL_REPLY, recipient, stamp))
+        {
             return Err(Unsealable::Bad);
         }
         let (key, aad) = self.reply_key(recipient, stamp);
@@ -322,7 +341,11 @@ impl Opener {
         stamp: Stamp,
         body: &[u8],
     ) -> Result<Vec<u8>, Unsealable> {
-        if !self.events.borrow_mut().insert((recipient, stamp)) {
+        if !self
+            .stamped
+            .borrow_mut()
+            .insert((LABEL_EVENT, recipient, stamp))
+        {
             return Err(Unsealable::Bad);
         }
         let (key, aad) = self.stamped_key(recipient, stamp, LABEL_EVENT);
@@ -334,7 +357,7 @@ impl Opener {
         recipient: u32,
         stamp: Stamp,
         body: &crate::events::Body,
-    ) -> Result<IndexRecord, Unsealable> {
+    ) -> Result<Written, Unsealable> {
         let sealed = self.seal_event(recipient, stamp, &body.encode())?;
         let event = crate::events::Event {
             generation: self.generation,
@@ -347,7 +370,14 @@ impl Opener {
             batch: self.batch,
             day: self.day,
         };
-        crate::events::record(self.tenant, &event, &self.wrap, &sealed).ok_or(Unsealable::Bad)
+        let record = crate::events::record(self.tenant, &event, &self.wrap, &sealed)
+            .ok_or(Unsealable::Bad)?;
+        let search = self
+            .search
+            .get(event.partition())
+            .map(|key| search::records(self.tenant, &event, &body.address, key).to_vec())
+            .unwrap_or_default();
+        Ok(Written { record, search })
     }
 
     pub fn open_event(
@@ -448,8 +478,8 @@ pub(crate) async fn opener(
         wrap: Box::new(*wrap),
         batch: clear.batch_key,
         day: clear.day,
-        replies: RefCell::new(BTreeSet::new()),
-        events: RefCell::new(BTreeSet::new()),
+        stamped: RefCell::new(BTreeSet::new()),
+        search: DayKeys::default(),
     })
 }
 

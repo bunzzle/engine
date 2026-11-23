@@ -760,6 +760,7 @@ fn optional_index_records_are_left_out_instead_of_waiting() {
             assert!(now().saturating_duration_since(started) < Duration::from_millis(10));
             assert_eq!(applied.locations.len(), 1);
             assert_eq!(applied.indexed.len(), 1, "write {n}");
+            assert_eq!(applied.busy, None);
             node.client.checkpoint().await.expect("checkpoint");
         }
         let applied = node
@@ -768,7 +769,61 @@ fn optional_index_records_are_left_out_instead_of_waiting() {
             .await
             .expect("apply");
         assert_eq!(applied.indexed, []);
+        assert_eq!(applied.busy, Some(KIND));
+        let other = IndexRecord {
+            kind: KIND + 1,
+            ..event(1, 0)
+        };
+        let applied = node
+            .changes
+            .apply_indexed(batch(1), 0, vec![other.clone(), event(1, 0)], true)
+            .await
+            .expect("apply");
+        assert_eq!((applied.indexed.len(), applied.busy), (0, Some(KIND)));
+        let applied = node
+            .changes
+            .apply_indexed(batch(1), 0, vec![other], true)
+            .await
+            .expect("apply");
+        assert_eq!((applied.indexed.len(), applied.busy), (1, None));
         assert_eq!(stamps(&node.changes).await.len(), store::DELAY_RUNS + 1);
+        drop(node.stop().await);
+    });
+}
+
+#[test]
+fn a_tie_in_runs_names_the_first_record_kind_as_busy() {
+    let driver = Rc::new(SimDriver::with_disk(13, Config::default(), created(13)));
+    Runtime::new(driver).block_on(async {
+        let tiering = Tiering {
+            flush_size: 0,
+            fan_in: 64,
+            ..Tiering::default()
+        };
+        let node = open(Some(tiering)).await;
+        node.changes.create(vec![batch(1)]).await.expect("create");
+        let pair = || {
+            let other = IndexRecord {
+                kind: KIND + 1,
+                ..event(1, 0)
+            };
+            vec![other, event(1, 0)]
+        };
+        for _ in 0..=store::DELAY_RUNS {
+            let applied = node
+                .changes
+                .apply_indexed(batch(1), 0, pair(), true)
+                .await
+                .expect("apply");
+            assert_eq!((applied.indexed.len(), applied.busy), (2, None));
+            node.client.checkpoint().await.expect("checkpoint");
+        }
+        let applied = node
+            .changes
+            .apply_indexed(batch(1), 0, pair(), true)
+            .await
+            .expect("apply");
+        assert_eq!((applied.indexed.len(), applied.busy), (0, Some(KIND + 1)));
         drop(node.stop().await);
     });
 }

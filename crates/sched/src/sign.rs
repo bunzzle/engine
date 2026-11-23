@@ -254,7 +254,9 @@ async fn prepare(
         &read.wrap,
     )
     .await
-    .map_err(|fault| unopened(fault, generation))?;
+    .map_err(|fault| unopened(fault, generation))?
+    .searching(keys)
+    .await;
     let (envelope, section) = opener
         .head(&read.head)
         .map_err(|fault| unopened(fault, generation))?;
@@ -352,7 +354,9 @@ pub(crate) async fn expiry_events(
         &read.wrap,
     )
     .await
-    .map_err(|_| lost)?;
+    .map_err(|_| lost)?
+    .searching(keys)
+    .await;
     let addresses = open_recipients(&opener, &read.slices, stored.clear.recipients, &wanted)
         .map_err(|_| lost)?;
     let mut events = Vec::with_capacity(open.len());
@@ -368,10 +372,11 @@ pub(crate) async fn expiry_events(
             attempts: state.attempts,
             class: state.class,
         };
-        let record = opener.event(recipient, stamp, &body).map_err(|_| lost)?;
+        let written = opener.event(recipient, stamp, &body).map_err(|_| lost)?;
         events.push(Event {
             recipient,
-            record,
+            record: written.record,
+            search: written.search,
             stamp,
             carried: 0,
         });

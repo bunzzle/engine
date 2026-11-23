@@ -6,8 +6,10 @@ use crypto::{BatchKey, DkimAlg, Secret, TenantKeys, Wrap};
 use keys::{BatchSettings, BatchStats, Batches, Fault, Ring};
 
 use crate::sealing::{
-    Batched, Deleted, HookSecret, Keys, Loaded, Made, Oldest, Signed, Unsealable, Unwrapped,
+    Batched, Deleted, HookSecret, Keys, Loaded, Made, Oldest, Searched, Signed, Unsealable,
+    Unwrapped,
 };
+use crate::search::DayKeys;
 
 pub struct Keyring {
     ring: Ring,
@@ -83,6 +85,24 @@ impl KeySource for Keyring {
 impl Keys for Keyring {
     fn ids(&self) -> Option<Secret<16>> {
         self.ring.ids()
+    }
+
+    fn search(&self, tenant: u32, generation: u32) -> Searched<'_> {
+        Box::pin(async move {
+            let working = self
+                .ring
+                .sealing(tenant, generation)
+                .await
+                .map_err(key_error)?;
+            let wall = keys::wall_day();
+            Ok(DayKeys::new(
+                working
+                    .search
+                    .days()
+                    .filter_map(|day| working.search_key(day, wall).map(|key| (day, key.copy())))
+                    .collect(),
+            ))
+        })
     }
 
     fn system(&self) -> Ready<'_> {

@@ -1,12 +1,12 @@
 use std::cell::{Cell, RefCell};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use rt::Notify;
 
 #[derive(Default)]
 pub struct Watch {
     head: Cell<u64>,
-    fresh: RefCell<BTreeSet<(u8, u32)>>,
+    fresh: RefCell<BTreeMap<u8, BTreeSet<u32>>>,
     notify: Notify,
 }
 
@@ -23,15 +23,7 @@ impl Watch {
     }
 
     pub fn take(&self, kind: u8) -> BTreeSet<u32> {
-        let mut fresh = self.fresh.borrow_mut();
-        let rest = fresh.split_off(&(kind.saturating_add(1), 0));
-        let taken = fresh
-            .split_off(&(kind, 0))
-            .into_iter()
-            .map(|(_, tenant)| tenant)
-            .collect();
-        fresh.extend(rest);
-        taken
+        self.fresh.borrow_mut().remove(&kind).unwrap_or_default()
     }
 
     pub async fn wait(&self) {
@@ -43,7 +35,11 @@ impl Watch {
     }
 
     pub(crate) fn indexed(&self, kind: u8, tenant: u32) {
-        self.fresh.borrow_mut().insert((kind, tenant));
+        self.fresh
+            .borrow_mut()
+            .entry(kind)
+            .or_default()
+            .insert(tenant);
     }
 
     pub(crate) fn wake(&self) {

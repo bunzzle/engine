@@ -18,6 +18,7 @@ mod policy;
 mod reader;
 mod requests;
 mod sealing;
+mod search;
 mod sign;
 mod start;
 mod status;
@@ -34,8 +35,8 @@ pub use envelope::{Envelope, Recipient, Required, Ret, decode_slice, encode_slic
 pub use error::{Error, Refusal};
 pub use events::{
     Body as EventBody, EVENT_DAYS, EVENT_SHAPE, EVENT_VALUE, Event, KIND_EVENT, Kind as EventKind,
-    MAX_REPLY, record as event_record, retain as retain_event, retired as retired_events,
-    sealed as event_sealed, sequence as event_sequence,
+    MAX_REPLY, Written as WrittenEvent, record as event_record, retain as retain_event,
+    retired as retired_events, sealed as event_sealed, sequence as event_sequence,
 };
 pub use hook::{HookChange, MAX_HOOKS, ROTATION_MS};
 pub use intake::{Draft, domain_of};
@@ -55,7 +56,11 @@ pub use requests::{
 };
 pub use sealing::{
     Batched, Deleted, HookSecret, Keys, LABEL_BODY, LABEL_EVENT, LABEL_HEAD, LABEL_REPLY,
-    LABEL_SLICE, Loaded, Made, Oldest, Opener, Sealing, Signed, Unsealable, Unwrapped,
+    LABEL_SLICE, Loaded, Made, Oldest, Opener, Sealing, Searched, Signed, Unsealable, Unwrapped,
+};
+pub use search::{
+    DayKeys, Field as SearchField, Found, KIND_SEARCH, SEARCH_HASH, SEARCH_SHAPE, SEARCH_VALUE,
+    event_key as search_event_key, hash as search_hash, key as search_key,
 };
 pub use sign::{Body, Fault, KEYS_WAIT, Outgoing, Plain, Prepared, SIGNED_BYTES};
 pub use start::{CONTROL_SHARD, Links, Meshes, Node, Parts, Running, Settings};

@@ -7,8 +7,8 @@ use spool::{
     Reply, Report, Slice, Spool, Stamp, StateClear, Status, state_item,
 };
 use store::{
-    Change, Client, DataFile, Delivery, Index, IndexRecord, IndexStamp, Keeper, Key, MAX_PAYLOAD,
-    Options, SLOT_SIZE, Setup, boot, control_key,
+    Change, Claim, Client, DataFile, Delivery, Index, IndexRecord, IndexStamp, Keeper, Key,
+    MAX_PAYLOAD, Options, SLOT_SIZE, Setup, Tiering, boot, control_key,
 };
 
 const PATH: &str = "/data/store";
@@ -36,6 +36,10 @@ struct Node {
 
 impl Node {
     async fn open() -> Self {
+        Self::open_with(None).await
+    }
+
+    async fn open_with(tiering: Option<Tiering>) -> Self {
         let setup = Setup {
             cores: 1,
             credits: 4,
@@ -44,7 +48,7 @@ impl Node {
         };
         let booted = boot(PATH, setup).await.expect("boot");
         let committer = spawn(async move { drop(booted.committer.run().await) });
-        let core = booted
+        let mut core = booted
             .starts
             .into_iter()
             .next()
@@ -52,6 +56,9 @@ impl Node {
             .open()
             .await
             .expect("open");
+        if let Some(tiering) = tiering {
+            core.keeper.set_tiering(tiering);
+        }
         let (spool, owner) = Spool::new(core, 1, LIMITS).expect("limits");
         Self {
             spool,
@@ -162,8 +169,124 @@ fn event(n: u8, stamp: Stamp) -> Event {
             partition: 0,
             entry: index::Entry::put(index::key(7, [0; 16]), vec![n; 61], vec![n; 5]),
         },
+        search: Vec::new(),
         carried: 0,
     }
+}
+
+fn search(n: u8) -> IndexRecord {
+    let mut key = index::key(7, [0; 16]);
+    key[4] = n;
+    IndexRecord {
+        stamp: IndexStamp::Tail,
+        kind: 4,
+        partition: 0,
+        entry: index::Entry::put(key, vec![n; 14], Vec::new()),
+    }
+}
+
+fn unit(n: u8, stamp: Stamp) -> Event {
+    Event {
+        search: (1..=3).map(search).collect(),
+        ..event(n, stamp)
+    }
+}
+
+async fn tails(spool: &Spool) -> Vec<(u64, u8)> {
+    spool
+        .changes()
+        .scan(0, (4, 0), [0; 20]..[0xff; 20], usize::MAX)
+        .await
+        .expect("scan")
+        .into_iter()
+        .map(|e| {
+            let tail = u64::from_be_bytes(e.key[12..20].try_into().expect("tail"));
+            (u64::MAX - tail, e.key[4])
+        })
+        .collect()
+}
+
+#[test]
+fn event_units_are_written_and_dropped_whole_and_counted_by_cause() {
+    on(created(), || async {
+        let node = Node::open_with(Some(Tiering {
+            flush_size: 0,
+            fan_in: 64,
+            ..Tiering::default()
+        }))
+        .await;
+        let spool = &node.spool;
+        let id = node.accept(0, 4, 500).await;
+        let report = |n: u8, event: Event| Report {
+            event: Some(event),
+            ..deferred(0, 50 + u64::from(n))
+        };
+        spool.claim(id, 0).expect("claim");
+        let first = report(1, unit(1, spool.stamp(0).expect("stamp")));
+        assert_eq!(
+            spool.report(id, vec![first]).await.expect("report"),
+            Done::Kept
+        );
+        let written = events(spool).await;
+        let mut found = tails(spool).await;
+        found.sort_unstable();
+        assert_eq!(written.len(), 1);
+        assert_eq!(
+            found,
+            (1..=3u8)
+                .map(|n| (written[0].0 + u64::from(n), n))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(spool.event_stats(), spool::EventStats::default());
+        node.client.checkpoint().await.expect("checkpoint");
+        for n in 0..=store::DELAY_RUNS {
+            let mut filler = search(9);
+            filler.entry.key[5] = u8::try_from(n).expect("few runs");
+            spool
+                .changes()
+                .index(0, Claim::Control, vec![filler])
+                .await
+                .expect("index");
+            node.client.checkpoint().await.expect("checkpoint");
+        }
+        spool.claim(id, 0).expect("claim");
+        let busy = report(2, unit(2, spool.stamp(0).expect("stamp")));
+        assert_eq!(
+            spool.report(id, vec![busy]).await.expect("report"),
+            Done::Kept
+        );
+        assert_eq!(events(spool).await.len(), 1);
+        let own = tails(spool).await.into_iter().filter(|t| t.1 != 9).count();
+        assert_eq!(own, 3);
+        spool.claim(id, 0).expect("claim");
+        let alone = report(3, event(3, spool.stamp(0).expect("stamp")));
+        assert_eq!(
+            spool.report(id, vec![alone]).await.expect("report"),
+            Done::Kept
+        );
+        assert_eq!(events(spool).await.len(), 2);
+        spool.claim(id, 0).expect("claim");
+        let mut wide = unit(4, spool.stamp(0).expect("stamp"));
+        wide.search[2].entry.value.push(0);
+        let refused = report(4, wide);
+        assert_eq!(
+            spool.report(id, vec![refused]).await.expect("report"),
+            Done::Kept
+        );
+        assert_eq!(events(spool).await.len(), 2);
+        assert_eq!(
+            spool.event_stats(),
+            spool::EventStats {
+                lost: 2,
+                busy_event: 0,
+                busy_search: 1,
+                refused: 1,
+                search_skipped: 1,
+            }
+        );
+        assert_eq!(spool.take_lost(7), 2);
+        node.close().await;
+    });
 }
 
 async fn events(spool: &Spool) -> Vec<(u64, u8)> {
@@ -523,6 +646,60 @@ fn expiry_events_commit_with_the_drop_for_open_recipients_only() {
         let values: Vec<u8> = events(spool).await.into_iter().map(|e| e.1).collect();
         assert_eq!(values, [12]);
         assert_eq!(spool.lost_events(), 0);
+        assert_eq!(spool.tenant(id), None);
+        node.close().await;
+    });
+}
+
+#[test]
+fn units_in_one_commit_keep_each_search_record_next_to_its_event() {
+    on(created(), || async {
+        let node = Node::open().await;
+        let spool = &node.spool;
+        let id = node.accept(0, 3, 500).await;
+        for r in 0..3 {
+            spool.claim(id, r).expect("claim");
+        }
+        let reports: Vec<Report> = (0..3u8)
+            .map(|r| Report {
+                event: Some(unit(20 + r, spool.stamp(0).expect("stamp"))),
+                ..deferred(u32::from(r), 60)
+            })
+            .collect();
+        assert_eq!(spool.report(id, reports).await.expect("report"), Done::Kept);
+        let written = events(spool).await;
+        let found = tails(spool).await;
+        assert_eq!((written.len(), found.len()), (3, 9));
+        for (sequence, back) in found {
+            let event = sequence - u64::from(back);
+            assert!(written.iter().any(|e| e.0 == event), "{sequence} {back}");
+        }
+        let starts: Vec<u64> = written.iter().map(|e| e.0).collect();
+        assert!(starts.windows(2).all(|w| w[1] - w[0] == 4), "{starts:?}");
+        node.close().await;
+    });
+}
+
+#[test]
+fn closing_units_past_the_region_are_lost_and_the_rest_written() {
+    on(created(), || async {
+        let node = Node::open().await;
+        let spool = &node.spool;
+        let id = node.accept(0, 40, 100).await;
+        let closing: Vec<Event> = (0..40u8)
+            .map(|r| {
+                let mut unit = unit(r, spool.stamp(0).expect("stamp"));
+                unit.recipient = u32::from(r);
+                unit.record.entry.payload = vec![r; 4000];
+                unit
+            })
+            .collect();
+        spool.expire_with(id, 150, closing).await.expect("expire");
+        let written = events(spool).await.len();
+        assert!(written > 0 && written < 40, "{written}");
+        assert_eq!(tails(spool).await.len(), 3 * written);
+        let stats = spool.event_stats();
+        assert_eq!((stats.lost, stats.refused), (40 - written as u64, 0));
         assert_eq!(spool.tenant(id), None);
         node.close().await;
     });
