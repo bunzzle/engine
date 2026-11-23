@@ -7,8 +7,8 @@ use spool::{
     Reply, Report, Slice, Spool, Stamp, StateClear, Status, state_item,
 };
 use store::{
-    Change, Client, DataFile, Delivery, Index, IndexRecord, Keeper, Key, MAX_PAYLOAD, Options,
-    SLOT_SIZE, Setup, boot, control_key,
+    Change, Client, DataFile, Delivery, Index, IndexRecord, IndexStamp, Keeper, Key, MAX_PAYLOAD,
+    Options, SLOT_SIZE, Setup, boot, control_key,
 };
 
 const PATH: &str = "/data/store";
@@ -157,7 +157,7 @@ fn event(n: u8, stamp: Stamp) -> Event {
         recipient: 0,
         stamp,
         record: IndexRecord {
-            sequenced: true,
+            stamp: IndexStamp::Head,
             kind: 3,
             partition: 0,
             entry: index::Entry::put(index::key(7, [0; 16]), vec![n; 61], vec![n; 5]),

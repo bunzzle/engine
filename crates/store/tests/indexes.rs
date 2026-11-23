@@ -6,8 +6,8 @@ use index::{Entry, Op, Shape};
 use rt::sim::{Config, SimDriver};
 use rt::{JoinHandle, Runtime, spawn};
 use store::{
-    Claim, Client, Committer, CoreFile, DataFile, Error, Event, IndexRecord, IndexRoot, Keeper,
-    Options, Part, Results, SLOT_SIZE, Session, ShardState, Source, Submission, Tiering,
+    Claim, Client, Committer, CoreFile, DataFile, Error, Event, IndexRecord, IndexRoot, IndexStamp,
+    Keeper, Options, Part, Results, SLOT_SIZE, Session, ShardState, Source, Submission, Tiering,
     decode_part, encode_part, load, recover,
 };
 
@@ -262,7 +262,7 @@ fn put(kind: u8, partition: u32, n: u64, round: u64) -> IndexRecord {
         vec![u8::try_from(n % 251).expect("fits"); usize::try_from(n % 40).expect("fits")]
     };
     IndexRecord {
-        sequenced: false,
+        stamp: IndexStamp::Off,
         kind,
         partition,
         entry: Entry::put(key(3, n), (n ^ round).to_le_bytes().to_vec(), payload),
@@ -271,7 +271,7 @@ fn put(kind: u8, partition: u32, n: u64, round: u64) -> IndexRecord {
 
 fn delete(kind: u8, partition: u32, n: u64) -> IndexRecord {
     IndexRecord {
-        sequenced: false,
+        stamp: IndexStamp::Off,
         kind,
         partition,
         entry: Entry::delete(key(3, n), SHAPE),
@@ -294,11 +294,18 @@ fn index_records_round_trip_and_refuse_damage() {
     let mut op = bytes.clone();
     op[1] = 3;
     assert_eq!(IndexRecord::decode(&op), None);
-    let mut reserved = bytes.clone();
-    reserved[12] = 2;
-    assert_eq!(IndexRecord::decode(&reserved), None);
+    for (at, flags) in [(12, 3), (12, 4), (12, 0x80), (15, 0x80)] {
+        let mut reserved = bytes.clone();
+        reserved[at] = flags;
+        assert_eq!(IndexRecord::decode(&reserved), None, "flags {at} {flags}");
+    }
+    let tail = IndexRecord {
+        stamp: IndexStamp::Tail,
+        ..record.clone()
+    };
+    assert_eq!(IndexRecord::decode(&tail.encode()), Some(tail));
     let sequenced = IndexRecord {
-        sequenced: true,
+        stamp: IndexStamp::Head,
         ..record.clone()
     };
     assert_eq!(IndexRecord::decode(&sequenced.encode()), Some(sequenced));
@@ -316,6 +323,47 @@ fn index_records_round_trip_and_refuse_damage() {
     for cut in 0..bytes.len() {
         assert_eq!(IndexRecord::decode(&bytes[..cut]), None);
     }
+}
+
+#[test]
+fn tail_stamp_writes_the_inverted_sequence_known_answer() {
+    let mut record = put(2, 20_001, 7, 1);
+    record.entry.key = [0x11; 20];
+    record.entry.key[12..20].fill(0);
+    let tail = IndexRecord {
+        stamp: IndexStamp::Tail,
+        ..record.clone()
+    };
+    let bytes = tail.encode();
+    assert_eq!(bytes[12..16], [2, 0, 0, 0]);
+    assert!(tail.unstamped());
+    let stamped = tail.stamped(0x0102_0304_0506_0708);
+    assert_eq!(
+        stamped.entry.key,
+        [
+            0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0xfe, 0xfd,
+            0xfc, 0xfb, 0xfa, 0xf9, 0xf8, 0xf7
+        ]
+    );
+    assert!(!stamped.unstamped());
+    let first = IndexRecord {
+        stamp: IndexStamp::Tail,
+        ..record.clone()
+    }
+    .stamped(1);
+    assert_eq!(
+        first.entry.key[12..20],
+        [0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xfe]
+    );
+    assert!(first.entry.key > stamped.entry.key);
+    let head = IndexRecord {
+        stamp: IndexStamp::Head,
+        ..record.clone()
+    }
+    .stamped(0x0102_0304_0506_0708);
+    assert_eq!(head.entry.key[4..12], [1, 2, 3, 4, 5, 6, 7, 8]);
+    assert_eq!(head.entry.key[12..20], [0; 8]);
+    assert_eq!(record.clone().stamped(9).entry.key, record.entry.key);
 }
 
 #[test]

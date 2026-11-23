@@ -10,7 +10,7 @@ use control::{KeySource, Naming, State, Table};
 use index::{Entry, Op, Shape};
 use rt::{JoinHandle, Notify, Sender, channel, sleep_until, spawn};
 use spool::MessageId;
-use store::{Changes, IndexRecord};
+use store::{Changes, IndexRecord, IndexStamp};
 
 use crate::clock::Clock;
 use crate::error::Refusal;
@@ -279,7 +279,7 @@ impl Requests {
             return Err(Refusal::Message);
         }
         Ok(IndexRecord {
-            sequenced: false,
+            stamp: IndexStamp::Off,
             kind: KIND_REQUEST,
             partition: self.today(),
             entry: Entry::put(index::key(ticket.tenant, ticket.hash), value, payload),

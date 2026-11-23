@@ -39,7 +39,7 @@ pub use ids::{
     CONTROL_BOOT, CONTROL_KINDS, Ids, LAST_BOOT, control_key, is_control, message_key, next_boot,
     split_key,
 };
-pub use indexes::{IndexRecord, KIND_INDEX};
+pub use indexes::{IndexRecord, IndexStamp, KIND_INDEX};
 pub use journal::{
     Allocation, Commit, Dead, Entry, Journal, KIND_COMMIT, Live, Position, Range, fits,
 };

@@ -6,7 +6,7 @@ use control::{KeySource, Label, Naming, State, Table, siphash, tenant_keys};
 use crypto::TenantKeys;
 use index::{Entry, Key, Op, Shape};
 use rt::{Ends, JoinHandle, Peers, Sender, channel, spawn};
-use store::{Changes, Claim, IndexRecord};
+use store::{Changes, Claim, IndexRecord, IndexStamp};
 
 use crate::clock::Clock;
 use crate::error::Refusal;
@@ -573,7 +573,7 @@ impl Suppressions {
             return Err(Refusal::Address);
         }
         let record = IndexRecord {
-            sequenced: false,
+            stamp: IndexStamp::Off,
             kind: KIND_SUPPRESS,
             partition: PARTITION.1,
             entry: Entry::put(index::key(tenant, hash), value.encode(), sealed),
@@ -594,7 +594,7 @@ impl Suppressions {
     ) -> Result<bool, Refusal> {
         let found = self.found(tenant, generation, shard, hash).await?.is_some();
         let record = IndexRecord {
-            sequenced: false,
+            stamp: IndexStamp::Off,
             kind: KIND_SUPPRESS,
             partition: PARTITION.1,
             entry: Entry::delete(index::key(tenant, hash), SHAPE),

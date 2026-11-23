@@ -31,7 +31,7 @@ use sched::{
     read_cursor, retain, retain_event, retain_request, retired_events, write_cursor,
 };
 use spool::{Body, Head, HeadClear, Message, MessageId, SLICE, Slice, Stamp};
-use store::{Client, Committer, DataFile, Options, SLOT_SIZE, Setup, Tiering, boot};
+use store::{Client, Committer, DataFile, IndexStamp, Options, SLOT_SIZE, Setup, Tiering, boot};
 
 const PATH: &str = "/data/store";
 const SHARDS: u16 = 8;
@@ -1222,7 +1222,7 @@ fn events_seal_under_their_message_and_open_from_the_record() {
             day: sealed.clear.day,
         };
         let record = event_record(1, &event, &sealed.wrap, &sealed_body).expect("record");
-        assert!(record.sequenced);
+        assert_eq!(record.stamp, IndexStamp::Head);
         assert_eq!((record.kind, record.partition), (KIND_EVENT, 3));
         assert_eq!(record.entry.key, index::key(1, [0; 16]));
         let decoded = Event::decode(&record.entry.value).expect("value");

@@ -7,7 +7,8 @@ use rt::sim::{Config, SimDriver};
 use rt::{Runtime, now, spawn};
 use store::{
     Batch, Change, Changes, Claim, Client, Committer, DataFile, Delivery, Error, HEAD_ITEM,
-    IndexRecord, Keeper, Key, Op as StoreOp, Options, SLOT_SIZE, Setup, Shards, Tiering, boot,
+    IndexRecord, IndexStamp, Keeper, Key, Op as StoreOp, Options, SLOT_SIZE, Setup, Shards,
+    Tiering, boot,
 };
 
 const PATH: &str = "/data/owner";
@@ -89,7 +90,7 @@ fn put(n: u64, round: u64) -> IndexRecord {
     let payload =
         vec![u8::try_from(n % 251).expect("fits"); usize::try_from(n % 30).expect("fits")];
     IndexRecord {
-        sequenced: false,
+        stamp: IndexStamp::Off,
         kind: KIND,
         partition: 0,
         entry: Entry::put(key(n), (n ^ round).to_le_bytes().to_vec(), payload),
@@ -98,7 +99,7 @@ fn put(n: u64, round: u64) -> IndexRecord {
 
 fn delete(n: u64) -> IndexRecord {
     IndexRecord {
-        sequenced: false,
+        stamp: IndexStamp::Off,
         kind: KIND,
         partition: 0,
         entry: Entry::delete(key(n), SHAPE),
@@ -463,7 +464,7 @@ fn a_create_carries_index_records_in_the_same_submission() {
 
 fn event(tenant: u32, n: u8) -> IndexRecord {
     IndexRecord {
-        sequenced: true,
+        stamp: IndexStamp::Head,
         kind: KIND,
         partition: 0,
         entry: Entry::put(index::key(tenant, [0; 16]), vec![n; 8], vec![n; 4]),
@@ -559,6 +560,108 @@ fn applies_carry_sequenced_index_records_that_survive_a_crash() {
     Runtime::new(driver).block_on(async move {
         let node = open(None).await;
         assert_eq!(stamps(&node.changes).await, written);
+        drop(node.stop().await);
+    });
+}
+
+fn tail(tenant: u32, n: u8) -> IndexRecord {
+    let mut key = index::key(tenant, [0; 16]);
+    key[4..12].fill(7);
+    IndexRecord {
+        stamp: IndexStamp::Tail,
+        kind: KIND,
+        partition: 0,
+        entry: Entry::put(key, vec![n; 8], Vec::new()),
+    }
+}
+
+async fn entries(changes: &Changes) -> Vec<([u8; 20], Vec<u8>)> {
+    changes
+        .scan(0, PARTITION, [0; 20]..[0xff; 20], usize::MAX)
+        .await
+        .expect("scan")
+        .into_iter()
+        .map(|e| (e.key, e.value))
+        .collect()
+}
+
+#[test]
+fn tail_stamped_records_of_one_submission_get_consecutive_inverted_sequences() {
+    let driver = Rc::new(SimDriver::with_disk(12, Config::default(), created(12)));
+    let written = Runtime::new(driver.clone()).block_on(async {
+        let node = open(None).await;
+        node.changes.create(vec![batch(1)]).await.expect("create");
+        let mut written = Vec::new();
+        for round in 0..3u8 {
+            let records = vec![
+                event(1, 10 * round),
+                tail(1, 10 * round + 1),
+                tail(1, 10 * round + 2),
+                tail(1, 10 * round + 3),
+            ];
+            let applied = node
+                .changes
+                .apply_indexed(batch(1), 0, records.clone(), false)
+                .await
+                .expect("apply");
+            let sequences: Vec<u64> = applied.indexed.iter().map(|l| l.sequence).collect();
+            assert_eq!(sequences.len(), 4);
+            assert!(
+                sequences.windows(2).all(|w| w[1] == w[0] + 1),
+                "{sequences:?}"
+            );
+            for (record, sequence) in records.into_iter().zip(sequences) {
+                let stamped = record.stamped(sequence);
+                if stamped.stamp == IndexStamp::Tail {
+                    assert_eq!(
+                        stamped.entry.key[12..20],
+                        (u64::MAX - sequence).to_be_bytes()
+                    );
+                }
+                written.push((stamped.entry.key, stamped.entry.value));
+            }
+            if round == 1 {
+                node.client.checkpoint().await.expect("checkpoint");
+            }
+        }
+        written.sort();
+        let found = entries(&node.changes).await;
+        assert_eq!(found, written);
+        let tails: Vec<u64> = found
+            .iter()
+            .filter(|(key, _)| key[4..12] == [7; 8])
+            .map(|(key, _)| u64::MAX - u64::from_be_bytes(key[12..20].try_into().expect("8")))
+            .collect();
+        assert_eq!(tails.len(), 9);
+        assert!(tails.windows(2).all(|w| w[0] > w[1]), "{tails:?}");
+        let mut stamped = tail(1, 99);
+        stamped.entry.key[19] = 1;
+        let refused = node
+            .changes
+            .apply_indexed(batch(1), 0, vec![stamped], false)
+            .await;
+        assert!(matches!(refused, Err(Error::Invalid("index stamp"))));
+        let erase = IndexRecord {
+            entry: Entry::delete(index::key(1, [0; 16]), SHAPE),
+            ..tail(1, 99)
+        };
+        let refused = node
+            .changes
+            .apply_indexed(batch(1), 0, vec![erase], false)
+            .await;
+        assert!(matches!(refused, Err(Error::Invalid("index stamp"))));
+        drop(node.stop().await);
+        written
+    });
+    let driver = Rc::new(SimDriver::with_disk(13, Config::default(), driver.crash()));
+    Runtime::new(driver).block_on(async move {
+        let node = open(None).await;
+        let found = entries(&node.changes).await;
+        assert_eq!(found, written);
+        assert_eq!(
+            found.iter().filter(|(key, _)| key[4..12] == [7; 8]).count(),
+            9
+        );
         drop(node.stop().await);
     });
 }
@@ -693,7 +796,7 @@ fn retire_closes_and_drops_partitions_of_one_kind() {
             node.client.checkpoint().await.expect("checkpoint");
         }
         let other = IndexRecord {
-            sequenced: false,
+            stamp: IndexStamp::Off,
             kind: KIND + 1,
             partition: 1,
             ..put(1, 7)

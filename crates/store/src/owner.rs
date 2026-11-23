@@ -10,7 +10,7 @@ use crate::committer::{Body, Client, Lease, Location, Submission, Write};
 use crate::core_file::CoreFile;
 use crate::error::Error;
 use crate::ids::is_control;
-use crate::indexes::IndexRecord;
+use crate::indexes::{IndexRecord, IndexStamp};
 use crate::journal::{Dead, Range};
 use crate::keeper::Keeper;
 use crate::merge::{DELAY_RUNS, Done, REFUSE_RUNS, merge};
@@ -644,7 +644,9 @@ impl Shards {
         }
         let mut shapes = BTreeMap::new();
         for record in records {
-            if !record.unstamped() || (record.sequenced && record.entry.op == index::Op::Delete) {
+            if !record.unstamped()
+                || (record.stamp != IndexStamp::Off && record.entry.op == index::Op::Delete)
+            {
                 return Err(Error::Invalid("index stamp"));
             }
             let partition = (record.kind, record.partition);
