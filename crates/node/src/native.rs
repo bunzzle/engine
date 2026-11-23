@@ -1,7 +1,6 @@
 use std::path::Path;
-use std::process;
 use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 
 use crypto::Secret;
 use deliver::Deliver;
@@ -86,8 +85,11 @@ where
     )
     .with_roots(roots);
     let plan = Arc::new(plan);
+    let failure = Arc::new(Mutex::new(None));
+    let failed = Arc::clone(&failure);
     let committer = store::launch(store, setup, move |core| {
         let plan = Arc::clone(&plan);
+        let failed = Arc::clone(&failed);
         let transport = transport(core.index);
         async move {
             let result = match transport {
@@ -95,12 +97,26 @@ where
                 Err(e) => Err(Error::Config(e)),
             };
             if let Err(e) = result {
-                eprintln!("bunzzle: {e}");
-                process::exit(1);
+                let mut first = failed.lock().unwrap_or_else(PoisonError::into_inner);
+                if rank(&e) > first.as_ref().map_or(0, rank) {
+                    *first = Some(e);
+                }
             }
         }
     })
     .map_err(Error::Store)?;
     drop(committer);
-    Ok(())
+    let failure = failure
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .take();
+    failure.map_or(Ok(()), Err)
+}
+
+fn rank(error: &Error) -> u8 {
+    match error {
+        Error::Stopped => 1,
+        Error::Core(..) => 2,
+        _ => 3,
+    }
 }
