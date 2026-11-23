@@ -1,6 +1,6 @@
 use index::{Entry, Shape};
 use spool::{MessageId, Stamp, WRAP};
-use store::IndexRecord;
+use store::{IndexRecord, IndexStamp};
 
 use crate::policy::Answer;
 use crate::requests::DAY;
@@ -174,7 +174,7 @@ pub fn record(tenant: u32, event: &Event, wrap: &[u8; WRAP], sealed: &[u8]) -> O
         return None;
     }
     Some(IndexRecord {
-        sequenced: true,
+        stamp: IndexStamp::Head,
         kind: KIND_EVENT,
         partition: event.partition(),
         entry: Entry::put(index::key(tenant, [0; 16]), event.encode(), payload),
