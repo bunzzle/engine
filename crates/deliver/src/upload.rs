@@ -5,6 +5,7 @@ use dns::Name;
 use rt::{TcpStream, timeout};
 use tls::{Connector, Verify};
 
+use crate::address::{Local, Rule};
 use crate::https;
 use crate::mx::{self, Addresses, Dns};
 
@@ -43,9 +44,10 @@ pub(crate) fn target(uri: &str) -> Option<Target> {
     })
 }
 
-pub(crate) async fn upload<D: Dns>(
+pub(crate) async fn upload<D: Dns, L: Local>(
     dns: &D,
     tls: &Connector,
+    rule: &Rule<'_, L>,
     egress: IpAddr,
     uri: &str,
     body: &[u8],
@@ -53,14 +55,15 @@ pub(crate) async fn upload<D: Dns>(
     let Some(target) = target(uri) else {
         return false;
     };
-    timeout(UPLOAD, send(dns, tls, egress, &target, body))
+    timeout(UPLOAD, send(dns, tls, rule, egress, &target, body))
         .await
         .unwrap_or(false)
 }
 
-async fn send<D: Dns>(
+async fn send<D: Dns, L: Local>(
     dns: &D,
     tls: &Connector,
+    rule: &Rule<'_, L>,
     egress: IpAddr,
     target: &Target,
     body: &[u8],
@@ -68,11 +71,16 @@ async fn send<D: Dns>(
     let Ok(name) = Name::parse(&target.host) else {
         return false;
     };
-    let Addresses::Found { ips, .. } = mx::public(dns, &name, egress.is_ipv6()).await else {
+    let Addresses::Found { ips, .. } =
+        mx::filtered(dns, &name, egress.is_ipv6(), |ip| rule.keep(ip)).await
+    else {
         return false;
     };
     let request = https::post(&target.host, &target.path, MEDIA, body);
     for ip in ips {
+        if rule.own(ip).await {
+            continue;
+        }
         let Ok(io) = TcpStream::connect_from(egress, SocketAddr::new(ip, target.port)).await else {
             continue;
         };

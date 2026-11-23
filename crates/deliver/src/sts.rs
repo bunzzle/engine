@@ -11,6 +11,7 @@ use rt::{Instant, TcpStream, now, timeout, wall_ms};
 use sched::Restore;
 use tls::{Connector, Verify};
 
+use crate::address::{Local, Rule};
 use crate::conn::left;
 use crate::https::{self, Parsed};
 use crate::mx::{self, Addresses, Dns};
@@ -407,10 +408,11 @@ impl Sts {
         self.cache.borrow_mut().extend(loaded);
     }
 
-    pub(crate) async fn policy<D: Dns>(
+    pub(crate) async fn policy<D: Dns, L: Local>(
         &self,
         dns: &D,
         tls: &Connector,
+        rule: &Rule<'_, L>,
         egress: IpAddr,
         domain: &Name,
         end: Instant,
@@ -426,7 +428,7 @@ impl Sts {
         {
             return Got::Policy(Rc::clone(policy));
         }
-        match self.fetch(dns, tls, egress, domain, id, end).await {
+        match self.fetch(dns, tls, rule, egress, domain, (id, end)).await {
             Fetched::Policy(policy) => Got::Policy(policy),
             Fetched::Busy => cached.map_or(Got::Busy, |(_, policy)| Got::Policy(policy)),
             Fetched::Failed(result) => {
@@ -435,14 +437,14 @@ impl Sts {
         }
     }
 
-    async fn fetch<D: Dns>(
+    async fn fetch<D: Dns, L: Local>(
         &self,
         dns: &D,
         tls: &Connector,
+        rule: &Rule<'_, L>,
         egress: IpAddr,
         domain: &Name,
-        id: String,
-        end: Instant,
+        (id, end): (String, Instant),
     ) -> Fetched {
         let running = self.joined.borrow().get(domain).cloned();
         if let Some(joined) = running {
@@ -466,7 +468,7 @@ impl Sts {
             domain: domain.clone(),
             done: Rc::clone(&joined),
         };
-        let fetched = timeout(left(end, FETCH), get_policy(dns, tls, egress, domain)).await;
+        let fetched = timeout(left(end, FETCH), get_policy(dns, tls, rule, egress, domain)).await;
         drop(counted);
         let fetched = match fetched {
             Ok(Ok((policy, text))) => {
@@ -485,10 +487,11 @@ impl Sts {
         }
     }
 
-    pub(crate) async fn refresh<D: Dns>(
+    pub(crate) async fn refresh<D: Dns, L: Local>(
         &self,
         dns: &D,
         tls: &Connector,
+        rule: &Rule<'_, L>,
         fixed: Option<IpAddr>,
         jitter: impl Fn(u64) -> u64,
     ) {
@@ -508,7 +511,7 @@ impl Sts {
             let Some((_, domain)) = next else {
                 return;
             };
-            self.refresh_one(dns, tls, fixed, &domain).await;
+            self.refresh_one(dns, tls, rule, fixed, &domain).await;
         }
     }
 
@@ -537,10 +540,11 @@ impl Sts {
         }
     }
 
-    async fn refresh_one<D: Dns>(
+    async fn refresh_one<D: Dns, L: Local>(
         &self,
         dns: &D,
         tls: &Connector,
+        rule: &Rule<'_, L>,
         fixed: Option<IpAddr>,
         domain: &Name,
     ) {
@@ -554,7 +558,7 @@ impl Sts {
             entry.id != id || left < max_age_ms(&entry.policy) / 4
         });
         if let (true, Some(egress)) = (needed, fixed.or(self.egress.get()))
-            && let Fetched::Busy = self.fetch(dns, tls, egress, domain, id, end).await
+            && let Fetched::Busy = self.fetch(dns, tls, rule, egress, domain, (id, end)).await
         {
             self.due.borrow_mut().insert((now() + BUSY, domain.clone()));
         }
@@ -641,21 +645,27 @@ async fn txt_id<D: Dns>(dns: &D, domain: &Name, end: Instant) -> Option<String> 
     }
 }
 
-async fn get_policy<D: Dns>(
+async fn get_policy<D: Dns, L: Local>(
     dns: &D,
     tls: &Connector,
+    rule: &Rule<'_, L>,
     egress: IpAddr,
     domain: &Name,
 ) -> Result<(Policy, Vec<u8>), ResultType> {
     let host = domain
         .prefixed("mta-sts")
         .map_err(|_| ResultType::StsPolicyFetchError)?;
-    let Addresses::Found { ips, .. } = mx::public(dns, &host, egress.is_ipv6()).await else {
+    let Addresses::Found { ips, .. } =
+        mx::filtered(dns, &host, egress.is_ipv6(), |ip| rule.keep(ip)).await
+    else {
         return Err(ResultType::StsPolicyFetchError);
     };
     let name = host.to_string();
     let mut failed = ResultType::StsPolicyFetchError;
     for ip in ips {
+        if rule.own(ip).await {
+            continue;
+        }
         match get(tls, egress, ip, &name).await {
             Ok(text) => {
                 return Policy::parse(&text)
