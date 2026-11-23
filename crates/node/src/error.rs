@@ -14,6 +14,7 @@ pub enum Error {
     Bind(SocketAddr, io::Error),
     Core(u16, String),
     Deadline,
+    Stopped,
 }
 
 impl fmt::Display for Error {
@@ -29,6 +30,7 @@ impl fmt::Display for Error {
             Self::Bind(address, e) => write!(f, "listen on {address}: {e}"),
             Self::Core(core, message) => write!(f, "core {core}: {message}"),
             Self::Deadline => write!(f, "boot deadline passed"),
+            Self::Stopped => write!(f, "stopped by another core"),
         }
     }
 }

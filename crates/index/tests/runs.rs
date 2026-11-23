@@ -1,8 +1,8 @@
 use std::collections::BTreeMap;
 
 use index::{
-    BLOCK, Cursor, Entry, Error, Footer, Key, Memtable, Merge, Merged, OVERHEAD, Op, Range, Run,
-    Segment, Shape, Source, Step, Writer, find, footer_range, key, payload, siphash128,
+    BLOCK, Bloom, Cursor, Entry, Error, Footer, Key, Memtable, Merge, Merged, OVERHEAD, Op, Probe,
+    Range, Run, Segment, Shape, Source, Step, Writer, find, footer_range, key, payload, siphash128,
 };
 
 const SHAPE: Shape = Shape { value: 12 };
@@ -327,4 +327,82 @@ fn resealed_footers_with_bad_fields_are_refused() {
         forged[BLOCK - 4..].copy_from_slice(&crc.to_le_bytes());
         assert!(Footer::decode(&forged).is_err(), "field at {at}");
     }
+}
+
+fn reseal(footer: &mut [u8]) {
+    let crc = sys::crc32c::checksum(&footer[..BLOCK - 4]);
+    footer[BLOCK - 4..].copy_from_slice(&crc.to_le_bytes());
+}
+
+type Shapes = [(&'static str, fn(u64) -> Key, fn(u64) -> Key); 2];
+
+fn stamped(tenant: u32, middle: u64, stamp: u64) -> Key {
+    let mut key = [0; 20];
+    key[..4].copy_from_slice(&tenant.to_be_bytes());
+    key[4..12].copy_from_slice(&middle.to_be_bytes());
+    key[12..].copy_from_slice(&stamp.to_be_bytes());
+    key
+}
+
+#[test]
+fn filter_rejects_absent_stamped_keys() {
+    let count = 50_000u64;
+    let size = usize::try_from(count).expect("fits");
+    let shapes: Shapes = [
+        (
+            "head",
+            |i| stamped(7, i, 0),
+            |i| stamped(7, i + 1_000_000, 0),
+        ),
+        (
+            "tail",
+            |i| stamped(7, 0x0100_0000_0000_0000 | (i % 64), u64::MAX - i),
+            |i| {
+                stamped(
+                    7,
+                    0x0100_0000_0000_0000 | (i % 64),
+                    u64::MAX - i - 1_000_000,
+                )
+            },
+        ),
+    ];
+    for (name, present, absent) in shapes {
+        let mut bloom = Bloom::new(size, Probe::Whole);
+        for i in 0..count {
+            bloom.add(&present(i));
+        }
+        assert!((0..count).all(|i| bloom.may(&present(i))), "{name}");
+        let hits = (0..count).filter(|&i| bloom.may(&absent(i))).count();
+        assert!(hits * 100 < size * 3, "{name}: {hits} of {count}");
+    }
+}
+
+#[test]
+fn format_one_segments_keep_their_filter() {
+    let mut rng = Rng(41);
+    let entries = sorted(&mut rng, 3000);
+    let mut bytes = write(&entries, u64::MAX, 1).remove(0);
+    let range = footer_range(bytes.len() as u64).expect("range");
+    let footer_at = usize::try_from(range.offset).expect("fits");
+    let meta = Footer::decode(&slice(&bytes, range))
+        .expect("footer")
+        .meta();
+    let mut split = Bloom::new(entries.len(), Probe::Split);
+    for entry in &entries {
+        split.add(&entry.key);
+    }
+    let filter = split.bytes();
+    let end = usize::try_from(meta.offset).expect("fits") + meta.length as usize;
+    bytes[end - filter.len()..end].copy_from_slice(filter);
+    let crc = sys::crc32c::checksum(&slice(&bytes, meta));
+    let footer = &mut bytes[footer_at..];
+    footer[4..8].copy_from_slice(&1u32.to_le_bytes());
+    footer[36..40].copy_from_slice(&crc.to_le_bytes());
+    reseal(footer);
+    let segment = open(&bytes).expect("format 1");
+    assert!(entries.iter().all(|e| segment.probe(&e.key).is_some()));
+    let footer = &mut bytes[footer_at..];
+    footer[4..8].copy_from_slice(&3u32.to_le_bytes());
+    reseal(footer);
+    assert!(open(&bytes).is_err());
 }

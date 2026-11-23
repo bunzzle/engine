@@ -2,12 +2,13 @@ use std::cmp::Ordering;
 
 use sys::crc32c::checksum;
 
-use crate::bloom::Bloom;
+use crate::bloom::{Bloom, Probe};
 use crate::entry::{self, BLOCK, Entry, Found, KEY, Key, Reference, Shape};
 use crate::error::Error;
 
 const MAGIC: u32 = 0x5844_4e49;
-const FORMAT: u32 = 1;
+const FORMAT: u32 = 2;
+const SPLIT_FORMAT: u32 = 1;
 const CRC: usize = BLOCK - 4;
 const BLOCK_LEN: u32 = 4096;
 
@@ -26,6 +27,7 @@ pub struct Footer {
     pub covered: u64,
     pub first: Key,
     pub last: Key,
+    format: u32,
     fences: u32,
     filter: u32,
     meta: u32,
@@ -36,7 +38,7 @@ impl Footer {
         if bytes.len() != BLOCK || !sealed(bytes) {
             return Err(Error::Corrupt("footer"));
         }
-        if u32_at(bytes, 0) != MAGIC || u32_at(bytes, 4) != FORMAT {
+        if u32_at(bytes, 0) != MAGIC || !(SPLIT_FORMAT..=FORMAT).contains(&u32_at(bytes, 4)) {
             return Err(Error::Corrupt("footer format"));
         }
         let footer = Self {
@@ -46,6 +48,7 @@ impl Footer {
             blocks: u32_at(bytes, 12),
             pages: u32_at(bytes, 16),
             entries: u64_at(bytes, 20),
+            format: u32_at(bytes, 4),
             fences: u32_at(bytes, 28),
             filter: u32_at(bytes, 32),
             meta: u32_at(bytes, 36),
@@ -106,8 +109,13 @@ impl Segment {
         if !ordered || keys.first() != Some(&footer.first) {
             return Err(Error::Corrupt("segment fences"));
         }
-        let bloom =
-            Bloom::from_bytes(meta[fences..].to_vec()).ok_or(Error::Corrupt("segment filter"))?;
+        let probe = if footer.format == SPLIT_FORMAT {
+            Probe::Split
+        } else {
+            Probe::Whole
+        };
+        let bloom = Bloom::from_bytes(meta[fences..].to_vec(), probe)
+            .ok_or(Error::Corrupt("segment filter"))?;
         Ok(Self {
             footer,
             fences: keys,
@@ -267,7 +275,7 @@ impl Writer {
         let pages = self.pages.len() / BLOCK
             + usize::from(!self.page.is_empty() || !entry.payload.is_empty())
             + usize::from(page_full && !entry.payload.is_empty());
-        let meta = blocks * KEY + Bloom::new(keys).bytes().len();
+        let meta = blocks * KEY + Bloom::new(keys, Probe::Whole).bytes().len();
         ((blocks + pages) * BLOCK + meta.next_multiple_of(BLOCK) + BLOCK) as u64
     }
 
@@ -300,7 +308,7 @@ impl Writer {
         }
         let blocks = u32::try_from(self.blocks.len() / BLOCK).expect("blocks fit u32");
         let pages = u32::try_from(self.pages.len() / BLOCK).expect("pages fit u32");
-        let mut bloom = Bloom::new(self.keys.len());
+        let mut bloom = Bloom::new(self.keys.len(), Probe::Whole);
         for key in &self.keys {
             bloom.add(key);
         }

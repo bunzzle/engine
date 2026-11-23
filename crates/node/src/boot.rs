@@ -1,15 +1,18 @@
 use std::cell::{Cell, RefCell};
+use std::future::{Future, poll_fn};
+use std::pin::pin;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::task::Poll;
 
 use api::Forward;
 use control::Naming;
 use crypto::Secret;
 use deliver::Hooks;
 use dns::Resolver;
-use intake::{Ask, Guard, Listener, listen, watch};
+use intake::{Ask, Guard, Listener, Watch, listen, watch};
 use keys::{BatchSettings, Client, Connect, Ring, RingSettings};
-use rt::{JoinHandle, Mesh, Notify, Signal, Signals, TcpListener, spawn, timeout};
+use rt::{JoinHandle, Mesh, Notify, Peers, Signal, Signals, TcpListener, spawn, timeout};
 use sched::{Clock, Keyring, Meshes, Node, Parts, Running, Settings, Transport};
 use store::Core;
 use tls::rustls::crypto::CryptoProvider;
@@ -23,6 +26,7 @@ const NAMES: usize = 65_536;
 const RETENTION: u16 = 30;
 const STOP: [Signal; 3] = [Signal::Hangup, Signal::Interrupt, Signal::Terminate];
 
+#[derive(Clone)]
 enum Order {
     Started(Result<(), String>),
     Go,
@@ -163,25 +167,18 @@ pub async fn run<T: Transport + 'static>(
             started
         })
     };
-    let mut watched = None;
-    if index == 0 {
-        timeout(plan.config.boot, orders.started(cores))
-            .await
-            .map_err(|_| Error::Deadline)??;
-        let signals = Signals::listen(&STOP).await.map_err(Error::Io)?;
-        let tls = &plan.config.tls;
-        watched = Some(watch(
-            signals,
-            Arc::clone(&plan.certs),
-            tls.chain.clone(),
-            tls.key.clone(),
-        ));
-        for core in 0..cores {
-            peers.send(core, Order::Go);
+    let (watched, failed) = if index == 0 {
+        lead(&plan, &orders, &peers).await
+    } else {
+        (None, None)
+    };
+    let up = match ready(starting, &orders, failed).await {
+        Ok(up) => up,
+        Err(e) => {
+            peers.close();
+            return Err(e);
         }
-    }
-    let up = starting.await?;
-    orders.until(|o| o.go.get() || o.stop.get()).await;
+    };
     report::start(&up.node, &plan.config);
     let hooking = up.node.start_hooks(Rc::clone(&up.hooks));
     let session = Rc::new(plan.config.session.clone());
@@ -237,13 +234,86 @@ pub async fn run<T: Transport + 'static>(
     for closed in closing {
         closed.await;
     }
-    up.guard.close();
-    up.node.close();
-    drop(up.running.stop().await);
-    drop(up.guarding);
+    halt(&up.guard, &up.node, up.running, up.guarding).await;
     drop(hooking);
     peers.close();
     stopped
+}
+
+async fn halt<T: Transport + 'static>(
+    guard: &Guard,
+    node: &Node<T>,
+    running: Running,
+    guarding: JoinHandle<()>,
+) {
+    guard.close();
+    node.close();
+    drop(running.stop().await);
+    drop(guarding);
+}
+
+async fn ready<T: Transport + 'static>(
+    starting: JoinHandle<Result<Up<T>, Error>>,
+    orders: &Orders,
+    failed: Option<Error>,
+) -> Result<Up<T>, Error> {
+    let up = started_or_stopped(starting, orders).await;
+    if let Some(e) = failed {
+        if let Some(Ok(up)) = up {
+            halt(&up.guard, &up.node, up.running, up.guarding).await;
+        }
+        return Err(e);
+    }
+    let up = up.ok_or(Error::Stopped)??;
+    orders.until(|o| o.go.get() || o.stop.get()).await;
+    if !orders.go.get() {
+        halt(&up.guard, &up.node, up.running, up.guarding).await;
+        return Err(Error::Stopped);
+    }
+    Ok(up)
+}
+
+async fn started_or_stopped<T>(
+    starting: JoinHandle<Result<Up<T>, Error>>,
+    orders: &Orders,
+) -> Option<Result<Up<T>, Error>> {
+    let mut starting = pin!(starting);
+    let mut stopped = pin!(orders.until(|o| o.stop.get()));
+    poll_fn(|cx| match starting.as_mut().poll(cx) {
+        Poll::Ready(up) => Poll::Ready(Some(up)),
+        Poll::Pending => stopped.as_mut().poll(cx).map(|()| None),
+    })
+    .await
+}
+
+async fn lead(
+    plan: &Plan,
+    orders: &Orders,
+    peers: &Peers<Order>,
+) -> (Option<Watch>, Option<Error>) {
+    let led = boot(plan, orders).await;
+    let order = if led.is_ok() { Order::Go } else { Order::Stop };
+    for core in 0..plan.config.cores {
+        peers.send(core, order.clone());
+    }
+    match led {
+        Ok(watching) => (Some(watching), None),
+        Err(e) => (None, Some(e)),
+    }
+}
+
+async fn boot(plan: &Plan, orders: &Orders) -> Result<Watch, Error> {
+    timeout(plan.config.boot, orders.started(plan.config.cores))
+        .await
+        .map_err(|_| Error::Deadline)??;
+    let signals = Signals::listen(&STOP).await.map_err(Error::Io)?;
+    let tls = &plan.config.tls;
+    Ok(watch(
+        signals,
+        Arc::clone(&plan.certs),
+        tls.chain.clone(),
+        tls.key.clone(),
+    ))
 }
 
 async fn start<T: Transport + 'static>(
