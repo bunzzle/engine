@@ -90,6 +90,7 @@ pub fn start<T: Transport + 'static>(
         stats: Rc::clone(&stats),
         forward: Rc::clone(&forward),
         reading: RefCell::default(),
+        searching: RefCell::default(),
     });
     let owner = Rc::downgrade(&context);
     forward.serve_with(Box::new(move |inbound, open| {

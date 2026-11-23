@@ -1644,6 +1644,16 @@ async fn search_cursors(reader: &Node<Idle>, domain: &SearchQuery, other: &Searc
         .expect("rest");
     assert_eq!(rest.events.len(), 3);
     assert!(!rest.events.iter().any(|r| r.id == page.events[0].id));
+    for (from, to) in [(true, true), (true, false), (false, true)] {
+        let pinned = domain.clone().fixed(from, to);
+        let again = reader.search(1, &pinned, Some(&page.next), 10).await;
+        assert!(again.is_ok());
+        let pinned = moved.clone().fixed(from, to);
+        assert_eq!(
+            reader.search(1, &pinned, Some(&page.next), 10).await.err(),
+            Some(ReadError::Cursor)
+        );
+    }
     assert_eq!(
         reader.search(1, other, Some(&page.next), 1).await.err(),
         Some(ReadError::Cursor)

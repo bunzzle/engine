@@ -19,6 +19,7 @@ pub struct Query {
     kinds: u8,
     from: u64,
     to: u64,
+    fixed: (bool, bool),
 }
 
 impl Query {
@@ -47,8 +48,21 @@ impl Query {
             kinds,
             from,
             to,
+            fixed: (false, false),
         }
         .ranged(from, to)
+    }
+
+    #[must_use]
+    pub fn fixed(self, from: bool, to: bool) -> Self {
+        Self {
+            fixed: (from, to),
+            ..self
+        }
+    }
+
+    pub(crate) fn fits(&self, from: u64, to: u64) -> bool {
+        (!self.fixed.0 || self.from == from) && (!self.fixed.1 || self.to == to)
     }
 
     pub(crate) fn ranged(&self, from: u64, to: u64) -> Option<Self> {

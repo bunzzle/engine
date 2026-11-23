@@ -35,13 +35,13 @@ pub(crate) async fn read<T: Transport + 'static>(
     Ok(ok(id, body(&page, &ids)))
 }
 
-struct Held<'a> {
+pub(crate) struct Held<'a> {
     reading: &'a RefCell<BTreeSet<u32>>,
     tenant: u32,
 }
 
 impl<'a> Held<'a> {
-    fn take(reading: &'a RefCell<BTreeSet<u32>>, tenant: u32) -> Option<Self> {
+    pub(crate) fn take(reading: &'a RefCell<BTreeSet<u32>>, tenant: u32) -> Option<Self> {
         if !reading.borrow_mut().insert(tenant) {
             return None;
         }
@@ -90,7 +90,7 @@ fn bad_limit() -> Problem {
     Problem::bad_request(format!("`limit` must be 1 to {EVENTS_LIMIT}"))
 }
 
-fn problem(error: ReadError) -> Problem {
+pub(crate) fn problem(error: ReadError) -> Problem {
     match error {
         ReadError::Tenant => Problem::suspended(),
         ReadError::Limit => bad_limit(),
@@ -100,7 +100,7 @@ fn problem(error: ReadError) -> Problem {
     }
 }
 
-fn body(page: &EventPage, ids: &Ids) -> String {
+pub(crate) fn body(page: &EventPage, ids: &Ids) -> String {
     let mut out = String::from("{\"events\":[");
     for (n, read) in page.events.iter().enumerate() {
         if n > 0 {
