@@ -13,6 +13,16 @@ use crate::server::{Context, Stop};
 const LIMIT: usize = 25;
 const DAY: u64 = 86_400_000;
 const VALUE: usize = 1024;
+const NAMES: [&str; 8] = [
+    "recipient",
+    "domain",
+    "message",
+    "type",
+    "from",
+    "to",
+    "limit",
+    "after",
+];
 const KINDS: [EventKind; 6] = [
     EventKind::Delivered,
     EventKind::Deferred,
@@ -70,10 +80,20 @@ impl Asked {
             let (name, raw) = pair
                 .split_once('=')
                 .ok_or_else(|| Problem::bad_request("query not accepted"))?;
+            if !NAMES.contains(&name) {
+                return Err(Problem::bad_request(
+                    "only `recipient`, `domain`, `message`, `type`, `from`, `to`, `limit` \
+                     and `after` are accepted",
+                ));
+            }
             if seen.contains(&name) {
                 return Err(Problem::bad_request(format!("`{name}` given twice")));
             }
             seen.push(name);
+            if name == "after" {
+                asked.after = Some(raw.to_owned());
+                continue;
+            }
             let value = unescape(raw)
                 .ok_or_else(|| Problem::bad_request(format!("`{name}` is not a valid value")))?;
             match name {
@@ -84,16 +104,7 @@ impl Asked {
                 "from" => asked.from = Some(time("from", &value)?),
                 "to" => asked.to = Some(time("to", &value)?),
                 "limit" => asked.limit = limit(&value)?,
-                "after" => {
-                    asked.after =
-                        Some(String::from_utf8(value).map_err(|_| Problem::bad_cursor())?);
-                }
-                _ => {
-                    return Err(Problem::bad_request(
-                        "only `recipient`, `domain`, `message`, `type`, `from`, `to`, `limit` \
-                         and `after` are accepted",
-                    ));
-                }
+                _ => unreachable!("names checked above"),
             }
         }
         if asked.field.is_none() {
@@ -123,8 +134,16 @@ impl Asked {
                 .to_vec(),
             _ => value.clone(),
         };
-        let to = self.to.unwrap_or(now.saturating_add(1));
-        let from = self.from.unwrap_or(to.saturating_sub(DAY));
+        let resumed = self.after.is_some();
+        let (from, to) = match (self.from, self.to) {
+            (Some(from), Some(to)) => (from, to),
+            (Some(from), None) if resumed => (from, from.saturating_add(1)),
+            (None, Some(to)) if resumed => (to.saturating_sub(1), to),
+            (from, to) => {
+                let to = to.unwrap_or(now.saturating_add(1));
+                (from.unwrap_or(to.saturating_sub(DAY)), to)
+            }
+        };
         if from >= to {
             return Err(Problem::bad_request("`from` must be before `to`"));
         }
@@ -273,8 +292,11 @@ mod tests {
         }
         let long = format!("recipient={}", "a".repeat(VALUE + 1));
         assert!(Asked::parse(Some(&long)).is_err());
-        let after = Asked::parse(Some("domain=b.c&after=%ff")).expect_err("cursor");
-        assert_eq!(after.code, "bad_cursor");
+        let cursor = "ab".repeat(1400);
+        let long = parsed(&format!("domain=b.c&after={cursor}"));
+        assert_eq!(long.after.as_deref(), Some(cursor.as_str()));
+        let unknown = Asked::parse(Some("x=%zz")).expect_err("unknown");
+        assert!(unknown.message.contains("only"), "{}", unknown.message);
     }
 
     #[test]
@@ -299,6 +321,14 @@ mod tests {
             let problem = parsed(bad).query(&ids, now).expect_err(bad);
             assert_eq!(problem.code, "bad_request", "{bad}");
         }
+        let week = "domain=b.c&from=1970-01-04T00:00:00Z";
+        assert!(parsed(week).query(&ids, now).is_ok());
+        let later = now + 2 * DAY;
+        assert!(parsed(week).query(&ids, later).is_err());
+        let resumed = parsed(&format!("{week}&after=ab")).query(&ids, later);
+        assert!(resumed.is_ok());
+        let until = "domain=b.c&to=1970-01-04T00:00:00Z&after=ab";
+        assert!(parsed(until).query(&ids, later).is_ok());
         let id = ids.encode(&[3; 16]);
         let (field, value) = range(&format!("message={id}")).expect("message");
         assert_eq!((field, value), (SearchField::Message, vec![3; 16]));
