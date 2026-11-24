@@ -11,7 +11,7 @@ use http::{Event, Limits, Phase, Request, Response, Server, Status};
 use intake::{Conn, End, Guard, Listener};
 use metrics::{Board, Def, Kind, Slab, negotiate};
 use rt::{Instant, JoinHandle, Notify, TcpListener, now, sleep, spawn, timeout, wall_ms};
-use sched::{Node, Transport};
+use sched::{Keyring, Node, Transport};
 
 use crate::Metrics;
 
@@ -82,6 +82,40 @@ catalog! {
     WebhookReportsFailed: Counter, "webhook_reports_failed", "Webhook status writes that failed";
     WebhookStreams: Gauge, "webhook_streams", "Webhook streams running";
     WebhookStreamsFailing: Gauge, "webhook_streams_failing", "Webhook streams with failing calls";
+    KeysConnects: Counter, "keys_connects", "Connections made to the key server";
+    KeysDrops: Counter, "keys_drops", "Key server connections dropped";
+    KeysSlow: Counter, "keys_slow", "Key server calls past their deadline";
+    KeysRefused: Counter, "keys_refused", "Key calls refused because the key ring failed";
+    KeysUnknown: Counter, "keys_unknown", "Key calls answered as unknown or conflicting";
+    KeysUnavailable: Counter, "keys_unavailable", "Key calls with no answer from the key server";
+    KeysBusy: Counter, "keys_busy", "Key calls answered as busy";
+    KeysFailed: Counter, "keys_failed", "Key calls answered as failed";
+    KeysGone: Counter, "keys_gone", "Key calls for tenants or generations that are gone";
+    KeysBad: Counter, "keys_bad", "Key answers that could not be opened or used";
+    KeysOpens: Counter, "keys_opens", "Tenant keys opened from the key server";
+    KeysUnwraps: Counter, "keys_unwraps", "Batch keys unwrapped by the key server";
+    KeysRefreshes: Counter, "keys_refreshes", "Tenant key refreshes started";
+    KeysDkimNew: Counter, "keys_dkim_new", "DKIM keys created";
+    KeysLoads: Counter, "keys_loads", "DKIM keys loaded";
+    KeysSigns: Counter, "keys_signs", "Signatures made by the key server";
+    KeysHookSecrets: Counter, "keys_hook_secrets", "Webhook secrets fetched";
+    KeysSearchEvicted: Counter, "keys_search_evicted", "Times search day keys past retention were dropped from a held tenant key";
+    KeysDaysBehind: Gauge, "keys_days_behind", "Days the last sealing key was behind the wall clock";
+    KeysHooksHeld: Gauge, "keys_hooks_held", "Webhook secrets held in memory";
+    KeysTenantHits: Counter, "keys_tenant_cache_hits", "Tenant key cache hits";
+    KeysTenantMisses: Counter, "keys_tenant_cache_misses", "Tenant key cache misses";
+    KeysTenantEvicted: Counter, "keys_tenant_cache_evicted", "Tenant keys evicted from the cache";
+    KeysHookHits: Counter, "keys_hook_cache_hits", "Webhook secret cache hits";
+    KeysHookMisses: Counter, "keys_hook_cache_misses", "Webhook secret cache misses";
+    KeysHookEvicted: Counter, "keys_hook_cache_evicted", "Webhook secrets evicted from the cache";
+    BatchesCreated: Counter, "batches_created", "Sealing batches created";
+    BatchesFull: Counter, "batches_full", "Sealing batches closed because they were full";
+    BatchesAged: Counter, "batches_aged", "Sealing batches closed because they were old";
+    BatchesDay: Counter, "batches_day", "Sealing batches closed because the key day ended";
+    BatchesMismatched: Counter, "batches_mismatched", "Batch key lookups refused because the tenant or generation did not match";
+    BatchCacheHits: Counter, "batch_cache_hits", "Batch key cache hits";
+    BatchCacheMisses: Counter, "batch_cache_misses", "Batch key cache misses";
+    BatchCacheEvicted: Counter, "batch_cache_evicted", "Batch keys evicted from the cache";
     EventsLost: Counter, "events_lost", "Delivery events lost before they were written";
     SearchSkipped: Counter, "search_skipped", "Search entries not written";
     SearchScans: Counter, "search_scans", "Search scans run";
@@ -101,6 +135,7 @@ pub(crate) struct Sources<'a, T> {
     pub node: &'a Node<T>,
     pub smtp: &'a [Listener],
     pub guard: &'a Guard,
+    pub keys: &'a Keyring,
     pub api: Option<&'a api::Api>,
 }
 
@@ -179,6 +214,7 @@ impl<T: Transport + 'static> Sources<'_, T> {
         set(Id::WebhooksDisabledGone, hooks.gone);
         set(Id::WebhooksDisabledFailing, hooks.failing);
         set(Id::WebhookReportsFailed, hooks.write_failed);
+        self.write_keys(slab);
         let events = self.node.event_stats();
         set(Id::EventsLost, events.lost);
         set(Id::SearchSkipped, events.search_skipped);
@@ -186,6 +222,51 @@ impl<T: Transport + 'static> Sources<'_, T> {
         set(Id::SearchScans, search.scans);
         set(Id::SearchBlocks, search.blocks);
         set(Id::SystemRecordsFailed, self.node.system_records().failed);
+    }
+}
+
+impl<T> Sources<'_, T> {
+    fn write_keys(&self, slab: &Slab) {
+        let set = |id: Id, value: u64| slab.set(id as usize, value);
+        let ring = self.keys.ring().stats();
+        set(Id::KeysConnects, ring.connects);
+        set(Id::KeysDrops, ring.drops);
+        set(Id::KeysSlow, ring.slow);
+        set(Id::KeysRefused, ring.refused);
+        set(Id::KeysUnknown, ring.unknown);
+        set(Id::KeysUnavailable, ring.unavailable);
+        set(Id::KeysBusy, ring.busy);
+        set(Id::KeysFailed, ring.failed);
+        set(Id::KeysGone, ring.gone);
+        set(Id::KeysBad, ring.bad);
+        set(Id::KeysOpens, ring.opens);
+        set(Id::KeysUnwraps, ring.unwraps);
+        set(Id::KeysRefreshes, ring.refreshes);
+        set(Id::KeysDkimNew, ring.dkim_new);
+        set(Id::KeysLoads, ring.loads);
+        set(Id::KeysSigns, ring.signs);
+        set(Id::KeysHookSecrets, ring.hook_secrets);
+        set(Id::KeysSearchEvicted, ring.search_evicted);
+        set(Id::KeysDaysBehind, u64::from(ring.behind));
+        set(
+            Id::KeysHooksHeld,
+            u64::try_from(ring.held_hooks).unwrap_or(u64::MAX),
+        );
+        set(Id::KeysTenantHits, ring.tenants.hits);
+        set(Id::KeysTenantMisses, ring.tenants.misses);
+        set(Id::KeysTenantEvicted, ring.tenants.evicted);
+        set(Id::KeysHookHits, ring.hooks.hits);
+        set(Id::KeysHookMisses, ring.hooks.misses);
+        set(Id::KeysHookEvicted, ring.hooks.evicted);
+        let batches = self.keys.batch_stats();
+        set(Id::BatchesCreated, batches.created);
+        set(Id::BatchesFull, batches.full);
+        set(Id::BatchesAged, batches.aged);
+        set(Id::BatchesDay, batches.day);
+        set(Id::BatchesMismatched, batches.mismatched);
+        set(Id::BatchCacheHits, batches.cache.hits);
+        set(Id::BatchCacheMisses, batches.cache.misses);
+        set(Id::BatchCacheEvicted, batches.cache.evicted);
     }
 }
 

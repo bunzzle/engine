@@ -149,6 +149,7 @@ struct Up<T> {
     guarding: JoinHandle<()>,
     acceptor: Rc<Acceptor>,
     hooks: Rc<dyn sched::Deliver>,
+    keys: Rc<Keyring>,
     sockets: Vec<(TcpListener, bool)>,
     apis: Vec<(TcpListener, bool, bool)>,
     scrapes: Vec<TcpListener>,
@@ -230,6 +231,7 @@ pub async fn run<T: Transport + 'static>(
         node: &up.node,
         smtp: &listeners,
         guard: &up.guard,
+        keys: &up.keys,
         api: apis.as_ref(),
     };
     let publishing = scrape::publishing(metrics, index, sources);
@@ -366,9 +368,13 @@ async fn start<T: Transport + 'static>(
         budget: usize::try_from(superblock.region_size() / 2).unwrap_or(usize::MAX),
     };
     let links = plan.meshes.take(index).expect("links of each core");
-    let keys = Keyring::new(ring(config), RETENTION, BatchSettings::default());
+    let keys = Rc::new(Keyring::new(
+        ring(config),
+        RETENTION,
+        BatchSettings::default(),
+    ));
     let parts = Parts {
-        keys: Rc::new(keys),
+        keys: Rc::clone(&keys) as Rc<dyn sched::Keys>,
         transport,
         clock: Clock::at(rt::wall_ms(), rt::now()),
     };
@@ -423,6 +429,7 @@ async fn start<T: Transport + 'static>(
         guarding,
         acceptor: Rc::new(acceptor),
         hooks,
+        keys,
         sockets,
         apis,
         scrapes,
