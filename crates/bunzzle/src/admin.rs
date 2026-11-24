@@ -14,7 +14,10 @@ pub const USAGE: &str = "usage: bunzzle admin <config> status
        bunzzle admin <config> tenant suspend <id>
        bunzzle admin <config> tenant resume <id>
        bunzzle admin <config> pool list [from <id>]
-       bunzzle admin <config> pool set <id> <ip>=<weight>[,<ip>=<weight>...]";
+       bunzzle admin <config> pool set <id> <ip>=<weight>[,<ip>=<weight>...]
+       bunzzle admin <config> queue list <tenant> [from <id>]
+       bunzzle admin <config> queue retry <tenant> <queue>
+       bunzzle admin <config> queue rebind <tenant> <queue> <pool>";
 
 const MAX_ITEMS: usize = 255;
 
@@ -29,6 +32,23 @@ pub fn parse(args: &[String]) -> Option<(&str, Request)> {
         ["tenant", "list", "from", id] => Request::TenantList(id.parse().ok()?),
         ["pool", "list"] => Request::PoolList(0),
         ["pool", "list", "from", id] => Request::PoolList(id.parse().ok()?),
+        ["queue", "list", tenant] => Request::QueueList {
+            tenant: tenant.parse().ok()?,
+            from: 0,
+        },
+        ["queue", "list", tenant, "from", from] => Request::QueueList {
+            tenant: tenant.parse().ok()?,
+            from: from.parse().ok()?,
+        },
+        ["queue", "retry", tenant, queue] => Request::QueueRetry {
+            tenant: tenant.parse().ok()?,
+            queue: queue.parse().ok()?,
+        },
+        ["queue", "rebind", tenant, queue, pool] => Request::QueueRebind {
+            tenant: tenant.parse().ok()?,
+            queue: queue.parse().ok()?,
+            pool: pool.parse().ok()?,
+        },
         ["tenant", "suspend", id] => Request::TenantSuspend(id.parse().ok()?),
         ["tenant", "resume", id] => Request::TenantResume(id.parse().ok()?),
         ["tenant", "create", id, pools, options @ ..] => {
@@ -189,6 +209,34 @@ mod tests {
             Some(Request::TenantList(9))
         );
         assert_eq!(parsed(&["pool", "list"]), Some(Request::PoolList(0)));
+        assert_eq!(
+            parsed(&["queue", "list", "5"]),
+            Some(Request::QueueList { tenant: 5, from: 0 })
+        );
+        assert_eq!(
+            parsed(&["queue", "list", "5", "from", "40"]),
+            Some(Request::QueueList {
+                tenant: 5,
+                from: 40
+            })
+        );
+        assert_eq!(
+            parsed(&["queue", "retry", "5", "40"]),
+            Some(Request::QueueRetry {
+                tenant: 5,
+                queue: 40
+            })
+        );
+        assert_eq!(
+            parsed(&["queue", "rebind", "5", "40", "2"]),
+            Some(Request::QueueRebind {
+                tenant: 5,
+                queue: 40,
+                pool: 2
+            })
+        );
+        assert_eq!(parsed(&["queue", "list"]), None);
+        assert_eq!(parsed(&["queue", "retry", "5"]), None);
         assert_eq!(
             parsed(&["pool", "list", "from", "3"]),
             Some(Request::PoolList(3))

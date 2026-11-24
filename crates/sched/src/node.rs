@@ -14,7 +14,7 @@ use spool::{
 
 use crate::clock::Clock;
 use crate::error::Refusal;
-use crate::lanes::{Entry, Lanes, Limits, QueueId, Take, ranges};
+use crate::lanes::{Entry, Lanes, Limits, QueueId, Take, Waiting, ranges};
 use crate::policy::{Answer, BACKOFF, Kind, clamp, delay, report_retry};
 use crate::sealing::{Keys, Unsealable};
 use crate::sign::{Outgoing, Signing, expiry_events};
@@ -481,6 +481,23 @@ impl<T: Transport + 'static> Sched<T> {
         self.use_table(Rc::clone(table));
         self.use_hook_reports(Rc::clone(reports));
         crate::start::restore_live(self, pending, table)
+    }
+
+    pub fn waiting(&self, queue: QueueId, tenant: u32) -> Option<Waiting> {
+        self.inner.lanes.borrow().waiting(queue, tenant)
+    }
+
+    pub fn retry_queue(&self, queue: QueueId, tenant: u32) -> bool {
+        let now = self.inner.clock.now();
+        let found = self
+            .inner
+            .lanes
+            .borrow_mut()
+            .retry_queue(queue, tenant, now);
+        if found {
+            self.inner.notify.notify();
+        }
+        found
     }
 
     pub fn retry_now(&self, queue: QueueId) {

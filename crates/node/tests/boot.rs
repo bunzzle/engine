@@ -732,6 +732,33 @@ fn tenant(id: u32, pools: &[u32]) -> admin::Request {
     })
 }
 
+async fn unknown_queues() {
+    use admin::Code::{NotFound, Ok};
+    use admin::Request::{QueueList, QueueRebind, QueueRetry};
+    assert_eq!(
+        ask(QueueList { tenant: 5, from: 0 }).await,
+        (Ok, String::new())
+    );
+    assert_eq!(
+        ask(QueueList { tenant: 7, from: 0 }).await,
+        (NotFound, "tenant 7 not found".into())
+    );
+    assert_eq!(
+        ask(QueueRetry {
+            tenant: 5,
+            queue: 1
+        })
+        .await,
+        (NotFound, "queue 1 of tenant 5 not found".into())
+    );
+    let rebind = QueueRebind {
+        tenant: 5,
+        queue: 1,
+        pool: 1,
+    };
+    assert_eq!(ask(rebind).await.0, NotFound);
+}
+
 #[test]
 fn admin_creates_suspends_and_resumes_tenants() {
     use admin::Code::{NotFound, Ok, Refused};
@@ -802,6 +829,7 @@ fn admin_creates_suspends_and_resumes_tenants() {
         assert_eq!(ask(TenantResume(5)).await.0, Ok);
         assert!(ask(TenantList(0)).await.1.starts_with("tenant 5 active generation 1"));
         assert!(ask(TenantList(6)).await.1.starts_with("tenant 6 active generation 1"));
+        unknown_queues().await;
         assert_eq!(ask(TenantSuspend(6)).await.0, Ok);
     });
     stopped(&driver, node);

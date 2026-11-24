@@ -12,6 +12,7 @@ use spool::Pending;
 use store::Tiering;
 use store::{Changes, Core, Keeper};
 
+use crate::admin::{Desk, Desks};
 use crate::clock::Clock;
 use crate::delete::sweep_queues;
 use crate::error::Error;
@@ -38,6 +39,7 @@ pub struct Meshes {
     suppress: Mesh<suppress::Ask>,
     events: Mesh<reader::Ask>,
     steps: Mesh<()>,
+    desks: Mesh<Desk>,
 }
 
 impl Meshes {
@@ -50,6 +52,7 @@ impl Meshes {
             suppress: Mesh::new(cores),
             events: Mesh::new(cores),
             steps: Mesh::new(cores),
+            desks: Mesh::new(cores),
         }
     }
 
@@ -62,6 +65,7 @@ impl Meshes {
             suppress: self.suppress.take(core)?,
             events: self.events.take(core)?,
             steps: self.steps.take(core)?,
+            desks: self.desks.take(core)?,
         })
     }
 }
@@ -74,6 +78,7 @@ pub struct Links {
     suppress: Ends<suppress::Ask>,
     events: Ends<reader::Ask>,
     steps: Ends<()>,
+    desks: Ends<Desk>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -104,6 +109,7 @@ pub(crate) struct Inner<T> {
     pub(crate) leases: Leases<u32>,
     pub(crate) table: Rc<RefCell<Table>>,
     pub(crate) suppressions: Suppressions,
+    pub(crate) desks: Rc<Desks<T>>,
     pub(crate) requests: Requests,
     reader: Reader,
     config: Peers<control::Note>,
@@ -232,6 +238,7 @@ impl<T: Transport + 'static> Node<T> {
             &settings.watched,
         );
         let restored = sched.use_node_config(&parts.keys, &table, &hook_reports, pending);
+        let (desks, desks_done) = Desks::start(links.desks, settings.naming.shards);
 
         leases.opened().await;
         barrier(links.steps).await;
@@ -249,6 +256,7 @@ impl<T: Transport + 'static> Node<T> {
             leases,
             table,
             suppressions,
+            desks,
             requests,
             reader,
             config,
@@ -261,11 +269,10 @@ impl<T: Transport + 'static> Node<T> {
             hook_reports,
             records,
         });
-        inner.sched.use_node(Rc::downgrade(&inner));
-        let ticks = maintain(Rc::downgrade(&inner), ticker);
-        let drops = drop_deleted(Rc::downgrade(&inner), deletions);
-        index_done.extend([config_done, names_done, leases_done, sched_done]);
-        index_done.extend([ticks, drops]);
+        attach(&inner);
+        index_done.extend([config_done, names_done, leases_done, sched_done, desks_done]);
+        index_done.push(maintain(Rc::downgrade(&inner), ticker));
+        index_done.push(drop_deleted(Rc::downgrade(&inner), deletions));
         let running = Running {
             done: index_done,
             owner,
@@ -275,6 +282,11 @@ impl<T: Transport + 'static> Node<T> {
         node.resume_deletes();
         Ok((node, running))
     }
+}
+
+fn attach<T: Transport + 'static>(inner: &Rc<Inner<T>>) {
+    inner.sched.use_node(Rc::downgrade(inner));
+    inner.desks.use_node(Rc::downgrade(inner));
 }
 
 impl<T: Transport + 'static> Node<T> {
@@ -586,6 +598,7 @@ impl<T: Transport + 'static> Node<T> {
         inner.queues.close();
         inner.leases.close();
         inner.suppressions.close();
+        inner.desks.close();
         inner.requests.close();
         inner.reader.close();
         inner.config.close();

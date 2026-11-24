@@ -5,7 +5,7 @@ use std::rc::Rc;
 use admin::{Admin, Code, Handler, PoolSpec, Reply, Request, TenantSpec};
 use control::{Limits, Object, Pool, State, Table, Tenant};
 use rt::UnixListener;
-use sched::{Node, Transport};
+use sched::{Node, QueueDone, QueueRefusal, Transport};
 
 const LIST_BYTES: usize = 60 * 1024;
 
@@ -35,6 +35,29 @@ impl<T: Transport + 'static> Handler for Ops<T> {
             Request::TenantSuspend(id) => self.switch(id, State::Active, State::Suspended).await,
             Request::TenantResume(id) => self.switch(id, State::Suspended, State::Active).await,
             Request::PoolSet(spec) => self.pool(spec).await,
+            Request::QueueList { tenant, from } => self.queues(tenant, from).await,
+            Request::QueueRetry { tenant, queue } => {
+                let done = self.node.queue_retry(tenant, queue).await;
+                queued(
+                    &format!("queue retry {tenant} {queue}"),
+                    tenant,
+                    queue,
+                    done,
+                )
+            }
+            Request::QueueRebind {
+                tenant,
+                queue,
+                pool,
+            } => {
+                let done = self.node.queue_rebind(tenant, queue, pool).await;
+                queued(
+                    &format!("queue rebind {tenant} {queue} {pool}"),
+                    tenant,
+                    queue,
+                    done,
+                )
+            }
         }
     }
 }
@@ -66,7 +89,7 @@ impl<T: Transport + 'static> Ops<T> {
             );
             (t.id, line)
         });
-        Reply::new(Code::Ok, listed(lines))
+        Reply::new(Code::Ok, listed(lines, None))
     }
 
     fn pools(&self, from: u32) -> Reply {
@@ -82,7 +105,36 @@ impl<T: Transport + 'static> Ops<T> {
                 format!("pool {} addresses {}\n", p.id, addresses.join(",")),
             )
         });
-        Reply::new(Code::Ok, listed(lines))
+        Reply::new(Code::Ok, listed(lines, None))
+    }
+
+    async fn queues(&self, tenant: u32, from: u32) -> Reply {
+        let known = self
+            .node
+            .table()
+            .tenant(tenant)
+            .is_some_and(|t| !t.state.deleted());
+        if !known {
+            return Reply::new(Code::NotFound, format!("tenant {tenant} not found"));
+        }
+        let page = match self.node.queue_list(tenant, from).await {
+            Ok(page) => page,
+            Err(refusal) => return refused(tenant, 0, refusal),
+        };
+        let lines = page.rows.iter().map(|row| {
+            let draining = if row.draining { " draining" } else { "" };
+            let line = format!(
+                "queue {} domain {} generation {} pool {} waiting {} in-flight {}{draining}\n",
+                row.id,
+                row.domain,
+                row.generation,
+                row.pool,
+                row.waiting.recipients,
+                row.waiting.in_flight,
+            );
+            (row.id, line)
+        });
+        Reply::new(Code::Ok, listed(lines, page.next))
     }
 
     async fn create(&self, spec: TenantSpec) -> Reply {
@@ -204,14 +256,56 @@ impl<T: Transport + 'static> Ops<T> {
     }
 }
 
-fn listed(lines: impl Iterator<Item = (u32, String)>) -> String {
+fn queued(command: &str, tenant: u32, queue: u32, done: Result<QueueDone, QueueRefusal>) -> Reply {
+    let reply = match done {
+        Ok(QueueDone::Retried(waiting)) => Reply::new(
+            Code::Ok,
+            format!("queue {queue} retry now, {waiting} recipients waiting\n"),
+        ),
+        Ok(QueueDone::Rebound(id)) => {
+            Reply::new(Code::Ok, format!("queue {queue} rebound, now queue {id}\n"))
+        }
+        Err(refusal) => refused(tenant, queue, refusal),
+    };
+    eprintln!(
+        "admin {command}: {:?} {}",
+        reply.code,
+        reply.text.trim_end()
+    );
+    reply
+}
+
+fn refused(tenant: u32, queue: u32, refusal: QueueRefusal) -> Reply {
+    match refusal {
+        QueueRefusal::NotFound => Reply::new(
+            Code::NotFound,
+            format!("queue {queue} of tenant {tenant} not found"),
+        ),
+        QueueRefusal::Tenant => Reply::new(Code::Refused, format!("tenant {tenant} is not active")),
+        QueueRefusal::Pool => Reply::new(
+            Code::Refused,
+            format!("pool not allowed for tenant {tenant}"),
+        ),
+        QueueRefusal::Draining => Reply::new(
+            Code::Refused,
+            format!("queue {queue} is draining into another queue"),
+        ),
+        QueueRefusal::Unanswered => Reply::new(Code::Failed, "a core did not answer"),
+        QueueRefusal::Failed(error) => Reply::new(Code::Failed, error.to_string()),
+    }
+}
+
+fn listed(lines: impl Iterator<Item = (u32, String)>, next: Option<u32>) -> String {
     let mut text = String::new();
     for (id, line) in lines {
         if text.len() + line.len() > LIST_BYTES {
             let _ = writeln!(text, "more from {id}");
-            break;
+            return text;
         }
         text.push_str(&line);
+    }
+    if let Some(next) = next {
+        let _ = writeln!(text, "more from {next}");
     }
     text
 }

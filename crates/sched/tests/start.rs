@@ -17,7 +17,8 @@ use rt::sim::{Config, Disk, Faults, Machine, SimDriver, Stalls, check};
 use rt::{JoinHandle, Runtime, sleep, spawn, timeout};
 use sched::{
     Answer, Answered, Attempt, Batched, Bounced, Clock, Draft, Keys, Kind, Limits, Meshes, Node,
-    OwnStats, Parts, Reason, Refusal, Running, Settings, Transport, Unsealable, Unwrapped,
+    OwnStats, Parts, QueueDone, QueueRefusal, Reason, Refusal, Running, Settings, Transport,
+    Unsealable, Unwrapped,
 };
 use spool::{Body, Head, HeadClear, Message, MessageId, SLICE, Slice};
 use store::{Client, DataFile, Options, SLOT_SIZE, Setup, boot};
@@ -1240,9 +1241,11 @@ fn node_exposes_the_transports_own_stats() {
     });
 }
 
-#[test]
-fn intake_refuses_what_the_rules_forbid() {
-    let seed = 5;
+fn on_two_cores<F, Fut>(seed: u64, check: F)
+where
+    F: FnOnce(Vec<Node<Simulated>>, u16) -> Fut + 'static,
+    Fut: Future<Output = ()> + 'static,
+{
     let driver = Rc::new(SimDriver::with_disk(seed, Config::default(), created(seed)));
     let world: Shared = Rc::default();
     let machine = Machine::new(Rc::clone(&driver), 3, Stalls::default());
@@ -1266,7 +1269,7 @@ fn intake_refuses_what_the_rules_forbid() {
     let shard = shards[0][0];
     machine.block_on(1, async move {
         ready(&checked[0]).await;
-        refusals(checked, shard).await;
+        check(checked, shard).await;
     });
     let client = booted.client;
     machine.block_on(0, async move {
@@ -1281,4 +1284,121 @@ fn intake_refuses_what_the_rules_forbid() {
         drop(client);
         drop(committer.await);
     });
+}
+
+#[test]
+fn intake_refuses_what_the_rules_forbid() {
+    on_two_cores(5, refusals);
+}
+
+async fn named(node: &Node<Simulated>, tenant: u32, pool: u32, address: &str) -> u32 {
+    let mut draft = node.draft(tenant, Some(pool)).expect("draft");
+    node.recipient(&mut draft, address).await.expect("named")
+}
+
+async fn queue_admin(nodes: Vec<Node<Simulated>>, _shard: u16) {
+    let node = &nodes[0];
+    let mut ones = Vec::new();
+    for domain in DOMAINS {
+        ones.push(named(node, 1, 1, &format!("a@{domain}")).await);
+    }
+    let two = named(node, 2, 1, "a@example.org").await;
+    let three = named(node, 3, 1, "a@b.example").await;
+    let cores: BTreeSet<u16> = ones
+        .iter()
+        .map(|q| sched::queue_core(*q, settings().naming.shards, 2))
+        .collect();
+    assert_eq!(cores.len(), 2);
+
+    let page = node.queue_list(1, 0).await.expect("list");
+    let listed: Vec<u32> = page.rows.iter().map(|r| r.id).collect();
+    let mut sorted = ones.clone();
+    sorted.sort_unstable();
+    assert_eq!(listed, sorted);
+    assert_eq!(page.next, None);
+    assert!(page.rows.iter().all(|r| r.generation == 1 && r.pool == 1));
+    let domains: BTreeSet<&str> = page.rows.iter().map(|r| &*r.domain).collect();
+    assert_eq!(domains, DOMAINS.into_iter().collect());
+    let later = node.queue_list(1, sorted[5]).await.expect("list");
+    assert_eq!(later.rows.len(), sorted.len() - 5);
+    let only = node.queue_list(2, 0).await.expect("list");
+    assert_eq!(only.rows.iter().map(|r| r.id).collect::<Vec<_>>(), [two]);
+    assert_eq!(node.queue_list(9, 0).await.expect("list").rows, []);
+
+    for queue in &ones {
+        assert_eq!(node.queue_retry(1, *queue).await, Ok(QueueDone::Retried(0)));
+        assert_eq!(
+            nodes[1].queue_retry(2, *queue).await,
+            Err(QueueRefusal::NotFound)
+        );
+        assert_eq!(
+            node.queue_rebind(2, *queue, 2).await,
+            Err(QueueRefusal::NotFound)
+        );
+    }
+    assert_eq!(node.queue_retry(1, two).await, Err(QueueRefusal::NotFound));
+    assert_eq!(
+        node.queue_retry(1, 999_999).await,
+        Err(QueueRefusal::NotFound)
+    );
+    assert_eq!(
+        node.queue_rebind(1, ones[0], 7).await,
+        Err(QueueRefusal::Pool)
+    );
+
+    let moved = ones[0];
+    let rebound = node.queue_rebind(1, moved, 2).await.expect("rebind");
+    assert_eq!(rebound, QueueDone::Rebound(moved));
+    let page = node.queue_list(1, moved).await.expect("list");
+    assert_eq!((page.rows[0].id, page.rows[0].pool), (moved, 2));
+    let other = named(node, 1, 1, &format!("b@{}", page.rows[0].domain)).await;
+    assert_ne!(other, moved);
+    assert_eq!(
+        node.queue_rebind(1, other, 2).await,
+        Ok(QueueDone::Rebound(moved))
+    );
+    let page = node.queue_list(1, other).await.expect("list");
+    assert!(page.rows[0].id == other && page.rows[0].draining);
+    assert_eq!(
+        node.queue_rebind(1, other, 1).await,
+        Err(QueueRefusal::Draining)
+    );
+    let page = node.queue_list(1, moved).await.expect("list");
+    assert_eq!((page.rows[0].id, page.rows[0].pool), (moved, 2));
+
+    node.write(tenant(3, 100, State::Suspended))
+        .await
+        .expect("suspend");
+    for core in &nodes {
+        while core
+            .table()
+            .tenant(3)
+            .is_some_and(|t| t.state == State::Active)
+        {
+            sleep(Duration::from_millis(1)).await;
+        }
+    }
+    assert_eq!(node.queue_retry(3, three).await, Err(QueueRefusal::Tenant));
+    assert_eq!(
+        node.queue_rebind(3, three, 2).await,
+        Err(QueueRefusal::Tenant)
+    );
+    assert_eq!(node.queue_list(3, 0).await.expect("list").rows.len(), 1);
+
+    node.delete_tenant(3).await.expect("delete");
+    for core in &nodes {
+        while !core.table().gone(3, 1) {
+            sleep(Duration::from_millis(1)).await;
+        }
+    }
+    assert_eq!(node.queue_list(3, 0).await.expect("list").rows, []);
+    assert_eq!(
+        node.queue_retry(3, three).await,
+        Err(QueueRefusal::NotFound)
+    );
+}
+
+#[test]
+fn admin_queue_commands_stay_inside_the_tenant() {
+    on_two_cores(6, queue_admin);
 }
