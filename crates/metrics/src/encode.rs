@@ -31,6 +31,21 @@ impl Board {
         if let Some(node) = self.node.as_deref().filter(|n| n.published().is_some()) {
             self.families(format, node.defs(), &[(String::new(), node)], out);
         }
+        if let Some(tenants) = self.tenants.as_ref().filter(|t| !t.ids.is_empty()) {
+            let width = tenants.ids.len();
+            let rows: Vec<(String, &Slab)> = (0..self.slabs.len())
+                .filter(|core| stamps[*core].is_some())
+                .flat_map(|core| {
+                    tenants.ids.iter().enumerate().map(move |(index, id)| {
+                        (
+                            format!("core=\"{core}\",tenant=\"{id}\""),
+                            &tenants.slabs[core * width + index],
+                        )
+                    })
+                })
+                .collect();
+            self.families(format, tenants.defs, &rows, out);
+        }
         self.header(
             out,
             UP,

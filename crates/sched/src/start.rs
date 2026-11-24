@@ -76,13 +76,14 @@ pub struct Links {
     steps: Ends<()>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Settings {
     pub node: u32,
     pub spool: spool::Limits,
     pub naming: Naming,
     pub sched: Config,
     pub budget: usize,
+    pub watched: Vec<u32>,
 }
 
 pub struct Parts<T> {
@@ -186,10 +187,8 @@ impl<T: Transport + 'static> Node<T> {
         while !table.borrow().loaded() {
             applied.wait().await;
         }
-        let loaded = {
-            let gone = |tenant, generation| table.borrow().gone(tenant, generation);
-            Queues::load(&core, settings.naming, &*parts.keys, &gone).await?
-        };
+        let gone = |tenant, generation| table.borrow().gone(tenant, generation);
+        let loaded = Queues::load(&core, settings.naming, &*parts.keys, &gone).await?;
         let found = system::load_all(&core, &*parts.keys, settings.naming.key).await?;
         let (spool, shards, pending) =
             spool::Spool::open(core, settings.node, settings.spool).await?;
@@ -230,6 +229,7 @@ impl<T: Transport + 'static> Node<T> {
             Rc::new(queues.clone()),
             parts.clock,
             settings.sched,
+            &settings.watched,
         );
         let restored = sched.use_node_config(&parts.keys, &table, &hook_reports, pending);
 
@@ -385,7 +385,7 @@ impl<T: Transport + 'static> Node<T> {
     }
 
     pub fn settings(&self) -> Settings {
-        self.inner.settings
+        self.inner.settings.clone()
     }
 
     pub fn restored(&self) -> u64 {

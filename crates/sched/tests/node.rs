@@ -65,6 +65,7 @@ struct World {
     restored: u64,
     spools: Vec<Spool>,
     closing: bool,
+    given: BTreeMap<u32, AnswerStats>,
 }
 
 type Shared = Rc<RefCell<World>>;
@@ -241,6 +242,7 @@ impl Transport for Simulated {
                     if matches!(answer, Answer::Delivered | Answer::Failed) {
                         *world.finals.entry(k).or_default() += 1;
                     }
+                    give(&mut world, attempt.queue / 10, answer);
                     Answered {
                         recipient: c.recipient,
                         answer,
@@ -260,6 +262,7 @@ impl Transport for Simulated {
                 if matches!(answer, Answer::Delivered | Answer::Failed) {
                     *world.finals.entry(k).or_default() += 1;
                 }
+                give(&mut world, attempt.queue / 10, answer);
                 let reply = if self.below(3) == 0 {
                     world.replies += 1;
                     vec![9; 24]
@@ -470,6 +473,7 @@ struct Session {
     deferred: u64,
     forgotten: u64,
     answers: AnswerStats,
+    tenants: BTreeMap<u32, AnswerStats>,
 }
 
 type Feed = (usize, Spool, Vec<u16>);
@@ -523,8 +527,15 @@ fn start_cores(
                 world: Rc::clone(&transport.world),
                 named: RefCell::default(),
             };
-            let (sched, done) =
-                Sched::start(ends, opened, transport, Rc::new(tens), clock, config());
+            let (sched, done) = Sched::start(
+                ends,
+                opened,
+                transport,
+                Rc::new(tens),
+                clock,
+                config(),
+                &WATCHED,
+            );
             sched.use_keys(Rc::new(Shredded));
             sched.restore(pending, |_| Some(1));
             (sched, done)
@@ -641,18 +652,52 @@ fn tally(scheds: &[Sched<Simulated>], finished: bool) -> Session {
         deferred: scheds.iter().map(|s| s.unopened_stats().deferred).sum(),
         forgotten: scheds.iter().map(|s| s.unopened_stats().forgotten).sum(),
         answers: answers(scheds),
+        tenants: WATCHED
+            .iter()
+            .map(|t| (*t, tenant_answers(scheds, *t)))
+            .filter(|(_, stats)| *stats != AnswerStats::default())
+            .collect(),
     }
 }
 
+const WATCHED: [u32; 4] = [0, 1, 2, 3];
+
 fn answers(scheds: &[Sched<Simulated>]) -> AnswerStats {
     let mut all = AnswerStats::default();
-    for stats in scheds.iter().map(Sched::answers) {
-        all.delivered += stats.delivered;
-        all.failed += stats.failed;
-        all.deferred += stats.deferred;
-        all.later += stats.later;
+    let mut split = AnswerStats::default();
+    for sched in scheds {
+        add(&mut all, sched.answers());
+        for tenant in WATCHED {
+            add(&mut split, sched.tenant_stats(tenant).answers);
+        }
+    }
+    assert_eq!(split, all, "tenant answers add up to the totals");
+    all
+}
+
+fn tenant_answers(scheds: &[Sched<Simulated>], tenant: u32) -> AnswerStats {
+    let mut all = AnswerStats::default();
+    for sched in scheds {
+        add(&mut all, sched.tenant_stats(tenant).answers);
     }
     all
+}
+
+fn give(world: &mut World, tenant: u32, answer: Answer) {
+    let stats = world.given.entry(tenant).or_default();
+    match answer {
+        Answer::Delivered => stats.delivered += 1,
+        Answer::Failed => stats.failed += 1,
+        Answer::Deferred(_) => stats.deferred += 1,
+        Answer::Unopened { .. } | Answer::Later(_) => stats.later += 1,
+    }
+}
+
+fn add(all: &mut AnswerStats, stats: AnswerStats) {
+    all.delivered += stats.delivered;
+    all.failed += stats.failed;
+    all.deferred += stats.deferred;
+    all.later += stats.later;
 }
 
 fn verify(seed: u64, world: &World) {
@@ -708,6 +753,11 @@ fn one_session(seed: u64) {
         "seed {seed}: final answers counted"
     );
     assert!(run.answers.delivered > 0 && run.answers.failed > 0 && run.answers.deferred > 0);
+    assert!(
+        run.answers.later > 0,
+        "seed {seed}: unopened answers counted"
+    );
+    assert_eq!(run.tenants, world.given, "seed {seed}: answers per tenant");
 }
 
 fn restart(seed: u64) {

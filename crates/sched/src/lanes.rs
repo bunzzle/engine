@@ -78,6 +78,7 @@ struct Tenant {
     due: VecDeque<QueueId>,
     queues: BTreeSet<QueueId>,
     in_ring: bool,
+    recipients: u64,
 }
 
 pub struct Lanes {
@@ -119,6 +120,10 @@ impl Lanes {
         self.recipients
     }
 
+    pub fn tenant_recipients(&self, tenant: u32) -> u64 {
+        self.tenants.get(&tenant).map_or(0, |t| t.recipients)
+    }
+
     pub fn entries(&self) -> usize {
         self.queues.values().map(|q| q.entries.len()).sum()
     }
@@ -157,8 +162,9 @@ impl Lanes {
             place: Place::Idle,
         });
         state.entries.insert((due, seq), entry);
-        let tenant = state.tenant;
-        self.tenants.entry(tenant).or_default().queues.insert(queue);
+        let tenant = self.tenants.entry(state.tenant).or_default();
+        tenant.queues.insert(queue);
+        tenant.recipients += u64::from(count);
         match state.place {
             Place::Timer(at) if due < at => {
                 self.timers.remove(&(at, queue));
@@ -281,6 +287,9 @@ impl Lanes {
         state.in_flight += count;
         self.active += count;
         self.recipients -= u64::from(count);
+        if let Some(tenant) = self.tenants.get_mut(&state.tenant) {
+            tenant.recipients -= u64::from(count);
+        }
         Some(Take {
             queue,
             tenant: state.tenant,

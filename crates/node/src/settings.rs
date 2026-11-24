@@ -44,6 +44,7 @@ pub struct Api {
 pub struct Metrics {
     pub listen: Vec<SocketAddr>,
     pub interval: Duration,
+    pub tenants: Vec<u32>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -484,8 +485,48 @@ fn metrics(mut table: Table, smtp: &[Listen], api: Option<&Api>) -> Result<Metri
         }
         None => Duration::from_secs(1),
     };
+    let tenants = match table.take("tenants") {
+        Some(entry) => tenants(&entry, &listen)?,
+        None => Vec::new(),
+    };
     table.finish()?;
-    Ok(Metrics { listen, interval })
+    Ok(Metrics {
+        listen,
+        interval,
+        tenants,
+    })
+}
+
+const METRIC_TENANTS: usize = 64;
+
+fn tenants(entry: &Entry, listen: &[SocketAddr]) -> Result<Vec<u32>, Error> {
+    let expected = || entry.error("must be an array of tenant ids");
+    let config::Value::Array(items) = entry.value() else {
+        return Err(expected());
+    };
+    if !items.is_empty() && !listen.iter().all(|a| private(a.ip())) {
+        return Err(
+            entry.error("needs every metrics `listen` address on loopback or a private network")
+        );
+    }
+    if items.len() > METRIC_TENANTS {
+        return Err(entry.error(format!("lists more than {METRIC_TENANTS} tenants")));
+    }
+    let mut out = Vec::with_capacity(items.len());
+    for item in items {
+        let config::Value::Int(number) = item else {
+            return Err(expected());
+        };
+        let id = u32::try_from(*number)
+            .ok()
+            .filter(|id| *id > 0)
+            .ok_or_else(|| entry.error(format!("must list ids between 1 and {}", u32::MAX)))?;
+        if out.contains(&id) {
+            return Err(entry.error("lists a tenant twice"));
+        }
+        out.push(id);
+    }
+    Ok(out)
 }
 
 fn addresses(
@@ -517,6 +558,13 @@ fn addresses(
 fn section(root: &mut Table, name: &str) -> Result<Table, Error> {
     root.table(name)
         .ok_or_else(|| Error::at(1, 1, format!("missing [{name}]")))
+}
+
+fn private(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => v4.is_loopback() || v4.is_private(),
+        IpAddr::V6(v6) => v6.is_loopback() || v6.is_unique_local(),
+    }
 }
 
 fn int<N: TryFrom<u64>>(entry: &Entry, min: u64, max: u64) -> Result<N, Error> {

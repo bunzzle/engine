@@ -614,6 +614,54 @@ fn key_ring_metrics_count_the_first_key_server_connect() {
 }
 
 #[test]
+fn listed_tenants_get_their_own_series() {
+    let driver = created(12);
+    let mut settings = config(7);
+    settings.metrics.as_mut().expect("metrics").tenants = vec![42, 5];
+    let node = booted(&driver, settings, CORES);
+    let machine = &node.machine;
+    machine.block_on(0, async {
+        drop(serving().await);
+        sleep(Duration::from_secs(2)).await;
+        let text = scrape("GET /metrics HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n").await;
+        assert!(
+            text.contains("# TYPE bunzzle_tenant_queue_recipients gauge\n"),
+            "{text}"
+        );
+        assert!(text.contains("# TYPE bunzzle_tenant_messages_accepted_total counter\n"));
+        for core in 0..CORES {
+            for tenant in [42, 5] {
+                let labels = format!("{{core=\"{core}\",tenant=\"{tenant}\"}}");
+                assert!(text.contains(&format!("bunzzle_tenant_queue_recipients{labels} 0\n")));
+                assert!(text.contains(&format!(
+                    "bunzzle_tenant_recipients_later_total{labels} 0\n"
+                )));
+            }
+        }
+        assert_eq!(
+            text.matches("tenant=\"").count(),
+            2 * 6 * usize::from(CORES)
+        );
+    });
+    stopped(&driver, node);
+}
+
+#[test]
+fn unlisted_tenants_add_no_series() {
+    let driver = created(13);
+    let node = booted(&driver, config(7), CORES);
+    let machine = &node.machine;
+    machine.block_on(0, async {
+        drop(serving().await);
+        sleep(Duration::from_secs(2)).await;
+        let text = scrape("GET /metrics HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n").await;
+        assert!(text.contains("bunzzle_core_up{core=\"0\"} 1\n"), "{text}");
+        assert!(!text.contains("bunzzle_tenant_"));
+    });
+    stopped(&driver, node);
+}
+
+#[test]
 fn a_silent_metrics_client_is_dropped() {
     let driver = created(10);
     let node = booted(&driver, config(7), CORES);

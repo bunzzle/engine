@@ -87,6 +87,34 @@ fn tenants_share_the_core_whatever_their_queue_count() {
 }
 
 #[test]
+fn waiting_recipients_are_counted_per_tenant() {
+    let mut lanes = Lanes::new(limits(1_000, 1_000, 30));
+    lanes.enqueue(1, 4, entry(1, 0..50), 0, 0);
+    lanes.enqueue(2, 4, entry(2, 0..10), 100, 0);
+    lanes.enqueue(3, 9, entry(3, 0..5), 0, 0);
+    assert_eq!(lanes.tenant_recipients(4), 60);
+    assert_eq!(lanes.tenant_recipients(9), 5);
+    assert_eq!(lanes.tenant_recipients(5), 0);
+    let take = lanes.next(0).expect("due");
+    let other = if take.tenant == 4 { 9 } else { 4 };
+    let before = if take.tenant == 4 { 60 } else { 5 };
+    assert_eq!(
+        lanes.tenant_recipients(take.tenant),
+        before - u64::from(take.count)
+    );
+    assert_eq!(
+        lanes.tenant_recipients(other),
+        if other == 4 { 60 } else { 5 }
+    );
+    while let Some(take) = lanes.next(1_000) {
+        lanes.done(take.queue, take.count, 1_000);
+    }
+    lanes.done(take.queue, take.count, 1_000);
+    assert_eq!(lanes.tenant_recipients(4), 0);
+    assert_eq!(lanes.tenant_recipients(9), 0);
+}
+
+#[test]
 fn retry_now_makes_waiting_entries_due() {
     let mut lanes = Lanes::new(Limits::default());
     lanes.enqueue(3, 9, entry(1, 0..2), 3_600_000, 0);
@@ -145,6 +173,7 @@ fn model(seed: u64) {
     let mut taken: BTreeMap<(MessageId, u32), u32> = BTreeMap::new();
     let mut open: Vec<Take> = Vec::new();
     let mut in_flight: BTreeMap<u32, u32> = BTreeMap::new();
+    let mut waiting = [0u64; 3];
     let mut now = 0;
     let mut message = 0;
     for _ in 0..3_000 {
@@ -159,6 +188,7 @@ fn model(seed: u64) {
                 for &r in &picked {
                     queue_due.insert((id(message), r), at);
                 }
+                waiting[queue as usize % 3] += picked.len() as u64;
                 let entry = Entry {
                     message: id(message),
                     recipients: ranges(picked),
@@ -168,6 +198,7 @@ fn model(seed: u64) {
             }
             3..=5 => {
                 if let Some(take) = lanes.next(now) {
+                    waiting[take.queue as usize % 3] -= u64::from(take.count);
                     let queue = in_flight.entry(take.queue).or_insert(0);
                     *queue += take.count;
                     assert!(*queue <= limits.queue, "seed {seed}: queue cap");
@@ -198,6 +229,13 @@ fn model(seed: u64) {
             _ => {}
         }
         assert!(lanes.active() <= limits.active, "seed {seed}: active");
+        for (tenant, expected) in (0..).zip(waiting) {
+            assert_eq!(
+                lanes.tenant_recipients(tenant),
+                expected,
+                "seed {seed}: tenant {tenant} waiting"
+            );
+        }
     }
     now += 10_000;
     loop {
@@ -217,6 +255,7 @@ fn model(seed: u64) {
     assert!(taken.values().all(|n| *n == 1), "seed {seed}: taken twice");
     assert_eq!(lanes.bytes(), 0);
     assert_eq!(lanes.active(), 0);
+    assert!((0..3).all(|t| lanes.tenant_recipients(t) == 0));
 }
 
 #[test]

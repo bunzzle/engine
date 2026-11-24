@@ -137,3 +137,30 @@ fn histogram_slots_ignore_scalar_access() {
     assert_eq!(slab.get(1), Some(3));
     slab.observe(7, 5);
 }
+
+#[test]
+fn tenant_sets_are_checked() {
+    static TENANT: [Def; 1] = [def("tenant_sent", Kind::Counter)];
+    static CLASH: [Def; 1] = [def("sent", Kind::Gauge)];
+    static NODE: [Def; 1] = [def("tenant_sent", Kind::Gauge)];
+    let board = || Board::new("bunzzle", &TWO, 2).expect("valid");
+    assert_eq!(
+        board().with_tenants(&TENANT, &[3, 3]).err(),
+        Some(Invalid::Tenants)
+    );
+    assert_eq!(
+        board().with_tenants(&CLASH, &[3]).err(),
+        Some(Invalid::Duplicate("sent"))
+    );
+    let node = Arc::new(Slab::new(&NODE).expect("valid"));
+    let tenants = board().with_tenants(&TENANT, &[3]).expect("valid");
+    assert_eq!(
+        tenants.with_node(Arc::clone(&node)).err(),
+        Some(Invalid::Duplicate("tenant_sent"))
+    );
+    let noded = board().with_node(node).expect("valid");
+    assert_eq!(
+        noded.with_tenants(&TENANT, &[3]).err(),
+        Some(Invalid::Duplicate("tenant_sent"))
+    );
+}

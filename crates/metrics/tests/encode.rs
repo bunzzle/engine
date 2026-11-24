@@ -163,3 +163,53 @@ fn an_unpublished_node_slab_is_left_out() {
     assert!(!out.contains("sync_seconds"));
     assert!(!out.contains("bunzzle_failed"));
 }
+
+static TENANT: [Def; 2] = [
+    Def {
+        name: "tenant_sent",
+        help: "Messages of the tenant sent",
+        kind: Kind::Counter,
+    },
+    Def {
+        name: "tenant_queued",
+        help: "Recipients of the tenant queued",
+        kind: Kind::Gauge,
+    },
+];
+
+#[test]
+fn tenant_families_follow_published_cores() {
+    let board = board().with_tenants(&TENANT, &[40, 7]).expect("valid");
+    assert_eq!(board.tenants(), &[40, 7]);
+    assert!(board.tenant_slab(0, 2).is_none());
+    assert!(board.tenant_slab(3, 0).is_none());
+    board.tenant_slab(0, 0).expect("slab").set(0, 3);
+    board.tenant_slab(1, 1).expect("slab").set(1, 9);
+    board.tenant_slab(2, 0).expect("slab").set(0, 4);
+    let mut out = String::new();
+    board.render(Format::Text, 3_250, 2_500, &mut out);
+    let expected = "\
+# HELP bunzzle_tenant_sent_total Messages of the tenant sent
+# TYPE bunzzle_tenant_sent_total counter
+bunzzle_tenant_sent_total{core=\"0\",tenant=\"40\"} 3
+bunzzle_tenant_sent_total{core=\"0\",tenant=\"7\"} 0
+bunzzle_tenant_sent_total{core=\"1\",tenant=\"40\"} 0
+bunzzle_tenant_sent_total{core=\"1\",tenant=\"7\"} 0
+# HELP bunzzle_tenant_queued Recipients of the tenant queued
+# TYPE bunzzle_tenant_queued gauge
+bunzzle_tenant_queued{core=\"0\",tenant=\"40\"} 0
+bunzzle_tenant_queued{core=\"0\",tenant=\"7\"} 0
+bunzzle_tenant_queued{core=\"1\",tenant=\"40\"} 0
+bunzzle_tenant_queued{core=\"1\",tenant=\"7\"} 9
+# HELP bunzzle_core_up";
+    assert!(out.contains(expected), "{out}");
+    assert!(!out.contains("core=\"2\",tenant"));
+}
+
+#[test]
+fn no_tenants_means_no_tenant_families() {
+    let board = board().with_tenants(&TENANT, &[]).expect("valid");
+    let mut out = String::new();
+    board.render(Format::Text, 3_250, 2_500, &mut out);
+    assert!(!out.contains("tenant"));
+}

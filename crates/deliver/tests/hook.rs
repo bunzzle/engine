@@ -282,6 +282,7 @@ fn settings_named(key: [u8; 16]) -> Settings {
         },
         sched: sched::Config::new(u32::from(SHARDS)),
         budget: usize::try_from(OPTIONS.region_size / 2).expect("fits"),
+        watched: Vec::new(),
     }
 }
 

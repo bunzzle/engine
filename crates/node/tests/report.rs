@@ -77,6 +77,7 @@ fn settings() -> Settings {
         },
         sched: sched::Config::new(u32::from(SHARDS)),
         budget: usize::try_from(OPTIONS.region_size / 2).expect("fits"),
+        watched: Vec::new(),
     }
 }
 

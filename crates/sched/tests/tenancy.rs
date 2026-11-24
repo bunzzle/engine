@@ -82,6 +82,7 @@ fn enqueue_with_another_tenant_or_generation_is_refused() {
             Rc::new(Held),
             clock,
             sched::Config::new(2),
+            &[],
         );
         let arrival = |tenant, generation, queue| Arrival {
             id: MessageId {

@@ -57,7 +57,10 @@ impl Plan {
         guard: [u8; 16],
     ) -> Self {
         let cores = config.cores;
-        let board = config.metrics.as_ref().map(|_| scrape::board(cores));
+        let board = config
+            .metrics
+            .as_ref()
+            .map(|m| scrape::board(cores, &m.tenants));
         Self {
             config,
             certs,
@@ -366,6 +369,11 @@ async fn start<T: Transport + 'static>(
         },
         sched: sched::Config::new(shards),
         budget: usize::try_from(superblock.region_size() / 2).unwrap_or(usize::MAX),
+        watched: config
+            .metrics
+            .as_ref()
+            .map(|m| m.tenants.clone())
+            .unwrap_or_default(),
     };
     let links = plan.meshes.take(index).expect("links of each core");
     let keys = Rc::new(Keyring::new(

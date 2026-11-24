@@ -24,19 +24,30 @@ const SESSIONS: usize = 16;
 const REQUESTS: u32 = 100;
 
 macro_rules! catalog {
-    ($($id:ident: $kind:ident, $name:literal, $help:literal;)*) => {
+    ($enum:ident, $list:ident; $($id:ident: $kind:ident, $name:literal, $help:literal;)*) => {
         #[derive(Clone, Copy)]
-        enum Id {
+        enum $enum {
             $($id,)*
         }
 
-        pub(crate) static CATALOG: &[Def] = &[
+        pub(crate) static $list: &[Def] = &[
             $(Def { name: $name, help: $help, kind: Kind::$kind },)*
         ];
     };
 }
 
 catalog! {
+    TenantId, TENANT_CATALOG;
+    Queued: Gauge, "tenant_queue_recipients", "Recipients of the tenant waiting in delivery lanes";
+    Accepted: Counter, "tenant_messages_accepted", "Messages of the tenant accepted into the spool";
+    Delivered: Counter, "tenant_recipients_delivered", "Recipient attempts of the tenant answered as delivered";
+    Failed: Counter, "tenant_recipients_failed", "Recipient attempts of the tenant answered as failed";
+    Deferred: Counter, "tenant_recipients_deferred", "Recipient attempts of the tenant answered as deferred";
+    Later: Counter, "tenant_recipients_later", "Recipient attempts of the tenant put back for later";
+}
+
+catalog! {
+    Id, CATALOG;
     QueueRecipients: Gauge, "queue_recipients", "Recipients waiting in delivery lanes";
     AttemptsOverdue: Gauge, "attempts_overdue", "Delivery attempts running past their bound";
     MessagesExpired: Counter, "messages_expired", "Messages expired before delivery";
@@ -123,10 +134,11 @@ catalog! {
     SystemRecordsFailed: Counter, "system_records_failed", "System record writes that failed";
 }
 
-pub(crate) fn board(cores: u16) -> Arc<Board> {
+pub(crate) fn board(cores: u16, tenants: &[u32]) -> Arc<Board> {
     Arc::new(
         Board::new(PREFIX, CATALOG, cores)
             .and_then(|board| board.with_node(store::metrics_slab()))
+            .and_then(|board| board.with_tenants(TENANT_CATALOG, tenants))
             .expect("metrics catalog"),
     )
 }
@@ -223,6 +235,23 @@ impl<T: Transport + 'static> Sources<'_, T> {
         set(Id::SearchBlocks, search.blocks);
         set(Id::SystemRecordsFailed, self.node.system_records().failed);
     }
+
+    fn write_tenants(&self, board: &Board, core: u16) {
+        let sched = self.node.sched();
+        for (index, tenant) in board.tenants().iter().enumerate() {
+            let Some(slab) = board.tenant_slab(core, index) else {
+                continue;
+            };
+            let set = |id: TenantId, value: u64| slab.set(id as usize, value);
+            let stats = sched.tenant_stats(*tenant);
+            set(TenantId::Queued, stats.queued);
+            set(TenantId::Accepted, stats.accepted);
+            set(TenantId::Delivered, stats.answers.delivered);
+            set(TenantId::Failed, stats.answers.failed);
+            set(TenantId::Deferred, stats.answers.deferred);
+            set(TenantId::Later, stats.answers.later);
+        }
+    }
 }
 
 impl<T> Sources<'_, T> {
@@ -270,9 +299,16 @@ impl<T> Sources<'_, T> {
     }
 }
 
-async fn publish<T: Transport + 'static>(slab: &Slab, interval: Duration, sources: Sources<'_, T>) {
+async fn publish<T: Transport + 'static>(
+    board: &Board,
+    core: u16,
+    slab: &Slab,
+    interval: Duration,
+    sources: Sources<'_, T>,
+) {
     loop {
         sources.write(slab);
+        sources.write_tenants(board, core);
         slab.publish(wall_ms());
         sleep(interval).await;
     }
@@ -285,7 +321,7 @@ pub(crate) fn publishing<'a, T: Transport + 'static>(
 ) -> Option<impl Future<Output = ()> + 'a> {
     let (board, settings) = metrics?;
     let slab = board.slab(core)?;
-    Some(publish(slab, settings.interval, sources))
+    Some(publish(board, core, slab, settings.interval, sources))
 }
 
 pub(crate) fn listeners(
