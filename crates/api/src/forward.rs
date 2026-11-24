@@ -442,3 +442,174 @@ impl Source for Remote {
         self.inbound.secure()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::cell::Cell;
+    use std::rc::Rc;
+    use std::time::Duration;
+
+    use control::Grant;
+    use http::{Framing, Headers, Request, Status};
+    use rt::sim::{Config, Machine, SimDriver, Stalls};
+    use rt::{Mesh, sleep, spawn};
+
+    use super::{Ahead, Back, Forwarder, Link, Open};
+    use crate::server::Route;
+
+    struct Held(Rc<Cell<bool>>);
+
+    impl Drop for Held {
+        fn drop(&mut self) {
+            self.0.set(true);
+        }
+    }
+
+    struct Waiting {
+        machine: Machine,
+        owner: Rc<Forwarder>,
+        link: Link,
+        dropped: Rc<Cell<bool>>,
+    }
+
+    fn open(method: &str) -> Open {
+        Open {
+            route: Route::Status,
+            request: Request {
+                method: method.into(),
+                path: "/v1/messages/m".into(),
+                query: None,
+                headers: Headers::default(),
+                body: Framing::None,
+                expect: false,
+                close: false,
+            },
+            grant: Grant {
+                access: 1,
+                tenant: 1,
+                generation: 1,
+                pool: 0,
+            },
+            id: "r1".into(),
+            secure: false,
+            shard: 1,
+        }
+    }
+
+    async fn until(what: impl Fn() -> bool) {
+        for _ in 0..1000 {
+            if what() {
+                return;
+            }
+            sleep(Duration::from_millis(1)).await;
+        }
+        panic!("not reached");
+    }
+
+    fn aborted_while_waiting(method: &'static str) -> Waiting {
+        let machine = Machine::new(
+            Rc::new(SimDriver::new(7, Config::default())),
+            2,
+            Stalls::default(),
+        );
+        let mesh = Mesh::new(2);
+        let front = mesh.take(0).expect("ends");
+        let owner = mesh.take(1).expect("ends");
+        let dropped = Rc::new(Cell::new(false));
+        let started = Rc::new(Cell::new(false));
+        let (held, began) = (Rc::clone(&dropped), Rc::clone(&started));
+        let owner = machine.block_on(1, async move {
+            let (owner, done) = Forwarder::start(owner);
+            drop(done);
+            owner.serve_with(Box::new(move |inbound, open| {
+                let abortable = open.request.method == "GET";
+                let (held, began) = (Held(Rc::clone(&held)), Rc::clone(&began));
+                spawn(async move {
+                    let forwarder = Rc::clone(&inbound.forwarder);
+                    let work = async move {
+                        let _held = held;
+                        began.set(true);
+                        std::future::pending::<()>().await;
+                    };
+                    forwarder
+                        .until_stopped(inbound.key(), abortable, work)
+                        .await;
+                    drop(inbound);
+                })
+            }));
+            owner
+        });
+        let watched = Rc::clone(&owner);
+        let link = machine.block_on(0, async move {
+            let (front, done) = Forwarder::start(front);
+            drop(done);
+            let link = front.open(1, open(method));
+            until(|| started.get()).await;
+            assert_eq!(watched.waiting.borrow().len(), 1);
+            link.send(Ahead::Abort);
+            link
+        });
+        Waiting {
+            machine,
+            owner,
+            link,
+            dropped,
+        }
+    }
+
+    async fn unavailable(link: Link) {
+        link.reply().await;
+        let Some(Back::Reply(reply)) = link.pipe().try_take() else {
+            panic!("no reply");
+        };
+        assert_eq!(reply.status(), Status::UNAVAILABLE);
+    }
+
+    #[test]
+    fn an_abort_ends_a_forwarded_read_already_waiting_on_the_owner() {
+        let Waiting {
+            machine,
+            owner,
+            link,
+            dropped,
+        } = aborted_while_waiting("GET");
+        let watched = Rc::clone(&owner);
+        machine.block_on(0, async move {
+            unavailable(link).await;
+            assert!(dropped.get());
+            until(|| watched.serving() == 0).await;
+        });
+        assert!(owner.aborted.borrow().is_empty());
+        assert!(owner.waiting.borrow().is_empty());
+        assert!(owner.inbound.borrow().is_empty());
+    }
+
+    #[test]
+    fn an_abort_leaves_a_forwarded_write_running_until_close() {
+        let Waiting {
+            machine,
+            owner,
+            link,
+            dropped,
+        } = aborted_while_waiting("POST");
+        let (watched, held) = (Rc::clone(&owner), Rc::clone(&dropped));
+        let link = machine.block_on(0, async move {
+            sleep(Duration::from_secs(5)).await;
+            assert!(!held.get());
+            assert_eq!(watched.serving(), 1);
+            assert!(!link.replied());
+            link
+        });
+        let closing = Rc::clone(&owner);
+        machine.block_on(1, async move {
+            closing.close(Duration::from_millis(100)).await;
+        });
+        machine.block_on(0, async move {
+            unavailable(link).await;
+        });
+        assert!(dropped.get());
+        assert_eq!(owner.serving(), 0);
+        assert!(owner.aborted.borrow().is_empty());
+        assert!(owner.waiting.borrow().is_empty());
+    }
+}
