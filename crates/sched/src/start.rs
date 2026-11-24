@@ -466,18 +466,36 @@ impl<T: Transport + 'static> Node<T> {
     }
 
     pub async fn write(&self, object: Object) -> Result<Update, Error> {
+        let node = self.clone();
+        spawn(async move {
+            let held = node.hold()?;
+            node.write_object(held, object).await
+        })
+        .await
+    }
+
+    pub async fn write_with<E, F>(&self, build: F) -> Result<Update, E>
+    where
+        E: From<Error> + 'static,
+        F: FnOnce(&Table) -> Result<Object, E> + 'static,
+    {
+        let node = self.clone();
+        spawn(async move {
+            let held = node.hold()?;
+            let object = build(&node.table())?;
+            node.write_object(held, object).await.map_err(E::from)
+        })
+        .await
+    }
+
+    async fn write_object(&self, mut held: Held<'_>, object: Object) -> Result<Update, Error> {
         if matches!(
             object,
             Object::Dkim(_) | Object::Access(_) | Object::Domain(_) | Object::Hook(_)
         ) {
             return Err(control::Error::Invalid("kind").into());
         }
-        let node = self.clone();
-        spawn(async move { node.write_held(object).await }).await
-    }
-
-    async fn write_held(&self, object: Object) -> Result<Update, Error> {
-        let mut held = self.hold()?;
+        object.check()?;
         self.create_keys(&object).await?;
         let update = held.writer().write(object).await?;
         self.apply(&update);

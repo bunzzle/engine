@@ -5,18 +5,74 @@ use std::process::ExitCode;
 use std::rc::Rc;
 use std::time::Duration;
 
-use admin::{Code, Reply, Request};
+use admin::{Code, PoolSpec, Reply, Request, TenantSpec};
 use rt::{Native, Runtime};
 
-pub const USAGE: &str = "usage: bunzzle admin <config> status";
+pub const USAGE: &str = "usage: bunzzle admin <config> status
+       bunzzle admin <config> tenant list [from <id>]
+       bunzzle admin <config> tenant create <id> <pool>[,<pool>...] [rate=<n>] [burst=<n>] [connections=<n>] [queued=<n>]
+       bunzzle admin <config> tenant suspend <id>
+       bunzzle admin <config> tenant resume <id>
+       bunzzle admin <config> pool list [from <id>]
+       bunzzle admin <config> pool set <id> <ip>=<weight>[,<ip>=<weight>...]";
 
-const WAIT: Duration = Duration::from_secs(30);
+const MAX_ITEMS: usize = 255;
+
+const WAIT: Duration = Duration::from_secs(90);
 
 pub fn parse(args: &[String]) -> Option<(&str, Request)> {
-    match args {
-        [config, command] if command == "status" => Some((config, Request::Status)),
-        _ => None,
+    let (config, rest) = args.split_first()?;
+    let words: Vec<&str> = rest.iter().map(String::as_str).collect();
+    let request = match words.as_slice() {
+        ["status"] => Request::Status,
+        ["tenant", "list"] => Request::TenantList(0),
+        ["tenant", "list", "from", id] => Request::TenantList(id.parse().ok()?),
+        ["pool", "list"] => Request::PoolList(0),
+        ["pool", "list", "from", id] => Request::PoolList(id.parse().ok()?),
+        ["tenant", "suspend", id] => Request::TenantSuspend(id.parse().ok()?),
+        ["tenant", "resume", id] => Request::TenantResume(id.parse().ok()?),
+        ["tenant", "create", id, pools, options @ ..] => {
+            Request::TenantCreate(tenant(id, pools, options)?)
+        }
+        ["pool", "set", id, addresses] => Request::PoolSet(PoolSpec {
+            id: id.parse().ok()?,
+            addresses: list(addresses, |item| {
+                let (ip, weight) = item.split_once('=')?;
+                Some((ip.parse().ok()?, weight.parse().ok()?))
+            })?,
+        }),
+        _ => return None,
+    };
+    Some((config, request))
+}
+
+fn tenant(id: &str, pools: &str, options: &[&str]) -> Option<TenantSpec> {
+    let mut spec = TenantSpec {
+        id: id.parse().ok()?,
+        pools: list(pools, |pool| pool.parse().ok())?,
+        ..TenantSpec::default()
+    };
+    let mut seen = Vec::new();
+    for option in options {
+        let (name, value) = option.split_once('=')?;
+        if seen.contains(&name) {
+            return None;
+        }
+        seen.push(name);
+        match name {
+            "rate" => spec.rate = value.parse().ok()?,
+            "burst" => spec.burst = value.parse().ok()?,
+            "connections" => spec.connections = value.parse().ok()?,
+            "queued" => spec.queued = value.parse().ok()?,
+            _ => return None,
+        }
     }
+    Some(spec)
+}
+
+fn list<T>(text: &str, item: impl Fn(&str) -> Option<T>) -> Option<Vec<T>> {
+    let items: Vec<T> = text.split(',').map(item).collect::<Option<_>>()?;
+    (items.len() <= MAX_ITEMS).then_some(items)
 }
 
 pub fn exit(reply: &Reply) -> ExitCode {
@@ -55,7 +111,7 @@ mod tests {
     use std::thread;
     use std::time::Duration;
 
-    use admin::{Code, Handler, Reply, Request};
+    use admin::{Code, Handler, PoolSpec, Reply, Request, TenantSpec};
     use rt::{Native, Runtime, UnixListener, sleep, yield_now};
 
     use super::{exit, parse, run};
@@ -111,16 +167,84 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    fn args(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| (*s).to_owned()).collect()
+    }
+
+    fn parsed(list: &[&str]) -> Option<Request> {
+        let mut all = vec!["/etc/bunzzle.toml"];
+        all.extend_from_slice(list);
+        parse(&args(&all)).map(|(config, request)| {
+            assert_eq!(config, "/etc/bunzzle.toml");
+            request
+        })
+    }
+
     #[test]
-    fn parses_status_only() {
-        let args = |list: &[&str]| list.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+    fn parses_every_command() {
+        assert_eq!(parsed(&["status"]), Some(Request::Status));
+        assert_eq!(parsed(&["tenant", "list"]), Some(Request::TenantList(0)));
         assert_eq!(
-            parse(&args(&["/etc/bunzzle.toml", "status"])),
-            Some(("/etc/bunzzle.toml", Request::Status))
+            parsed(&["tenant", "list", "from", "9"]),
+            Some(Request::TenantList(9))
         );
-        assert_eq!(parse(&args(&["/etc/bunzzle.toml"])), None);
-        assert_eq!(parse(&args(&["/etc/bunzzle.toml", "other"])), None);
-        assert_eq!(parse(&args(&["/etc/bunzzle.toml", "status", "x"])), None);
+        assert_eq!(parsed(&["pool", "list"]), Some(Request::PoolList(0)));
+        assert_eq!(
+            parsed(&["pool", "list", "from", "3"]),
+            Some(Request::PoolList(3))
+        );
+        assert_eq!(
+            parsed(&["tenant", "suspend", "7"]),
+            Some(Request::TenantSuspend(7))
+        );
+        assert_eq!(
+            parsed(&["tenant", "resume", "7"]),
+            Some(Request::TenantResume(7))
+        );
+        assert_eq!(
+            parsed(&["tenant", "create", "7", "2,1", "queued=10", "connections=3"]),
+            Some(Request::TenantCreate(TenantSpec {
+                id: 7,
+                pools: vec![2, 1],
+                connections: 3,
+                queued: 10,
+                ..TenantSpec::default()
+            }))
+        );
+        assert_eq!(
+            parsed(&["pool", "set", "1", "192.0.2.1=1,2001:db8::1=3"]),
+            Some(Request::PoolSet(PoolSpec {
+                id: 1,
+                addresses: vec![
+                    ("192.0.2.1".parse().expect("ip"), 1),
+                    ("2001:db8::1".parse().expect("ip"), 3),
+                ],
+            }))
+        );
+    }
+
+    #[test]
+    fn refuses_bad_commands() {
+        for bad in [
+            &[][..],
+            &["status", "x"],
+            &["other"],
+            &["tenant", "suspend", "x"],
+            &["tenant", "suspend", "-1"],
+            &["tenant", "create", "7"],
+            &["tenant", "create", "7", "1,x"],
+            &["tenant", "create", "7", "1", "rate"],
+            &["tenant", "create", "7", "1", "colour=3"],
+            &["tenant", "create", "7", "1", "rate=1", "rate=2"],
+            &["pool", "set", "1", "192.0.2.1"],
+            &["pool", "set", "1", "192.0.2.1=70000"],
+            &["pool", "set", "1", "host=1"],
+        ] {
+            assert_eq!(parsed(bad), None, "{bad:?}");
+        }
+        let many: Vec<String> = (0..256).map(|n| n.to_string()).collect();
+        assert_eq!(parsed(&["tenant", "create", "7", &many.join(",")]), None);
+        assert_eq!(parse(&[]), None);
     }
 
     #[test]

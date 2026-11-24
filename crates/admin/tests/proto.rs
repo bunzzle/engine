@@ -1,4 +1,4 @@
-use admin::{Code, Error, Frames, MAX_FRAME, Reply, Request, VERSION};
+use admin::{Code, Error, Frames, MAX_FRAME, PoolSpec, Reply, Request, TenantSpec, VERSION};
 
 fn body(frame: &[u8]) -> Vec<u8> {
     let mut frames = Frames::default();
@@ -89,4 +89,68 @@ fn random_input_never_panics() {
             }
         }
     }
+}
+
+#[test]
+fn every_request_round_trips() {
+    let requests = [
+        Request::Status,
+        Request::TenantList(7),
+        Request::PoolList(0),
+        Request::TenantSuspend(u32::MAX),
+        Request::TenantResume(7),
+        Request::TenantCreate(TenantSpec {
+            id: 7,
+            pools: vec![3, 1, 2],
+            rate: 10,
+            burst: 20,
+            connections: 5,
+            queued: u64::MAX,
+        }),
+        Request::TenantCreate(TenantSpec::default()),
+        Request::PoolSet(PoolSpec {
+            id: 1,
+            addresses: vec![
+                ("192.0.2.1".parse().expect("ip"), 1),
+                ("2001:db8::1".parse().expect("ip"), u16::MAX),
+            ],
+        }),
+        Request::PoolSet(PoolSpec {
+            id: 2,
+            addresses: Vec::new(),
+        }),
+    ];
+    for request in requests {
+        assert_eq!(Request::decode(&body(&request.encode())), Ok(request));
+    }
+}
+
+#[test]
+fn short_long_or_odd_fields_are_refused() {
+    let create = body(
+        &Request::TenantCreate(TenantSpec {
+            id: 7,
+            pools: vec![1],
+            ..TenantSpec::default()
+        })
+        .encode(),
+    );
+    for cut in 2..create.len() {
+        assert_eq!(Request::decode(&create[..cut]), Err(Error::Body), "{cut}");
+    }
+    let mut long = create.clone();
+    long.push(0);
+    assert_eq!(Request::decode(&long), Err(Error::Body));
+    let pool = body(
+        &Request::PoolSet(PoolSpec {
+            id: 1,
+            addresses: vec![("192.0.2.1".parse().expect("ip"), 1)],
+        })
+        .encode(),
+    );
+    let mut odd = pool.clone();
+    odd[7] = 5;
+    assert_eq!(Request::decode(&odd), Err(Error::Body));
+    assert_eq!(Request::decode(&[VERSION, 4, 0, 0, 0]), Err(Error::Body));
+    assert_eq!(Request::decode(&[VERSION, 8]), Err(Error::Command));
 }

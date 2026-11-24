@@ -715,3 +715,117 @@ fn the_admin_socket_answers_status_on_the_control_core() {
         assert!(refused.is_err());
     });
 }
+
+async fn ask(request: admin::Request) -> (admin::Code, String) {
+    let reply = admin::call(Path::new(ADMIN), UID, &request, WAIT)
+        .await
+        .expect("reply");
+    (reply.code, reply.text)
+}
+
+fn tenant(id: u32, pools: &[u32]) -> admin::Request {
+    admin::Request::TenantCreate(admin::TenantSpec {
+        id,
+        pools: pools.to_vec(),
+        queued: 100,
+        ..admin::TenantSpec::default()
+    })
+}
+
+#[test]
+fn admin_creates_suspends_and_resumes_tenants() {
+    use admin::Code::{NotFound, Ok, Refused};
+    use admin::Request::{PoolList, PoolSet, TenantList, TenantResume, TenantSuspend};
+    let driver = created(22);
+    let extra = format!("[admin]\nsocket = \"{ADMIN}\"\n");
+    let node = booted(&driver, config_with(7, &extra), CORES);
+    node.machine.block_on(0, async move {
+        drop(serving().await);
+        let (code, text) = ask(tenant(5, &[1])).await;
+        assert_eq!((code, text.as_str()), (NotFound, "pool 1 not found"));
+        let pool = admin::PoolSpec {
+            id: 1,
+            addresses: vec![("192.0.2.1".parse().expect("ip"), 1)],
+        };
+        assert_eq!(ask(PoolSet(pool)).await.0, Ok);
+        let bad = admin::PoolSpec {
+            id: 2,
+            addresses: vec![("192.0.2.2".parse().expect("ip"), 0)],
+        };
+        assert_eq!(ask(PoolSet(bad)).await, (Refused, "invalid addresses".into()));
+        let twice = admin::PoolSpec {
+            id: 2,
+            addresses: vec![
+                ("192.0.2.2".parse().expect("ip"), 1),
+                ("::ffff:192.0.2.2".parse().expect("ip"), 1),
+            ],
+        };
+        assert_eq!(ask(PoolSet(twice)).await, (Refused, "invalid addresses".into()));
+        let unspecified = admin::PoolSpec {
+            id: 2,
+            addresses: vec![("::".parse().expect("ip"), 1)],
+        };
+        assert_eq!(ask(PoolSet(unspecified)).await.0, Refused);
+        let mapped = admin::PoolSpec {
+            id: 2,
+            addresses: vec![("::ffff:192.0.2.3".parse().expect("ip"), 2)],
+        };
+        assert_eq!(ask(PoolSet(mapped)).await.0, Ok);
+        assert_eq!(
+            ask(PoolList(0)).await.1,
+            "pool 1 addresses 192.0.2.1=1\npool 2 addresses 192.0.2.3=2\n"
+        );
+        assert_eq!(ask(PoolList(2)).await.1, "pool 2 addresses 192.0.2.3=2\n");
+
+        assert_eq!(ask(tenant(5, &[1])).await.0, Ok);
+        assert_eq!(ask(tenant(6, &[1])).await.0, Ok);
+        assert_eq!(
+            ask(tenant(5, &[1])).await,
+            (Ok, "tenant 5 exists with this spec".into())
+        );
+        assert_eq!(ask(tenant(5, &[2])).await, (Refused, "tenant 5 exists".into()));
+        assert_eq!(ask(tenant(8, &[1, 1])).await, (Refused, "invalid pools".into()));
+        assert_eq!(ask(tenant(0, &[1])).await, (Refused, "invalid tenant id".into()));
+        assert_eq!(ask(tenant(9, &[])).await, (Refused, "invalid pools".into()));
+
+        assert_eq!(ask(TenantSuspend(5)).await.0, Ok);
+        let listed = ask(TenantList(0)).await.1;
+        assert_eq!(
+            listed,
+            "tenant 5 suspended generation 1 pools 1 default 1 connections 0 queued 100 rate 0 burst 0\n\
+             tenant 6 active generation 1 pools 1 default 1 connections 0 queued 100 rate 0 burst 0\n"
+        );
+        assert_eq!(ask(TenantSuspend(5)).await, (Ok, "tenant 5 already suspended".into()));
+        assert_eq!(ask(TenantResume(6)).await, (Ok, "tenant 6 already active".into()));
+        assert_eq!(ask(TenantSuspend(7)).await, (NotFound, "tenant 7 not found".into()));
+        assert_eq!(ask(TenantResume(7)).await, (NotFound, "tenant 7 not found".into()));
+        assert_eq!(ask(TenantResume(5)).await.0, Ok);
+        assert!(ask(TenantList(0)).await.1.starts_with("tenant 5 active generation 1"));
+        assert!(ask(TenantList(6)).await.1.starts_with("tenant 6 active generation 1"));
+        assert_eq!(ask(TenantSuspend(6)).await.0, Ok);
+    });
+    stopped(&driver, node);
+
+    let node = booted(&driver, config_with(7, &extra), CORES);
+    node.machine.block_on(0, async move {
+        drop(serving().await);
+        assert_eq!(
+            ask(TenantList(0)).await.1,
+            "tenant 5 active generation 1 pools 1 default 1 connections 0 queued 100 rate 0 burst 0\n\
+             tenant 6 suspended generation 1 pools 1 default 1 connections 0 queued 100 rate 0 burst 0\n"
+        );
+        assert_eq!(
+            ask(PoolList(0)).await.1,
+            "pool 1 addresses 192.0.2.1=1\npool 2 addresses 192.0.2.3=2\n"
+        );
+    });
+    stopped(&driver, node);
+
+    let machine = Machine::new(Rc::clone(&driver), 1, Stalls::default());
+    machine.block_on(0, async {
+        let vault = Vault::open(Path::new(KEYS)).await.expect("vault");
+        let mut tenants: Vec<u32> = vault.listed().iter().map(|l| l.tenant).collect();
+        tenants.sort_unstable();
+        assert_eq!(tenants, [5, 6]);
+    });
+}
