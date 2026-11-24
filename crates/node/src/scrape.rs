@@ -44,6 +44,12 @@ catalog! {
     AttemptsUnreadable: Counter, "attempts_unreadable", "Delivery attempts skipped because the message could not be read";
     SigningFaults: Counter, "signing_faults", "Signing attempts refused for a message format fault";
     SchedRefused: Counter, "sched_refused", "Scheduler entries and notes refused as stale or invalid";
+    RecipientsDelivered: Counter, "recipients_delivered", "Recipient attempts answered as delivered";
+    RecipientsFailed: Counter, "recipients_failed", "Recipient attempts answered as failed";
+    RecipientsDeferred: Counter, "recipients_deferred", "Recipient attempts answered as deferred";
+    RecipientsLater: Counter, "recipients_later", "Recipient attempts put off by local limits or retried at once";
+    PooledConnections: Gauge, "pooled_connections", "Open outbound connections kept in the pool";
+    PathsDown: Gauge, "paths_down", "Source and remote address pairs marked down";
     TicksLate: Counter, "ticks_late", "Scheduler ticks that ran late";
     SmtpSessions: Gauge, "smtp_sessions", "Open SMTP sessions";
     SmtpRefused: Counter, "smtp_refused", "SMTP connections refused by connection limits";
@@ -83,6 +89,14 @@ impl<T: Transport + 'static> Sources<'_, T> {
         set(Id::SigningFaults, sched.unsigned());
         set(Id::SchedRefused, sched.refused());
         set(Id::TicksLate, self.node.ticks_late());
+        let answers = sched.answers();
+        set(Id::RecipientsDelivered, answers.delivered);
+        set(Id::RecipientsFailed, answers.failed);
+        set(Id::RecipientsDeferred, answers.deferred);
+        set(Id::RecipientsLater, answers.later);
+        let transport = sched.transport().stats();
+        set(Id::PooledConnections, transport.pooled);
+        set(Id::PathsDown, transport.dead_hosts);
         let smtp = self.smtp;
         set(
             Id::SmtpSessions,

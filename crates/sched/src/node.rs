@@ -30,6 +30,14 @@ const DAMAGED_TRIES: u8 = 3;
 const DAMAGED_KEPT: usize = 4096;
 const UPKEEP: u64 = 60_000;
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AnswerStats {
+    pub delivered: u64,
+    pub failed: u64,
+    pub deferred: u64,
+    pub later: u64,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Config {
     pub shards: u32,
@@ -175,6 +183,7 @@ struct Inner<T> {
     refused: Cell<u64>,
     unreadable: Cell<u64>,
     unrouted: Cell<u64>,
+    answers: Cell<AnswerStats>,
     damaged: RefCell<BTreeMap<MessageId, u8>>,
     signing: OnceCell<Rc<Signing>>,
     table: OnceCell<Rc<RefCell<Table>>>,
@@ -253,6 +262,7 @@ impl<T: Transport + 'static> Sched<T> {
             refused: Cell::new(0),
             unreadable: Cell::new(0),
             unrouted: Cell::new(0),
+            answers: Cell::default(),
             damaged: RefCell::new(BTreeMap::new()),
             signing: OnceCell::new(),
             table: OnceCell::new(),
@@ -319,6 +329,10 @@ impl<T: Transport + 'static> Sched<T> {
 
     pub fn unreadable(&self) -> u64 {
         self.inner.unreadable.get()
+    }
+
+    pub fn answers(&self) -> AnswerStats {
+        self.inner.answers.get()
     }
 
     pub fn unrouted(&self) -> u64 {
@@ -782,6 +796,7 @@ impl<T: Transport + 'static> Sched<T> {
                 let answer = answered
                     .as_ref()
                     .map_or(Answer::Deferred(Kind::Temporary), |a| a.answer);
+                self.count(answer);
                 let outcome = match answer {
                     Answer::Delivered => Outcome::Delivered,
                     Answer::Failed => Outcome::Failed,
@@ -910,6 +925,18 @@ impl<T: Transport + 'static> Sched<T> {
             pool: name.pool,
             egress,
         })
+    }
+
+    fn count(&self, answer: Answer) {
+        let mut answers = self.inner.answers.get();
+        let slot = match answer {
+            Answer::Delivered => &mut answers.delivered,
+            Answer::Failed => &mut answers.failed,
+            Answer::Deferred(_) => &mut answers.deferred,
+            Answer::Unopened { .. } | Answer::Later(_) => &mut answers.later,
+        };
+        *slot += 1;
+        self.inner.answers.set(answers);
     }
 
     fn unroute(&self, route: Route, claimed: &[Claimed]) {

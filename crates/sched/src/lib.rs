@@ -47,7 +47,7 @@ pub use json::{event_json, kind_name as event_kind_name};
 pub use keyring::Keyring;
 pub use lanes::{Entry, Lanes, Limits, QueueId, Take, ranges};
 pub use message::{MESSAGE_LIMIT, MessagePage, MessageRecipient};
-pub use node::{Arrival, Claim, Config, Note, ReportErrors, Route, Sched, queue_core};
+pub use node::{AnswerStats, Arrival, Claim, Config, Note, ReportErrors, Route, Sched, queue_core};
 pub use normal::{MAX_ADDRESS, normalize, punycode};
 pub use policy::{
     Answer, BACKOFF, CLASS_FULL, CLASS_GREYLIST, CLASS_RETRY_AFTER, CLASS_THROTTLE, Kind, LONGEST,
@@ -79,5 +79,6 @@ pub use suppress::{
 pub use system::{Done, RecordStats, Records, Restore, Saved, Unsaved};
 pub use transport::{
     Answered, Attempt, Claimed, Destination, OwnStats, ReportMail, Reported, Transport,
+    TransportStats,
 };
 pub use unopened::{Action, DROPS_PER_MINUTE, UnopenedStats, action};

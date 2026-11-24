@@ -12,8 +12,8 @@ use crypto::{TenantKeys, Wrap};
 use rt::sim::{Config, Disk, Faults, Machine, SimDriver, Stalls, check};
 use rt::{JoinHandle, Mesh, Runtime, sleep, spawn, timeout};
 use sched::{
-    Answer, Answered, Arrival, Attempt, Batched, Clock, Keys, Kind, Limits, Note, Oldest, Sched,
-    Transport, Unsealable, Unwrapped,
+    Answer, AnswerStats, Answered, Arrival, Attempt, Batched, Clock, Keys, Kind, Limits, Note,
+    Oldest, Sched, Transport, Unsealable, Unwrapped,
 };
 use spool::{Body, Head, HeadClear, Message, MessageId, SLICE, Slice, Spool};
 use store::{Client, DataFile, Keeper, Options, SLOT_SIZE, Setup, boot};
@@ -469,6 +469,7 @@ struct Session {
     held: u64,
     deferred: u64,
     forgotten: u64,
+    answers: AnswerStats,
 }
 
 type Feed = (usize, Spool, Vec<u16>);
@@ -597,17 +598,7 @@ fn session(driver: &Rc<SimDriver>, world: &Shared, intake_on: bool, limit: Durat
         });
         let finished = matches!(timeout(limit, race).await, Ok(true));
         running.set(false);
-        let session = Session {
-            finished,
-            overdue: scheds.iter().map(Sched::overdue).sum(),
-            errors: scheds.iter().map(|s| s.report_errors().total()).sum(),
-            refused: scheds.iter().map(Sched::refused).sum(),
-            expired: scheds.iter().map(Sched::expired).sum(),
-            dropped: scheds.iter().map(|s| s.unopened_stats().dropped).sum(),
-            held: scheds.iter().map(|s| s.unopened_stats().held).sum(),
-            deferred: scheds.iter().map(|s| s.unopened_stats().deferred).sum(),
-            forgotten: scheds.iter().map(|s| s.unopened_stats().forgotten).sum(),
-        };
+        let session = tally(&scheds, finished);
         if power.is_halted() {
             return session;
         }
@@ -636,6 +627,32 @@ fn session(driver: &Rc<SimDriver>, world: &Shared, intake_on: bool, limit: Durat
     });
     world.borrow_mut().spools.clear();
     result
+}
+
+fn tally(scheds: &[Sched<Simulated>], finished: bool) -> Session {
+    Session {
+        finished,
+        overdue: scheds.iter().map(Sched::overdue).sum(),
+        errors: scheds.iter().map(|s| s.report_errors().total()).sum(),
+        refused: scheds.iter().map(Sched::refused).sum(),
+        expired: scheds.iter().map(Sched::expired).sum(),
+        dropped: scheds.iter().map(|s| s.unopened_stats().dropped).sum(),
+        held: scheds.iter().map(|s| s.unopened_stats().held).sum(),
+        deferred: scheds.iter().map(|s| s.unopened_stats().deferred).sum(),
+        forgotten: scheds.iter().map(|s| s.unopened_stats().forgotten).sum(),
+        answers: answers(scheds),
+    }
+}
+
+fn answers(scheds: &[Sched<Simulated>]) -> AnswerStats {
+    let mut all = AnswerStats::default();
+    for stats in scheds.iter().map(Sched::answers) {
+        all.delivered += stats.delivered;
+        all.failed += stats.failed;
+        all.deferred += stats.deferred;
+        all.later += stats.later;
+    }
+    all
 }
 
 fn verify(seed: u64, world: &World) {
@@ -684,6 +701,13 @@ fn one_session(seed: u64) {
         "seed {seed}: final answer twice"
     );
     assert!(world.replies > 0);
+    let finals: u64 = world.finals.values().map(|n| u64::from(*n)).sum();
+    assert_eq!(
+        run.answers.delivered + run.answers.failed,
+        finals,
+        "seed {seed}: final answers counted"
+    );
+    assert!(run.answers.delivered > 0 && run.answers.failed > 0 && run.answers.deferred > 0);
 }
 
 fn restart(seed: u64) {

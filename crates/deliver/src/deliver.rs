@@ -11,7 +11,7 @@ use dns::{Found, Name, Record, Type};
 use rt::{Ends, Instant, JoinHandle, now, timeout, wall_ms};
 use sched::{
     Answer, Answered, Attempt, Body, Destination, Envelope, EventBody, EventKind, Kind, OwnStats,
-    Recipient, ReportMail, Reported, Required, Restore, Ret, Transport,
+    Recipient, ReportMail, Reported, Required, Restore, Ret, Transport, TransportStats,
 };
 use smtp::client::{
     self, Answer as Reply, Capabilities, Dots, Mail, Rcpt, Refused, Response, Step, Transaction,
@@ -986,6 +986,14 @@ impl<D: Dns, L: Local> Transport for Deliver<D, L> {
 
     fn own_stats(&self) -> OwnStats {
         self.own.stats()
+    }
+
+    fn stats(&self) -> TransportStats {
+        let wide = |n: usize| u64::try_from(n).unwrap_or(u64::MAX);
+        TransportStats {
+            pooled: wide(self.pooled()),
+            dead_hosts: wide(self.dead_hosts()),
+        }
     }
 
     fn restore(&self, restore: Restore) -> impl Future<Output = ()> {

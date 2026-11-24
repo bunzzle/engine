@@ -459,6 +459,8 @@ fn metrics_are_served_for_every_core() {
             assert!(text.contains(&format!("bunzzle_queue_recipients{{core=\"{core}\"}} 0\n")));
         }
         assert!(text.contains("# TYPE bunzzle_smtp_refused_total counter\n"));
+        assert!(text.contains("bunzzle_recipients_delivered_total{core=\"0\"} 0\n"));
+        assert!(text.contains("# TYPE bunzzle_paths_down gauge\n"));
         assert!(!text.contains("# EOF"));
 
         let open = scrape(
