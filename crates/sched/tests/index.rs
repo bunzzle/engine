@@ -29,8 +29,8 @@ use sched::{
     Refusal, Restore, Running, SEARCH_VALUE, SHAPE, SearchField, SearchQuery, Searched, Sending,
     Settings, Suppression, Ticket, Transport, Unsealable, Unwrapped, drop_cursor, encode_slice,
     event_record, event_sealed, event_sequence, normalize, punycode, read_cursor, retain,
-    retain_event, retain_request, retired_events, search_event_key, search_hash, search_key,
-    write_cursor,
+    retain_event, retain_request, retain_search, retired_events, search_event_key, search_hash,
+    search_key, write_cursor,
 };
 use spool::{Body, Head, HeadClear, Message, MessageId, SLICE, Slice, Stamp};
 use store::{Client, Committer, DataFile, IndexStamp, Options, SLOT_SIZE, Setup, Tiering, boot};
@@ -189,7 +189,9 @@ impl Keys for Toy {
         id: u64,
         wrap: Wrap,
     ) -> Unwrapped<'_> {
-        let key = if (wrap.generation, wrap.shard) == (generation, shard) {
+        let key = if UNWRAP_DOWN.with(Cell::get) {
+            Err(Unsealable::Unavailable)
+        } else if (wrap.generation, wrap.shard) == (generation, shard) {
             open_batch(&toy_day_secret(tenant, wrap.day), tenant, id, &wrap)
                 .map(|secret| Rc::new(BatchKey::new(&secret)))
                 .map_err(|_| Unsealable::Bad)
@@ -208,6 +210,8 @@ thread_local! {
     static ANSWERS: RefCell<Option<Answers>> = const { RefCell::new(None) };
     static HOOK_KEYS_DOWN: Cell<bool> = const { Cell::new(false) };
     static KEYS_DOWN_ON_GONE: Cell<bool> = const { Cell::new(false) };
+    static UNWRAP_DOWN: Cell<bool> = const { Cell::new(false) };
+    static LISTED: RefCell<BTreeMap<[u8; 16], Vec<String>>> = const { RefCell::new(BTreeMap::new()) };
 }
 
 type Given = (MessageId, u32, u16, EventKind);
@@ -250,7 +254,12 @@ async fn answer(attempt: Attempt) -> Vec<Answered> {
         let body = EventBody {
             kind,
             time: clock.now(),
-            address: Vec::new(),
+            address: LISTED.with_borrow(|l| {
+                l.get(&attempt.message.bytes())
+                    .and_then(|a| a.get(usize::try_from(c.recipient).ok()?))
+                    .map(|a| a.as_bytes().to_vec())
+                    .unwrap_or_default()
+            }),
             reply: b"250 ok".to_vec(),
             attempts,
             class: c.class,
@@ -685,6 +694,30 @@ fn event_retention_keeps_a_week_and_drops_old_generations() {
     assert!(retain_event(
         &table,
         &Entry::delete(index::key(1, [0; 16]), EVENT_SHAPE)
+    ));
+    let found = |tenant: u32, generation: u32| {
+        let found = Found {
+            back: 1,
+            time: 1,
+            kind: EventKind::Delivered,
+            generation,
+        };
+        Entry::put(index::key(tenant, [0; 16]), found.encode(), Vec::new())
+    };
+    table.take(control::Note::Snapshot(control::Snapshot {
+        version: 2,
+        objects: vec![tenant(1, 2, State::Active), tenant(2, 1, State::Active)],
+    }));
+    assert!(retain_search(&table, &found(2, 1)));
+    assert!(!retain_search(&table, &found(1, 1)));
+    assert!(retain_search(&table, &found(1, 2)));
+    assert!(retain_search(&table, &found(9, 1)));
+    let mut short = found(1, 1);
+    short.value.pop();
+    assert!(retain_search(&table, &short));
+    assert!(retain_search(
+        &table,
+        &Entry::delete(index::key(1, [0; 16]), sched::SEARCH_SHAPE)
     ));
     assert_eq!(EVENT_DAYS, 7);
     assert_eq!(retired_events(20), 14);
@@ -1372,6 +1405,8 @@ async fn accept_listed(
         body,
         slices: vec![slice],
     };
+    let listed = addresses.iter().map(|a| (*a).to_owned()).collect();
+    LISTED.with_borrow_mut(|l| l.insert(id.bytes(), listed));
     node.accept(draft, message).await.expect("accept");
     (id, wrap)
 }
@@ -1765,8 +1800,392 @@ fn search_finds_events_by_each_field_in_pages_across_cores() {
         assert_eq!(searched(reader, 1, &later, 10).await, []);
         assert_eq!(searched(reader, 2, &domain, 10).await, []);
         search_cursors(reader, &domain, &other, to).await;
+        UNWRAP_DOWN.set(true);
+        assert_eq!(
+            reader.search(1, &domain, None, 10).await.err(),
+            Some(ReadError::Unavailable)
+        );
+        UNWRAP_DOWN.set(false);
+        assert_eq!(searched(reader, 1, &domain, 10).await.len(), 4);
     });
     cluster.stop();
+}
+
+#[test]
+fn a_search_past_the_scan_budget_pages_on_without_skipping() {
+    let driver = Rc::new(SimDriver::with_disk(49, Config::default(), created(49)));
+    let cluster = started(&driver, 1);
+    let nodes = cluster.nodes.clone();
+    cluster.run(async move {
+        ready(&nodes).await;
+        let node = &nodes[0];
+        let shard = owned_shard(node).await;
+        let batch = |n: usize| -> Vec<String> {
+            (0..100).map(|r| format!("b{n}.{r}@example.org")).collect()
+        };
+        let mut ids = Vec::new();
+        for n in 0..12 {
+            let addresses = batch(n);
+            let addresses: Vec<&str> = addresses.iter().map(String::as_str).collect();
+            let id = accept_listed(node, shard, &addresses, 1).await.0;
+            while node.spool().tenant(id).is_some() {
+                sleep(Duration::from_millis(50)).await;
+            }
+            ids.push(id);
+            if n == 0 {
+                sleep(Duration::from_secs(1)).await;
+            }
+        }
+        let old = every_event(node).await;
+        let cut = old
+            .iter()
+            .filter(|r| r.event.message == ids[0])
+            .map(|r| r.event.time)
+            .max()
+            .expect("time")
+            + 1;
+        let (from, _) = search_range();
+        let older =
+            SearchQuery::new(SearchField::Domain, b"example.org", &[], from, cut).expect("query");
+        let first = node.search(1, &older, None, 10).await.expect("page");
+        assert_eq!(first.events, []);
+        assert!(first.more);
+        let (got, _) = search_from(node, &older, Some(first.next)).await;
+        let found: BTreeSet<[u8; 16]> = got.iter().copied().collect();
+        assert_eq!(found.len(), got.len());
+        let want: BTreeSet<[u8; 16]> = old
+            .iter()
+            .filter(|r| r.event.message == ids[0])
+            .map(|r| r.id)
+            .collect();
+        assert_eq!(want.len(), 100);
+        assert_eq!(found, want);
+        let all = searched(node, 1, &domain_query(), 100).await;
+        assert_eq!(ids_of(&all).len(), 1200);
+        assert_eq!(all.len(), 1200);
+        assert!(node.search_stats().scans > 12);
+    });
+    cluster.stop();
+}
+
+#[test]
+fn a_search_finds_nothing_after_a_shred_with_real_keys() {
+    let wall = 20_000 * DAY + 3_600_000;
+    let config = Config {
+        wall_start_ms: wall,
+        ..Config::default()
+    };
+    let driver = Rc::new(SimDriver::with_disk(50, config, created(50)));
+    let cluster = started_with_keys(&driver, 2);
+    let nodes = cluster.nodes.clone();
+    cluster.run(async move {
+        keys_listening().await;
+        ready(&nodes).await;
+        let node = &nodes[0];
+        let shard = owned_shard(node).await;
+        let (id, _) = accept_listed(node, shard, &["k@example.org"], 1).await;
+        while node.spool().tenant(id).is_some() {
+            sleep(Duration::from_millis(50)).await;
+        }
+        let (from, to) = (wall - DAY, wall + DAY);
+        let queries = [
+            SearchQuery::new(SearchField::Domain, b"example.org", &[], from, to).expect("query"),
+            SearchQuery::new(SearchField::Recipient, b"k@example.org", &[], from, to)
+                .expect("query"),
+            SearchQuery::new(SearchField::Message, &id.bytes(), &[], from, to).expect("query"),
+        ];
+        for query in &queries {
+            for reader in &nodes {
+                assert_eq!(searched(reader, 1, query, 10).await.len(), 1);
+            }
+        }
+        regenerate(&nodes, 1).await;
+        for query in &queries {
+            for reader in &nodes {
+                assert_eq!(searched(reader, 1, query, 10).await, []);
+            }
+        }
+    });
+    cluster.stop();
+}
+
+fn search_range() -> (u64, u64) {
+    let wall = Config::default().wall_start_ms;
+    (wall - DAY, wall + DAY)
+}
+
+fn domain_query() -> SearchQuery {
+    let (from, to) = search_range();
+    SearchQuery::new(SearchField::Domain, b"example.org", &[], from, to).expect("query")
+}
+
+async fn every_event(node: &Node<Idle>) -> Vec<sched::EventRead> {
+    let mut found = Vec::new();
+    let mut cursor: Option<String> = None;
+    loop {
+        let page = node.events(1, cursor.as_deref(), 100).await.expect("page");
+        found.extend(page.events);
+        cursor = Some(page.next);
+        if !page.more {
+            return found;
+        }
+    }
+}
+
+async fn search_from(
+    node: &Node<Idle>,
+    query: &SearchQuery,
+    after: Option<String>,
+) -> (Vec<[u8; 16]>, String) {
+    let mut found = Vec::new();
+    let mut cursor = after;
+    loop {
+        let page = node
+            .search(1, query, cursor.as_deref(), 3)
+            .await
+            .expect("page");
+        found.extend(page.events.iter().map(|r| r.id));
+        cursor = Some(page.next);
+        if !page.more {
+            return (found, cursor.unwrap_or_default());
+        }
+    }
+}
+
+fn ids_of(reads: &[sched::EventRead]) -> BTreeSet<[u8; 16]> {
+    reads.iter().map(|r| r.id).collect()
+}
+
+fn address_of(read: &sched::EventRead) -> Vec<u8> {
+    read.body
+        .as_ref()
+        .expect("opened")
+        .address
+        .to_ascii_lowercase()
+}
+
+async fn each_field_finds(seed: u64, node: &Node<Idle>, whole: &[sched::EventRead]) {
+    let (from, to) = search_range();
+    let all = ids_of(whole);
+    assert_eq!(all.len(), whole.len(), "seed {seed}: event ids repeat");
+    let found = searched(node, 1, &domain_query(), 7).await;
+    assert_eq!(ids_of(&found), all, "seed {seed}: domain");
+    assert_eq!(found.len(), all.len(), "seed {seed}: domain repeats");
+    let mut asked = BTreeSet::new();
+    for read in whole {
+        let address = address_of(read);
+        let message = read.event.message.bytes();
+        for (field, value) in [
+            (SearchField::Recipient, address.clone()),
+            (SearchField::Message, message.to_vec()),
+        ] {
+            if !asked.insert((field, value.clone())) {
+                continue;
+            }
+            let want: BTreeSet<[u8; 16]> = whole
+                .iter()
+                .filter(|r| match field {
+                    SearchField::Recipient => address_of(r) == value,
+                    _ => r.event.message.bytes()[..] == value[..],
+                })
+                .map(|r| r.id)
+                .collect();
+            let query = SearchQuery::new(field, &value, &[], from, to).expect("query");
+            let found = searched(node, 1, &query, 2).await;
+            assert_eq!(found.len(), want.len(), "seed {seed}: {field:?} repeats");
+            assert_eq!(ids_of(&found), want, "seed {seed}: {field:?}");
+        }
+    }
+}
+
+async fn search_drained(seed: u64, nodes: &[Node<Idle>]) {
+    let empty = || nodes.iter().all(|n| n.spool().messages_of(1).is_empty());
+    for _ in 0..20_000 {
+        if empty() {
+            return;
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
+    panic!("seed {seed}: messages left");
+}
+
+async fn old_generation_entries(nodes: &[Node<Idle>]) -> (usize, usize) {
+    let start = index::key(1, [0; 16]);
+    let end = index::key(1, [0xff; 16]);
+    let (mut old, mut new) = (0, 0);
+    for node in nodes {
+        let changes = node.spool().changes();
+        let mut fresh = BTreeSet::new();
+        let mut stale = BTreeSet::new();
+        for (owner, partition) in changes.partitions(KIND_SEARCH).await.expect("partitions") {
+            let entries = changes
+                .scan(owner, (KIND_SEARCH, partition), start..end, usize::MAX)
+                .await
+                .expect("scan");
+            for entry in entries {
+                let found = Found::decode(&entry.value).expect("value");
+                if found.generation == 1 {
+                    stale.insert(owner);
+                    old += 1;
+                } else {
+                    fresh.insert(owner);
+                    new += 1;
+                }
+            }
+        }
+        assert!(
+            fresh.intersection(&stale).next().is_none(),
+            "old generation kept next to new entries"
+        );
+    }
+    (old, new)
+}
+
+fn search_crashed(seed: u64, cores: u16) -> Disk {
+    let config = Config {
+        halt_after: Some(30 + seed * 7_919 % 80),
+        faults: Faults {
+            torn_write: MILLION / 4,
+            ..Faults::default()
+        },
+        ..Config::default()
+    };
+    let first = Rc::new(SimDriver::with_disk(seed, config, created(seed)));
+    if let Some(cluster) = try_started(&first, cores, 0, None, false, settings_named(NAMING)) {
+        let nodes = cluster.nodes.clone();
+        let power = Rc::clone(&first);
+        cluster.run(async move {
+            let work = async {
+                ready(&nodes).await;
+                answering(&nodes);
+                accept_some(&nodes, 0, 5).await;
+                expire_some(&nodes, 0, 2).await;
+                sleep(Duration::from_secs(3600)).await;
+            };
+            let _ = unless_halted(&power, work).await;
+        });
+        if !first.is_halted() {
+            cluster.stop();
+        }
+    }
+    first.crash()
+}
+
+async fn search_round(seed: u64, reader: &Node<Idle>) -> usize {
+    let before = ids_of(&every_event(reader).await);
+    let (got, _) = search_from(reader, &domain_query(), None).await;
+    let paged: BTreeSet<[u8; 16]> = got.iter().copied().collect();
+    assert_eq!(paged.len(), got.len(), "seed {seed}: a cursor repeated");
+    assert!(paged.is_superset(&before), "seed {seed}: a cursor skipped");
+    before.len()
+}
+
+type Carried = (BTreeSet<[u8; 16]>, BTreeSet<[u8; 16]>, String);
+
+async fn search_second(seed: u64, nodes: Vec<Node<Idle>>) -> Carried {
+    ready(&nodes).await;
+    answering(&nodes);
+    let done = Rc::new(Cell::new(false));
+    let reader = nodes[nodes.len() - 1].clone();
+    let finished = Rc::clone(&done);
+    let polling = spawn(async move {
+        let mut rounds = 0;
+        while !finished.get() {
+            search_round(seed, &reader).await;
+            rounds += 1;
+            sleep(Duration::from_millis(300)).await;
+        }
+        rounds
+    });
+    accept_some(&nodes, 5, 3).await;
+    expire_some(&nodes, 2, 1).await;
+    search_drained(seed, &nodes).await;
+    done.set(true);
+    assert!(polling.await > 1, "seed {seed}: no rounds while writing");
+    let whole = every_event(&nodes[0]).await;
+    assert_eq!(search_round(seed, &nodes[0]).await, whole.len());
+    each_field_finds(seed, &nodes[0], &whole).await;
+    let page = nodes[0]
+        .search(1, &domain_query(), None, 3)
+        .await
+        .expect("page");
+    (ids_of(&page.events), ids_of(&whole), page.next)
+}
+
+async fn search_third(
+    seed: u64,
+    nodes: Vec<Node<Idle>>,
+    client: Client,
+    (mut paged, before, cursor): Carried,
+) {
+    ready(&nodes).await;
+    answering(&nodes);
+    accept_some(&nodes, 8, 2).await;
+    search_drained(seed, &nodes).await;
+    let (more, _) = search_from(&nodes[0], &domain_query(), Some(cursor.clone())).await;
+    paged.extend(more);
+    assert!(paged.is_superset(&before), "seed {seed}: a cursor skipped");
+    let whole = every_event(&nodes[0]).await;
+    each_field_finds(seed, &nodes[nodes.len() - 1], &whole).await;
+    regenerate(&nodes, 1).await;
+    let query = domain_query();
+    assert_eq!(
+        nodes[0].search(1, &query, Some(&cursor), 10).await.err(),
+        Some(ReadError::Cursor),
+        "seed {seed}: old cursor"
+    );
+    for node in &nodes {
+        assert_eq!(searched(node, 1, &query, 10).await, [], "seed {seed}");
+    }
+    let (from, to) = search_range();
+    for read in &whole {
+        for (field, value) in [
+            (SearchField::Recipient, address_of(read)),
+            (SearchField::Message, read.event.message.bytes().to_vec()),
+        ] {
+            let query = SearchQuery::new(field, &value, &[], from, to).expect("query");
+            assert_eq!(searched(&nodes[0], 1, &query, 10).await, [], "seed {seed}");
+        }
+    }
+    accept_some(&nodes, 10, nodes.len() * 2).await;
+    search_drained(seed, &nodes).await;
+    client.checkpoint().await.expect("checkpoint");
+    let (_, new) = old_generation_entries(&nodes).await;
+    assert_ne!(new, 0, "seed {seed}");
+    let whole = every_event(&nodes[0]).await;
+    assert!(whole.iter().all(|r| r.event.generation == 2), "seed {seed}");
+    let read =
+        |nodes: &[Node<Idle>]| -> u64 { nodes.iter().map(|n| n.search_stats().blocks).sum() };
+    let before = read(&nodes);
+    each_field_finds(seed, &nodes[0], &whole).await;
+    assert!(read(&nodes) > before, "seed {seed}: no blocks read");
+}
+
+fn search_sim(seed: u64) {
+    ANSWERS.set(None);
+    let (first, second) =
+        [(1, 2), (2, 4), (4, 1), (2, 1)][usize::try_from(seed % 4).expect("small")];
+    let disk = search_crashed(seed, first);
+    let driver = Rc::new(SimDriver::with_disk(seed + 1, Config::default(), disk));
+    let cluster = started(&driver, second);
+    let nodes = cluster.nodes.clone();
+    let carried = cluster.run(search_second(seed, nodes));
+    cluster.stop();
+    let driver = Rc::new(SimDriver::with_disk(
+        seed + 2,
+        Config::default(),
+        driver.crash(),
+    ));
+    let cluster = started(&driver, first);
+    let nodes = cluster.nodes.clone();
+    let client = cluster.client.clone();
+    cluster.run(search_third(seed, nodes, client, carried));
+    cluster.stop();
+}
+
+#[test]
+fn search_finds_every_event_through_crashes_core_changes_and_a_shred() {
+    check(0..4, search_sim);
 }
 
 #[test]

@@ -53,7 +53,7 @@ pub use policy::{
     Answer, BACKOFF, CLASS_FULL, CLASS_GREYLIST, CLASS_RETRY_AFTER, CLASS_THROTTLE, Kind, LONGEST,
     clamp, delay, report_retry,
 };
-pub use reader::{EventPage, MAX_LIMIT as EVENTS_LIMIT, Read as EventRead, ReadError};
+pub use reader::{EventPage, MAX_LIMIT as EVENTS_LIMIT, Read as EventRead, ReadError, SearchStats};
 pub use requests::{
     Begun, DAY, INLINE_IDS, KIND_REQUEST, REQUEST_SHAPE, RequestInputs, Requests, Ticket,
     retain_request,
@@ -64,7 +64,7 @@ pub use sealing::{
 };
 pub use search::{
     DayKeys, Field as SearchField, Found, KIND_SEARCH, SEARCH_HASH, SEARCH_SHAPE, SEARCH_VALUE,
-    event_key as search_event_key, hash as search_hash, key as search_key,
+    event_key as search_event_key, hash as search_hash, key as search_key, retain as retain_search,
 };
 pub use sign::{Body, Fault, KEYS_WAIT, Outgoing, Plain, Prepared, SIGNED_BYTES};
 pub use start::{CONTROL_SHARD, Links, Meshes, Node, Parts, Running, Settings};
