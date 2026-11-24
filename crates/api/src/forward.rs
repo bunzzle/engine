@@ -1,5 +1,5 @@
 use std::cell::{Cell, OnceCell, RefCell};
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::future::poll_fn;
 use std::rc::Rc;
 use std::task::{Poll, Waker};
@@ -98,6 +98,7 @@ pub(crate) struct Forwarder {
     serving: Cell<usize>,
     idle: Notify,
     waiting: RefCell<BTreeMap<(u16, u64), Waker>>,
+    aborted: RefCell<BTreeSet<(u16, u64)>>,
     stopped: Cell<bool>,
     forwarded: Cell<u64>,
     served: Cell<u64>,
@@ -116,6 +117,7 @@ impl Forwarder {
             serving: Cell::new(0),
             idle: Notify::default(),
             waiting: RefCell::new(BTreeMap::new()),
+            aborted: RefCell::new(BTreeSet::new()),
             stopped: Cell::new(false),
             forwarded: Cell::new(0),
             served: Cell::new(0),
@@ -186,7 +188,14 @@ impl Forwarder {
         match message {
             Message::Open { ticket, open } => self.accept(from, ticket, open),
             Message::Ahead { ticket, ahead } => {
-                if let Some(pipe) = self.inbound.borrow().get(&(from, ticket)) {
+                let key = (from, ticket);
+                if let Some(pipe) = self.inbound.borrow().get(&key) {
+                    if matches!(ahead, Ahead::Abort) {
+                        self.aborted.borrow_mut().insert(key);
+                        if let Some(waker) = self.waiting.borrow_mut().remove(&key) {
+                            waker.wake();
+                        }
+                    }
                     pipe.put(ahead);
                 }
             }
@@ -228,10 +237,15 @@ impl Forwarder {
         drop(serve(inbound, open));
     }
 
-    pub(crate) async fn until_stopped<F: Future<Output = ()>>(&self, key: (u16, u64), work: F) {
+    pub(crate) async fn until_stopped<F: Future<Output = ()>>(
+        &self,
+        key: (u16, u64),
+        abortable: bool,
+        work: F,
+    ) {
         let mut work = std::pin::pin!(work);
         poll_fn(|cx| {
-            if self.stopped.get() {
+            if self.stopped.get() || (abortable && self.aborted.borrow().contains(&key)) {
                 return Poll::Ready(());
             }
             if work.as_mut().poll(cx).is_ready() {
@@ -242,6 +256,7 @@ impl Forwarder {
         })
         .await;
         self.waiting.borrow_mut().remove(&key);
+        self.aborted.borrow_mut().remove(&key);
     }
 
     pub(crate) async fn close(&self, drain: std::time::Duration) {
@@ -373,6 +388,10 @@ impl Drop for Inbound {
         let forwarder = &self.forwarder;
         forwarder
             .inbound
+            .borrow_mut()
+            .remove(&(self.from, self.ticket));
+        forwarder
+            .aborted
             .borrow_mut()
             .remove(&(self.from, self.ticket));
         forwarder.serving.set(forwarder.serving.get() - 1);

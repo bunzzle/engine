@@ -17,6 +17,7 @@ pub const PAGE_BYTES: usize = 1 << 20;
 const CURSOR_KIND: u8 = 0xc0;
 const CURSOR_FORMAT: u8 = 1;
 const SEARCH_KIND: u8 = 0xc1;
+const SEARCH_FORMAT: u8 = 2;
 const EVENT_ID: &[u8; 5] = b"event";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -207,6 +208,7 @@ impl Reader {
         let cores = usize::from(self.inner.cores);
         let mut label = label(&system, tenant, generation);
         label[8] = SEARCH_KIND;
+        label[9] = SEARCH_FORMAT;
         query.label(&mut label);
         let (query, positions) = match after {
             None => (query.clone(), vec![0; cores]),
@@ -276,7 +278,7 @@ impl Reader {
                 let (from, to) = query.range();
                 let mut clear = from.to_le_bytes().to_vec();
                 clear.extend_from_slice(&to.to_le_bytes());
-                clear.extend_from_slice(&cursor(&next));
+                clear.extend_from_slice(&search_cursor(&next));
                 clear
             })
             .map_err(|_| ReadError::Failed)?;
@@ -573,10 +575,27 @@ fn resumed(
         return Err(ReadError::Cursor);
     }
     let query = query.ranged(from, to).ok_or(ReadError::Cursor)?;
-    Ok((query, positions(rest, cores).ok_or(ReadError::Cursor)?))
+    Ok((
+        query,
+        search_positions(rest, cores).ok_or(ReadError::Cursor)?,
+    ))
 }
 
 fn positions(clear: &[u8], cores: usize) -> Option<Vec<u64>> {
+    Some(fitted(decoded(clear)?, cores))
+}
+
+fn search_cursor(next: &[u64]) -> Vec<u8> {
+    let flipped: Vec<u64> = next.iter().map(|p| p.wrapping_neg()).collect();
+    cursor(&flipped)
+}
+
+fn search_positions(clear: &[u8], cores: usize) -> Option<Vec<u64>> {
+    let found = decoded(clear)?.into_iter().map(u64::wrapping_neg).collect();
+    Some(fitted(found, cores))
+}
+
+fn decoded(clear: &[u8]) -> Option<Vec<u64>> {
     let (count, mut rest) = clear.split_first_chunk::<2>()?;
     let count = usize::from(u16::from_le_bytes(*count));
     let mut found = Vec::with_capacity(count);
@@ -586,7 +605,7 @@ fn positions(clear: &[u8], cores: usize) -> Option<Vec<u64>> {
         loop {
             let (&byte, tail) = rest.split_first()?;
             rest = tail;
-            if shift > 63 {
+            if shift > 63 || (shift == 63 && byte > 1) {
                 return None;
             }
             value |= u64::from(byte & 0x7f) << shift;
@@ -600,11 +619,15 @@ fn positions(clear: &[u8], cores: usize) -> Option<Vec<u64>> {
     if !rest.is_empty() {
         return None;
     }
+    Some(found)
+}
+
+fn fitted(found: Vec<u64>, cores: usize) -> Vec<u64> {
     if found.len() == cores {
-        return Some(found);
+        return found;
     }
     let floor = found.iter().copied().min().unwrap_or(0);
-    Some(vec![floor; cores])
+    vec![floor; cores]
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -732,6 +755,20 @@ mod tests {
         long.push(0);
         assert_eq!(super::positions(&long, 4), None);
         assert_eq!(super::positions(&clear[..clear.len() - 1], 4), None);
+        let mut over = vec![1, 0];
+        over.extend_from_slice(&[0xff; 9]);
+        over.push(2);
+        assert_eq!(super::positions(&over, 1), None);
+        over[11] = 1;
+        assert_eq!(super::positions(&over, 1), Some(vec![u64::MAX]));
+        let tails = [0, u64::MAX - 4, u64::MAX - 300, 1];
+        let clear = search_cursor(&tails);
+        assert_eq!(clear.len(), 2 + 1 + 1 + 2 + 10);
+        assert_eq!(search_positions(&clear, 4), Some(tails.to_vec()));
+        assert_eq!(search_positions(&clear, 2), Some(vec![0, 0]));
+        let clear = search_cursor(&tails[1..3]);
+        assert_eq!(clear.len(), 2 + 1 + 2);
+        assert_eq!(search_positions(&clear, 3), Some(vec![u64::MAX - 300; 3]));
         assert_eq!(unhex(&hex(&[0, 0xab, 0xff])), Some(vec![0, 0xab, 0xff]));
         assert_eq!(unhex("abc"), None);
         assert_eq!(unhex("zz"), None);
