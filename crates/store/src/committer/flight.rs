@@ -321,7 +321,10 @@ impl Committer {
             }
             Err(Error::Invalid("part"))
         } else {
-            self.write_flight(flight, renew).await
+            let started = self.probe.checkpoint_start();
+            let written = self.write_flight(flight, renew).await;
+            self.probe.checkpoint_finish(started, written.is_ok());
+            written
         };
         if result.is_ok() {
             self.broadcast(|| Event::Published { sequence });
