@@ -23,7 +23,7 @@ use crate::reader::{self, EventPage, ReadError, Reader};
 use crate::requests::{KIND_REQUEST, RequestInputs, Requests, retain_request};
 use crate::sealing::{Holds, Keys};
 use crate::search::{self, KIND_SEARCH};
-use crate::status::{HookStats, Reports};
+use crate::status::{CallStats, HookStats, Reports};
 use crate::suppress::{self, Inputs, KIND_SUPPRESS, Suppressions};
 use crate::system::{self, RecordStats, Stored};
 use crate::transport::{OwnStats, Transport};
@@ -308,6 +308,10 @@ impl<T: Transport + 'static> Node<T> {
 
     pub fn hook_stats(&self) -> HookStats {
         self.inner.hook_reports.borrow().stats()
+    }
+
+    pub fn call_stats(&self) -> CallStats {
+        self.inner.hook_reports.borrow().call_stats()
     }
 
     pub fn queues(&self) -> &Queues {

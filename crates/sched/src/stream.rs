@@ -157,19 +157,7 @@ async fn run<T: Transport + 'static>(
         let watch = Rc::clone(node.spool().changes().watch());
         let fresh = watch.take(KIND_EVENT);
         let done: Vec<_> = shared.done.borrow_mut().drain(..).collect();
-        let mut report_now = false;
-        for (hook, ticket, outcome) in done {
-            if all.draining.get(&hook) == Some(&ticket) {
-                all.draining.remove(&hook);
-                all.synced = None;
-            } else if let Some(stream) = all.live.get_mut(&hook)
-                && stream.sending
-                && stream.ticket == ticket
-            {
-                report_now |= outcome == Outcome::Gone;
-                settle(stream, outcome, node.sched().clock().now());
-            }
-        }
+        let report_now = settle_done(&node, &mut all, done);
         sync(&node, &mut all).await;
         for (below, reply) in tallies.take() {
             let counted = tally(&node, &mut all, below).await;
@@ -215,6 +203,7 @@ async fn run<T: Transport + 'static>(
             reported = Some(rt::now());
         }
         let streams = &all.live;
+        count_streams(&node, streams);
         let ready = streams.values().any(|s| {
             !s.gone
                 && s.more
@@ -239,6 +228,38 @@ async fn run<T: Transport + 'static>(
         let woken = first(watch.wait(), shared.wake.wait());
         let _ = timeout(wait, first(woken, tallies.wake.wait())).await;
     }
+}
+
+fn settle_done<T: Transport + 'static>(
+    node: &Node<T>,
+    all: &mut Streams,
+    done: Vec<(u32, u64, Outcome)>,
+) -> bool {
+    let mut report_now = false;
+    for (hook, ticket, outcome) in done {
+        node.inner.hook_reports.borrow_mut().settled(&outcome);
+        if all.draining.get(&hook) == Some(&ticket) {
+            all.draining.remove(&hook);
+            all.synced = None;
+        } else if let Some(stream) = all.live.get_mut(&hook)
+            && stream.sending
+            && stream.ticket == ticket
+        {
+            report_now |= outcome == Outcome::Gone;
+            settle(stream, outcome, node.sched().clock().now());
+        }
+    }
+    report_now
+}
+
+fn count_streams<T>(node: &Node<T>, streams: &BTreeMap<u32, Stream>) {
+    let open = streams.values().filter(|s| !s.gone);
+    let failing = open.clone().filter(|s| s.failing_since.is_some()).count();
+    let wide = |n: usize| u64::try_from(n).unwrap_or(u64::MAX);
+    node.inner
+        .hook_reports
+        .borrow_mut()
+        .streams(wide(open.count()), wide(failing));
 }
 
 fn report_due(reported: Option<Instant>) -> bool {

@@ -22,15 +22,15 @@ use keys::{
 use rt::sim::{Config, Disk, Faults, Machine, Rng, SimDriver, Stalls, check};
 use rt::{JoinHandle, Runtime, TcpListener, TcpStream, sleep, spawn, timeout};
 use sched::{
-    Answer, Answered, Attempt, Batched, Begun, Call, Clock, Cursor, DAY, DayKeys, Deliver, Draft,
-    EVENT_DAYS, EVENT_SHAPE, EVENT_VALUE, Event, EventBody, EventKind, Fault, Found, Hash,
-    HookChange, HookStats, KIND_EVENT, KIND_REQUEST, KIND_SEARCH, KIND_SUPPRESS, Keyring, Keys,
-    MAX_HOOKS, MAX_REPLY, Meshes, Node, Outcome, Parts, ROTATION_MS, ReadError, Reason, Recipient,
-    Refusal, Restore, Running, SEARCH_VALUE, SHAPE, SearchField, SearchQuery, Searched, Sending,
-    Settings, Suppression, Ticket, Transport, Unsealable, Unwrapped, drop_cursor, encode_slice,
-    event_record, event_sealed, event_sequence, normalize, punycode, read_cursor, retain,
-    retain_event, retain_request, retain_search, retired_events, search_event_key, search_hash,
-    search_key, write_cursor,
+    Answer, Answered, Attempt, Batched, Begun, Call, CallStats, Clock, Cursor, DAY, DayKeys,
+    Deliver, Draft, EVENT_DAYS, EVENT_SHAPE, EVENT_VALUE, Event, EventBody, EventKind, Fault,
+    Found, Hash, HookChange, HookStats, KIND_EVENT, KIND_REQUEST, KIND_SEARCH, KIND_SUPPRESS,
+    Keyring, Keys, MAX_HOOKS, MAX_REPLY, Meshes, Node, Outcome, Parts, ROTATION_MS, ReadError,
+    Reason, Recipient, Refusal, Restore, Running, SEARCH_VALUE, SHAPE, SearchField, SearchQuery,
+    Searched, Sending, Settings, Suppression, Ticket, Transport, Unsealable, Unwrapped,
+    drop_cursor, encode_slice, event_record, event_sealed, event_sequence, normalize, punycode,
+    read_cursor, retain, retain_event, retain_request, retain_search, retired_events,
+    search_event_key, search_hash, search_key, write_cursor,
 };
 use spool::{Body, Head, HeadClear, Message, MessageId, SLICE, Slice, Stamp};
 use store::{Client, Committer, DataFile, IndexStamp, Options, SLOT_SIZE, Setup, Tiering, boot};
@@ -5275,6 +5275,44 @@ fn a_gone_stream_disables_the_hook_on_every_core_without_retrying() {
         for node in nodes.iter().filter(|n| !n.controls()) {
             assert_eq!(node.hook_stats(), HookStats::default());
         }
+        drop(tasks);
+    });
+    cluster.stop();
+}
+
+#[test]
+fn webhook_calls_and_streams_are_counted_on_each_core() {
+    let seed = 72;
+    let driver = Rc::new(SimDriver::with_disk(seed, Config::default(), created(seed)));
+    let cluster = started(&driver, 2);
+    let nodes = cluster.nodes.clone();
+    cluster.run(async move {
+        ready(&nodes).await;
+        status_hook(&nodes).await;
+        let answers = Rc::new(HookAnswers {
+            calls: RefCell::new(vec![0; nodes.len()]),
+        });
+        let acked = Outcome::Acked { status: 200 };
+        let tasks = start_hook_answers(&nodes, &answers, vec![acked, retry_status()]);
+        sleep(Duration::from_secs(10)).await;
+        assert_eq!(answers.calls.borrow().as_slice(), &[1, 1]);
+        assert_eq!(
+            nodes[0].call_stats(),
+            CallStats {
+                acked: 1,
+                streams: 1,
+                ..CallStats::default()
+            }
+        );
+        assert_eq!(
+            nodes[1].call_stats(),
+            CallStats {
+                retried: 1,
+                streams: 1,
+                failing: 1,
+                ..CallStats::default()
+            }
+        );
         drop(tasks);
     });
     cluster.stop();

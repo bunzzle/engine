@@ -8,7 +8,7 @@ use std::task::Poll;
 use std::time::Duration;
 
 use http::{Event, Limits, Phase, Request, Response, Server, Status};
-use intake::{Conn, End, Listener};
+use intake::{Conn, End, Guard, Listener};
 use metrics::{Board, Def, Kind, Slab, negotiate};
 use rt::{Instant, JoinHandle, Notify, TcpListener, now, sleep, spawn, timeout, wall_ms};
 use sched::{Node, Transport};
@@ -59,6 +59,29 @@ catalog! {
     ApiRefused: Counter, "api_refused", "API connections refused by connection limits";
     ApiForwarded: Counter, "api_forwarded", "API requests forwarded to another core";
     ApiServed: Counter, "api_served", "API requests served for another core";
+    GuardSessions: Gauge, "guard_sessions", "Sessions held by the connection guard";
+    GuardReservedBytes: Gauge, "guard_reserved_bytes", "Memory reserved by sessions";
+    GuardPeakReservedBytes: Gauge, "guard_peak_reserved_bytes", "Highest memory reserved by sessions since start";
+    GuardWaiting: Gauge, "guard_waiting", "Guard asks waiting for an owner answer";
+    GuardEntries: Gauge, "guard_entries", "Address entries tracked by this core";
+    GuardSessionLimit: Counter, "guard_session_limit", "Sessions refused by the session limit, a cause within smtp_refused and api_refused";
+    GuardMemoryLimit: Counter, "guard_memory_limit", "Reservations refused by the memory budget, a cause within smtp_refused and api_refused";
+    GuardOpenLimit: Counter, "guard_open_limit", "Connections refused by the per-address or per-tenant limit, a cause within smtp_refused and api_refused";
+    GuardBanned: Counter, "guard_banned", "Connections refused from banned addresses, a cause within smtp_refused and api_refused";
+    GuardUnanswered: Counter, "guard_unanswered", "Guard asks with no owner answer in time";
+    GuardFailures: Counter, "guard_failures", "Failures recorded against addresses";
+    GuardBans: Counter, "guard_bans", "Address bans started";
+    GuardTableFull: Counter, "guard_table_full", "Address entries not stored because the table was full";
+    GuardEvicted: Counter, "guard_evicted", "Address entries evicted for new ones";
+    WebhookAcked: Counter, "webhook_acked", "Webhook calls answered with success";
+    WebhookRetried: Counter, "webhook_retried", "Webhook calls that failed and will be retried";
+    WebhookRefused: Counter, "webhook_refused", "Webhook calls not sent because the hook was not current or an internal fault";
+    WebhookGone: Counter, "webhook_gone", "Webhook calls answered as gone";
+    WebhooksDisabledGone: Counter, "webhooks_disabled_gone", "Webhooks disabled as gone";
+    WebhooksDisabledFailing: Counter, "webhooks_disabled_failing", "Webhooks disabled after failing too long";
+    WebhookReportsFailed: Counter, "webhook_reports_failed", "Webhook status writes that failed";
+    WebhookStreams: Gauge, "webhook_streams", "Webhook streams running";
+    WebhookStreamsFailing: Gauge, "webhook_streams_failing", "Webhook streams with failing calls";
     EventsLost: Counter, "events_lost", "Delivery events lost before they were written";
     SearchSkipped: Counter, "search_skipped", "Search entries not written";
     SearchScans: Counter, "search_scans", "Search scans run";
@@ -77,6 +100,7 @@ pub(crate) fn board(cores: u16) -> Arc<Board> {
 pub(crate) struct Sources<'a, T> {
     pub node: &'a Node<T>,
     pub smtp: &'a [Listener],
+    pub guard: &'a Guard,
     pub api: Option<&'a api::Api>,
 }
 
@@ -126,6 +150,35 @@ impl<T: Transport + 'static> Sources<'_, T> {
             set(Id::ApiForwarded, api.forwarded());
             set(Id::ApiServed, api.served());
         }
+        let guard = self.guard.stats();
+        set(Id::GuardSessions, wide(guard.sessions));
+        set(Id::GuardReservedBytes, wide(guard.reserved));
+        set(Id::GuardPeakReservedBytes, wide(guard.peak));
+        set(Id::GuardWaiting, wide(guard.waiting));
+        set(
+            Id::GuardEntries,
+            wide(guard.owner.nets.saturating_add(guard.owner.wides)),
+        );
+        set(Id::GuardSessionLimit, guard.refused);
+        set(Id::GuardMemoryLimit, guard.busy);
+        set(Id::GuardOpenLimit, guard.owner.full);
+        set(Id::GuardBanned, guard.owner.banned);
+        set(Id::GuardUnanswered, guard.unanswered);
+        set(Id::GuardFailures, guard.owner.failures);
+        set(Id::GuardBans, guard.owner.bans);
+        set(Id::GuardTableFull, guard.owner.table_full);
+        set(Id::GuardEvicted, guard.owner.evicted);
+        let calls = self.node.call_stats();
+        set(Id::WebhookAcked, calls.acked);
+        set(Id::WebhookRetried, calls.retried);
+        set(Id::WebhookRefused, calls.refused);
+        set(Id::WebhookGone, calls.gone);
+        set(Id::WebhookStreams, calls.streams);
+        set(Id::WebhookStreamsFailing, calls.failing);
+        let hooks = self.node.hook_stats();
+        set(Id::WebhooksDisabledGone, hooks.gone);
+        set(Id::WebhooksDisabledFailing, hooks.failing);
+        set(Id::WebhookReportsFailed, hooks.write_failed);
         let events = self.node.event_stats();
         set(Id::EventsLost, events.lost);
         set(Id::SearchSkipped, events.search_skipped);
