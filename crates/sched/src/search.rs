@@ -154,6 +154,16 @@ pub fn records(
     })
 }
 
+pub fn retain(table: &control::Table, entry: &Entry) -> bool {
+    if entry.op == index::Op::Delete {
+        return true;
+    }
+    let Some(found) = Found::decode(&entry.value) else {
+        return true;
+    };
+    !table.gone(index::tenant(&entry.key), found.generation)
+}
+
 pub fn sequence(key: &index::Key) -> u64 {
     u64::MAX - u64::from_be_bytes(key[12..20].try_into().expect("8"))
 }

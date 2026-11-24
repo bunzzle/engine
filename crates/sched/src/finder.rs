@@ -146,6 +146,7 @@ pub(crate) struct Hits {
     pub found: Vec<Hit>,
     pub scanned: u64,
     pub full: bool,
+    pub blocks: u64,
 }
 
 pub(crate) fn tail(key: &index::Key) -> u64 {
@@ -245,6 +246,7 @@ pub(crate) async fn serve(changes: &Changes, scan: &Scan) -> Result<Hits, ReadEr
         found: hits,
         scanned,
         full,
+        blocks: u64::try_from(tails.blocks).unwrap_or(u64::MAX),
     })
 }
 
@@ -331,6 +333,7 @@ mod tests {
                 .collect(),
             scanned,
             full,
+            blocks: 0,
         }
     }
 

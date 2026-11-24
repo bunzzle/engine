@@ -83,6 +83,13 @@ struct Inner {
     waiting: RefCell<BTreeMap<u64, Sender<Result<Part, ReadError>>>>,
     searching: RefCell<BTreeMap<u64, Sender<Result<Hits, ReadError>>>>,
     tickets: Cell<u64>,
+    stats: Cell<SearchStats>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SearchStats {
+    pub scans: u64,
+    pub blocks: u64,
 }
 
 #[derive(Clone)]
@@ -91,6 +98,10 @@ pub struct Reader {
 }
 
 impl Reader {
+    pub fn search_stats(&self) -> SearchStats {
+        self.inner.stats.get()
+    }
+
     pub fn start(
         ends: Ends<Ask>,
         changes: Changes,
@@ -105,6 +116,7 @@ impl Reader {
                 waiting: RefCell::new(BTreeMap::new()),
                 searching: RefCell::new(BTreeMap::new()),
                 tickets: Cell::new(0),
+                stats: Cell::new(SearchStats::default()),
             }),
         };
         let handler = reader.clone();
@@ -351,6 +363,13 @@ impl Reader {
                 let reader = self.clone();
                 drop(spawn(async move {
                     let hits = finder::serve(&reader.inner.changes, &scan).await;
+                    if let Ok(hits) = &hits {
+                        let stats = reader.inner.stats.get();
+                        reader.inner.stats.set(SearchStats {
+                            scans: stats.scans + 1,
+                            blocks: stats.blocks.saturating_add(hits.blocks),
+                        });
+                    }
                     if let Some(peers) = reader.inner.peers.get() {
                         peers.send(from, Ask(Message::Found { ticket, hits }));
                     }

@@ -22,6 +22,7 @@ use crate::node::{Config, Note, Sched};
 use crate::reader::{self, EventPage, ReadError, Reader};
 use crate::requests::{KIND_REQUEST, RequestInputs, Requests, retain_request};
 use crate::sealing::{Holds, Keys};
+use crate::search::{self, KIND_SEARCH};
 use crate::status::{HookStats, Reports};
 use crate::suppress::{self, Inputs, KIND_SUPPRESS, Suppressions};
 use crate::system::{self, RecordStats, Stored};
@@ -295,6 +296,10 @@ impl<T: Transport + 'static> Node<T> {
 
     pub fn own_stats(&self) -> OwnStats {
         self.inner.sched.transport().own_stats()
+    }
+
+    pub fn search_stats(&self) -> reader::SearchStats {
+        self.inner.reader.search_stats()
     }
 
     pub fn event_stats(&self) -> spool::EventStats {
@@ -831,6 +836,7 @@ fn retain_current(core: &mut Core, table: &Rc<RefCell<Table>>, clock: Clock) {
                 KIND_SUPPRESS => suppress::retain(&table, clock.now(), entry, oldest),
                 KIND_REQUEST => retain_request(&table, clock.now(), entry),
                 KIND_EVENT => events::retain(&table, entry),
+                KIND_SEARCH => search::retain(&table, entry),
                 _ => true,
             }
         }),
