@@ -229,6 +229,7 @@ pub async fn run<T: Transport + 'static>(
     let sources = scrape::Sources {
         node: &up.node,
         smtp: &listeners,
+        guard: &up.guard,
         api: apis.as_ref(),
     };
     let publishing = scrape::publishing(metrics, index, sources);

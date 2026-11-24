@@ -505,6 +505,42 @@ fn metrics_are_served_for_every_core() {
 }
 
 #[test]
+fn guard_and_webhook_metrics_follow_open_sessions() {
+    let driver = created(10);
+    let node = booted(&driver, config(7), CORES);
+    let machine = &node.machine;
+    machine.block_on(0, async {
+        let held = serving().await;
+        assert!(banner(&held).await.starts_with("220 "));
+        sleep(Duration::from_secs(2)).await;
+        let text = scrape("GET /metrics HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n").await;
+        let sessions: u64 = text
+            .lines()
+            .filter_map(|line| line.strip_prefix("bunzzle_guard_sessions{"))
+            .filter_map(|rest| rest.split(' ').nth(1)?.parse::<u64>().ok())
+            .sum();
+        assert_eq!(sessions, 1, "{text}");
+        for family in [
+            "# TYPE bunzzle_guard_reserved_bytes gauge\n",
+            "# TYPE bunzzle_guard_banned_total counter\n",
+            "# TYPE bunzzle_guard_session_limit_total counter\n",
+            "# TYPE bunzzle_webhook_acked_total counter\n",
+            "# TYPE bunzzle_webhook_streams gauge\n",
+            "# TYPE bunzzle_webhooks_disabled_gone_total counter\n",
+        ] {
+            assert!(text.contains(family), "{family}");
+        }
+        drop(held);
+        sleep(Duration::from_secs(2)).await;
+        let text = scrape("GET /metrics HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n").await;
+        for core in 0..CORES {
+            assert!(text.contains(&format!("bunzzle_guard_sessions{{core=\"{core}\"}} 0\n")));
+        }
+    });
+    stopped(&driver, node);
+}
+
+#[test]
 fn a_silent_metrics_client_is_dropped() {
     let driver = created(10);
     let node = booted(&driver, config(7), CORES);

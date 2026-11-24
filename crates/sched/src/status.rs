@@ -3,6 +3,7 @@ use std::collections::BTreeMap;
 use control::{Hook, HookState, KIND_HOOK, Note, Object, State, Table};
 
 use crate::requests::DAY;
+use crate::stream::Outcome;
 
 pub const REPORT_PERIOD: u64 = 60_000;
 pub const REPORT_CHUNK: usize = 64;
@@ -42,6 +43,16 @@ pub struct HookStats {
     pub write_failed: u64,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CallStats {
+    pub acked: u64,
+    pub retried: u64,
+    pub refused: u64,
+    pub gone: u64,
+    pub streams: u64,
+    pub failing: u64,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Disable {
     pub tenant: u32,
@@ -71,6 +82,7 @@ pub(crate) struct Reports {
     active: BTreeMap<u32, Active>,
     by_core: BTreeMap<u16, CoreReports>,
     stats: HookStats,
+    calls: CallStats,
 }
 
 impl Reports {
@@ -80,6 +92,7 @@ impl Reports {
             active: BTreeMap::new(),
             by_core: BTreeMap::new(),
             stats: HookStats::default(),
+            calls: CallStats::default(),
         }
     }
 
@@ -336,6 +349,26 @@ impl Reports {
 
     pub(crate) fn stats(&self) -> HookStats {
         self.stats
+    }
+
+    pub(crate) fn settled(&mut self, outcome: &Outcome) {
+        let calls = &mut self.calls;
+        let count = match outcome {
+            Outcome::Acked { .. } => &mut calls.acked,
+            Outcome::Retry { .. } => &mut calls.retried,
+            Outcome::Refused(_) => &mut calls.refused,
+            Outcome::Gone => &mut calls.gone,
+        };
+        *count = count.saturating_add(1);
+    }
+
+    pub(crate) fn streams(&mut self, streams: u64, failing: u64) {
+        self.calls.streams = streams;
+        self.calls.failing = failing;
+    }
+
+    pub(crate) fn call_stats(&self) -> CallStats {
+        self.calls
     }
 }
 
