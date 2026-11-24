@@ -20,6 +20,7 @@ const UID: u32 = 1000;
 const CORES: u16 = 2;
 const SMTP: &str = "10.0.0.1:587";
 const API: &str = "127.0.0.1:8080";
+const METRICS: &str = "127.0.0.1:9464";
 const OPTIONS: Options = Options {
     journal_size: 8 * SLOT_SIZE,
     region_size: 8 * SLOT_SIZE,
@@ -65,6 +66,7 @@ fn config(id: u32) -> Config {
          [tls]\nchain = \"/etc/a.pem\"\nkey = \"/etc/a.key\"\n\
          [intake]\ndrain = \"2s\"\n\
          [api]\nplain = [\"{API}\"]\ndrain = \"2s\"\n\
+         [metrics]\nlisten = [\"{METRICS}\"]\n\
          [dns]\nservers = [\"127.0.0.1\"]\n\
          [[listen]]\naddress = \"{SMTP}\"\n"
     );
@@ -210,6 +212,27 @@ async fn health() -> String {
     String::from_utf8_lossy(&buf[..n]).into_owned()
 }
 
+async fn scrape(request: &str) -> String {
+    let stream = TcpStream::connect(METRICS.parse().expect("address"))
+        .await
+        .expect("connect");
+    stream
+        .write_all(Buf::from_slice(request.as_bytes()))
+        .await
+        .0
+        .expect("write");
+    let mut out = Vec::new();
+    loop {
+        let (read, buf) = stream.read(Buf::new(4096)).await;
+        let n = read.expect("read");
+        if n == 0 {
+            break;
+        }
+        out.extend_from_slice(&buf[..n]);
+    }
+    String::from_utf8(out).expect("utf-8")
+}
+
 async fn serving() -> TcpStream {
     for _ in 0..600 {
         if let Ok(stream) = TcpStream::connect(smtp()).await {
@@ -228,7 +251,9 @@ fn stopped(driver: &Rc<SimDriver>, node: Booted) {
     } = node;
     let signals = Rc::clone(driver);
     machine.block_on(0, async move {
-        drop(serving().await);
+        let first = serving().await;
+        assert!(banner(&first).await.starts_with("220 "));
+        drop(first);
         signals.raise(Signal::Terminate);
         for core in cores {
             core.await.expect("stopped");
@@ -416,4 +441,69 @@ fn a_connection_queued_during_boot_waits_for_every_core() {
             drop(committer.await);
         });
     });
+}
+
+#[test]
+fn metrics_are_served_for_every_core() {
+    let driver = created(9);
+    let node = booted(&driver, config(7), CORES);
+    let machine = &node.machine;
+    machine.block_on(0, async {
+        drop(serving().await);
+        sleep(Duration::from_secs(2)).await;
+        let text = scrape("GET /metrics HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n").await;
+        assert!(text.starts_with("HTTP/1.1 200 OK\r\n"), "{text}");
+        assert!(text.contains("Content-Type: text/plain; version=0.0.4; charset=utf-8\r\n"));
+        for core in 0..CORES {
+            assert!(text.contains(&format!("bunzzle_core_up{{core=\"{core}\"}} 1\n")));
+            assert!(text.contains(&format!("bunzzle_queue_recipients{{core=\"{core}\"}} 0\n")));
+        }
+        assert!(text.contains("# TYPE bunzzle_smtp_refused_total counter\n"));
+        assert!(!text.contains("# EOF"));
+
+        let open = scrape(
+            "GET /metrics HTTP/1.1\r\nHost: x\r\nAccept: application/openmetrics-text;version=1.0.0\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert!(open.contains("Content-Type: application/openmetrics-text; version=1.0.0; charset=utf-8\r\n"));
+        assert!(open.contains("# TYPE bunzzle_smtp_refused counter\n"));
+        assert!(open.ends_with("# EOF\n"));
+
+        let head = scrape("HEAD /metrics HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n").await;
+        assert!(head.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(head.ends_with("\r\n\r\n"));
+        let missing = scrape("GET /other HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n").await;
+        assert!(missing.starts_with("HTTP/1.1 404 "));
+        let posted = scrape("POST /metrics HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
+        assert!(posted.starts_with("HTTP/1.1 405 "));
+        assert!(posted.contains("Allow: GET, HEAD\r\n"));
+        let piped = scrape(
+            "GET /metrics HTTP/1.1\r\nHost: x\r\n\r\nGET /metrics HTTP/1.1\r\nHost: x\r\n\r\nGET /metrics HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert_eq!(piped.matches("HTTP/1.1 200 OK\r\n").count(), 3);
+        assert_eq!(piped.matches("bunzzle_core_up{core=\"0\"} 1\n").count(), 3);
+        let broken = scrape("GARBAGE\r\n\r\n").await;
+        assert!(broken.starts_with("HTTP/1.1 400 "));
+    });
+    stopped(&driver, node);
+}
+
+#[test]
+fn a_silent_metrics_client_is_dropped() {
+    let driver = created(10);
+    let node = booted(&driver, config(7), CORES);
+    let machine = &node.machine;
+    machine.block_on(0, async {
+        drop(serving().await);
+        let stream = TcpStream::connect(METRICS.parse().expect("address"))
+            .await
+            .expect("connect");
+        let started = rt::now();
+        let (read, _) = stream.read(Buf::new(64)).await;
+        assert_eq!(read.expect("read"), 0);
+        let waited = rt::now().saturating_duration_since(started);
+        assert!(waited >= Duration::from_secs(10) && waited < Duration::from_secs(12));
+    });
+    stopped(&driver, node);
 }

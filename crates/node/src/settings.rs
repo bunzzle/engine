@@ -20,6 +20,7 @@ pub struct Config {
     pub limits: intake::Limits,
     pub listen: Vec<Listen>,
     pub api: Option<Api>,
+    pub metrics: Option<Metrics>,
     pub dns: dns::Settings,
     pub delivery: Delivery,
     pub tlsrpt: Option<Tlsrpt>,
@@ -37,6 +38,12 @@ pub struct Api {
     pub settings: api::Config,
     pub listen: Vec<SocketAddr>,
     pub plain: Vec<SocketAddr>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Metrics {
+    pub listen: Vec<SocketAddr>,
+    pub interval: Duration,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -101,6 +108,10 @@ pub fn parse(text: &str) -> Result<Config, Error> {
         Some(table) => Some(http(table, name.str()?, session.lifetime, &listen)?),
         None => None,
     };
+    let metrics = match root.table("metrics") {
+        Some(table) => Some(metrics(table, &listen, api.as_ref())?),
+        None => None,
+    };
     let dns = dns(section(&mut root, "dns")?)?;
     let mut delivery = Delivery {
         settings: deliver::Settings::new(name.str()?),
@@ -129,6 +140,7 @@ pub fn parse(text: &str) -> Result<Config, Error> {
         limits,
         listen,
         api,
+        metrics,
         dns,
         delivery,
         tlsrpt,
@@ -451,6 +463,29 @@ fn http(mut table: Table, name: &str, lifetime: u64, smtp: &[Listen]) -> Result<
         listen,
         plain,
     })
+}
+
+fn metrics(mut table: Table, smtp: &[Listen], api: Option<&Api>) -> Result<Metrics, Error> {
+    let mut taken: Vec<SocketAddr> = smtp.iter().map(|l| l.address).collect();
+    if let Some(api) = api {
+        taken.extend(api.listen.iter().chain(&api.plain));
+    }
+    let listen = addresses(&mut table, "listen", &mut taken, false)?;
+    if listen.is_empty() {
+        return Err(Error::at(1, 1, "[metrics] needs `listen`"));
+    }
+    let interval = match table.take("interval") {
+        Some(entry) => {
+            let value = entry.duration()?;
+            if !(Duration::from_secs(1)..=Duration::from_secs(60)).contains(&value) {
+                return Err(entry.error("must be between 1s and 60s"));
+            }
+            value
+        }
+        None => Duration::from_secs(1),
+    };
+    table.finish()?;
+    Ok(Metrics { listen, interval })
 }
 
 fn addresses(
