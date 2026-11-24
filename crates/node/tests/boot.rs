@@ -572,6 +572,48 @@ fn a_connection_over_the_address_limit_is_counted() {
 }
 
 #[test]
+fn key_ring_metrics_count_the_first_key_server_connect() {
+    let driver = created(12);
+    let node = booted(&driver, config(7), CORES);
+    let machine = &node.machine;
+    machine.block_on(0, async {
+        drop(serving().await);
+        let connects = |text: &str| -> u64 {
+            text.lines()
+                .filter_map(|line| line.strip_prefix("bunzzle_keys_connects_total{"))
+                .filter_map(|rest| rest.split(' ').nth(1)?.parse::<u64>().ok())
+                .sum()
+        };
+        let mut text = String::new();
+        for _ in 0..60 {
+            sleep(Duration::from_secs(10)).await;
+            text = scrape("GET /metrics HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n").await;
+            if connects(&text) > 0 {
+                break;
+            }
+        }
+        assert!(connects(&text) >= 1, "{text}");
+        for core in 0..CORES {
+            assert!(text.contains(&format!(
+                "bunzzle_keys_refused_total{{core=\"{core}\"}} 0\n"
+            )));
+            assert!(text.contains(&format!("bunzzle_keys_drops_total{{core=\"{core}\"}} 0\n")));
+            assert!(text.contains(&format!(
+                "bunzzle_batches_mismatched_total{{core=\"{core}\"}} 0\n"
+            )));
+        }
+        for family in [
+            "# TYPE bunzzle_keys_days_behind gauge\n",
+            "# TYPE bunzzle_keys_tenant_cache_hits_total counter\n",
+            "# TYPE bunzzle_batch_cache_evicted_total counter\n",
+        ] {
+            assert!(text.contains(family), "{family}");
+        }
+    });
+    stopped(&driver, node);
+}
+
+#[test]
 fn a_silent_metrics_client_is_dropped() {
     let driver = created(10);
     let node = booted(&driver, config(7), CORES);
