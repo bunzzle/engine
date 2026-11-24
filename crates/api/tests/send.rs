@@ -2284,6 +2284,98 @@ fn message_status_pages_recipients_and_hides_other_tenants() {
     });
 }
 
+async fn stalled_read(request: Vec<u8>, front: bool) {
+    let mut first = Http::plain().await;
+    first.send(&request).await;
+    sleep(Duration::from_millis(100)).await;
+    let mut second = Http::plain().await;
+    let reply = second.send_reply(&request).await;
+    let busy = if front {
+        (429, "rate_limited")
+    } else {
+        (503, "unavailable")
+    };
+    assert_eq!((reply.status, reply.code().as_str()), busy);
+    assert_eq!(reply.header("retry-after"), Some("5"));
+    let reply = first.reply().await.expect("reply");
+    assert_eq!((reply.status, reply.code().as_str()), (503, "unavailable"));
+    assert_eq!(reply.header("retry-after"), Some("5"));
+    let mut third = Http::plain().await;
+    let reply = third.send_reply(&request).await;
+    assert_eq!(reply.status, 200, "{reply:?}");
+}
+
+#[test]
+fn stalled_reads_answer_busy_then_unavailable_and_free_their_slot() {
+    let run = 11;
+    let cluster = started(run, 2);
+    let nodes = cluster.nodes.clone();
+    let seen = Rc::clone(&cluster.seen);
+    let forwards = Mesh::new(2);
+    let owners = owners(&cluster, &forwards);
+    let ends = forwards.take(0).expect("ends");
+    let (token, sent, ports) = cluster.run(async move {
+        let tokens = prepare(&nodes).await;
+        let config = ApiConfig::new("mx1.example.net".into());
+        let ports = serve_with(&nodes[0], run, config, ends).await;
+        seen.deliver.set(Some(nodes[0].sched().clock()));
+        let mut http = Http::plain().await;
+        let ids = Ids::new(&nodes[0].ids().expect("ids")).expect("ids");
+        let body = r#"{"from":"ann@example.org","to":"a@example.com","text":"x"}"#;
+        let mut sent = String::new();
+        for n in 0..64 {
+            let reply = http
+                .send_reply(&keyed(&tokens.first, &format!("s{n}"), body))
+                .await;
+            sent = reply.id();
+            let id = MessageId::from_bytes(ids.decode(sent.as_bytes()).expect("id"));
+            if id.shard % 2 == 1 {
+                break;
+            }
+        }
+        for _ in 0..2000 {
+            if !searched_all(&mut http, &tokens.first, "domain=example.com")
+                .await
+                .is_empty()
+            {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+        let reply = http.send_reply(&status(&tokens.first, &sent, "")).await;
+        assert_eq!(reply.status, 200);
+        (tokens.first, sent, ports)
+    });
+    let requests = [
+        (search(&token, "domain=example.com"), true),
+        (status(&token, &sent, ""), false),
+    ];
+    for (request, front) in requests {
+        cluster.machine.pause(2, Duration::from_secs(15));
+        cluster.run(stalled_read(request, front));
+    }
+    let watched = Rc::clone(&owners);
+    cluster.run(async move {
+        let head = format!(
+            "HEAD /v1/messages/{sent} HTTP/1.1\r\nHost: api.test\r\nAuthorization: Bearer {token}\r\n\
+             Connection: close\r\n\r\n"
+        );
+        let mut probe = Http::plain().await;
+        probe.send(head.as_bytes()).await;
+        while probe.fill().await {}
+        let text = String::from_utf8(probe.input.clone()).expect("ascii");
+        assert!(text.starts_with("HTTP/1.1 200"), "{text}");
+        assert!(text.ends_with("\r\n\r\n"), "{text}");
+        assert_eq!(ports.count(Route::Search, 429), 1);
+        assert_eq!(ports.count(Route::Search, 503), 1);
+        assert_eq!(ports.count(Route::Status, 503), 2);
+        watched.stop();
+        ports.close().await;
+    });
+    owners.join(&cluster.machine);
+    cluster.stop();
+}
+
 struct ApiStatus(u32, u32);
 
 impl Deliver for ApiStatus {

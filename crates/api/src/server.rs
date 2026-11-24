@@ -136,6 +136,7 @@ pub(crate) async fn serve<T: Transport + 'static>(
     open: Box<Open>,
 ) {
     let key = inbound.key();
+    let abortable = open.request.method == "GET" || open.request.method == "HEAD";
     let work = async {
         let Open {
             route,
@@ -159,7 +160,7 @@ pub(crate) async fn serve<T: Transport + 'static>(
         };
         inbound.reply(response);
     };
-    context.forward.until_stopped(key, work).await;
+    context.forward.until_stopped(key, abortable, work).await;
 }
 
 struct Session<'a, T> {
