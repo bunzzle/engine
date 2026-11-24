@@ -2084,6 +2084,150 @@ fn events_are_searched_by_recipient_domain_and_message_over_http() {
     });
 }
 
+fn status(token: &str, id: &str, query: &str) -> Vec<u8> {
+    format!(
+        "GET /v1/messages/{id}{query} HTTP/1.1\r\nHost: api.test\r\nAuthorization: Bearer {token}\r\n\r\n"
+    )
+    .into_bytes()
+}
+
+fn indexes(value: &Value) -> Vec<(u64, String)> {
+    value
+        .get("recipients")
+        .and_then(Value::as_array)
+        .expect("recipients")
+        .iter()
+        .map(|r| {
+            let index = r.get("index").and_then(Value::as_u64).expect("index");
+            let address = r.get("address").and_then(Value::as_str).expect("address");
+            (index, address.to_owned())
+        })
+        .collect()
+}
+
+async fn check_queued(http: &mut Http, token: &str, id: &str) {
+    let reply = http.send_reply(&status(token, id, "")).await;
+    assert_eq!(reply.status, 200, "{reply:?}");
+    let value = reply.json();
+    assert_eq!(value.get("id").and_then(Value::as_str), Some(id));
+    assert_eq!(value.get("state").and_then(Value::as_str), Some("queued"));
+    assert_eq!(value.get("more").and_then(Value::as_bool), Some(false));
+    let all: Vec<(u64, String)> = ["a@example.com", "b@example.com", "c@example.com"]
+        .iter()
+        .enumerate()
+        .map(|(n, a)| (n as u64, (*a).to_owned()))
+        .collect();
+    assert_eq!(indexes(&value), all);
+    for recipient in value
+        .get("recipients")
+        .and_then(Value::as_array)
+        .expect("r")
+    {
+        let state = recipient.get("state").and_then(Value::as_str);
+        assert!(matches!(state, Some("queued" | "deferred")), "{state:?}");
+        let next = recipient.get("next_attempt").and_then(Value::as_str);
+        assert!(next.is_some_and(|t| parse_rfc3339(t.as_bytes()).is_some()));
+    }
+    let first = http.send_reply(&status(token, id, "?limit=2")).await.json();
+    assert_eq!(indexes(&first), all[..2]);
+    assert_eq!(first.get("more").and_then(Value::as_bool), Some(true));
+    let rest = http
+        .send_reply(&status(token, id, "?after=1&limit=2"))
+        .await
+        .json();
+    assert_eq!(indexes(&rest), all[2..]);
+    assert_eq!(rest.get("more").and_then(Value::as_bool), Some(false));
+    let past = http.send_reply(&status(token, id, "?after=9")).await.json();
+    assert_eq!(indexes(&past), []);
+    for bad in ["?limit=0", "?limit=101", "?after=x", "?other=1"] {
+        let reply = http.send_reply(&status(token, id, bad)).await;
+        assert_eq!((reply.status, reply.code().as_str()), (400, "bad_request"));
+    }
+}
+
+#[test]
+fn message_status_pages_recipients_and_hides_other_tenants() {
+    check(0..2, |seed| {
+        let cluster = started(seed, 2);
+        let nodes = cluster.nodes.clone();
+        let seen = Rc::clone(&cluster.seen);
+        let forwards = Mesh::new(2);
+        let owners = owners(&cluster, &forwards);
+        let ends = forwards.take(0).expect("ends");
+        let watched = Rc::clone(&owners);
+        cluster.run(async move {
+            let owners = watched;
+            let tokens = prepare(&nodes).await;
+            let config = ApiConfig::new("mx1.example.net".into());
+            let ports = serve_with(&nodes[0], seed, config, ends).await;
+            let mut http = Http::plain().await;
+            let to = r#"["a@example.com","b@example.com","c@example.com"]"#;
+            let body = format!(r#"{{"from":"ann@example.org","to":{to},"text":"x"}}"#);
+            let ids = Ids::new(&nodes[0].ids().expect("ids")).expect("ids");
+            let core = |id: &str| {
+                MessageId::from_bytes(ids.decode(id.as_bytes()).expect("id")).shard % 2
+            };
+            let mut queued = Vec::new();
+            for n in 0..64 {
+                let reply = http.send_reply(&keyed(&tokens.first, &format!("k{n}"), &body)).await;
+                let id = reply.id();
+                if queued.iter().all(|q: &String| core(q) != core(&id)) {
+                    queued.push(id);
+                }
+                if queued.len() == 2 {
+                    break;
+                }
+            }
+            assert_eq!(queued.len(), 2);
+            for id in &queued {
+                check_queued(&mut http, &tokens.first, id).await;
+                for token in [&tokens.second, &tokens.third] {
+                    let reply = http.send_reply(&status(token, id, "")).await;
+                    assert_eq!((reply.status, reply.code().as_str()), (404, "not_found"));
+                }
+            }
+            let mut bytes = ids.decode(queued[0].as_bytes()).expect("id");
+            bytes[15] ^= 1;
+            for absent in [ids.encode(&bytes), "nope".into(), String::new()] {
+                let reply = http.send_reply(&status(&tokens.first, &absent, "")).await;
+                assert_eq!((reply.status, reply.code().as_str()), (404, "not_found"));
+            }
+            let request = format!(
+                "DELETE /v1/messages/{} HTTP/1.1\r\nHost: api.test\r\nAuthorization: Bearer {}\r\n\r\n",
+                queued[0], tokens.first
+            );
+            let reply = http.send_reply(request.as_bytes()).await;
+            assert_eq!(reply.status, 405);
+            assert_eq!(reply.header("allow"), Some("GET, HEAD"));
+
+            seen.deliver.set(Some(nodes[0].sched().clock()));
+            let sent = http.post(&tokens.first, &body).await.id();
+            let mut done = None;
+            for _ in 0..2000 {
+                let reply = http.send_reply(&status(&tokens.first, &sent, "")).await;
+                assert_eq!(reply.status, 200, "{reply:?}");
+                let value = reply.json();
+                if indexes(&value).is_empty() {
+                    done = Some(value);
+                    break;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+            let done = done.expect("message dropped");
+            assert_eq!(done.get("state").and_then(Value::as_str), Some("done"));
+            assert_eq!(done.get("more").and_then(Value::as_bool), Some(false));
+            let reply = http.send_reply(&status(&tokens.second, &sent, "")).await;
+            assert_eq!((reply.status, reply.code().as_str()), (404, "not_found"));
+            assert!(ports.count(Route::Status, 200) >= 8);
+            assert_eq!(ports.count(Route::Status, 405), 1);
+            owners.stop();
+            ports.close().await;
+        });
+        owners.join(&cluster.machine);
+        cluster.stop();
+    });
+}
+
 struct ApiStatus(u32, u32);
 
 impl Deliver for ApiStatus {

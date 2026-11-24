@@ -13,6 +13,7 @@ mod intake;
 mod json;
 mod keyring;
 mod lanes;
+mod message;
 mod node;
 mod normal;
 mod policy;
@@ -45,6 +46,7 @@ pub use intake::{Draft, domain_of};
 pub use json::{event_json, kind_name as event_kind_name};
 pub use keyring::Keyring;
 pub use lanes::{Entry, Lanes, Limits, QueueId, Take, ranges};
+pub use message::{MESSAGE_LIMIT, MessagePage, MessageRecipient};
 pub use node::{Arrival, Claim, Config, Note, ReportErrors, Route, Sched, queue_core};
 pub use normal::{MAX_ADDRESS, normalize, punycode};
 pub use policy::{

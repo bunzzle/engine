@@ -43,6 +43,9 @@ impl<T: Transport + 'static, S: Source> Handler<'_, T, S> {
             Route::Messages => self.send(request).await?,
             Route::Raw => self.raw(request).await?,
             Route::Hooks => return crate::hooks::handle(self, request, id).await,
+            Route::Status => {
+                return crate::message::read(self.context, self.grant, request, id).await;
+            }
             Route::Events | Route::Search | Route::Health | Route::Other => {
                 return Err(Problem::not_found().into());
             }

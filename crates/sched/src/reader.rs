@@ -290,7 +290,7 @@ impl Reader {
         answer
     }
 
-    fn generation(&self, tenant: u32) -> Result<u32, ReadError> {
+    pub(crate) fn generation(&self, tenant: u32) -> Result<u32, ReadError> {
         self.inner
             .table
             .borrow()

@@ -17,6 +17,7 @@ use crate::delete::sweep_queues;
 use crate::error::Error;
 use crate::events::{self, KIND_EVENT};
 use crate::finder::Query;
+use crate::message::{self, MESSAGE_LIMIT, MessagePage};
 use crate::node::{Config, Note, Sched};
 use crate::reader::{self, EventPage, ReadError, Reader};
 use crate::requests::{KIND_REQUEST, RequestInputs, Requests, retain_request};
@@ -339,6 +340,31 @@ impl<T: Transport + 'static> Node<T> {
             .reader
             .search(self.keys(), tenant, query, after, limit)
             .await
+    }
+
+    pub async fn message(
+        &self,
+        tenant: u32,
+        generation: u32,
+        id: spool::MessageId,
+        after: Option<u32>,
+        limit: usize,
+    ) -> Result<Option<MessagePage>, ReadError> {
+        if limit == 0 || limit > MESSAGE_LIMIT {
+            return Err(ReadError::Limit);
+        }
+        if self.inner.reader.generation(tenant)? != generation {
+            return Err(ReadError::Tenant);
+        }
+        let owner = (tenant, generation);
+        let spool = self.spool();
+        if let Some(page) = message::live(spool, self.keys(), owner, id, after, limit).await? {
+            return Ok(Some(page));
+        }
+        let now = self.sched().clock().now();
+        let query = message::finished_query(id, now).ok_or(ReadError::Failed)?;
+        let page = self.search(tenant, &query, None, 1).await?;
+        Ok((!page.events.is_empty()).then(MessagePage::finished))
     }
 
     pub fn suppressions(&self) -> &Suppressions {

@@ -4,6 +4,7 @@ mod handler;
 mod hooks;
 pub mod json;
 mod listen;
+mod message;
 pub mod mime;
 mod problem;
 mod search;
