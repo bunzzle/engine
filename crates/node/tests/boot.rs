@@ -22,6 +22,7 @@ const SMTP: &str = "10.0.0.1:587";
 const API: &str = "127.0.0.1:8080";
 const METRICS: &str = "127.0.0.1:9464";
 const ADMIN: &str = "/run/admin.sock";
+const WAIT: Duration = Duration::from_secs(5);
 const OPTIONS: Options = Options {
     journal_size: 8 * SLOT_SIZE,
     region_size: 8 * SLOT_SIZE,
@@ -690,7 +691,7 @@ fn the_admin_socket_answers_status_on_the_control_core() {
     node.machine.block_on(0, async move {
         drop(serving().await);
         let socket = Path::new(ADMIN);
-        let reply = admin::call(socket, UID, &admin::Request::Status)
+        let reply = admin::call(socket, UID, &admin::Request::Status, WAIT)
             .await
             .expect("status");
         assert_eq!(reply.code, admin::Code::Ok);
@@ -701,7 +702,7 @@ fn the_admin_socket_answers_status_on_the_control_core() {
         );
         control.set_uid(UID + 1);
         assert!(
-            admin::call(socket, UID, &admin::Request::Status)
+            admin::call(socket, UID, &admin::Request::Status, WAIT)
                 .await
                 .is_err()
         );

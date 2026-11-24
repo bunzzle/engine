@@ -122,22 +122,8 @@ impl Admin {
 async fn session<H: Handler>(stream: &UnixStream, handler: &H, state: &Shared) {
     let mut frames = Frames::default();
     loop {
-        let body = loop {
-            match frames.pop() {
-                Ok(Some(body)) => break body,
-                Ok(None) => {}
-                Err(_) => {
-                    state.count(|s| s.malformed += 1);
-                    return;
-                }
-            }
-            let Ok((read, buf)) = timeout(IDLE, stream.read(Buf::new(READ))).await else {
-                return;
-            };
-            match read {
-                Ok(0) | Err(_) => return,
-                Ok(n) => frames.push(&buf[..n]),
-            }
+        let Ok(Some(body)) = timeout(IDLE, frame(stream, &mut frames, state)).await else {
+            return;
         };
         let reply = match Request::decode(&body) {
             Ok(request) => {
@@ -149,9 +135,27 @@ async fn session<H: Handler>(stream: &UnixStream, handler: &H, state: &Shared) {
                 Reply::new(Code::Refused, error.to_string())
             }
         };
-        let (written, _) = stream.write_all(Buf::from_slice(&reply.encode())).await;
-        if written.is_err() {
+        let written = timeout(IDLE, stream.write_all(Buf::from_slice(&reply.encode()))).await;
+        if !matches!(written, Ok((Ok(()), _))) {
             return;
+        }
+    }
+}
+
+async fn frame(stream: &UnixStream, frames: &mut Frames, state: &Shared) -> Option<Vec<u8>> {
+    loop {
+        match frames.pop() {
+            Ok(Some(body)) => return Some(body),
+            Ok(None) => {}
+            Err(_) => {
+                state.count(|s| s.malformed += 1);
+                return None;
+            }
+        }
+        let (read, buf) = stream.read(Buf::new(READ)).await;
+        match read {
+            Ok(0) | Err(_) => return None,
+            Ok(n) => frames.push(&buf[..n]),
         }
     }
 }
