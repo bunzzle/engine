@@ -3,6 +3,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicU32;
 use std::time::Duration;
 
+use metrics::Slab;
 use rt::{Buf, Receiver, Sender, channel};
 
 mod compaction;
@@ -20,6 +21,7 @@ use crate::regions::{Claim, Regions};
 use crate::run;
 use crate::session::{Answer, Event, Owned, Results, Session};
 use crate::shard::KIND_STATE;
+use crate::stats::{Probe, Snapshot, Tally};
 use crate::usage::Usage;
 use compaction::Compaction;
 pub use compaction::{CompactionStats, Space};
@@ -201,6 +203,8 @@ pub struct Committer {
     part_timeout: Duration,
     compaction: Compaction,
     failed: bool,
+    probe: Probe,
+    tally: Tally,
 }
 
 impl Committer {
@@ -241,6 +245,8 @@ impl Committer {
             part_timeout: PART_TIMEOUT,
             compaction: Compaction::new(count),
             failed: false,
+            probe: Probe::default(),
+            tally: Tally::default(),
         };
         (committer, Client { sender })
     }
@@ -272,6 +278,11 @@ impl Committer {
     }
 
     fn reply(&mut self, reply: Reply, result: Result<Durable, Error>) {
+        if result.is_ok() {
+            self.tally.submissions += 1;
+        } else {
+            self.tally.refused += 1;
+        }
         match reply {
             Reply::Once(sender) => {
                 let _ = sender.send(result);
@@ -337,12 +348,36 @@ impl Committer {
         self.failed
     }
 
+    pub fn observe(&mut self, slab: Arc<Slab>) {
+        self.probe.attach(slab);
+    }
+
+    fn publish(&self) {
+        self.probe.publish(|| {
+            let compaction = self.compaction();
+            Snapshot {
+                tally: self.tally,
+                failed: self.failed,
+                free: self.regions.free(),
+                reserved: self.regions.reserved(),
+                quarantined: self.usage.quarantined_count(),
+                low: self.low_space(),
+                journal_free: self.journal.free(),
+                journal: self.journal.size(),
+                victims: compaction.victims,
+                moved: compaction.moved,
+            }
+        });
+    }
+
     pub async fn run(mut self) -> Self {
+        self.publish();
         loop {
             let first = match self.next_request().await {
                 Next::Request(request) => request,
                 Next::Tick => {
                     self.settle().await;
+                    self.publish();
                     continue;
                 }
                 Next::Closed => break,
@@ -356,8 +391,10 @@ impl Committer {
                 self.commit(batch).await;
             }
             self.settle().await;
+            self.publish();
         }
         self.close().await;
+        self.publish();
         self
     }
 
@@ -627,6 +664,7 @@ impl Committer {
         };
         self.allocations.clear();
         self.usage.settle(&commit.live, &commit.dead);
+        self.tally.commits += 1;
         for entry in accepted {
             let durable = Durable {
                 sequence,
@@ -641,13 +679,30 @@ impl Committer {
     }
 
     async fn write(&mut self, buffers: Vec<(u64, Buf)>, commit: &Commit) -> Result<u64, Error> {
+        let started = self.probe.start();
+        let mut synced = None;
+        let result = self.write_sync(buffers, commit, &mut synced).await;
+        self.probe.finish(started, synced, result.is_ok());
+        result
+    }
+
+    async fn write_sync(
+        &mut self,
+        buffers: Vec<(u64, Buf)>,
+        commit: &Commit,
+        synced: &mut Option<rt::Instant>,
+    ) -> Result<u64, Error> {
         let file = self.data.file();
+        let mut bytes = 0u64;
         for (offset, buf) in buffers {
+            bytes = bytes.saturating_add(u64::try_from(buf.len()).unwrap_or(u64::MAX));
             let (result, _) = file.write_all_at(buf, offset).await;
             result?;
         }
         let position = self.journal.append(file, commit).await?;
+        *synced = self.probe.now();
         file.sync_data().await?;
+        self.tally.bytes = self.tally.bytes.saturating_add(bytes);
         Ok(position.sequence)
     }
 

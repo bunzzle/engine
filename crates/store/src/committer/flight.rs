@@ -412,6 +412,7 @@ impl Committer {
         self.regions.checkpointed();
         self.free_unpinned(pending);
         self.release_state(&referenced);
+        self.tally.checkpoints += 1;
         Ok(position)
     }
 

@@ -87,7 +87,8 @@ where
     let plan = Arc::new(plan);
     let failure = Arc::new(Mutex::new(None));
     let failed = Arc::clone(&failure);
-    let committer = store::launch(store, setup, move |core| {
+    let metrics = plan.metrics().and_then(|board| board.node().cloned());
+    let committer = store::launch(store, setup, metrics, move |core| {
         let plan = Arc::clone(&plan);
         let failed = Arc::clone(&failed);
         let transport = transport(core.index);

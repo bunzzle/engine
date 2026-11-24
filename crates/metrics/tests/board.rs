@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::thread;
 
-use metrics::{Board, Def, Invalid, Kind};
+use metrics::{Board, Def, Invalid, Kind, Slab};
 
 const fn def(name: &'static str, kind: Kind) -> Def {
     Def {
@@ -90,4 +90,50 @@ fn readers_see_values_published_before_the_stamp() {
     }
     writer.join().expect("writer");
     assert_eq!(slab.get(0), Some(20_000));
+}
+
+#[test]
+fn refuses_bad_histograms() {
+    const fn histogram(name: &'static str, bounds: &'static [u64]) -> Def {
+        def(name, Kind::Histogram(bounds))
+    }
+    static EMPTY: [Def; 1] = [histogram("x_seconds", &[])];
+    static UNSORTED: [Def; 1] = [histogram("x_seconds", &[5, 5])];
+    static UNIT: [Def; 1] = [histogram("x", &[5])];
+    static CLASH: [Def; 2] = [
+        histogram("x_seconds", &[5]),
+        def("x_seconds_count", Kind::Gauge),
+    ];
+    let check = |defs: &'static [Def]| Slab::new(defs).err();
+    assert_eq!(check(&EMPTY), Some(Invalid::Bounds("x_seconds")));
+    assert_eq!(check(&UNSORTED), Some(Invalid::Bounds("x_seconds")));
+    assert_eq!(check(&UNIT), Some(Invalid::Name("x")));
+    assert_eq!(check(&CLASH), Some(Invalid::Duplicate("x_seconds_count")));
+}
+
+#[test]
+fn node_names_must_not_clash_with_core_names() {
+    static NODE: [Def; 1] = [def("queued", Kind::Counter)];
+    let node = Arc::new(Slab::new(&NODE).expect("valid"));
+    let board = Board::new("bunzzle", &TWO, 1).expect("valid");
+    assert_eq!(
+        board.with_node(node).err(),
+        Some(Invalid::Duplicate("queued"))
+    );
+}
+
+#[test]
+fn histogram_slots_ignore_scalar_access() {
+    static MIXED: [Def; 2] = [
+        def("wait_seconds", Kind::Histogram(&[10])),
+        def("sent", Kind::Counter),
+    ];
+    let slab = Slab::new(&MIXED).expect("valid");
+    slab.set(0, 9);
+    assert_eq!(slab.get(0), None);
+    slab.observe(1, 5);
+    slab.observe(0, 5);
+    slab.set(1, 3);
+    assert_eq!(slab.get(1), Some(3));
+    slab.observe(7, 5);
 }

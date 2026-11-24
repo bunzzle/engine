@@ -1,6 +1,6 @@
 use std::fmt::Write;
 
-use crate::board::{AGE, Board, Kind, Slab, UP};
+use crate::board::{AGE, Board, Def, Kind, Slab, UP};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Format {
@@ -20,27 +20,16 @@ impl Format {
 impl Board {
     pub fn render(&self, format: Format, now_ms: u64, stale_ms: u64, out: &mut String) {
         let stamps: Vec<Option<u64>> = self.slabs.iter().map(Slab::published).collect();
-        for (index, def) in self.defs.iter().enumerate() {
-            let counter = def.kind == Kind::Counter;
-            let family = if counter && format == Format::Text {
-                "_total"
-            } else {
-                ""
-            };
-            let sample = if counter { "_total" } else { "" };
-            let kind = if counter { "counter" } else { "gauge" };
-            self.header(out, def.name, family, def.help, kind);
-            for (core, slab) in self.slabs.iter().enumerate() {
-                if stamps[core].is_none() {
-                    continue;
-                }
-                let value = slab.get(index).unwrap_or(0);
-                let _ = writeln!(
-                    out,
-                    "{}_{}{sample}{{core=\"{core}\"}} {value}",
-                    self.prefix, def.name
-                );
-            }
+        let live: Vec<(String, &Slab)> = self
+            .slabs
+            .iter()
+            .enumerate()
+            .filter(|(core, _)| stamps[*core].is_some())
+            .map(|(core, slab)| (format!("core=\"{core}\""), slab))
+            .collect();
+        self.families(format, self.defs, &live, out);
+        if let Some(node) = self.node.as_deref().filter(|n| n.published().is_some()) {
+            self.families(format, node.defs(), &[(String::new(), node)], out);
         }
         self.header(
             out,
@@ -82,9 +71,75 @@ impl Board {
         }
     }
 
+    fn families(&self, format: Format, defs: &[Def], slabs: &[(String, &Slab)], out: &mut String) {
+        let prefix = self.prefix;
+        for (index, def) in defs.iter().enumerate() {
+            let name = def.name;
+            match def.kind {
+                Kind::Counter | Kind::Gauge => {
+                    let counter = def.kind == Kind::Counter;
+                    let family = if counter && format == Format::Text {
+                        "_total"
+                    } else {
+                        ""
+                    };
+                    let sample = if counter { "_total" } else { "" };
+                    let kind = if counter { "counter" } else { "gauge" };
+                    self.header(out, name, family, def.help, kind);
+                    for (labels, slab) in slabs {
+                        let value = slab.get(index).unwrap_or(0);
+                        let _ = writeln!(out, "{prefix}_{name}{sample}{} {value}", braces(labels));
+                    }
+                }
+                Kind::Histogram(bounds) => {
+                    self.header(out, name, "", def.help, "histogram");
+                    for (labels, slab) in slabs {
+                        let Some(histogram) = slab.histogram(index) else {
+                            continue;
+                        };
+                        let join = if labels.is_empty() { "" } else { "," };
+                        let mut count = 0u64;
+                        for (bucket, value) in histogram.buckets.iter().enumerate() {
+                            count = count.saturating_add(*value);
+                            let le = bounds
+                                .get(bucket)
+                                .map_or_else(|| "+Inf".to_owned(), |b| seconds(*b));
+                            let _ = writeln!(
+                                out,
+                                "{prefix}_{name}_bucket{{{labels}{join}le=\"{le}\"}} {count}"
+                            );
+                        }
+                        let braced = braces(labels);
+                        let _ = writeln!(
+                            out,
+                            "{prefix}_{name}_sum{braced} {}",
+                            seconds(histogram.sum)
+                        );
+                        let _ = writeln!(out, "{prefix}_{name}_count{braced} {count}");
+                    }
+                }
+            }
+        }
+    }
+
     fn header(&self, out: &mut String, name: &str, suffix: &str, help: &str, kind: &str) {
         let prefix = self.prefix;
         let _ = writeln!(out, "# HELP {prefix}_{name}{suffix} {help}");
         let _ = writeln!(out, "# TYPE {prefix}_{name}{suffix} {kind}");
     }
+}
+
+fn braces(labels: &str) -> String {
+    if labels.is_empty() {
+        String::new()
+    } else {
+        format!("{{{labels}}}")
+    }
+}
+
+fn seconds(micros: u64) -> String {
+    let fraction = format!("{:06}", micros % 1_000_000);
+    let fraction = fraction.trim_end_matches('0');
+    let fraction = if fraction.is_empty() { "0" } else { fraction };
+    format!("{}.{fraction}", micros / 1_000_000)
 }

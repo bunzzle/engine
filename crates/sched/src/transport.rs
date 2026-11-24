@@ -34,6 +34,12 @@ pub struct Attempt {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TransportStats {
+    pub pooled: u64,
+    pub dead_hosts: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct OwnStats {
     pub ipv4_off: bool,
     pub ipv6_off: bool,
@@ -91,5 +97,9 @@ pub trait Transport {
 
     fn own_stats(&self) -> OwnStats {
         OwnStats::default()
+    }
+
+    fn stats(&self) -> TransportStats {
+        TransportStats::default()
     }
 }
