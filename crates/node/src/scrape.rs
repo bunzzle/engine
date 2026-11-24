@@ -54,6 +54,8 @@ catalog! {
     AttemptsUnrouted: Counter, "attempts_unrouted", "Delivery attempts that found no route";
     AttemptsUnreadable: Counter, "attempts_unreadable", "Delivery attempts skipped because the message could not be read";
     SigningFaults: Counter, "signing_faults", "Signing attempts refused for a message format fault";
+    SuppressionsBounced: Counter, "suppressions_bounced", "Recipients suppressed after a mailbox-level hard failure";
+    SuppressionsBounceFailed: Counter, "suppressions_bounce_failed", "Mailbox-level hard failures that could not be suppressed";
     SchedRefused: Counter, "sched_refused", "Scheduler entries and notes refused as stale or invalid";
     RecipientsDelivered: Counter, "recipients_delivered", "Recipient attempts answered as delivered";
     RecipientsFailed: Counter, "recipients_failed", "Recipient attempts answered as failed";
@@ -162,6 +164,8 @@ impl<T: Transport + 'static> Sources<'_, T> {
         set(Id::AttemptsUnrouted, sched.unrouted());
         set(Id::AttemptsUnreadable, sched.unreadable());
         set(Id::SigningFaults, sched.unsigned());
+        set(Id::SuppressionsBounced, sched.bounced());
+        set(Id::SuppressionsBounceFailed, sched.bounce_failed());
         set(Id::SchedRefused, sched.refused());
         set(Id::TicksLate, self.node.ticks_late());
         let answers = sched.answers();

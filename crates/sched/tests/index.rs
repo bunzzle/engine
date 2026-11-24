@@ -274,6 +274,7 @@ async fn answer(attempt: Attempt) -> Vec<Answered> {
             answer,
             reply: Vec::new(),
             event: opener.event(c.recipient, c.stamp, &body).ok(),
+            bounced: None,
         });
     }
     answered

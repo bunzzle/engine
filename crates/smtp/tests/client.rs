@@ -214,6 +214,7 @@ fn pipelined_transaction_answers_each_recipient() {
     assert_eq!(steps[4], Step::Body);
     assert_eq!(steps[5], Step::Done);
     assert_eq!(codes(&t), ["ok", "refused 550", "again 452"]);
+    assert_eq!(t.refused_at_rcpt(), [false, true, true]);
     assert!(t.again());
     assert!(t.reusable());
 }
@@ -233,6 +234,7 @@ fn a_refused_mail_answers_everyone_and_skips_the_rest() {
     assert_eq!(steps, [Step::Wait, Step::Wait, Step::Wait, Step::Done]);
     assert_eq!(codes(&t), ["refused 451", "refused 451"]);
     assert_eq!(t.mail_refused().map(|r| r.code), Some(451));
+    assert_eq!(t.refused_at_rcpt(), [false, false]);
     assert!(t.reusable());
     let (sent, steps, t) = run(&caps(true), 1, &["550 no", "250 ok", "354 go", "554 no"]);
     assert_eq!(
@@ -262,12 +264,14 @@ fn no_body_goes_out_when_no_recipient_or_data_fails() {
     );
     assert_eq!(steps.last(), Some(&Step::Done));
     assert_eq!(codes(&t), ["refused 451", "refused 550"]);
+    assert_eq!(t.refused_at_rcpt(), [false, true]);
     let (_, _, t) = run(
         &caps(true),
         1,
         &["250 ok", "250 ok", "354 go", "552 5.3.4 too big"],
     );
     assert_eq!(codes(&t), ["refused 552"]);
+    assert_eq!(t.refused_at_rcpt(), [false]);
 }
 
 #[test]

@@ -109,6 +109,7 @@ impl Fault {
                     .and_then(|(opener, text)| opener.seal_reply(c.recipient, c.stamp, text).ok())
                     .unwrap_or_default(),
                 event: None,
+                bounced: None,
             })
             .collect()
     }

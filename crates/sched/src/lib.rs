@@ -80,7 +80,7 @@ pub use suppress::{
 };
 pub use system::{Done, RecordStats, Records, Restore, Saved, Unsaved};
 pub use transport::{
-    Answered, Attempt, Claimed, Destination, OwnStats, ReportMail, Reported, Transport,
+    Answered, Attempt, Bounced, Claimed, Destination, OwnStats, ReportMail, Reported, Transport,
     TransportStats,
 };
 pub use unopened::{Action, DROPS_PER_MINUTE, UnopenedStats, action};

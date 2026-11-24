@@ -298,6 +298,28 @@ impl Suppressions {
         until: Option<u64>,
     ) -> Result<(), Refusal> {
         let generation = self.generation(tenant)?;
+        self.put(tenant, generation, address, reason, until).await
+    }
+
+    pub(crate) async fn bounce(
+        &self,
+        tenant: u32,
+        generation: u32,
+        address: &str,
+    ) -> Result<(), Refusal> {
+        self.holds(tenant, generation)?;
+        self.put(tenant, generation, address, Reason::Bounce, None)
+            .await
+    }
+
+    async fn put(
+        &self,
+        tenant: u32,
+        generation: u32,
+        address: &str,
+        reason: Reason,
+        until: Option<u64>,
+    ) -> Result<(), Refusal> {
         let address = normalize(address).ok_or(Refusal::Address)?;
         let hash = self.hash(tenant, generation, &address).await?;
         let shard = self.owner(tenant, &hash);
@@ -492,6 +514,17 @@ impl Suppressions {
         }
     }
 
+    fn holds(&self, tenant: u32, generation: u32) -> Result<(), Refusal> {
+        self.inner
+            .parts
+            .table
+            .borrow()
+            .tenant(tenant)
+            .filter(|t| t.generation == generation && !t.state.deleted())
+            .map(|_| ())
+            .ok_or(Refusal::Tenant)
+    }
+
     async fn values(
         &self,
         tenant: u32,
@@ -554,7 +587,7 @@ impl Suppressions {
         reason: Reason,
         until: Option<u64>,
     ) -> Result<(), Refusal> {
-        self.current(tenant, generation)?;
+        self.holds(tenant, generation)?;
         let parts = &self.inner.parts;
         let keys = keys_of(parts.keys.as_ref(), tenant, generation).await?;
         let value = Value {

@@ -18,6 +18,32 @@ const THROTTLE: [&str; 6] = [
     "too many concurrent",
 ];
 
+const GONE: [&str; 9] = [
+    "user unknown",
+    "unknown user",
+    "no such user",
+    "no such mailbox",
+    "mailbox not found",
+    "recipient unknown",
+    "unknown recipient",
+    "user does not exist",
+    "mailbox does not exist",
+];
+
+pub fn gone(response: &Response) -> bool {
+    if !matches!(response.code, 550 | 551 | 553) {
+        return false;
+    }
+    match response.status {
+        Some((5, subject, detail)) => matches!((subject, detail), (1, 1 | 6 | 10) | (2, 1)),
+        Some(_) => false,
+        None => {
+            let text = response.lines.join(" ").to_ascii_lowercase();
+            GONE.iter().any(|w| text.contains(w))
+        }
+    }
+}
+
 pub fn answer(response: &Response) -> Answer {
     match response.code {
         200..=399 => Answer::Delivered,
@@ -102,6 +128,28 @@ mod tests {
         ];
         for (response, want) in cases {
             assert_eq!(answer(&response), want, "{}", response.text());
+        }
+    }
+
+    #[test]
+    fn only_mailbox_level_failures_are_gone() {
+        let cases = [
+            (response(550, Some((5, 1, 1)), "no such user"), true),
+            (response(550, Some((5, 1, 10)), "null MX"), true),
+            (response(551, Some((5, 1, 6)), "moved"), true),
+            (response(550, Some((5, 2, 1)), "account disabled"), true),
+            (response(550, None, "User unknown"), true),
+            (response(553, None, "mailbox does not exist"), true),
+            (response(550, Some((5, 7, 1)), "user unknown"), false),
+            (response(554, Some((5, 1, 1)), "no such user"), false),
+            (response(550, Some((5, 2, 2)), "mailbox full"), false),
+            (response(550, Some((4, 1, 1)), "no such user"), false),
+            (response(550, None, "blocked"), false),
+            (response(550, None, "sender domain does not exist"), false),
+            (response(450, Some((4, 1, 1)), "user unknown"), false),
+        ];
+        for (response, want) in cases {
+            assert_eq!(gone(&response), want, "{}", response.text());
         }
     }
 }

@@ -18,7 +18,7 @@ mod sts;
 mod upload;
 
 pub use address::{Bind, Cidr, Local};
-pub use classify::{answer, kind};
+pub use classify::{answer, gone, kind};
 pub use deliver::{Deliver, Due, Message, Outcome};
 pub use gzip::gzip;
 pub use hook::{HookSettings, Hooks, delivery_id, signature};
