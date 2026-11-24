@@ -44,6 +44,12 @@ impl Entry {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Waiting {
+    pub recipients: u64,
+    pub in_flight: u32,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Take {
     pub queue: QueueId,
@@ -213,6 +219,22 @@ impl Lanes {
         if matches!(state.place, Place::Parked | Place::Idle) {
             self.place(queue, now);
         }
+    }
+
+    pub fn waiting(&self, queue: QueueId, tenant: u32) -> Option<Waiting> {
+        let state = self.queues.get(&queue).filter(|q| q.tenant == tenant)?;
+        Some(Waiting {
+            recipients: state.entries.values().map(|e| u64::from(e.count())).sum(),
+            in_flight: state.in_flight,
+        })
+    }
+
+    pub fn retry_queue(&mut self, queue: QueueId, tenant: u32, now: u64) -> bool {
+        if self.queues.get(&queue).is_none_or(|q| q.tenant != tenant) {
+            return false;
+        }
+        self.retry_now(queue, now);
+        true
     }
 
     pub fn retry_now(&mut self, queue: QueueId, now: u64) {

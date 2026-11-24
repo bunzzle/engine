@@ -97,6 +97,16 @@ fn every_request_round_trips() {
         Request::Status,
         Request::TenantList(7),
         Request::PoolList(0),
+        Request::QueueList { tenant: 5, from: 9 },
+        Request::QueueRetry {
+            tenant: 5,
+            queue: 9,
+        },
+        Request::QueueRebind {
+            tenant: 5,
+            queue: 9,
+            pool: 2,
+        },
         Request::TenantSuspend(u32::MAX),
         Request::TenantResume(7),
         Request::TenantCreate(TenantSpec {

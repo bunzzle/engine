@@ -391,6 +391,23 @@ impl Queues {
         })
     }
 
+    pub fn queue(&self, id: u32) -> Option<Queue> {
+        self.inner.owned.borrow().queues.get(&id).cloned()
+    }
+
+    pub fn tenant_queues(&self, tenant: u32, from: u32, limit: usize) -> Vec<Queue> {
+        self.inner
+            .owned
+            .borrow()
+            .queues
+            .range(from..)
+            .map(|(_, queue)| queue)
+            .filter(|queue| queue.name.tenant == tenant)
+            .take(limit)
+            .cloned()
+            .collect()
+    }
+
     pub fn naming_core(&self, tenant: u32, domain: &str) -> u16 {
         let naming = &self.inner.naming;
         naming_shard(&naming.key, tenant, domain, naming.shards) % self.inner.cores
