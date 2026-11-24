@@ -1,8 +1,10 @@
 use std::cell::RefCell;
 use std::collections::BTreeSet;
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::Duration;
 
+use metrics::{Board, Format, Slab};
 use rt::sim::{Config, Faults, SimDriver, check};
 use rt::{Buf, File, JoinHandle, OpenOptions, Runtime, sleep, spawn};
 use store::{
@@ -162,6 +164,61 @@ fn recovery_starts_from_the_checkpoint() {
         assert_eq!(recovered.state.record_sequence, last + 1);
         verify(&data, &acked).await;
     });
+}
+
+#[test]
+fn a_checkpoint_in_flight_shows_its_start_time_until_it_is_written() {
+    let setup = Rc::new(SimDriver::new(41, Config::default()));
+    run(&setup, async {
+        DataFile::create(PATH, &OPTIONS).await.expect("create");
+    });
+    let slow = Config {
+        sync_latency: (Duration::from_secs(10), Duration::from_secs(10)),
+        ..Config::default()
+    };
+    let driver = Rc::new(SimDriver::with_disk(41, slow, setup.crash()));
+    let slab = store::metrics_slab();
+    let observed = Arc::clone(&slab);
+    run(&driver, async move {
+        let (data, recovered) = reopen().await;
+        let recovered = recovered.expect("recover");
+        let (mut committer, client) = Committer::new(data, recovered.journal, recovered.state);
+        committer.observe(observed);
+        let running = spawn(committer.run());
+        let mut acked = Vec::new();
+        commit_some(&client, 0, 1, &mut acked).await;
+        let checkpoint = {
+            let client = client.clone();
+            spawn(async move { client.checkpoint().await })
+        };
+        sleep(Duration::from_secs(5)).await;
+        assert_ne!(
+            value(&slab, "bunzzle_store_checkpoint_started_seconds"),
+            "0"
+        );
+        assert_eq!(value(&slab, "bunzzle_store_checkpoint_seconds_count"), "0");
+        checkpoint.await.expect("checkpoint");
+        assert_eq!(
+            value(&slab, "bunzzle_store_checkpoint_started_seconds"),
+            "0"
+        );
+        assert_eq!(value(&slab, "bunzzle_store_checkpoint_seconds_count"), "1");
+        let sum = value(&slab, "bunzzle_store_checkpoint_seconds_sum");
+        assert!(sum.parse::<f64>().expect("sum") >= 10.0, "{sum}");
+        drop(client);
+        drop(running.await);
+    });
+}
+
+fn value(slab: &Arc<Slab>, name: &str) -> String {
+    let board = Board::new("bunzzle", &[], 1)
+        .and_then(|board| board.with_node(Arc::clone(slab)))
+        .expect("board");
+    let mut text = String::new();
+    board.render(Format::Text, 0, 0, &mut text);
+    text.lines()
+        .find_map(|line| line.strip_prefix(name)?.strip_prefix(' '))
+        .map_or_else(|| panic!("{name} missing in {text}"), str::to_owned)
 }
 
 #[test]
