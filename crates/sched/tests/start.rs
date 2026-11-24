@@ -1281,6 +1281,12 @@ async fn queue_admin(nodes: Vec<Node<Simulated>>, _shard: u16) {
     );
     let page = node.queue_list(1, other).await.expect("list");
     assert!(page.rows[0].id == other && page.rows[0].draining);
+    assert_eq!(
+        node.queue_rebind(1, other, 1).await,
+        Err(QueueRefusal::Draining)
+    );
+    let page = node.queue_list(1, moved).await.expect("list");
+    assert_eq!((page.rows[0].id, page.rows[0].pool), (moved, 2));
 
     node.write(tenant(3, 100, State::Suspended))
         .await
@@ -1300,6 +1306,18 @@ async fn queue_admin(nodes: Vec<Node<Simulated>>, _shard: u16) {
         Err(QueueRefusal::Tenant)
     );
     assert_eq!(node.queue_list(3, 0).await.expect("list").rows.len(), 1);
+
+    node.delete_tenant(3).await.expect("delete");
+    for core in &nodes {
+        while !core.table().gone(3, 1) {
+            sleep(Duration::from_millis(1)).await;
+        }
+    }
+    assert_eq!(node.queue_list(3, 0).await.expect("list").rows, []);
+    assert_eq!(
+        node.queue_retry(3, three).await,
+        Err(QueueRefusal::NotFound)
+    );
 }
 
 #[test]

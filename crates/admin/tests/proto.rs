@@ -162,5 +162,6 @@ fn short_long_or_odd_fields_are_refused() {
     odd[7] = 5;
     assert_eq!(Request::decode(&odd), Err(Error::Body));
     assert_eq!(Request::decode(&[VERSION, 4, 0, 0, 0]), Err(Error::Body));
-    assert_eq!(Request::decode(&[VERSION, 8]), Err(Error::Command));
+    assert_eq!(Request::decode(&[VERSION, 8]), Err(Error::Body));
+    assert_eq!(Request::decode(&[VERSION, 255]), Err(Error::Command));
 }

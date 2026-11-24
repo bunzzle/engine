@@ -395,14 +395,20 @@ impl Queues {
         self.inner.owned.borrow().queues.get(&id).cloned()
     }
 
-    pub fn tenant_queues(&self, tenant: u32, from: u32, limit: usize) -> Vec<Queue> {
+    pub fn tenant_queues(
+        &self,
+        tenant: u32,
+        from: u32,
+        limit: usize,
+        keep: &dyn Fn(&Queue) -> bool,
+    ) -> Vec<Queue> {
         self.inner
             .owned
             .borrow()
             .queues
             .range(from..)
             .map(|(_, queue)| queue)
-            .filter(|queue| queue.name.tenant == tenant)
+            .filter(|queue| queue.name.tenant == tenant && keep(queue))
             .take(limit)
             .cloned()
             .collect()
@@ -441,6 +447,14 @@ impl Queues {
     }
 
     pub async fn rebind(&self, name: &Name, pool: u32) -> Result<u32, Error> {
+        self.rebind_named(name, pool, None).await
+    }
+
+    pub async fn rebind_queue(&self, id: u32, name: &Name, pool: u32) -> Result<u32, Error> {
+        self.rebind_named(name, pool, Some(id)).await
+    }
+
+    async fn rebind_named(&self, name: &Name, pool: u32, only: Option<u32>) -> Result<u32, Error> {
         name.check()?;
         let naming = self.inner.naming;
         let shard = naming_shard(&naming.key, name.tenant, &name.domain, naming.shards);
@@ -451,6 +465,9 @@ impl Queues {
         let (id, target) = {
             let owned = self.inner.owned.borrow();
             let id = *owned.names.get(name).ok_or(Error::Invalid("queue"))?;
+            if only.is_some_and(|only| only != id) {
+                return Err(Error::Invalid("queue"));
+            }
             if pool == name.pool {
                 return Ok(id);
             }

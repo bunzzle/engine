@@ -109,7 +109,12 @@ impl<T: Transport + 'static> Ops<T> {
     }
 
     async fn queues(&self, tenant: u32, from: u32) -> Reply {
-        if self.node.table().tenant(tenant).is_none() {
+        let known = self
+            .node
+            .table()
+            .tenant(tenant)
+            .is_some_and(|t| !t.state.deleted());
+        if !known {
             return Reply::new(Code::NotFound, format!("tenant {tenant} not found"));
         }
         let page = match self.node.queue_list(tenant, from).await {
@@ -281,8 +286,12 @@ fn refused(tenant: u32, queue: u32, refusal: QueueRefusal) -> Reply {
             Code::Refused,
             format!("pool not allowed for tenant {tenant}"),
         ),
-        QueueRefusal::Busy => Reply::new(Code::Busy, "queue is busy, try again"),
-        QueueRefusal::Failed => Reply::new(Code::Failed, "a core did not answer"),
+        QueueRefusal::Draining => Reply::new(
+            Code::Refused,
+            format!("queue {queue} is draining into another queue"),
+        ),
+        QueueRefusal::Unanswered => Reply::new(Code::Failed, "a core did not answer"),
+        QueueRefusal::Failed(error) => Reply::new(Code::Failed, error.to_string()),
     }
 }
 

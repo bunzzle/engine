@@ -1,9 +1,10 @@
 use std::cell::{Cell, OnceCell, RefCell};
 use std::collections::BTreeMap;
 use std::rc::{Rc, Weak};
+use std::time::Duration;
 
 use control::{Queue, State};
-use rt::{Ends, JoinHandle, Peers, Sender, channel, spawn};
+use rt::{Ends, JoinHandle, Peers, Sender, channel, spawn, timeout};
 
 use crate::lanes::{QueueId, Waiting};
 use crate::node::queue_core;
@@ -11,6 +12,7 @@ use crate::start::{Inner, Node};
 use crate::transport::Transport;
 
 pub const QUEUE_PAGE: usize = 200;
+const ANSWER: Duration = Duration::from_secs(60);
 
 pub struct Desk(Message);
 
@@ -63,13 +65,14 @@ pub enum Done {
     Rebound(QueueId),
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum QueueRefusal {
     NotFound,
     Tenant,
     Pool,
-    Busy,
-    Failed,
+    Draining,
+    Unanswered,
+    Failed(Box<str>),
 }
 
 pub(crate) struct Desks<T> {
@@ -79,6 +82,7 @@ pub(crate) struct Desks<T> {
     peers: OnceCell<Peers<Desk>>,
     waiting: RefCell<BTreeMap<u64, Sender<Answer>>>,
     tickets: Cell<u64>,
+    closed: Cell<bool>,
 }
 
 impl<T: Transport + 'static> Desks<T> {
@@ -90,6 +94,7 @@ impl<T: Transport + 'static> Desks<T> {
             peers: OnceCell::new(),
             waiting: RefCell::new(BTreeMap::new()),
             tickets: Cell::new(0),
+            closed: Cell::new(false),
         });
         let handler = Rc::clone(&desks);
         let (peers, done) = ends.start(move |from, Desk(message)| handler.handle(from, message));
@@ -102,21 +107,31 @@ impl<T: Transport + 'static> Desks<T> {
     }
 
     pub(crate) fn close(&self) {
+        self.closed.set(true);
         self.waiting.borrow_mut().clear();
         if let Some(peers) = self.peers.get() {
             peers.close();
         }
     }
 
-    fn send(&self, core: u16, request: Request) -> rt::Receiver<Answer> {
+    fn send(&self, core: u16, request: Request) -> (u64, rt::Receiver<Answer>) {
         let (reply, answer) = channel();
         let ticket = self.tickets.get();
         self.tickets.set(ticket + 1);
+        if self.closed.get() {
+            return (ticket, answer);
+        }
         self.waiting.borrow_mut().insert(ticket, reply);
         if let Some(peers) = self.peers.get() {
             peers.send(core, Desk(Message::Ask { ticket, request }));
         }
-        answer
+        (ticket, answer)
+    }
+
+    async fn answer(&self, (ticket, mut answer): (u64, rt::Receiver<Answer>)) -> Option<Answer> {
+        let got = timeout(ANSWER, answer.recv()).await.ok().flatten();
+        self.waiting.borrow_mut().remove(&ticket);
+        got
     }
 
     fn handle(self: &Rc<Self>, from: u16, message: Message) {
@@ -124,7 +139,11 @@ impl<T: Transport + 'static> Desks<T> {
             Message::Ask { ticket, request } => {
                 let desks = Rc::clone(self);
                 drop(spawn(async move {
-                    let answer = desks.serve(request).await;
+                    let answer = if desks.closed.get() {
+                        Answer::Done(Err(QueueRefusal::Unanswered))
+                    } else {
+                        desks.serve(request).await
+                    };
                     if let Some(peers) = desks.peers.get() {
                         peers.send(from, Desk(Message::Answer { ticket, answer }));
                     }
@@ -145,7 +164,7 @@ impl<T: Transport + 'static> Desks<T> {
             .and_then(Weak::upgrade)
             .map(|inner| Node { inner })
         else {
-            return Answer::Done(Err(QueueRefusal::Failed));
+            return Answer::Done(Err(QueueRefusal::Unanswered));
         };
         match request {
             Request::List {
@@ -169,9 +188,11 @@ fn listed<T: Transport + 'static>(
     from: u32,
     limit: usize,
 ) -> Vec<Row> {
+    let table = Rc::clone(&node.inner.table);
+    let live = move |queue: &Queue| !table.borrow().gone(tenant, queue.name.generation);
     node.inner
         .queues
-        .tenant_queues(tenant, from, limit)
+        .tenant_queues(tenant, from, limit, &live)
         .into_iter()
         .map(|queue| Row {
             waiting: node
@@ -200,6 +221,9 @@ fn owned<T: Transport + 'static>(
         .filter(|q| q.name.tenant == tenant)
         .ok_or(QueueRefusal::NotFound)?;
     let table = node.inner.table.borrow();
+    if table.gone(tenant, found.name.generation) {
+        return Err(QueueRefusal::NotFound);
+    }
     let current = table
         .tenant(tenant)
         .filter(|t| t.generation == found.name.generation)
@@ -233,20 +257,28 @@ async fn rebound<T: Transport + 'static>(
     pool: u32,
 ) -> Result<Done, QueueRefusal> {
     let found = owned(node, tenant, queue)?;
-    let allowed = node
-        .inner
-        .table
-        .borrow()
-        .tenant(tenant)
-        .is_some_and(|t| t.pools.contains(&pool));
+    if found.draining {
+        return Err(QueueRefusal::Draining);
+    }
+    let allowed = {
+        let table = node.inner.table.borrow();
+        table.pool(pool).is_some()
+            && table
+                .tenant(tenant)
+                .is_some_and(|t| t.pools.contains(&pool))
+    };
     if !allowed {
         return Err(QueueRefusal::Pool);
     }
-    match node.inner.queues.rebind(&found.name, pool).await {
+    match node
+        .inner
+        .queues
+        .rebind_queue(queue, &found.name, pool)
+        .await
+    {
         Ok(id) => Ok(Done::Rebound(id)),
         Err(control::Error::Invalid("queue")) => Err(QueueRefusal::NotFound),
-        Err(control::Error::Busy) => Err(QueueRefusal::Busy),
-        Err(_) => Err(QueueRefusal::Failed),
+        Err(error) => Err(QueueRefusal::Failed(error.to_string().into())),
     }
 }
 
@@ -266,11 +298,15 @@ impl<T: Transport + 'static> Node<T> {
             })
             .collect();
         let mut rows = Vec::new();
-        for mut answer in asked {
-            let Some(Answer::Listed(found)) = answer.recv().await else {
-                return Err(QueueRefusal::Failed);
-            };
-            rows.extend(found);
+        let mut failed = false;
+        for asked in asked {
+            match desks.answer(asked).await {
+                Some(Answer::Listed(found)) => rows.extend(found),
+                _ => failed = true,
+            }
+        }
+        if failed {
+            return Err(QueueRefusal::Unanswered);
         }
         rows.sort_by_key(|row| row.id);
         let next = rows.get(QUEUE_PAGE).map(|row| row.id);
@@ -303,9 +339,9 @@ impl<T: Transport + 'static> Node<T> {
     async fn ask_owner(&self, queue: QueueId, request: Request) -> Result<Done, QueueRefusal> {
         let desks = &self.inner.desks;
         let core = queue_core(queue, desks.shards, desks.cores);
-        match desks.send(core, request).recv().await {
+        match desks.answer(desks.send(core, request)).await {
             Some(Answer::Done(done)) => done,
-            _ => Err(QueueRefusal::Failed),
+            _ => Err(QueueRefusal::Unanswered),
         }
     }
 }
