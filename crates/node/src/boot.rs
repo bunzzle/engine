@@ -19,6 +19,7 @@ use tls::rustls::crypto::CryptoProvider;
 use tls::{Acceptor, Certs, Connector};
 
 use crate::report;
+use crate::scrape;
 use crate::{Config, Error};
 
 const BACKLOG: u32 = 1024;
@@ -44,6 +45,7 @@ pub struct Plan {
     guards: Mesh<Ask>,
     orders: Mesh<Order>,
     forwards: Mesh<Forward>,
+    board: Option<Arc<metrics::Board>>,
 }
 
 impl Plan {
@@ -55,6 +57,7 @@ impl Plan {
         guard: [u8; 16],
     ) -> Self {
         let cores = config.cores;
+        let board = config.metrics.as_ref().map(|_| scrape::board(cores));
         Self {
             config,
             certs,
@@ -66,6 +69,7 @@ impl Plan {
             guards: Mesh::new(cores),
             orders: Mesh::new(cores),
             forwards: Mesh::new(cores),
+            board,
         }
     }
 
@@ -77,6 +81,10 @@ impl Plan {
 
     pub fn config(&self) -> &Config {
         &self.config
+    }
+
+    pub fn metrics(&self) -> Option<&metrics::Board> {
+        self.board.as_deref()
     }
 }
 
@@ -143,6 +151,7 @@ struct Up<T> {
     hooks: Rc<dyn sched::Deliver>,
     sockets: Vec<(TcpListener, bool)>,
     apis: Vec<(TcpListener, bool, bool)>,
+    scrapes: Vec<TcpListener>,
 }
 
 pub async fn run<T: Transport + 'static>(
@@ -215,7 +224,38 @@ pub async fn run<T: Transport + 'static>(
             ends,
         )
     });
-    let stopped = if let Some(watched) = watched {
+    let metrics = plan.board.as_ref().zip(plan.config.metrics.as_ref());
+    let scrapes = scrape::listeners(metrics, up.scrapes);
+    let sources = scrape::Sources {
+        node: &up.node,
+        smtp: &listeners,
+        api: apis.as_ref(),
+    };
+    let publishing = scrape::publishing(metrics, index, sources);
+    let stopping = stop(watched, &orders, &peers, cores);
+    let stopped = scrape::alongside(stopping, publishing).await;
+    let mut closing: Vec<_> = listeners
+        .into_iter()
+        .map(|listener| spawn(listener.close()))
+        .collect();
+    closing.extend(apis.into_iter().map(|api| spawn(api.close())));
+    closing.extend(scrapes.into_iter().map(|scrape| spawn(scrape.close())));
+    for closed in closing {
+        closed.await;
+    }
+    halt(&up.guard, &up.node, up.running, up.guarding).await;
+    drop(hooking);
+    peers.close();
+    stopped
+}
+
+async fn stop(
+    watched: Option<Watch>,
+    orders: &Orders,
+    peers: &Peers<Order>,
+    cores: u16,
+) -> Result<(), Error> {
+    if let Some(watched) = watched {
         let requested = watched.stop_requested().await;
         watched.close().await;
         for core in 1..cores {
@@ -225,19 +265,7 @@ pub async fn run<T: Transport + 'static>(
     } else {
         orders.until(|o| o.stop.get()).await;
         Ok(())
-    };
-    let mut closing: Vec<_> = listeners
-        .into_iter()
-        .map(|listener| spawn(listener.close()))
-        .collect();
-    closing.extend(apis.into_iter().map(|api| spawn(api.close())));
-    for closed in closing {
-        closed.await;
     }
-    halt(&up.guard, &up.node, up.running, up.guarding).await;
-    drop(hooking);
-    peers.close();
-    stopped
 }
 
 async fn halt<T: Transport + 'static>(
@@ -378,6 +406,15 @@ async fn start<T: Transport + 'static>(
             apis.push((socket, secure, address.ip().is_loopback()));
         }
     }
+    let mut scrapes = Vec::new();
+    if let Some(metrics) = &config.metrics {
+        for address in &metrics.listen {
+            let socket = TcpListener::bind_shared(*address, BACKLOG)
+                .await
+                .map_err(|e| Error::Bind(*address, e))?;
+            scrapes.push(socket);
+        }
+    }
     Ok(Up {
         node,
         running,
@@ -387,6 +424,7 @@ async fn start<T: Transport + 'static>(
         hooks,
         sockets,
         apis,
+        scrapes,
     })
 }
 

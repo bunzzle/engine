@@ -545,6 +545,51 @@ fn check_reads_the_config_and_the_certificate_pair() {
 }
 
 #[test]
+fn metrics_settings_are_read() {
+    assert!(parse(MINIMAL).expect("config").metrics.is_none());
+    let text = format!("{MINIMAL}[metrics]\nlisten = [\"127.0.0.1:9464\", \"10.0.0.1:9464\"]\n");
+    let metrics = parse(&text).expect("config").metrics.expect("metrics");
+    assert_eq!(metrics.listen.len(), 2);
+    assert_eq!(metrics.interval, Duration::from_secs(1));
+    let text = format!("{MINIMAL}[metrics]\nlisten = [\"127.0.0.1:9464\"]\ninterval = \"5s\"\n");
+    let metrics = parse(&text).expect("config").metrics.expect("metrics");
+    assert_eq!(metrics.interval, Duration::from_secs(5));
+
+    assert_eq!(
+        error(&format!("{MINIMAL}[metrics]\ninterval = \"5s\"\n")),
+        "line 1, column 1: [metrics] needs `listen`"
+    );
+    assert_eq!(
+        error(&format!("{MINIMAL}[metrics]\nlisten = [\"0.0.0.0:25\"]\n")),
+        "line 22, column 1: `listen` lists an address twice"
+    );
+    assert_eq!(
+        error(&format!(
+            "{MINIMAL}[api]\nplain = [\"127.0.0.1:8080\"]\n[metrics]\nlisten = [\"127.0.0.1:8080\"]\n"
+        )),
+        "line 24, column 1: `listen` lists an address twice"
+    );
+    assert_eq!(
+        error(&format!(
+            "{MINIMAL}[metrics]\nlisten = [\"127.0.0.1:9464\"]\ninterval = \"500ms\"\n"
+        )),
+        "line 23, column 1: `interval` must be between 1s and 60s"
+    );
+    assert_eq!(
+        error(&format!(
+            "{MINIMAL}[metrics]\nlisten = [\"127.0.0.1:9464\"]\ninterval = \"2m\"\n"
+        )),
+        "line 23, column 1: `interval` must be between 1s and 60s"
+    );
+    assert!(
+        error(&format!(
+            "{MINIMAL}[metrics]\nlisten = [\"127.0.0.1:9464\"]\nport = 1\n"
+        ))
+        .contains("port")
+    );
+}
+
+#[test]
 fn api_settings_are_read() {
     assert!(parse(MINIMAL).expect("config").api.is_none());
     let text = format!(

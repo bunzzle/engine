@@ -15,7 +15,9 @@ crypto = { path = "../crypto" }
 deliver = { path = "../deliver" }
 dns = { path = "../dns" }
 intake = { path = "../intake" }
+http = { path = "../http" }
 keys = { path = "../keys" }
+metrics = { path = "../metrics" }
 rt = { path = "../rt" }
 sched = { path = "../sched" }
 spool = { path = "../spool" }
