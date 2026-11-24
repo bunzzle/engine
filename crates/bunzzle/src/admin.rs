@@ -9,24 +9,26 @@ use admin::{Code, PoolSpec, Reply, Request, TenantSpec};
 use rt::{Native, Runtime};
 
 pub const USAGE: &str = "usage: bunzzle admin <config> status
-       bunzzle admin <config> tenant list
+       bunzzle admin <config> tenant list [from <id>]
        bunzzle admin <config> tenant create <id> <pool>[,<pool>...] [rate=<n>] [burst=<n>] [connections=<n>] [queued=<n>]
        bunzzle admin <config> tenant suspend <id>
        bunzzle admin <config> tenant resume <id>
-       bunzzle admin <config> pool list
+       bunzzle admin <config> pool list [from <id>]
        bunzzle admin <config> pool set <id> <ip>=<weight>[,<ip>=<weight>...]";
 
 const MAX_ITEMS: usize = 255;
 
-const WAIT: Duration = Duration::from_secs(30);
+const WAIT: Duration = Duration::from_secs(90);
 
 pub fn parse(args: &[String]) -> Option<(&str, Request)> {
     let (config, rest) = args.split_first()?;
     let words: Vec<&str> = rest.iter().map(String::as_str).collect();
     let request = match words.as_slice() {
         ["status"] => Request::Status,
-        ["tenant", "list"] => Request::TenantList,
-        ["pool", "list"] => Request::PoolList,
+        ["tenant", "list"] => Request::TenantList(0),
+        ["tenant", "list", "from", id] => Request::TenantList(id.parse().ok()?),
+        ["pool", "list"] => Request::PoolList(0),
+        ["pool", "list", "from", id] => Request::PoolList(id.parse().ok()?),
         ["tenant", "suspend", id] => Request::TenantSuspend(id.parse().ok()?),
         ["tenant", "resume", id] => Request::TenantResume(id.parse().ok()?),
         ["tenant", "create", id, pools, options @ ..] => {
@@ -181,8 +183,16 @@ mod tests {
     #[test]
     fn parses_every_command() {
         assert_eq!(parsed(&["status"]), Some(Request::Status));
-        assert_eq!(parsed(&["tenant", "list"]), Some(Request::TenantList));
-        assert_eq!(parsed(&["pool", "list"]), Some(Request::PoolList));
+        assert_eq!(parsed(&["tenant", "list"]), Some(Request::TenantList(0)));
+        assert_eq!(
+            parsed(&["tenant", "list", "from", "9"]),
+            Some(Request::TenantList(9))
+        );
+        assert_eq!(parsed(&["pool", "list"]), Some(Request::PoolList(0)));
+        assert_eq!(
+            parsed(&["pool", "list", "from", "3"]),
+            Some(Request::PoolList(3))
+        );
         assert_eq!(
             parsed(&["tenant", "suspend", "7"]),
             Some(Request::TenantSuspend(7))

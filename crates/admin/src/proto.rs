@@ -52,11 +52,11 @@ pub struct PoolSpec {
 pub enum Request {
     Status,
     TenantCreate(TenantSpec),
-    TenantList,
+    TenantList(u32),
     TenantSuspend(u32),
     TenantResume(u32),
     PoolSet(PoolSpec),
-    PoolList,
+    PoolList(u32),
 }
 
 impl Request {
@@ -71,13 +71,15 @@ impl Request {
                 body.extend_from_slice(&spec.burst.to_be_bytes());
                 body.extend_from_slice(&spec.connections.to_be_bytes());
                 body.extend_from_slice(&spec.queued.to_be_bytes());
-                let count = u8::try_from(spec.pools.len()).unwrap_or(u8::MAX);
-                body.push(count);
-                for pool in spec.pools.iter().take(usize::from(count)) {
+                body.push(u8::try_from(spec.pools.len()).expect("at most 255 pools"));
+                for pool in &spec.pools {
                     body.extend_from_slice(&pool.to_be_bytes());
                 }
             }
-            Self::TenantList => body.push(TENANT_LIST),
+            Self::TenantList(from) => {
+                body.push(TENANT_LIST);
+                body.extend_from_slice(&from.to_be_bytes());
+            }
             Self::TenantSuspend(id) => {
                 body.push(TENANT_SUSPEND);
                 body.extend_from_slice(&id.to_be_bytes());
@@ -89,9 +91,8 @@ impl Request {
             Self::PoolSet(spec) => {
                 body.push(POOL_SET);
                 body.extend_from_slice(&spec.id.to_be_bytes());
-                let count = u8::try_from(spec.addresses.len()).unwrap_or(u8::MAX);
-                body.push(count);
-                for (ip, weight) in spec.addresses.iter().take(usize::from(count)) {
+                body.push(u8::try_from(spec.addresses.len()).expect("at most 255 addresses"));
+                for (ip, weight) in &spec.addresses {
                     match ip {
                         IpAddr::V4(v4) => {
                             body.push(4);
@@ -105,7 +106,10 @@ impl Request {
                     body.extend_from_slice(&weight.to_be_bytes());
                 }
             }
-            Self::PoolList => body.push(POOL_LIST),
+            Self::PoolList(from) => {
+                body.push(POOL_LIST);
+                body.extend_from_slice(&from.to_be_bytes());
+            }
         }
         framed(&body)
     }
@@ -135,7 +139,7 @@ impl Request {
                     queued,
                 })
             }
-            TENANT_LIST => Self::TenantList,
+            TENANT_LIST => Self::TenantList(fields.u32()?),
             TENANT_SUSPEND => Self::TenantSuspend(fields.u32()?),
             TENANT_RESUME => Self::TenantResume(fields.u32()?),
             POOL_SET => {
@@ -146,7 +150,7 @@ impl Request {
                     .collect::<Result<_, _>>()?;
                 Self::PoolSet(PoolSpec { id, addresses })
             }
-            POOL_LIST => Self::PoolList,
+            POOL_LIST => Self::PoolList(fields.u32()?),
             _ => return Err(Error::Command),
         };
         if !fields.0.is_empty() {

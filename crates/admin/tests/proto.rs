@@ -95,8 +95,8 @@ fn random_input_never_panics() {
 fn every_request_round_trips() {
     let requests = [
         Request::Status,
-        Request::TenantList,
-        Request::PoolList,
+        Request::TenantList(7),
+        Request::PoolList(0),
         Request::TenantSuspend(u32::MAX),
         Request::TenantResume(7),
         Request::TenantCreate(TenantSpec {
