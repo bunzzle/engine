@@ -376,6 +376,7 @@ name = "store"
 version = "0.0.0"
 dependencies = [
  "index",
+ "metrics",
  "rt",
  "sys",
 ]

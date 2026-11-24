@@ -67,7 +67,11 @@ catalog! {
 }
 
 pub(crate) fn board(cores: u16) -> Arc<Board> {
-    Arc::new(Board::new(PREFIX, CATALOG, cores).expect("metrics catalog"))
+    Arc::new(
+        Board::new(PREFIX, CATALOG, cores)
+            .and_then(|board| board.with_node(store::metrics_slab()))
+            .expect("metrics catalog"),
+    )
 }
 
 pub(crate) struct Sources<'a, T> {

@@ -65,7 +65,7 @@ impl Committer {
         }
     }
 
-    fn low_space(&self) -> bool {
+    pub(super) fn low_space(&self) -> bool {
         let held = self.regions.held();
         let margin = (self.regions.count() / LOW_SHARE).max(2);
         self.regions.free() < self.regions.reserve() + held + margin

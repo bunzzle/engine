@@ -9,6 +9,7 @@ use std::thread::{self, ThreadId};
 use std::time::Duration;
 use std::{fs, process};
 
+use metrics::{Board, Format};
 use rt::{Native, Runtime, sleep, spawn};
 use store::{
     Change, Claim, Core, DataFile, Delivery, Error, Event, Index, KIND_STATE, Key, Location,
@@ -160,13 +161,44 @@ fn cores_run_on_their_own_threads_and_rebuild_their_shards() {
     let first = Arc::new(Mutex::new(Seen::default()));
     let seen = Arc::clone(&first);
     let done = Arc::new(AtomicU16::new(0));
-    let committer = launch(&path, SETUP, move |core| {
+    let slab = store::metrics_slab();
+    let committer = launch(&path, SETUP, Some(Arc::clone(&slab)), move |core| {
         record(&seen, &core);
         fill(core, SETUP.cores, Arc::clone(&done))
     })
     .expect("launch");
     assert!(!committer.is_failed());
     drop(committer);
+    let board = Board::new("bunzzle", &[], 1)
+        .and_then(|board| board.with_node(slab))
+        .expect("board");
+    let mut text = String::new();
+    board.render(Format::Text, 0, 0, &mut text);
+    let value = |name: &str| -> u64 {
+        let line = text
+            .lines()
+            .find(|l| l.starts_with(&format!("{name} ")))
+            .unwrap_or_else(|| panic!("{name} missing in {text}"));
+        line.rsplit(' ')
+            .next()
+            .and_then(|v| v.parse().ok())
+            .expect("value")
+    };
+    assert!(value("bunzzle_store_commits_total") > 0);
+    assert!(value("bunzzle_store_submissions_total") > 0);
+    assert!(value("bunzzle_store_bytes_written_total") > 0);
+    assert_eq!(
+        value("bunzzle_store_commit_seconds_count"),
+        value("bunzzle_store_commits_total")
+    );
+    assert_eq!(
+        value("bunzzle_store_sync_seconds_count"),
+        value("bunzzle_store_commits_total")
+    );
+    assert_eq!(value("bunzzle_store_write_started_seconds"), 0);
+    assert_eq!(value("bunzzle_store_failed"), 0);
+    assert_eq!(value("bunzzle_store_regions_quarantined"), 0);
+    assert!(value("bunzzle_store_journal_bytes") >= value("bunzzle_store_journal_free_bytes"));
     let first = first.lock().expect("lock");
     let threads: Vec<ThreadId> = first.threads.values().copied().collect();
     assert_eq!(threads.len(), 3);
@@ -180,7 +212,7 @@ fn cores_run_on_their_own_threads_and_rebuild_their_shards() {
     let second = Arc::new(Mutex::new(Seen::default()));
     let seen = Arc::clone(&second);
     let setup = Setup { cores: 2, ..SETUP };
-    launch(&path, setup, move |core| {
+    launch(&path, setup, None, move |core| {
         record(&seen, &core);
         async {}
     })
@@ -195,7 +227,7 @@ fn cores_run_on_their_own_threads_and_rebuild_their_shards() {
 fn a_bad_core_count_is_refused_before_any_thread_starts() {
     let path = scratch("cores");
     for cores in [0, 5] {
-        let result = launch(&path, Setup { cores, ..SETUP }, |_| async {});
+        let result = launch(&path, Setup { cores, ..SETUP }, None, |_| async {});
         assert!(matches!(result, Err(Error::Config(_))));
     }
     fs::remove_dir_all(path.parent().expect("dir")).expect("clean up");

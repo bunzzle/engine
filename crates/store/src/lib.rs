@@ -20,6 +20,7 @@ mod roots;
 mod run;
 mod session;
 mod shard;
+mod stats;
 mod superblock;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 mod threads;
@@ -63,6 +64,7 @@ pub use shard::{
     BODY_SIZE, Change, Delivery, Delta, HEAD_ITEM, INDEX_SIZE, Index, Item, KIND_STATE, Key, Parts,
     ShardState,
 };
+pub use stats::{METRICS, slab as metrics_slab};
 pub use superblock::{
     COPIES, Checkpoint, CheckpointCopy, FORMAT, MAX_SECTOR_SIZE, MAX_SHARDS, MIN_SECTOR_SIZE,
     SLOT_SIZE, Superblock, ZONE_SIZE,

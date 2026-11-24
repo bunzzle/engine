@@ -9,6 +9,7 @@ autotests = false
 
 [dependencies]
 index = { path = "../index" }
+metrics = { path = "../metrics" }
 rt = { path = "../rt" }
 sys = { path = "../sys" }
 

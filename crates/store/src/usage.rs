@@ -12,6 +12,7 @@ pub struct Count {
 pub struct Usage {
     counts: Vec<Count>,
     quarantined: Vec<bool>,
+    quarantined_count: u32,
     tenants: BTreeMap<u32, u64>,
     held: BTreeMap<u32, Count>,
     held_tenants: BTreeMap<u32, u64>,
@@ -22,6 +23,7 @@ impl Usage {
         Self {
             counts: vec![Count::default(); count as usize],
             quarantined: vec![false; count as usize],
+            quarantined_count: 0,
             tenants: BTreeMap::new(),
             held: BTreeMap::new(),
             held_tenants: BTreeMap::new(),
@@ -36,6 +38,8 @@ impl Usage {
         assert_eq!(counts.len(), quarantined.len(), "usage table mismatch");
         Self {
             counts,
+            quarantined_count: u32::try_from(quarantined.iter().filter(|&&q| q).count())
+                .expect("region count fits in u32"),
             quarantined,
             tenants,
             held: BTreeMap::new(),
@@ -63,7 +67,14 @@ impl Usage {
         &self.quarantined
     }
 
+    pub fn quarantined_count(&self) -> u32 {
+        self.quarantined_count
+    }
+
     pub fn quarantine(&mut self, region: u32) {
+        if !self.quarantined[region as usize] {
+            self.quarantined_count += 1;
+        }
         self.quarantined[region as usize] = true;
     }
 

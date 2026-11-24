@@ -4,13 +4,19 @@ use std::rc::Rc;
 use std::sync::{Arc, mpsc};
 use std::thread::{self, JoinHandle};
 
+use metrics::Slab;
 use rt::{Native, Runtime};
 
 use crate::boot::{Booted, Core, Setup, Start, boot};
 use crate::committer::Committer;
 use crate::error::Error;
 
-pub fn launch<F, Fut>(path: impl AsRef<Path>, setup: Setup, work: F) -> Result<Committer, Error>
+pub fn launch<F, Fut>(
+    path: impl AsRef<Path>,
+    setup: Setup,
+    metrics: Option<Arc<Slab>>,
+    work: F,
+) -> Result<Committer, Error>
 where
     F: Fn(Core) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = ()> + 'static,
@@ -18,11 +24,14 @@ where
     let runtime = Runtime::new(Rc::new(Native::new()?));
     let path = path.as_ref().to_path_buf();
     let Booted {
-        committer,
+        mut committer,
         client,
         starts,
     } = runtime.block_on(async move { boot(path, setup).await })?;
     drop(client);
+    if let Some(slab) = metrics {
+        committer.observe(slab);
+    }
     let work = Arc::new(work);
     let (opened, reports) = mpsc::channel();
     let mut threads = Vec::with_capacity(starts.len());

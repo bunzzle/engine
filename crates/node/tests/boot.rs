@@ -124,10 +124,14 @@ fn booted(driver: &Rc<SimDriver>, config: Config, cores: u16) -> Booted {
         flush: 1,
     };
     let store = machine.block_on(0, boot(PATH, setup)).expect("boot");
-    let committer = machine.spawn_on(0, store.committer.run());
-    drop(store.client);
     let certs = Arc::new(Certs::new(CHAIN, KEY).expect("certs"));
     let plan = Arc::new(Plan::new(config, certs, simulated(5), naming, [7; 16]));
+    let mut committer = store.committer;
+    if let Some(slab) = plan.metrics().and_then(|board| board.node()) {
+        committer.observe(Arc::clone(slab));
+    }
+    let committer = machine.spawn_on(0, committer.run());
+    drop(store.client);
     let cores = store
         .starts
         .into_iter()
@@ -162,10 +166,14 @@ fn probed(driver: &Rc<SimDriver>, config: Config, cores: u16, calls: &Arc<Atomic
         flush: 1,
     };
     let store = machine.block_on(0, boot(PATH, setup)).expect("boot");
-    let committer = machine.spawn_on(0, store.committer.run());
-    drop(store.client);
     let certs = Arc::new(Certs::new(CHAIN, KEY).expect("certs"));
     let plan = Arc::new(Plan::new(config, certs, simulated(5), naming, [7; 16]));
+    let mut committer = store.committer;
+    if let Some(slab) = plan.metrics().and_then(|board| board.node()) {
+        committer.observe(Arc::clone(slab));
+    }
+    let committer = machine.spawn_on(0, committer.run());
+    drop(store.client);
     let cores = store
         .starts
         .into_iter()
@@ -461,6 +469,11 @@ fn metrics_are_served_for_every_core() {
         assert!(text.contains("# TYPE bunzzle_smtp_refused_total counter\n"));
         assert!(text.contains("bunzzle_recipients_delivered_total{core=\"0\"} 0\n"));
         assert!(text.contains("# TYPE bunzzle_paths_down gauge\n"));
+        assert!(text.contains("# TYPE bunzzle_store_commit_seconds histogram\n"));
+        assert!(text.contains("bunzzle_store_sync_seconds_bucket{le=\"+Inf\"} "));
+        assert!(text.contains("bunzzle_store_failed 0\n"));
+        assert!(text.contains("bunzzle_store_write_started_seconds 0\n"));
+        assert!(!text.contains("store_commits_total{"));
         assert!(!text.contains("# EOF"));
 
         let open = scrape(
