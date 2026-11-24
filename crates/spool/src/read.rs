@@ -170,21 +170,22 @@ impl Spool {
         })
     }
 
-    pub async fn open_slices(
-        &self,
-        stored: &Stored,
-    ) -> Result<([u8; WRAP], Vec<(u32, Vec<u8>)>), Error> {
+    pub async fn stored_wrap(&self, stored: &Stored) -> Result<[u8; WRAP], Error> {
         let _pins = self.pin(stored);
         let region = self.sealed(stored.head, stored.tenant).await?;
         let (wrap, _) = head_parts(&region).ok_or(Error::State("head"))?;
-        let wrap = *wrap;
+        Ok(*wrap)
+    }
+
+    pub async fn open_slices(&self, stored: &Stored) -> Result<Vec<(u32, Vec<u8>)>, Error> {
+        let _pins = self.pin(stored);
         let mut slices = Vec::with_capacity(stored.slices.len());
         for &(n, at) in &stored.slices {
             let payload = self.sealed(at, stored.tenant).await?;
             let (_, sealed) = slice_parts(&payload).ok_or(Error::State("slice"))?;
             slices.push((n, sealed.to_vec()));
         }
-        Ok((wrap, slices))
+        Ok(slices)
     }
 
     async fn sealed(&self, at: Location, tenant: u32) -> Result<Vec<u8>, Error> {

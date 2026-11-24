@@ -2145,6 +2145,49 @@ async fn check_queued(http: &mut Http, token: &str, id: &str) {
     }
 }
 
+async fn renewed(nodes: &[Node<Idle>]) -> String {
+    let control = nodes.iter().find(|n| n.controls()).expect("control core");
+    control.delete_tenant(1).await.expect("delete");
+    until("deleted", || {
+        nodes.iter().all(|n| {
+            n.table()
+                .tenant(1)
+                .is_some_and(|t| t.state == State::Deleted)
+        })
+    })
+    .await;
+    let Object::Tenant(mut renewed) = tenant(1) else {
+        unreachable!("tenant object")
+    };
+    renewed.generation = 2;
+    for _ in 0..1000 {
+        match control.write(Object::Tenant(renewed.clone())).await {
+            Ok(_) => break,
+            Err(sched::Error::Control(control::Error::Busy)) => {
+                sleep(Duration::from_millis(10)).await;
+            }
+            Err(error) => panic!("write: {error:?}"),
+        }
+    }
+    until("generation", || {
+        nodes
+            .iter()
+            .all(|n| n.table().tenant(1).is_some_and(|t| t.generation == 2))
+    })
+    .await;
+    let api = Scopes {
+        smtp: false,
+        api: true,
+        hooks: false,
+    };
+    let (access, token) = control.access_new(1, api, 0).await.expect("access");
+    until("access", || {
+        nodes.iter().all(|n| n.table().access(access.id).is_some())
+    })
+    .await;
+    String::from_utf8(token.to_vec()).expect("ascii token")
+}
+
 #[test]
 fn message_status_pages_recipients_and_hides_other_tenants() {
     check(0..2, |seed| {
@@ -2201,7 +2244,15 @@ fn message_status_pages_recipients_and_hides_other_tenants() {
             assert_eq!(reply.header("allow"), Some("GET, HEAD"));
 
             seen.deliver.set(Some(nodes[0].sched().clock()));
-            let sent = http.post(&tokens.first, &body).await.id();
+            let mut sent = String::new();
+            for n in 0..64 {
+                let reply = http.send_reply(&keyed(&tokens.first, &format!("d{n}"), &body)).await;
+                sent = reply.id();
+                if core(&sent) == 1 {
+                    break;
+                }
+            }
+            assert_eq!(core(&sent), 1);
             let mut done = None;
             for _ in 0..2000 {
                 let reply = http.send_reply(&status(&tokens.first, &sent, "")).await;
@@ -2220,6 +2271,11 @@ fn message_status_pages_recipients_and_hides_other_tenants() {
             assert_eq!((reply.status, reply.code().as_str()), (404, "not_found"));
             assert!(ports.count(Route::Status, 200) >= 8);
             assert_eq!(ports.count(Route::Status, 405), 1);
+            let newer = renewed(&nodes).await;
+            for id in queued.iter().chain([&sent]) {
+                let reply = http.send_reply(&status(&newer, id, "")).await;
+                assert_eq!((reply.status, reply.code().as_str()), (404, "not_found"));
+            }
             owners.stop();
             ports.close().await;
         });

@@ -46,27 +46,28 @@ pub(crate) async fn live(
 ) -> Result<Option<MessagePage>, ReadError> {
     let from = after.map_or(0, |a| a.saturating_add(1));
     let count = u32::try_from(limit).map_err(|_| ReadError::Limit)?;
-    let Some(states) = spool.states(id, from, count).filter(|s| s.tenant == tenant) else {
+    let Some(states) = spool.states(tenant, id, from, count) else {
         return Ok(None);
     };
     let wanted: Vec<u32> = states.recipients.iter().map(|(r, _)| *r).collect();
-    let stored = match spool.stored(id, &wanted).await {
-        Ok(stored) => stored,
-        Err(spool::Error::State("message")) => return Ok(None),
-        Err(_) => return Err(ReadError::Failed),
+    let Some(stored) = spool
+        .stored(id, &wanted)
+        .await
+        .ok()
+        .filter(|s| s.tenant == tenant)
+    else {
+        return Ok(None);
     };
-    if stored.tenant != tenant {
+    let Ok(wrap) = spool.stored_wrap(&stored).await else {
+        return Ok(None);
+    };
+    if Wrap::decode(&wrap).map_or(true, |w| w.generation != generation) {
         return Ok(None);
     }
-    let (wrap, slices) = match spool.open_slices(&stored).await {
-        Ok(opened) => opened,
-        Err(spool::Error::State("message")) => return Ok(None),
-        Err(_) => return Err(ReadError::Failed),
-    };
-    let decoded = Wrap::decode(&wrap).map_err(|_| ReadError::Failed)?;
-    if decoded.generation != generation {
-        return Ok(None);
-    }
+    let slices = spool
+        .open_slices(&stored)
+        .await
+        .map_err(|_| ReadError::Failed)?;
     let opener = opener(keys, tenant, generation, id, &stored.clear, &wrap)
         .await
         .map_err(unsealable)?;
