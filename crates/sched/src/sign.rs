@@ -384,7 +384,7 @@ pub(crate) async fn expiry_events(
     Ok(events)
 }
 
-fn open_recipients(
+pub(crate) fn open_recipients(
     opener: &Opener,
     sealed: &[(u32, Vec<u8>)],
     total: u32,

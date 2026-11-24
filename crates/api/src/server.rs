@@ -19,6 +19,7 @@ use tls::Acceptor;
 use crate::events;
 use crate::forward::{Ahead, Back, Forwarder, Inbound, Link, Open, Remote};
 use crate::handler::{Handler, Source, chunk, key, ok, refusal};
+use crate::message::{self, PREFIX};
 use crate::problem::Problem;
 use crate::search;
 
@@ -51,6 +52,7 @@ pub enum Route {
     Raw,
     Events,
     Search,
+    Status,
     Hooks,
     Health,
     Other,
@@ -70,6 +72,7 @@ pub(crate) struct Context<T> {
     pub(crate) forward: Rc<Forwarder>,
     pub(crate) reading: RefCell<BTreeSet<u32>>,
     pub(crate) searching: RefCell<BTreeSet<u32>>,
+    pub(crate) looking: RefCell<BTreeSet<u32>>,
 }
 
 pub(crate) struct Port {
@@ -291,6 +294,13 @@ impl<T: Transport + 'static> Session<'_, T> {
                 (Route::Raw, self.post(Route::Raw, request, &id).await)
             }
             "/v1/messages/raw" => (Route::Raw, Err(Problem::method("POST").into())),
+            path if path.starts_with(PREFIX) => {
+                if request.method == "GET" || request.method == "HEAD" {
+                    (Route::Status, self.status(request, &id).await)
+                } else {
+                    (Route::Status, Err(Problem::method("GET, HEAD").into()))
+                }
+            }
             "/v1/events" if request.method == "GET" || request.method == "HEAD" => {
                 (Route::Events, self.events(request, &id).await)
             }
@@ -332,6 +342,27 @@ impl<T: Transport + 'static> Session<'_, T> {
     async fn search(&mut self, request: &Request, id: &str) -> Result<Response, Stop> {
         let grant = self.auth(request, Scope::Api).await?;
         search::read(self.context, grant.tenant, request, id).await
+    }
+
+    async fn status(&mut self, request: &Request, id: &str) -> Result<Response, Stop> {
+        let grant = self.auth(request, Scope::Api).await?;
+        let context = self.context;
+        let shard = message::Asked::parse(&message::ids(context)?, request)?
+            .id
+            .shard;
+        let owner = context.forward.owner(shard);
+        if owner != context.forward.index() {
+            let open = Open {
+                route: Route::Status,
+                request: request.clone(),
+                grant,
+                id: id.to_owned(),
+                secure: self.secure(),
+                shard,
+            };
+            return self.forward(owner, open).await;
+        }
+        message::read(context, grant, request, id).await
     }
 
     async fn hooks(&mut self, request: &Request, id: &str) -> Result<Response, Stop> {

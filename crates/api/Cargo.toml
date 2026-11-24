@@ -16,12 +16,12 @@ intake = { path = "../intake" }
 rt = { path = "../rt" }
 sched = { path = "../sched" }
 smtp = { path = "../smtp" }
+spool = { path = "../spool" }
 tls = { path = "../tls" }
 
 [dev-dependencies]
 aws-lc-rs = "=1.19.0"
 keys = { path = "../keys" }
-spool = { path = "../spool" }
 store = { path = "../store" }
 
 [[test]]

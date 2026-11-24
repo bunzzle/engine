@@ -52,6 +52,13 @@ pub struct Recipient {
     pub notified: bool,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct States {
+    pub total: u32,
+    pub done: bool,
+    pub recipients: Vec<(u32, Recipient)>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Outcome {
     Deferred { due: u64, class: u8, notified: bool },
@@ -436,6 +443,25 @@ impl Spool {
             .messages
             .get(&(id.shard, id.key))?
             .recipient(recipient)
+    }
+
+    pub fn states(&self, tenant: u32, id: MessageId, from: u32, limit: u32) -> Option<States> {
+        if id.node != self.inner.node {
+            return None;
+        }
+        let table = self.inner.table.borrow();
+        let entry = table
+            .messages
+            .get(&(id.shard, id.key))
+            .filter(|entry| entry.tenant == tenant)?;
+        let end = from.saturating_add(limit).min(entry.recipients);
+        Some(States {
+            total: entry.recipients,
+            done: entry.finals >= entry.recipients,
+            recipients: (from..end)
+                .filter_map(|r| entry.recipient(r).map(|state| (r, state)))
+                .collect(),
+        })
     }
 
     pub fn oldest_day(&self) -> Option<u32> {
