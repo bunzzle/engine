@@ -59,6 +59,10 @@ impl Transport for Probed {
 }
 
 fn config(id: u32) -> Config {
+    config_with(id, "")
+}
+
+fn config_with(id: u32, extra: &str) -> Config {
     let text = format!(
         "[node]\nid = {id}\nname = \"mx1.example.net\"\ncores = {CORES}\nboot_deadline = \"30s\"\n\
          [store]\npath = \"{PATH}\"\n\
@@ -68,7 +72,7 @@ fn config(id: u32) -> Config {
          [api]\nplain = [\"{API}\"]\ndrain = \"2s\"\n\
          [metrics]\nlisten = [\"{METRICS}\"]\n\
          [dns]\nservers = [\"127.0.0.1\"]\n\
-         [[listen]]\naddress = \"{SMTP}\"\n"
+         [[listen]]\naddress = \"{SMTP}\"\n{extra}"
     );
     parse(&text).expect("config")
 }
@@ -522,7 +526,7 @@ fn guard_and_webhook_metrics_follow_open_sessions() {
         assert_eq!(sessions, 1, "{text}");
         for family in [
             "# TYPE bunzzle_guard_reserved_bytes gauge\n",
-            "# TYPE bunzzle_guard_banned_total counter\n",
+            "# TYPE bunzzle_guard_open_limit_total counter\n",
             "# TYPE bunzzle_guard_session_limit_total counter\n",
             "# TYPE bunzzle_webhook_acked_total counter\n",
             "# TYPE bunzzle_webhook_streams gauge\n",
@@ -536,6 +540,33 @@ fn guard_and_webhook_metrics_follow_open_sessions() {
         for core in 0..CORES {
             assert!(text.contains(&format!("bunzzle_guard_sessions{{core=\"{core}\"}} 0\n")));
         }
+    });
+    stopped(&driver, node);
+}
+
+#[test]
+fn a_connection_over_the_address_limit_is_counted() {
+    let driver = created(11);
+    let node = booted(&driver, config_with(7, "[guard]\nper_net = 1\n"), CORES);
+    let machine = &node.machine;
+    machine.block_on(0, async {
+        let held = serving().await;
+        assert!(banner(&held).await.starts_with("220 "));
+        let over = TcpStream::connect(smtp()).await.expect("connect");
+        assert!(!banner(&over).await.starts_with("220 "));
+        sleep(Duration::from_secs(2)).await;
+        let text = scrape("GET /metrics HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n").await;
+        let total = |family: &str| -> u64 {
+            text.lines()
+                .filter_map(|line| line.strip_prefix(family)?.strip_prefix('{'))
+                .filter_map(|rest| rest.split(' ').nth(1)?.parse::<u64>().ok())
+                .sum()
+        };
+        assert_eq!(total("bunzzle_guard_open_limit_total"), 1, "{text}");
+        assert_eq!(total("bunzzle_guard_session_limit_total"), 0);
+        assert_eq!(total("bunzzle_smtp_refused_total"), 1);
+        drop((held, over));
+        sleep(Duration::from_secs(2)).await;
     });
     stopped(&driver, node);
 }
