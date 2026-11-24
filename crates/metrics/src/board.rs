@@ -24,6 +24,7 @@ pub enum Invalid {
     Duplicate(&'static str),
     Bounds(&'static str),
     Cores,
+    Tenants,
 }
 
 impl fmt::Display for Invalid {
@@ -34,6 +35,7 @@ impl fmt::Display for Invalid {
             Self::Duplicate(name) => write!(f, "duplicate metric name `{name}`"),
             Self::Bounds(name) => write!(f, "invalid histogram bounds for `{name}`"),
             Self::Cores => f.write_str("a board needs at least one core"),
+            Self::Tenants => f.write_str("tenant ids must be distinct"),
         }
     }
 }
@@ -134,11 +136,18 @@ impl Slab {
     }
 }
 
+pub(crate) struct Tenants {
+    pub defs: &'static [Def],
+    pub ids: Box<[u32]>,
+    pub slabs: Box<[Slab]>,
+}
+
 pub struct Board {
     pub(crate) prefix: &'static str,
     pub(crate) defs: &'static [Def],
     pub(crate) slabs: Box<[Slab]>,
     pub(crate) node: Option<Arc<Slab>>,
+    pub(crate) tenants: Option<Tenants>,
 }
 
 impl Board {
@@ -156,15 +165,44 @@ impl Board {
             defs,
             slabs,
             node: None,
+            tenants: None,
         })
     }
 
     pub fn with_node(mut self, node: Arc<Slab>) -> Result<Self, Invalid> {
-        let mut seen = builtins();
-        check(self.defs, &mut seen)?;
-        check(node.defs, &mut seen)?;
+        self.verify(Some(node.defs), self.tenants.as_ref().map(|t| t.defs))?;
         self.node = Some(node);
         Ok(self)
+    }
+
+    pub fn with_tenants(mut self, defs: &'static [Def], ids: &[u32]) -> Result<Self, Invalid> {
+        self.verify(self.node.as_ref().map(|n| n.defs), Some(defs))?;
+        let distinct: HashSet<u32> = ids.iter().copied().collect();
+        if distinct.len() != ids.len() {
+            return Err(Invalid::Tenants);
+        }
+        let slabs = (0..self.slabs.len() * ids.len())
+            .map(|_| Slab::build(defs))
+            .collect();
+        self.tenants = Some(Tenants {
+            defs,
+            ids: ids.into(),
+            slabs,
+        });
+        Ok(self)
+    }
+
+    fn verify(
+        &self,
+        node: Option<&'static [Def]>,
+        tenants: Option<&'static [Def]>,
+    ) -> Result<(), Invalid> {
+        let mut seen = builtins();
+        check(self.defs, &mut seen)?;
+        for defs in [node, tenants].into_iter().flatten() {
+            check(defs, &mut seen)?;
+        }
+        Ok(())
     }
 
     pub fn defs(&self) -> &'static [Def] {
@@ -181,6 +219,20 @@ impl Board {
 
     pub fn node(&self) -> Option<&Arc<Slab>> {
         self.node.as_ref()
+    }
+
+    pub fn tenants(&self) -> &[u32] {
+        self.tenants.as_ref().map_or(&[], |t| &t.ids)
+    }
+
+    pub fn tenant_slab(&self, core: u16, index: usize) -> Option<&Slab> {
+        let tenants = self.tenants.as_ref()?;
+        if index >= tenants.ids.len() {
+            return None;
+        }
+        tenants
+            .slabs
+            .get(usize::from(core) * tenants.ids.len() + index)
     }
 }
 

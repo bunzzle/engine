@@ -220,6 +220,7 @@ impl<T: Transport + 'static> Node<T> {
             }
         }
         draft.taken.clear();
+        self.inner.sched.tenant_accepted(draft.tenant);
         self.inner.sched.enqueue(arrival);
         Ok(())
     }

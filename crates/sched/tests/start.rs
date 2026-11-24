@@ -77,6 +77,8 @@ struct World {
     restored: u64,
     writes: u64,
     rebinds: u64,
+    taken: BTreeMap<u32, u64>,
+    counted: BTreeMap<u32, u64>,
 }
 
 type Shared = Rc<RefCell<World>>;
@@ -312,6 +314,7 @@ fn settings() -> Settings {
             ..sched::Config::new(u32::from(SHARDS))
         },
         budget: usize::try_from(OPTIONS.region_size / 2).expect("fits"),
+        watched: TENANTS.to_vec(),
     }
 }
 
@@ -461,6 +464,7 @@ async fn intake(node: Node<Simulated>, shards: Vec<u16>, driver: Rc<SimDriver>, 
         match node.accept(draft, message).await {
             Ok(()) => {
                 let mut world = world.borrow_mut();
+                *world.taken.entry(tenant).or_default() += 1;
                 let limit = queued_limit(tenant);
                 if limit > 0 && open_total(&world, tenant) > limit {
                     world.over += 1;
@@ -784,6 +788,22 @@ fn observe(nodes: &[Node<Simulated>], finished: bool) -> Session {
     session
 }
 
+fn count_accepted(world: &Shared, nodes: Vec<Node<Simulated>>) {
+    let counts = TENANTS.map(|tenant| {
+        let sum: u64 = nodes
+            .iter()
+            .map(|n| n.sched().tenant_stats(tenant).accepted)
+            .sum();
+        (tenant, sum)
+    });
+    drop(nodes);
+    let mut world = world.borrow_mut();
+    world.nodes.clear();
+    for (tenant, sum) in counts.into_iter().filter(|(_, sum)| *sum > 0) {
+        *world.counted.entry(tenant).or_default() += sum;
+    }
+}
+
 fn session(
     driver: &Rc<SimDriver>,
     world: &Shared,
@@ -871,8 +891,7 @@ fn session(
             for running in runnings {
                 drop(running.stop().await);
             }
-            drop(nodes);
-            watched.borrow_mut().nodes.clear();
+            count_accepted(&watched, nodes);
             drop(client);
             drop(committer.await);
         };
@@ -920,6 +939,10 @@ fn one_session(seed: u64, cores: u16) {
     let world: Shared = Rc::default();
     let run = session(&driver, &world, cores, HORIZON, |_| {});
     verify(seed, &world.borrow(), &run);
+    let done = world.borrow();
+    assert!(!done.taken.is_empty(), "seed {seed}: nothing accepted");
+    assert_eq!(done.counted, done.taken, "seed {seed}: accepted per tenant");
+    drop(done);
     assert_eq!(
         run.versions.first().copied(),
         Some(world.borrow().writes),

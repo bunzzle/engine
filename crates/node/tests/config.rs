@@ -590,6 +590,77 @@ fn metrics_settings_are_read() {
 }
 
 #[test]
+fn metric_tenants_are_read() {
+    let base = format!("{MINIMAL}[metrics]\nlisten = [\"127.0.0.1:9464\"]\n");
+    let metrics = parse(&base).expect("config").metrics.expect("metrics");
+    assert_eq!(metrics.tenants, Vec::<u32>::new());
+    let metrics = parse(&format!("{base}tenants = [7, 4294967295, 1]\n"))
+        .expect("config")
+        .metrics
+        .expect("metrics");
+    assert_eq!(metrics.tenants, vec![7, u32::MAX, 1]);
+    let many: Vec<String> = (1..=65).map(|n| n.to_string()).collect();
+    let cases = [
+        ("tenants = [3, 3]".to_owned(), "lists a tenant twice"),
+        (
+            "tenants = [0]".to_owned(),
+            "must list ids between 1 and 4294967295",
+        ),
+        (
+            "tenants = [4294967296]".to_owned(),
+            "must list ids between 1 and 4294967295",
+        ),
+        (
+            "tenants = [-1]".to_owned(),
+            "must list ids between 1 and 4294967295",
+        ),
+        (
+            "tenants = [\"7\"]".to_owned(),
+            "must be an array of tenant ids",
+        ),
+        ("tenants = 7".to_owned(), "must be an array of tenant ids"),
+        (
+            format!("tenants = [{}]", many.join(", ")),
+            "lists more than 64 tenants",
+        ),
+    ];
+    for (line, message) in cases {
+        let text = error(&format!("{base}{line}\n"));
+        assert!(text.contains(message), "{line}: {text}");
+    }
+    let open = "needs every metrics `listen` address on loopback or a private network";
+    for listen in [
+        "0.0.0.0:9464",
+        "203.0.113.5:9464",
+        "[::]:9464",
+        "[2001:db8::1]:9464",
+    ] {
+        let text = error(&format!(
+            "{MINIMAL}[metrics]\nlisten = [\"127.0.0.1:9464\", \"{listen}\"]\ntenants = [7]\n"
+        ));
+        assert!(text.contains(open), "{listen}: {text}");
+    }
+    for listen in [
+        "10.1.2.3:9464",
+        "172.16.0.9:9464",
+        "192.168.1.1:9464",
+        "[::1]:9464",
+        "[fd00::9]:9464",
+    ] {
+        let text = format!("{MINIMAL}[metrics]\nlisten = [\"{listen}\"]\ntenants = [7]\n");
+        assert!(parse(&text).is_ok(), "{listen}");
+    }
+    let text = format!("{MINIMAL}[metrics]\nlisten = [\"0.0.0.0:9464\"]\ntenants = []\n");
+    assert!(parse(&text).is_ok());
+    let most: Vec<String> = (1..=64).map(|n| n.to_string()).collect();
+    let metrics = parse(&format!("{base}tenants = [{}]\n", most.join(", ")))
+        .expect("config")
+        .metrics
+        .expect("metrics");
+    assert_eq!(metrics.tenants.len(), 64);
+}
+
+#[test]
 fn api_settings_are_read() {
     assert!(parse(MINIMAL).expect("config").api.is_none());
     let text = format!(

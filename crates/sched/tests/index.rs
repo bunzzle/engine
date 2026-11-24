@@ -391,6 +391,7 @@ fn settings_named(key: [u8; 16]) -> Settings {
         },
         sched: sched::Config::new(u32::from(SHARDS)),
         budget: usize::try_from(OPTIONS.region_size / 2).expect("fits"),
+        watched: Vec::new(),
     }
 }
 
@@ -419,11 +420,19 @@ fn started_tuned(
     behind: u64,
     tuning: Option<(u64, usize)>,
 ) -> Cluster {
-    try_started(driver, cores, behind, tuning, false, settings_named(NAMING)).expect("start")
+    try_started(
+        driver,
+        cores,
+        behind,
+        tuning,
+        false,
+        &settings_named(NAMING),
+    )
+    .expect("start")
 }
 
 fn started_with_keys(driver: &Rc<SimDriver>, cores: u16) -> Cluster {
-    try_started(driver, cores, 0, None, true, settings_named(NAMING)).expect("start")
+    try_started(driver, cores, 0, None, true, &settings_named(NAMING)).expect("start")
 }
 
 const KEYS_DIR: &str = "/keys";
@@ -471,7 +480,7 @@ fn try_started(
     behind: u64,
     tuning: Option<(u64, usize)>,
     real_keys: bool,
-    settings: Settings,
+    settings: &Settings,
 ) -> Option<Cluster> {
     let machine = Machine::new(Rc::clone(driver), usize::from(cores) + 1, Stalls::default());
     let setup = Setup {
@@ -495,6 +504,7 @@ fn try_started(
     for start in booted.starts {
         let index = start.index();
         let links = meshes.take(index).expect("links");
+        let settings = settings.clone();
         tasks.push(machine.spawn_on(usize::from(index) + 1, async move {
             let mut core = timeout(Duration::from_secs(60), start.open())
                 .await
@@ -1022,7 +1032,7 @@ fn a_different_naming_key_refuses_to_start() {
             0,
             None,
             false,
-            settings_named(*b"another key 16 b")
+            &settings_named(*b"another key 16 b")
         )
         .is_none()
     );
@@ -1044,7 +1054,7 @@ fn a_different_node_id_refuses_to_start() {
         ..settings_named(NAMING)
     };
     let other = Rc::new(SimDriver::with_disk(37, Config::default(), disk.clone()));
-    assert!(try_started(&other, 2, 0, None, false, moved).is_none());
+    assert!(try_started(&other, 2, 0, None, false, &moved).is_none());
     let same = Rc::new(SimDriver::with_disk(38, Config::default(), disk));
     let restarted = started(&same, 2);
     restarted.stop();
@@ -2051,7 +2061,7 @@ fn search_crashed(seed: u64, cores: u16) -> Disk {
         ..Config::default()
     };
     let first = Rc::new(SimDriver::with_disk(seed, config, created(seed)));
-    if let Some(cluster) = try_started(&first, cores, 0, None, false, settings_named(NAMING)) {
+    if let Some(cluster) = try_started(&first, cores, 0, None, false, &settings_named(NAMING)) {
         let nodes = cluster.nodes.clone();
         let power = Rc::clone(&first);
         cluster.run(async move {
@@ -3174,7 +3184,7 @@ fn index_session(
         0,
         Some(tuning),
         false,
-        settings_named(NAMING),
+        &settings_named(NAMING),
     ) else {
         return false;
     };
@@ -4267,7 +4277,7 @@ fn crashed_while_answering(seed: u64) -> Disk {
         ..Config::default()
     };
     let first = Rc::new(SimDriver::with_disk(seed, config, created(seed)));
-    if let Some(cluster) = try_started(&first, 2, 0, None, false, settings_named(NAMING)) {
+    if let Some(cluster) = try_started(&first, 2, 0, None, false, &settings_named(NAMING)) {
         let nodes = cluster.nodes.clone();
         let power = Rc::clone(&first);
         cluster.run(async move {
