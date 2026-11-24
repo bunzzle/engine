@@ -1,10 +1,17 @@
 use std::fmt;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 pub const VERSION: u8 = 1;
 pub const MAX_FRAME: usize = 64 * 1024;
 
 const LEN: usize = 4;
 const STATUS: u8 = 1;
+const TENANT_CREATE: u8 = 2;
+const TENANT_LIST: u8 = 3;
+const TENANT_SUSPEND: u8 = 4;
+const TENANT_RESUME: u8 = 5;
+const POOL_SET: u8 = 6;
+const POOL_LIST: u8 = 7;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
@@ -25,17 +32,82 @@ impl fmt::Display for Error {
     }
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TenantSpec {
+    pub id: u32,
+    pub pools: Vec<u32>,
+    pub rate: u32,
+    pub burst: u32,
+    pub connections: u32,
+    pub queued: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PoolSpec {
+    pub id: u32,
+    pub addresses: Vec<(IpAddr, u16)>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Request {
     Status,
+    TenantCreate(TenantSpec),
+    TenantList,
+    TenantSuspend(u32),
+    TenantResume(u32),
+    PoolSet(PoolSpec),
+    PoolList,
 }
 
 impl Request {
     pub fn encode(&self) -> Vec<u8> {
-        let op = match self {
-            Self::Status => STATUS,
-        };
-        framed(&[VERSION, op])
+        let mut body = vec![VERSION];
+        match self {
+            Self::Status => body.push(STATUS),
+            Self::TenantCreate(spec) => {
+                body.push(TENANT_CREATE);
+                body.extend_from_slice(&spec.id.to_be_bytes());
+                body.extend_from_slice(&spec.rate.to_be_bytes());
+                body.extend_from_slice(&spec.burst.to_be_bytes());
+                body.extend_from_slice(&spec.connections.to_be_bytes());
+                body.extend_from_slice(&spec.queued.to_be_bytes());
+                let count = u8::try_from(spec.pools.len()).unwrap_or(u8::MAX);
+                body.push(count);
+                for pool in spec.pools.iter().take(usize::from(count)) {
+                    body.extend_from_slice(&pool.to_be_bytes());
+                }
+            }
+            Self::TenantList => body.push(TENANT_LIST),
+            Self::TenantSuspend(id) => {
+                body.push(TENANT_SUSPEND);
+                body.extend_from_slice(&id.to_be_bytes());
+            }
+            Self::TenantResume(id) => {
+                body.push(TENANT_RESUME);
+                body.extend_from_slice(&id.to_be_bytes());
+            }
+            Self::PoolSet(spec) => {
+                body.push(POOL_SET);
+                body.extend_from_slice(&spec.id.to_be_bytes());
+                let count = u8::try_from(spec.addresses.len()).unwrap_or(u8::MAX);
+                body.push(count);
+                for (ip, weight) in spec.addresses.iter().take(usize::from(count)) {
+                    match ip {
+                        IpAddr::V4(v4) => {
+                            body.push(4);
+                            body.extend_from_slice(&v4.octets());
+                        }
+                        IpAddr::V6(v6) => {
+                            body.push(6);
+                            body.extend_from_slice(&v6.octets());
+                        }
+                    }
+                    body.extend_from_slice(&weight.to_be_bytes());
+                }
+            }
+            Self::PoolList => body.push(POOL_LIST),
+        }
+        framed(&body)
     }
 
     pub fn decode(body: &[u8]) -> Result<Self, Error> {
@@ -43,14 +115,78 @@ impl Request {
         if version != VERSION {
             return Err(Error::Version);
         }
+        let mut fields = Fields(rest);
         let request = match op {
             STATUS => Self::Status,
+            TENANT_CREATE => {
+                let id = fields.u32()?;
+                let rate = fields.u32()?;
+                let burst = fields.u32()?;
+                let connections = fields.u32()?;
+                let queued = fields.u64()?;
+                let count = fields.u8()?;
+                let pools = (0..count).map(|_| fields.u32()).collect::<Result<_, _>>()?;
+                Self::TenantCreate(TenantSpec {
+                    id,
+                    pools,
+                    rate,
+                    burst,
+                    connections,
+                    queued,
+                })
+            }
+            TENANT_LIST => Self::TenantList,
+            TENANT_SUSPEND => Self::TenantSuspend(fields.u32()?),
+            TENANT_RESUME => Self::TenantResume(fields.u32()?),
+            POOL_SET => {
+                let id = fields.u32()?;
+                let count = fields.u8()?;
+                let addresses = (0..count)
+                    .map(|_| Ok((fields.ip()?, fields.u16()?)))
+                    .collect::<Result<_, _>>()?;
+                Self::PoolSet(PoolSpec { id, addresses })
+            }
+            POOL_LIST => Self::PoolList,
             _ => return Err(Error::Command),
         };
-        if !rest.is_empty() {
+        if !fields.0.is_empty() {
             return Err(Error::Body);
         }
         Ok(request)
+    }
+}
+
+struct Fields<'a>(&'a [u8]);
+
+impl Fields<'_> {
+    fn take<const N: usize>(&mut self) -> Result<[u8; N], Error> {
+        let (first, rest) = self.0.split_first_chunk::<N>().ok_or(Error::Body)?;
+        self.0 = rest;
+        Ok(*first)
+    }
+
+    fn u8(&mut self) -> Result<u8, Error> {
+        Ok(self.take::<1>()?[0])
+    }
+
+    fn u16(&mut self) -> Result<u16, Error> {
+        Ok(u16::from_be_bytes(self.take()?))
+    }
+
+    fn u32(&mut self) -> Result<u32, Error> {
+        Ok(u32::from_be_bytes(self.take()?))
+    }
+
+    fn u64(&mut self) -> Result<u64, Error> {
+        Ok(u64::from_be_bytes(self.take()?))
+    }
+
+    fn ip(&mut self) -> Result<IpAddr, Error> {
+        match self.u8()? {
+            4 => Ok(IpAddr::V4(Ipv4Addr::from(self.take::<4>()?))),
+            6 => Ok(IpAddr::V6(Ipv6Addr::from(self.take::<16>()?))),
+            _ => Err(Error::Body),
+        }
     }
 }
 

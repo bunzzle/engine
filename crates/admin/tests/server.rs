@@ -22,6 +22,7 @@ impl Handler for Status {
                 self.0.set(self.0.get() + 1);
                 Reply::new(Code::Ok, format!("calls {}", self.0.get()))
             }
+            _ => Reply::new(Code::Refused, "not here"),
         }
     }
 }
