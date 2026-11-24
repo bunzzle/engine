@@ -899,7 +899,7 @@ fn session(
         )
         .await;
         let mut session = observe(&nodes, finished);
-        bounce_check(&power, &watched, &nodes[0], &mut session).await;
+        bounce_check(&power, &watched, &nodes, &mut session).await;
         let stop = async move {
             ticker.await;
             for node in &nodes {
@@ -920,15 +920,26 @@ fn session(
 async fn bounce_check(
     power: &Rc<SimDriver>,
     world: &Shared,
-    node: &Node<Simulated>,
+    nodes: &[Node<Simulated>],
     session: &mut Session,
 ) {
     let bounces = std::mem::take(&mut world.borrow_mut().bounces);
     let checked = Rc::new(Cell::new(None));
     let check = {
         let checked = Rc::clone(&checked);
-        let node = node.clone();
-        async move { checked.set(bounces_checked(&node, bounces).await) }
+        let nodes = nodes.to_vec();
+        async move {
+            let want = u64::try_from(bounces.len()).expect("fits");
+            while nodes
+                .iter()
+                .map(|n| n.sched().bounced() + n.sched().bounce_failed())
+                .sum::<u64>()
+                < want
+            {
+                sleep(Duration::from_millis(100)).await;
+            }
+            checked.set(bounces_checked(&nodes[0], bounces).await);
+        }
     };
     let _ = timeout(
         Duration::from_secs(600),

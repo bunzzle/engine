@@ -1088,17 +1088,8 @@ impl<D: Dns, L: Local> Transport for Deliver<D, L> {
                 let (answer, reply) = outcome.map_or((TEMPORARY, Lost::Closed.text()), |o| {
                     (o.answer, o.reply.as_slice())
                 });
-                let found = prepared
-                    .recipients
-                    .iter()
-                    .find(|(r, _)| *r == c.recipient)
-                    .map(|(_, r)| r.address.as_str());
-                let bounced = found
-                    .filter(|_| answer == Answer::Failed && outcome.is_some_and(|o| o.gone))
-                    .map(|address| Bounced {
-                        generation: prepared.opener.generation(),
-                        address: address.into(),
-                    });
+                let found = address_of(&prepared.recipients, c.recipient);
+                let bounced = bounced(found, outcome, prepared.opener.generation());
                 let address = found.map(|a| a.as_bytes().to_vec()).unwrap_or_default();
                 let event = EventKind::of(answer).and_then(|kind| {
                     let body = EventBody {
@@ -1149,6 +1140,22 @@ fn finished(
         return all(recipients, Answer::Failed, REQUIRETLS);
     }
     all(recipients, TEMPORARY, &last)
+}
+
+fn address_of(recipients: &[(u32, Recipient)], recipient: u32) -> Option<&str> {
+    recipients
+        .iter()
+        .find(|(r, _)| *r == recipient)
+        .map(|(_, r)| r.address.as_str())
+}
+
+fn bounced(address: Option<&str>, outcome: Option<&Outcome>, generation: u32) -> Option<Bounced> {
+    address
+        .filter(|_| outcome.is_some_and(|o| o.gone && o.answer == Answer::Failed))
+        .map(|address| Bounced {
+            generation,
+            address: address.into(),
+        })
 }
 
 fn transacted(
@@ -1277,9 +1284,48 @@ async fn body(conn: &mut Conn, message: &mut Message<'_>, limit: Duration) -> Re
 
 #[cfg(test)]
 mod tests {
-    use sched::Required;
+    use sched::{Answer, Bounced, Kind, Recipient, Required};
 
-    use super::honoured;
+    use super::{Outcome, address_of, bounced, honoured};
+
+    #[test]
+    fn only_a_gone_failure_names_its_own_address_and_generation() {
+        let recipients: Vec<(u32, Recipient)> = [(4, "a@example.com"), (9, "b@example.com")]
+            .into_iter()
+            .map(|(r, address)| {
+                let recipient = Recipient {
+                    address: address.to_owned(),
+                    ..Recipient::default()
+                };
+                (r, recipient)
+            })
+            .collect();
+        let outcome = |answer, gone| Outcome {
+            recipient: 9,
+            answer,
+            reply: Vec::new(),
+            gone,
+        };
+        let gone = outcome(Answer::Failed, true);
+        assert_eq!(
+            bounced(address_of(&recipients, 9), Some(&gone), 7),
+            Some(Bounced {
+                generation: 7,
+                address: "b@example.com".into(),
+            })
+        );
+        assert_eq!(address_of(&recipients, 4), Some("a@example.com"));
+        assert_eq!(address_of(&recipients, 5), None);
+        assert_eq!(bounced(None, Some(&gone), 7), None);
+        assert_eq!(bounced(address_of(&recipients, 9), None, 7), None);
+        for other in [
+            outcome(Answer::Failed, false),
+            outcome(Answer::Deferred(Kind::Temporary), true),
+            outcome(Answer::Delivered, true),
+        ] {
+            assert_eq!(bounced(address_of(&recipients, 9), Some(&other), 7), None);
+        }
+    }
 
     #[test]
     fn only_the_report_tenant_keeps_tls_optional() {

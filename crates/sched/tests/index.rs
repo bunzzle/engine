@@ -896,6 +896,83 @@ fn suppressions_expire_and_end_with_a_new_generation() {
 }
 
 #[test]
+fn bounces_keep_live_suppressions_and_follow_the_generation() {
+    let driver = Rc::new(SimDriver::with_disk(3, Config::default(), created(3)));
+    let cluster = started(&driver, 2);
+    let nodes = cluster.nodes.clone();
+    cluster.run(async move {
+        ready(&nodes).await;
+        let lists = nodes[0].suppressions();
+        lists
+            .add(1, "said@example.org", Reason::Complaint, None)
+            .await
+            .expect("add");
+        lists
+            .bounce(1, 1, "said@example.org")
+            .await
+            .expect("bounce");
+        lists
+            .bounce(1, 1, "gone@example.org")
+            .await
+            .expect("bounce");
+        let said = lists.get(1, "said@example.org").await.expect("get");
+        assert_eq!(said.map(|s| s.reason), Some(Reason::Complaint));
+        let gone = lists.get(1, "gone@example.org").await.expect("get");
+        assert_eq!(
+            gone.map(|s| (s.reason, s.until)),
+            Some((Reason::Bounce, None))
+        );
+        assert_eq!(
+            lists.bounce(1, 2, "ahead@example.org").await,
+            Err(Refusal::Tenant)
+        );
+        assert_eq!(lists.get(2, "gone@example.org").await, Ok(None));
+
+        configure(&nodes, vec![tenant(2, 1, State::Suspended)]).await;
+        wait_for(&nodes, 2, 1, State::Suspended).await;
+        lists
+            .bounce(2, 1, "paused@example.org")
+            .await
+            .expect("bounce while suspended");
+        configure(&nodes, vec![tenant(2, 1, State::Active)]).await;
+        wait_for(&nodes, 2, 1, State::Active).await;
+        let paused = lists.get(2, "paused@example.org").await.expect("get");
+        assert_eq!(paused.map(|s| s.reason), Some(Reason::Bounce));
+
+        regenerate(&nodes, 1).await;
+        wait_for(&nodes, 1, 2, State::Active).await;
+        assert_eq!(
+            lists.bounce(1, 1, "late@example.org").await,
+            Err(Refusal::Tenant)
+        );
+        assert_eq!(lists.get(1, "gone@example.org").await, Ok(None));
+        assert_eq!(lists.get(1, "late@example.org").await, Ok(None));
+        lists
+            .bounce(1, 2, "new@example.org")
+            .await
+            .expect("bounce in the new generation");
+        assert_eq!(
+            lists.check(1, 2, &["new@example.org"]).await,
+            Ok(vec![true])
+        );
+
+        let control = nodes.iter().find(|n| n.controls()).expect("control core");
+        control.delete_tenant(2).await.expect("delete");
+        while nodes
+            .iter()
+            .any(|n| n.table().tenant(2).is_some_and(|t| !t.state.deleted()))
+        {
+            sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            lists.bounce(2, 1, "end@example.org").await,
+            Err(Refusal::Tenant)
+        );
+    });
+    cluster.stop();
+}
+
+#[test]
 fn missing_keys_refuse_for_now_and_never_answer_not_suppressed() {
     let driver = Rc::new(SimDriver::with_disk(21, Config::default(), created(21)));
     let cluster = started(&driver, 2);

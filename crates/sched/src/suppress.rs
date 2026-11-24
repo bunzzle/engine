@@ -147,6 +147,7 @@ enum Request {
         address: Box<str>,
         reason: Reason,
         until: Option<u64>,
+        keep: bool,
     },
     Remove {
         tenant: u32,
@@ -196,6 +197,7 @@ struct Inner {
     parts: Inputs,
     cores: u16,
     unopened: Cell<u64>,
+    closed: Cell<bool>,
     peers: OnceCell<Peers<Ask>>,
     waiting: RefCell<BTreeMap<u64, Sender<Answer>>>,
     tickets: Cell<u64>,
@@ -212,6 +214,7 @@ impl Suppressions {
             parts,
             cores: ends.cores(),
             unopened: Cell::new(0),
+            closed: Cell::new(false),
             peers: OnceCell::new(),
             waiting: RefCell::new(BTreeMap::new()),
             tickets: Cell::new(0),
@@ -224,6 +227,7 @@ impl Suppressions {
     }
 
     pub fn close(&self) {
+        self.inner.closed.set(true);
         self.inner.waiting.borrow_mut().clear();
         if let Some(peers) = self.inner.peers.get() {
             peers.close();
@@ -298,17 +302,13 @@ impl Suppressions {
         until: Option<u64>,
     ) -> Result<(), Refusal> {
         let generation = self.generation(tenant)?;
-        self.put(tenant, generation, address, reason, until).await
+        self.put(tenant, generation, address, reason, until, false)
+            .await
     }
 
-    pub(crate) async fn bounce(
-        &self,
-        tenant: u32,
-        generation: u32,
-        address: &str,
-    ) -> Result<(), Refusal> {
+    pub async fn bounce(&self, tenant: u32, generation: u32, address: &str) -> Result<(), Refusal> {
         self.holds(tenant, generation)?;
-        self.put(tenant, generation, address, Reason::Bounce, None)
+        self.put(tenant, generation, address, Reason::Bounce, None, true)
             .await
     }
 
@@ -319,6 +319,7 @@ impl Suppressions {
         address: &str,
         reason: Reason,
         until: Option<u64>,
+        keep: bool,
     ) -> Result<(), Refusal> {
         let address = normalize(address).ok_or(Refusal::Address)?;
         let hash = self.hash(tenant, generation, &address).await?;
@@ -331,6 +332,7 @@ impl Suppressions {
             address: address.into(),
             reason,
             until,
+            keep,
         };
         match self.ask(shard, request).await? {
             Answer::Added(result) => result,
@@ -427,6 +429,9 @@ impl Suppressions {
 
     fn send(&self, core: u16, request: Request) -> rt::Receiver<Answer> {
         let (reply, answer) = channel();
+        if self.inner.closed.get() {
+            return answer;
+        }
         let ticket = self.inner.tickets.get();
         self.inner.tickets.set(ticket + 1);
         self.inner.waiting.borrow_mut().insert(ticket, reply);
@@ -470,10 +475,13 @@ impl Suppressions {
                 address,
                 reason,
                 until,
-            } => Answer::Added(
+                keep,
+            } => Answer::Added(if keep {
+                self.kept(tenant, generation, shard, hash, &address).await
+            } else {
                 self.added(tenant, generation, shard, hash, &address, reason, until)
-                    .await,
-            ),
+                    .await
+            }),
             Request::Remove {
                 tenant,
                 generation,
@@ -532,6 +540,15 @@ impl Suppressions {
         keys: &[(u16, Hash)],
     ) -> Result<Vec<Option<Value>>, Refusal> {
         self.current(tenant, generation)?;
+        self.stored(tenant, generation, keys).await
+    }
+
+    async fn stored(
+        &self,
+        tenant: u32,
+        generation: u32,
+        keys: &[(u16, Hash)],
+    ) -> Result<Vec<Option<Value>>, Refusal> {
         let asked = keys
             .iter()
             .map(|&(shard, hash)| (shard, index::key(tenant, hash)))
@@ -574,6 +591,30 @@ impl Suppressions {
     ) -> Result<Option<Suppression>, Refusal> {
         let values = self.values(tenant, generation, &[(shard, hash)]).await?;
         Ok(values[0].map(|v| v.suppression))
+    }
+
+    async fn kept(
+        &self,
+        tenant: u32,
+        generation: u32,
+        shard: u16,
+        hash: Hash,
+        address: &str,
+    ) -> Result<(), Refusal> {
+        self.holds(tenant, generation)?;
+        if self.stored(tenant, generation, &[(shard, hash)]).await?[0].is_some() {
+            return Ok(());
+        }
+        self.added(
+            tenant,
+            generation,
+            shard,
+            hash,
+            address,
+            Reason::Bounce,
+            None,
+        )
+        .await
     }
 
     #[allow(clippy::too_many_arguments)]

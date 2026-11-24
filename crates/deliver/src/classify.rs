@@ -30,6 +30,8 @@ const GONE: [&str; 9] = [
     "mailbox does not exist",
 ];
 
+const NOT_RECIPIENT: [&str; 2] = ["sender", "verif"];
+
 pub fn gone(response: &Response) -> bool {
     if !matches!(response.code, 550 | 551 | 553) {
         return false;
@@ -39,7 +41,12 @@ pub fn gone(response: &Response) -> bool {
         Some(_) => false,
         None => {
             let text = response.lines.join(" ").to_ascii_lowercase();
-            GONE.iter().any(|w| text.contains(w))
+            let quoted = response
+                .lines
+                .iter()
+                .any(|l| l.trim_start().to_ascii_lowercase().starts_with("response:"));
+            let sender = NOT_RECIPIENT.iter().any(|w| text.contains(w));
+            !quoted && !sender && GONE.iter().any(|w| text.contains(w))
         }
     }
 }
@@ -147,6 +154,29 @@ mod tests {
             (response(550, None, "blocked"), false),
             (response(550, None, "sender domain does not exist"), false),
             (response(450, Some((4, 1, 1)), "user unknown"), false),
+            (
+                Response {
+                    code: 550,
+                    status: None,
+                    lines: vec![
+                        "Verification failed for <noreply@example.com>".to_owned(),
+                        "No Such User Here".to_owned(),
+                        "Sender verify failed".to_owned(),
+                    ],
+                },
+                false,
+            ),
+            (
+                Response {
+                    code: 550,
+                    status: None,
+                    lines: vec![
+                        "Callout check failed".to_owned(),
+                        "Response: 550 5.1.1 <a@example.com> User unknown".to_owned(),
+                    ],
+                },
+                false,
+            ),
         ];
         for (response, want) in cases {
             assert_eq!(gone(&response), want, "{}", response.text());
