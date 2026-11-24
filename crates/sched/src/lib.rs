@@ -1,4 +1,5 @@
 mod access;
+mod admin;
 mod clock;
 mod cursor;
 mod delete;
@@ -31,6 +32,7 @@ mod tally;
 mod transport;
 mod unopened;
 
+pub use admin::{Desk, Done as QueueDone, QUEUE_PAGE, QueuePage, QueueRefusal, Row as QueueRow};
 pub use clock::Clock;
 pub use cursor::{Cursor, drop_cursor, read_cursor, write_cursor};
 pub use envelope::{Envelope, Recipient, Required, Ret, decode_slice, encode_slice};
@@ -45,7 +47,7 @@ pub use hook::{HookChange, MAX_HOOKS, ROTATION_MS};
 pub use intake::{Draft, domain_of};
 pub use json::{event_json, kind_name as event_kind_name};
 pub use keyring::Keyring;
-pub use lanes::{Entry, Lanes, Limits, QueueId, Take, ranges};
+pub use lanes::{Entry, Lanes, Limits, QueueId, Take, Waiting, ranges};
 pub use message::{MESSAGE_LIMIT, MessagePage, MessageRecipient};
 pub use node::{
     AnswerStats, Arrival, Claim, Config, Note, ReportErrors, Route, Sched, TenantStats, queue_core,

@@ -12,6 +12,9 @@ const TENANT_SUSPEND: u8 = 4;
 const TENANT_RESUME: u8 = 5;
 const POOL_SET: u8 = 6;
 const POOL_LIST: u8 = 7;
+const QUEUE_LIST: u8 = 8;
+const QUEUE_RETRY: u8 = 9;
+const QUEUE_REBIND: u8 = 10;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
@@ -57,6 +60,9 @@ pub enum Request {
     TenantResume(u32),
     PoolSet(PoolSpec),
     PoolList(u32),
+    QueueList { tenant: u32, from: u32 },
+    QueueRetry { tenant: u32, queue: u32 },
+    QueueRebind { tenant: u32, queue: u32, pool: u32 },
 }
 
 impl Request {
@@ -110,6 +116,26 @@ impl Request {
                 body.push(POOL_LIST);
                 body.extend_from_slice(&from.to_be_bytes());
             }
+            Self::QueueList { tenant, from } => {
+                body.push(QUEUE_LIST);
+                body.extend_from_slice(&tenant.to_be_bytes());
+                body.extend_from_slice(&from.to_be_bytes());
+            }
+            Self::QueueRetry { tenant, queue } => {
+                body.push(QUEUE_RETRY);
+                body.extend_from_slice(&tenant.to_be_bytes());
+                body.extend_from_slice(&queue.to_be_bytes());
+            }
+            Self::QueueRebind {
+                tenant,
+                queue,
+                pool,
+            } => {
+                body.push(QUEUE_REBIND);
+                body.extend_from_slice(&tenant.to_be_bytes());
+                body.extend_from_slice(&queue.to_be_bytes());
+                body.extend_from_slice(&pool.to_be_bytes());
+            }
         }
         framed(&body)
     }
@@ -151,6 +177,19 @@ impl Request {
                 Self::PoolSet(PoolSpec { id, addresses })
             }
             POOL_LIST => Self::PoolList(fields.u32()?),
+            QUEUE_LIST => Self::QueueList {
+                tenant: fields.u32()?,
+                from: fields.u32()?,
+            },
+            QUEUE_RETRY => Self::QueueRetry {
+                tenant: fields.u32()?,
+                queue: fields.u32()?,
+            },
+            QUEUE_REBIND => Self::QueueRebind {
+                tenant: fields.u32()?,
+                queue: fields.u32()?,
+                pool: fields.u32()?,
+            },
             _ => return Err(Error::Command),
         };
         if !fields.0.is_empty() {
