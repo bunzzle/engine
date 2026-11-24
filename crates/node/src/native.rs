@@ -10,7 +10,7 @@ use sched::Transport;
 use store::Setup;
 use tls::{Certs, Connector};
 
-use crate::{Config, Error, Plan, load, naming, run};
+use crate::{Config, Error, Plan, clear_socket, load, naming, run};
 
 pub fn serve<T, F>(path: &Path, transport: F) -> Result<(), Error>
 where
@@ -64,6 +64,9 @@ where
 {
     sys::process::private_umask();
     sys::process::no_core_dumps().map_err(Error::Io)?;
+    if let Some(admin) = &config.admin {
+        clear_socket(&admin.socket).map_err(Error::Config)?;
+    }
     let runtime = Runtime::new(Rc::new(Native::new().map_err(Error::Io)?));
     let probe = config.clone();
     let naming = runtime.block_on(async move { naming(&probe).await })?;

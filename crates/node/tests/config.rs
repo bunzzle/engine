@@ -773,3 +773,23 @@ fn webhook_settings_are_read() {
         "line 23, column 1: `egress` must be a unicast address"
     );
 }
+
+#[test]
+fn admin_settings_are_read() {
+    assert!(parse(MINIMAL).expect("config").admin.is_none());
+    let text = format!("{MINIMAL}[admin]\nsocket = \"/run/bunzzle/admin.sock\"\n");
+    let admin = parse(&text).expect("config").admin.expect("admin");
+    assert_eq!(admin.socket, Path::new("/run/bunzzle/admin.sock"));
+    assert_eq!(
+        error(&format!(
+            "{MINIMAL}[admin]\nsocket = \"/run/bunzzle/keys.sock\"\n"
+        )),
+        "line 22, column 1: `socket` must differ from the keys socket"
+    );
+    assert_eq!(
+        error(&format!("{MINIMAL}[admin]\nsocket = \"admin.sock\"\n")),
+        "line 22, column 1: `socket` must be an absolute path"
+    );
+    assert!(error(&format!("{MINIMAL}[admin]\n")).contains("socket"));
+    assert!(error(&format!("{MINIMAL}[admin]\nsocket = \"/a\"\nother = 1\n")).contains("other"));
+}

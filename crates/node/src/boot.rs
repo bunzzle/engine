@@ -12,12 +12,15 @@ use deliver::Hooks;
 use dns::Resolver;
 use intake::{Ask, Guard, Listener, Watch, listen, watch};
 use keys::{BatchSettings, Client, Connect, Ring, RingSettings};
-use rt::{JoinHandle, Mesh, Notify, Peers, Signal, Signals, TcpListener, spawn, timeout};
+use rt::{
+    JoinHandle, Mesh, Notify, Peers, Signal, Signals, TcpListener, UnixListener, spawn, timeout,
+};
 use sched::{Clock, Keyring, Meshes, Node, Parts, Running, Settings, Transport};
 use store::Core;
 use tls::rustls::crypto::CryptoProvider;
 use tls::{Acceptor, Certs, Connector};
 
+use crate::ops;
 use crate::report;
 use crate::scrape;
 use crate::{Config, Error};
@@ -46,6 +49,7 @@ pub struct Plan {
     orders: Mesh<Order>,
     forwards: Mesh<Forward>,
     board: Option<Arc<metrics::Board>>,
+    engine: u32,
 }
 
 impl Plan {
@@ -73,12 +77,19 @@ impl Plan {
             orders: Mesh::new(cores),
             forwards: Mesh::new(cores),
             board,
+            engine: sys::process::euid(),
         }
     }
 
     #[must_use]
     pub fn with_roots(mut self, roots: Option<Vec<u8>>) -> Self {
         self.roots = roots;
+        self
+    }
+
+    #[must_use]
+    pub fn with_engine(mut self, uid: u32) -> Self {
+        self.engine = uid;
         self
     }
 
@@ -156,6 +167,7 @@ struct Up<T> {
     sockets: Vec<(TcpListener, bool)>,
     apis: Vec<(TcpListener, bool, bool)>,
     scrapes: Vec<TcpListener>,
+    admin: Option<UnixListener>,
 }
 
 pub async fn run<T: Transport + 'static>(
@@ -230,6 +242,7 @@ pub async fn run<T: Transport + 'static>(
     });
     let metrics = plan.board.as_ref().zip(plan.config.metrics.as_ref());
     let scrapes = scrape::listeners(metrics, up.scrapes);
+    let admin = ops::serve(up.admin, &up.node, cores, plan.engine);
     let sources = scrape::Sources {
         node: &up.node,
         smtp: &listeners,
@@ -246,6 +259,7 @@ pub async fn run<T: Transport + 'static>(
         .collect();
     closing.extend(apis.into_iter().map(|api| spawn(api.close())));
     closing.extend(scrapes.into_iter().map(|scrape| spawn(scrape.close())));
+    closing.extend(admin.into_iter().map(|admin| spawn(admin.close())));
     for closed in closing {
         closed.await;
     }
@@ -430,6 +444,14 @@ async fn start<T: Transport + 'static>(
             scrapes.push(socket);
         }
     }
+    let admin = match &config.admin {
+        Some(admin) if node.controls() => Some(
+            UnixListener::bind(&admin.socket)
+                .await
+                .map_err(|e| Error::BindUnix(admin.socket.clone(), e))?,
+        ),
+        _ => None,
+    };
     Ok(Up {
         node,
         running,
@@ -441,6 +463,7 @@ async fn start<T: Transport + 'static>(
         sockets,
         apis,
         scrapes,
+        admin,
     })
 }
 
