@@ -1,6 +1,7 @@
 use std::fmt;
 use std::io;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 
 #[derive(Debug)]
 pub enum Error {
@@ -12,6 +13,7 @@ pub enum Error {
     Start(sched::Error),
     Tls(tls::Error),
     Bind(SocketAddr, io::Error),
+    BindUnix(PathBuf, io::Error),
     Core(u16, String),
     Deadline,
     Stopped,
@@ -28,6 +30,7 @@ impl fmt::Display for Error {
             Self::Start(e) => write!(f, "{e}"),
             Self::Tls(e) => write!(f, "tls: {e}"),
             Self::Bind(address, e) => write!(f, "listen on {address}: {e}"),
+            Self::BindUnix(path, e) => write!(f, "listen on {}: {e}", path.display()),
             Self::Core(core, message) => write!(f, "core {core}: {message}"),
             Self::Deadline => write!(f, "boot deadline passed"),
             Self::Stopped => write!(f, "stopped by another core"),

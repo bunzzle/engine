@@ -21,6 +21,7 @@ const CORES: u16 = 2;
 const SMTP: &str = "10.0.0.1:587";
 const API: &str = "127.0.0.1:8080";
 const METRICS: &str = "127.0.0.1:9464";
+const ADMIN: &str = "/run/admin.sock";
 const OPTIONS: Options = Options {
     journal_size: 8 * SLOT_SIZE,
     region_size: 8 * SLOT_SIZE,
@@ -129,7 +130,7 @@ fn booted(driver: &Rc<SimDriver>, config: Config, cores: u16) -> Booted {
     };
     let store = machine.block_on(0, boot(PATH, setup)).expect("boot");
     let certs = Arc::new(Certs::new(CHAIN, KEY).expect("certs"));
-    let plan = Arc::new(Plan::new(config, certs, simulated(5), naming, [7; 16]));
+    let plan = Arc::new(Plan::new(config, certs, simulated(5), naming, [7; 16]).with_engine(UID));
     let mut committer = store.committer;
     if let Some(slab) = plan.metrics().and_then(|board| board.node()) {
         committer.observe(Arc::clone(slab));
@@ -678,4 +679,38 @@ fn a_silent_metrics_client_is_dropped() {
         assert!(waited >= Duration::from_secs(10) && waited < Duration::from_secs(12));
     });
     stopped(&driver, node);
+}
+
+#[test]
+fn the_admin_socket_answers_status_on_the_control_core() {
+    let driver = created(21);
+    let extra = format!("[admin]\nsocket = \"{ADMIN}\"\n");
+    let node = booted(&driver, config_with(7, &extra), CORES);
+    let control = Rc::clone(&driver);
+    node.machine.block_on(0, async move {
+        drop(serving().await);
+        let socket = Path::new(ADMIN);
+        let reply = admin::call(socket, UID, &admin::Request::Status)
+            .await
+            .expect("status");
+        assert_eq!(reply.code, admin::Code::Ok);
+        assert!(
+            reply.text.starts_with("node 7\ncores 2\ncontrol version "),
+            "{}",
+            reply.text
+        );
+        control.set_uid(UID + 1);
+        assert!(
+            admin::call(socket, UID, &admin::Request::Status)
+                .await
+                .is_err()
+        );
+        control.set_uid(UID);
+    });
+    stopped(&driver, node);
+    let machine = Machine::new(Rc::clone(&driver), 1, Stalls::default());
+    machine.block_on(0, async {
+        let refused = rt::UnixStream::connect(Path::new(ADMIN)).await;
+        assert!(refused.is_err());
+    });
 }

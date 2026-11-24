@@ -21,6 +21,7 @@ pub struct Config {
     pub listen: Vec<Listen>,
     pub api: Option<Api>,
     pub metrics: Option<Metrics>,
+    pub admin: Option<Admin>,
     pub dns: dns::Settings,
     pub delivery: Delivery,
     pub tlsrpt: Option<Tlsrpt>,
@@ -45,6 +46,11 @@ pub struct Metrics {
     pub listen: Vec<SocketAddr>,
     pub interval: Duration,
     pub tenants: Vec<u32>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Admin {
+    pub socket: PathBuf,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -113,6 +119,10 @@ pub fn parse(text: &str) -> Result<Config, Error> {
         Some(table) => Some(metrics(table, &listen, api.as_ref())?),
         None => None,
     };
+    let admin = match root.table("admin") {
+        Some(table) => Some(admin(table, &keys)?),
+        None => None,
+    };
     let dns = dns(section(&mut root, "dns")?)?;
     let mut delivery = Delivery {
         settings: deliver::Settings::new(name.str()?),
@@ -142,6 +152,7 @@ pub fn parse(text: &str) -> Result<Config, Error> {
         listen,
         api,
         metrics,
+        admin,
         dns,
         delivery,
         tlsrpt,
@@ -270,6 +281,16 @@ fn keys(mut table: Table) -> Result<Keys, Error> {
     };
     table.finish()?;
     Ok(keys)
+}
+
+fn admin(mut table: Table, keys: &Keys) -> Result<Admin, Error> {
+    let entry = table.require("socket")?;
+    let socket = path(&entry)?;
+    if socket == keys.socket {
+        return Err(entry.error("must differ from the keys socket"));
+    }
+    table.finish()?;
+    Ok(Admin { socket })
 }
 
 fn tls(mut table: Table) -> Result<Tls, Error> {

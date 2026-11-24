@@ -3,6 +3,13 @@
 version = 4
 
 [[package]]
+name = "admin"
+version = "0.0.0"
+dependencies = [
+ "rt",
+]
+
+[[package]]
 name = "api"
 version = "0.0.0"
 dependencies = [
@@ -241,6 +248,7 @@ version = "0.0.0"
 name = "node"
 version = "0.0.0"
 dependencies = [
+ "admin",
  "api",
  "config",
  "control",

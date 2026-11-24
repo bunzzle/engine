@@ -5,7 +5,7 @@ use std::path::Path;
 
 use tls::{Certs, Connector};
 
-use crate::{Config, parse};
+use crate::{Config, parse, socket_path};
 
 const MAX_FILE: u64 = 1 << 20;
 
@@ -20,7 +20,10 @@ pub fn load(path: &Path) -> Result<(Config, Certs, Option<Vec<u8>>), String> {
     }
     let text = read(path)?;
     let text = String::from_utf8(text).map_err(|_| format!("{}: not UTF-8", path.display()))?;
-    let config = parse(&text).map_err(|e| format!("{}: {e}", path.display()))?;
+    let mut config = parse(&text).map_err(|e| format!("{}: {e}", path.display()))?;
+    if let Some(admin) = &mut config.admin {
+        admin.socket = socket_path(&admin.socket, euid)?;
+    }
     let key = key_file(&config.tls.key, euid)?;
     let chain = read(&config.tls.chain)?;
     let certs = Certs::new(&chain, &key).map_err(|e| {
