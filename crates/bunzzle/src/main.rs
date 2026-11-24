@@ -1,3 +1,4 @@
+mod admin;
 mod keys;
 
 use std::path::Path;
@@ -16,6 +17,26 @@ fn main() -> ExitCode {
                 Err(error) => {
                     eprintln!("bunzzle keys: {error}");
                     ExitCode::FAILURE
+                }
+            }
+        }
+        Some((mode, rest)) if mode == "admin" => {
+            let Some((config, request)) = admin::parse(rest) else {
+                eprintln!("{}", admin::USAGE);
+                return ExitCode::from(2);
+            };
+            match admin::run(Path::new(config), &request) {
+                Ok(reply) => {
+                    if reply.code == ::admin::Code::Ok {
+                        print!("{}", reply.text);
+                    } else {
+                        eprintln!("bunzzle admin: {}", reply.text);
+                    }
+                    admin::exit(&reply)
+                }
+                Err(error) => {
+                    eprintln!("bunzzle admin: {error}");
+                    ExitCode::from(2)
                 }
             }
         }
