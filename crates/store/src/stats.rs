@@ -25,6 +25,8 @@ catalog! {
     CommitSeconds: Kind::Histogram(LATENCY), "store_commit_seconds", "Time to write and sync one commit batch";
     SyncSeconds: Kind::Histogram(LATENCY), "store_sync_seconds", "Time the data device took to sync";
     WriteStarted: Kind::Gauge, "store_write_started_seconds", "Unix time the commit write and sync in flight started, 0 when idle";
+    CheckpointSeconds: Kind::Histogram(LATENCY), "store_checkpoint_seconds", "Time to write and sync one checkpoint";
+    CheckpointStarted: Kind::Gauge, "store_checkpoint_started_seconds", "Unix time the checkpoint write and sync in flight started, 0 when idle";
     Commits: Kind::Counter, "store_commits", "Commit batches made durable";
     Submissions: Kind::Counter, "store_submissions", "Submissions made durable";
     Refused: Kind::Counter, "store_refused", "Submissions answered with an error";
@@ -84,8 +86,29 @@ impl Probe {
     }
 
     pub fn start(&self) -> Option<Instant> {
+        self.begin(Id::WriteStarted)
+    }
+
+    pub fn checkpoint_start(&self) -> Option<Instant> {
+        self.begin(Id::CheckpointStarted)
+    }
+
+    pub fn checkpoint_finish(&self, started: Option<Instant>, ok: bool) {
+        let (Some(slab), Some(started)) = (&self.slab, started) else {
+            return;
+        };
+        slab.set(Id::CheckpointStarted as usize, 0);
+        if ok {
+            slab.observe(
+                Id::CheckpointSeconds as usize,
+                micros(now().saturating_duration_since(started)),
+            );
+        }
+    }
+
+    fn begin(&self, id: Id) -> Option<Instant> {
         let slab = self.slab.as_ref()?;
-        slab.set(Id::WriteStarted as usize, (wall_ms() / 1000).max(1));
+        slab.set(id as usize, (wall_ms() / 1000).max(1));
         Some(now())
     }
 
