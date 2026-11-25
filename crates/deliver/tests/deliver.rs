@@ -1233,6 +1233,38 @@ fn waits_for_a_free_connection() {
 }
 
 #[test]
+fn domains_with_the_same_mx_share_a_connection_limit() {
+    let (shared, own) = run(async {
+        let script = Script::new(&["PIPELINING"]);
+        script.stalls.set(1);
+        serve(MX1, script);
+        let zone = zone();
+        zone.set(
+            "example.net",
+            Type::Mx,
+            mx(&[(5, "MX1.example.com"), (10, "mx2.example.com")]),
+        );
+        zone.set("example.org", Type::Mx, mx(&[(10, "mx1.example.com")]));
+        let mesh = Mesh::new(1);
+        let (leases, _done) = limits(mesh.take(0).expect("ends"), 1, [7; 16]);
+        let mut settings = settings();
+        settings.deadline = Duration::from_secs(20);
+        settings.wait = Duration::from_millis(200);
+        let deliver = Rc::new(limited(zone, settings, Some(leases)));
+        let stuck = Rc::clone(&deliver);
+        let first = spawn(async move { simple(&stuck, "example.com").await });
+        sleep(Duration::from_millis(100)).await;
+        let shared = simple(&deliver, "example.net").await;
+        let own = simple(&deliver, "example.org").await;
+        first.await;
+        (shared, own)
+    });
+    assert_eq!(answers(&shared), [Answer::Later(200)]);
+    assert_eq!(reply(&shared[0]), "451 4.4.5 Connection limit reached");
+    assert_eq!(answers(&own), [Answer::Delivered]);
+}
+
+#[test]
 fn keeps_the_egress_of_a_pooled_connection() {
     let seen = run(async {
         let seen = serve(MX1, Script::new(&[]));

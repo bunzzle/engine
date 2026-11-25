@@ -390,7 +390,39 @@ fn deliver(mut table: Table, delivery: &mut Delivery, roots: bool) -> Result<(),
     t.command = duration(&mut table, "command_timeout", t.command)?;
     t.body = duration(&mut table, "body_timeout", t.body)?;
     t.final_reply = duration(&mut table, "final_timeout", t.final_reply)?;
+    sites(&mut table, &mut settings.sites)?;
     table.finish()
+}
+
+fn sites(table: &mut Table, sites: &mut Vec<deliver::Site>) -> Result<(), Error> {
+    for mut rule in table.tables("site") {
+        let name = rule.require("name")?;
+        let text = name.str()?;
+        if text.is_empty() || text.len() > 255 {
+            return Err(name.error("must be between 1 and 255 bytes"));
+        }
+        if sites.iter().any(|site| site.name == text) {
+            return Err(name.error("is listed twice"));
+        }
+        let suffix = rule.require("suffix")?;
+        let mut suffixes = Vec::new();
+        for host in suffix.strs()? {
+            let host = host.to_ascii_lowercase();
+            if !intake::node_name(&host) {
+                return Err(suffix.error("must list host names"));
+            }
+            suffixes.push(host);
+        }
+        if suffixes.is_empty() {
+            return Err(suffix.error("must list at least one host name"));
+        }
+        rule.finish()?;
+        sites.push(deliver::Site {
+            name: text.to_owned(),
+            suffixes,
+        });
+    }
+    Ok(())
 }
 
 fn intake(mut table: Table, session: &mut intake::Config) -> Result<(), Error> {

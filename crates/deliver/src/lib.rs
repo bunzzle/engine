@@ -14,6 +14,7 @@ mod report;
 mod results;
 mod saver;
 mod settings;
+mod site;
 mod sts;
 mod upload;
 
@@ -28,5 +29,5 @@ pub use pool::{Remote, limits};
 pub use report::{Applied, Applies, Detail, MAILTO, Report, ResultType, Rua};
 pub use results::{ResultStats, Taken};
 pub use sched::OwnStats;
-pub use settings::{EightBit, Reporter, Settings, Timeouts};
+pub use settings::{EightBit, Reporter, Settings, Site, Timeouts};
 pub use sts::PolicyStats;

@@ -30,6 +30,7 @@ use crate::pool::{Key, Level, Link, Pool, Remote, Slot};
 use crate::report::{Applied, Report, ResultType, Rua, rua};
 use crate::results::{Failure, ResultStats, Results, Scope, Taken};
 use crate::settings::{EightBit, Settings};
+use crate::site;
 use crate::sts::{Got, Mode, PolicyStats, Sts};
 use crate::upload::upload;
 
@@ -362,12 +363,13 @@ impl<D: Dns, L: Local> Deliver<D, L> {
             Ok(hosts) => hosts,
             Err((answer, reply)) => return every(answer, reply),
         };
+        let site = site::name(&destination.domain, &hosts, &self.settings.sites);
         let enforced = self.enforce(egress, &domain, (&mut hosts, secure), (end, envelope));
         let (sts, scope) = match enforced.await {
             Ok(enforced) => enforced,
             Err((answer, reply)) => return every(answer, reply),
         };
-        let remote: Remote = (egress, destination.domain.clone());
+        let remote: Remote = (egress, site.into());
         let mut slot = None;
         let mut last = NO_HOST.to_vec();
         let mut tried = 0;
