@@ -3,7 +3,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
-use control::{Ask, Error, Gcra, LIFETIME, Leases, Limits, limit_core};
+use control::{Ask, Error, Gcra, LIFETIME, Leases, Limits, Quota, Rate, Taken, limit_core};
 use rt::sim::{Config, Machine, SimDriver, Stalls, check};
 use rt::{Instant, JoinHandle, Mesh, Runtime, sleep, spawn};
 
@@ -15,6 +15,20 @@ const BOTH: u32 = 3;
 const RATE: u32 = 1_000;
 const BURST: u32 = 50;
 const LIMIT: u64 = 400;
+
+const SLOW: u32 = 4;
+const PERIOD: Duration = Duration::from_secs(10);
+
+fn quota(key: u32) -> Option<Quota> {
+    if key == SLOW {
+        return Some(Quota {
+            rate: Rate::per_minute(6),
+            burst: 1,
+            queued: LIMIT,
+        });
+    }
+    limits(key).map(Quota::from)
+}
 
 fn limits(tenant: u32) -> Option<Limits> {
     match tenant {
@@ -60,7 +74,7 @@ impl Node {
         for core in 0..CORES {
             let ends = mesh.take(core).expect("ends");
             let (lease, handle) = machine.block_on(usize::from(core), async move {
-                Leases::start(ends, |t| limit_core(*t, SHARDS, CORES), |t| limits(*t))
+                Leases::start(ends, |t| limit_core(*t, SHARDS, CORES), |t| quota(*t))
             });
             leases.push(lease);
             done.push(handle);
@@ -368,12 +382,12 @@ fn spread(seed: u64) {
             now += 500_000_000;
         }
         let want = u32::try_from(sim.random() % 200).expect("small") + 1;
-        let tokens = gcra.grant(limits, want, Instant::from_nanos(now));
+        let tokens = gcra.grant(limits.into(), want, Instant::from_nanos(now));
         assert!(tokens.count <= want.min(RATE / 10));
         if tokens.count == 0 {
             let next = tokens.next.expect("next").as_nanos();
             assert!(next > now);
-            let again = gcra.grant(limits, 1, Instant::from_nanos(next));
+            let again = gcra.grant(limits.into(), 1, Instant::from_nanos(next));
             assert_eq!(again.count, 1, "seed {seed}: refused at its next time");
             grants.push((next, 1));
         } else {
@@ -414,8 +428,8 @@ fn gcra_gives_the_whole_burst_after_idle() {
     };
     let mut gcra = Gcra::default();
     let start = Instant::from_nanos(5_000_000_000);
-    assert_eq!(gcra.grant(limits, 100, start).count, BURST);
-    let refused = gcra.grant(limits, 1, start);
+    assert_eq!(gcra.grant(limits.into(), 100, start).count, BURST);
+    let refused = gcra.grant(limits.into(), 1, start);
     assert_eq!(refused.count, 0);
     assert_eq!(refused.next, Some(start + Duration::from_millis(1)));
     let wide = Limits {
@@ -424,8 +438,8 @@ fn gcra_gives_the_whole_burst_after_idle() {
         ..limits
     };
     let mut gcra = Gcra::default();
-    assert_eq!(gcra.grant(wide, 1_000, start).count, RATE / 10);
-    assert_eq!(gcra.grant(wide, 1_000, start).count, RATE / 10);
+    assert_eq!(gcra.grant(wide.into(), 1_000, start).count, RATE / 10);
+    assert_eq!(gcra.grant(wide.into(), 1_000, start).count, RATE / 10);
 }
 
 #[test]
@@ -434,7 +448,7 @@ fn waits_as_long_as_asked() {
     Runtime::new(sim).block_on(async {
         let mesh = Mesh::<Ask<u32>>::new(1);
         let ends = mesh.take(0).expect("ends");
-        let (leases, done) = Leases::start(ends, |_| 0, |t| limits(*t));
+        let (leases, done) = Leases::start(ends, |_| 0, |t| quota(*t));
         let mut held = Vec::new();
         for _ in 0..LIMIT {
             held.push(leases.take(&QUEUED).await.expect("slot"));
@@ -458,4 +472,163 @@ fn waits_as_long_as_asked() {
         leases.close();
         done.await;
     });
+}
+
+#[test]
+fn rates_below_one_per_second_never_mean_no_limit() {
+    assert_eq!(Rate::per_second(0), Rate::NONE);
+    assert_eq!(Rate::per_hour(0).period(), None);
+    assert_eq!(Rate::per_hour(1).period(), Some(Duration::from_secs(3_600)));
+    assert_eq!(
+        Rate::per(u32::MAX, Duration::from_nanos(1)).period(),
+        Some(Duration::from_nanos(1))
+    );
+    assert!(Rate::per(1, Duration::MAX).period().is_some());
+    let start = Instant::from_nanos(5_000_000_000);
+    for burst in [0, 1, 7, u32::MAX] {
+        let quota = Quota {
+            rate: Rate::per(1, Duration::MAX),
+            burst,
+            queued: 0,
+        };
+        let mut gcra = Gcra::default();
+        let mut granted = 0;
+        for step in 0..1_000 {
+            granted += gcra
+                .grant(quota, 1, start + Duration::from_secs(step))
+                .count;
+        }
+        assert_eq!(granted, burst.clamp(1, 1_000), "burst {burst}");
+    }
+    let hourly = Quota {
+        rate: Rate::per_hour(2),
+        burst: 1,
+        queued: 0,
+    };
+    let mut gcra = Gcra::default();
+    assert_eq!(gcra.grant(hourly, 5, start).count, 1);
+    let refused = gcra.grant(hourly, 1, start + Duration::from_secs(60));
+    assert_eq!(refused.count, 0);
+    assert_eq!(refused.next, Some(start + Duration::from_mins(30)));
+}
+
+#[test]
+fn a_slow_key_gives_one_token_per_period() {
+    let sim = Rc::new(SimDriver::new(4, Config::default()));
+    Runtime::new(sim).block_on(async {
+        let mesh = Mesh::<Ask<u32>>::new(1);
+        let ends = mesh.take(0).expect("ends");
+        let (leases, done) = Leases::start(ends, |_| 0, |t| quota(*t));
+        let start = rt::now();
+        let first = leases.take(&SLOW).await.expect("first token");
+        assert!(first.token.is_some() && first.slot);
+        let mut taken = vec![start];
+        while rt::now() < start + PERIOD * 3 + PERIOD / 2 {
+            if leases.take(&SLOW).await.is_ok() {
+                taken.push(rt::now());
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(taken.len(), 4, "{taken:?}");
+        for pair in taken.windows(2) {
+            let gap = pair[1].saturating_duration_since(pair[0]);
+            assert!(gap + LIFETIME >= PERIOD, "{gap:?}");
+        }
+        leases.close();
+        done.await;
+    });
+}
+
+#[test]
+fn a_token_only_take_holds_no_slot() {
+    let node = Node::start(5);
+    let leases = node.leases.clone();
+    node.machine.block_on(1, async move {
+        let lease = &leases[1];
+        for _ in 0..20 {
+            let taken = lease.take_token(&BOTH).await.expect("token");
+            assert!(taken.token.is_some());
+            assert!(!taken.slot);
+        }
+        assert_eq!(lease.used(&BOTH), 0);
+        assert_eq!(lease.held(&BOTH), 0);
+        let free = lease.take_token(&QUEUED).await.expect("no rate");
+        assert_eq!(free.token, None);
+        assert!(!free.slot);
+        assert_eq!(lease.held(&QUEUED), 0);
+        let owner = usize::from(limit_core(BOTH, SHARDS, CORES));
+        assert_eq!(leases[owner].granted(&BOTH), 0);
+    });
+    node.stop();
+}
+
+fn blocked(seed: u64) {
+    let node = Node::start(seed);
+    let leases = node.leases.clone();
+    let owner = usize::from(limit_core(QUEUED, SHARDS, CORES));
+    let hot = usize::try_from(seed % u64::from(CORES)).expect("small");
+    let other = (hot + 1) % usize::from(CORES);
+    node.machine.block_on(hot, async move {
+        let lease = &leases[hot];
+        for _ in 0..10 {
+            lease.take(&QUEUED).await.expect("slot");
+        }
+        let full = leases.clone();
+        let waiter = spawn(async move {
+            let mut held = 0;
+            loop {
+                match full[other]
+                    .take_within(&QUEUED, Duration::from_secs(5))
+                    .await
+                {
+                    Ok(_) => held += 1,
+                    Err(e) => return (held, e),
+                }
+            }
+        });
+        sleep(Duration::from_millis(50)).await;
+        leases[other].block(&QUEUED);
+        let (held, refused) = waiter.await;
+        assert!(matches!(refused, Error::Blocked), "{refused}");
+        assert_eq!(held + 10, LIMIT, "seed {seed}");
+        let deadline = rt::now() + Duration::from_secs(1);
+        while !leases.iter().all(|l| l.blocked(&QUEUED)) && rt::now() < deadline {
+            sleep(Duration::from_millis(1)).await;
+        }
+        for core in &leases {
+            assert!(core.blocked(&QUEUED));
+            assert!(matches!(core.take(&QUEUED).await, Err(Error::Blocked)));
+            assert!(matches!(
+                core.take_token(&QUEUED).await,
+                Err(Error::Blocked)
+            ));
+            assert_eq!(core.held(&QUEUED), core.used(&QUEUED));
+        }
+        lease.free(&QUEUED, 9);
+        lease.give_back(
+            &QUEUED,
+            Taken {
+                token: None,
+                slot: true,
+            },
+        );
+        leases[other].free(&QUEUED, held);
+        sleep(Duration::from_millis(10)).await;
+        assert_eq!(leases[owner].granted(&QUEUED), 0);
+        lease.unblock(&QUEUED);
+        let deadline = rt::now() + Duration::from_secs(1);
+        while leases.iter().any(|l| l.blocked(&QUEUED)) && rt::now() < deadline {
+            sleep(Duration::from_millis(1)).await;
+        }
+        for core in &leases {
+            assert!(!core.blocked(&QUEUED));
+            assert!(core.take(&QUEUED).await.expect("unblocked").slot);
+        }
+    });
+    node.stop();
+}
+
+#[test]
+fn a_blocked_key_refuses_takes_on_every_core_until_unblocked() {
+    check(0..8, blocked);
 }

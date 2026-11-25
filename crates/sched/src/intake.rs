@@ -134,7 +134,7 @@ impl<T: Transport + 'static> Node<T> {
         self.current(draft)?;
         let taken = match inner.leases.take(&draft.tenant).await {
             Ok(taken) => taken,
-            Err(control::Error::Busy) => return Err(Refusal::Busy),
+            Err(control::Error::Busy | control::Error::Blocked) => return Err(Refusal::Busy),
             Err(_) => return Err(Refusal::Tenant),
         };
         let name = Name {

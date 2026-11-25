@@ -4,7 +4,7 @@ use std::net::IpAddr;
 use std::rc::Rc;
 use std::time::Duration;
 
-use control::{Ask, Leases, Limits, siphash};
+use control::{Ask, Leases, Quota, Rate, siphash};
 use dns::Name;
 use rt::{Ends, JoinHandle, sleep, spawn};
 use smtp::client::Capabilities;
@@ -23,10 +23,9 @@ pub fn limits(
         ends,
         move |remote| owner(&key, remote, cores),
         move |_| {
-            Some(Limits {
-                rate: 0,
+            Some(Quota {
+                rate: Rate::NONE,
                 burst: 0,
-                connections,
                 queued: u64::from(connections),
             })
         },

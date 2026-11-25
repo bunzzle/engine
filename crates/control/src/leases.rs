@@ -13,7 +13,67 @@ pub const LIFETIME: Duration = Duration::from_millis(100);
 pub const WAIT: Duration = Duration::from_millis(50);
 pub const IDLE: Duration = Duration::from_secs(1);
 
-const SECOND: u64 = 1_000_000_000;
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Rate {
+    period: u64,
+}
+
+impl Rate {
+    pub const NONE: Self = Self { period: 0 };
+
+    pub fn per(count: u32, span: Duration) -> Self {
+        if count == 0 {
+            return Self::NONE;
+        }
+        let period = span.as_nanos() / u128::from(count);
+        Self {
+            period: u64::try_from(period).unwrap_or(u64::MAX).max(1),
+        }
+    }
+
+    pub fn per_second(count: u32) -> Self {
+        Self::per(count, Duration::from_secs(1))
+    }
+
+    pub fn per_minute(count: u32) -> Self {
+        Self::per(count, Duration::from_secs(60))
+    }
+
+    pub fn per_hour(count: u32) -> Self {
+        Self::per(count, Duration::from_secs(3_600))
+    }
+
+    pub fn period(self) -> Option<Duration> {
+        (self.period > 0).then(|| Duration::from_nanos(self.period))
+    }
+
+    fn limited(self) -> bool {
+        self.period > 0
+    }
+
+    fn per_lifetime(self) -> u32 {
+        let life = u64::try_from(LIFETIME.as_nanos()).expect("fits in u64");
+        let count = life / self.period.max(1);
+        u32::try_from(count).unwrap_or(u32::MAX).max(1)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Quota {
+    pub rate: Rate,
+    pub burst: u32,
+    pub queued: u64,
+}
+
+impl From<Limits> for Quota {
+    fn from(limits: Limits) -> Self {
+        Self {
+            rate: Rate::per_second(limits.rate),
+            burst: limits.burst,
+            queued: limits.queued,
+        }
+    }
+}
 
 pub fn limit_core(tenant: u32, shards: u32, cores: u16) -> u16 {
     queue_shard(tenant, shards) % cores
@@ -49,6 +109,14 @@ pub enum Ask<K> {
         slots: u64,
     },
     Opened,
+    Block {
+        key: K,
+        on: bool,
+    },
+    Blocked {
+        key: K,
+        on: bool,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -76,6 +144,7 @@ struct Lease {
     token_next: Option<Instant>,
     slot_ask: Option<Instant>,
     recalled: bool,
+    blocked: bool,
     touched: Instant,
     waiters: Vec<Sender<()>>,
 }
@@ -92,6 +161,7 @@ impl Lease {
             token_next: None,
             slot_ask: None,
             recalled: false,
+            blocked: false,
             touched: now,
             waiters: Vec::new(),
         }
@@ -136,32 +206,34 @@ impl Lease {
             && self.token_ask.is_none()
             && self.slot_ask.is_none()
             && self.waiters.is_empty()
+            && !self.blocked
     }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Gcra {
-    tat: u64,
+    tat: u128,
 }
 
 impl Gcra {
-    pub fn grant(&mut self, limits: Limits, want: u32, now: Instant) -> Tokens {
-        let period = (SECOND / u64::from(limits.rate.max(1))).max(1);
-        let burst = u64::from(limits.burst.max(1));
-        let now_ns = now.as_nanos();
+    pub fn grant(&mut self, quota: Quota, want: u32, now: Instant) -> Tokens {
+        let period = u128::from(quota.rate.period.max(1));
+        let gap = u128::from(quota.burst.max(1) - 1) * period;
+        let now_ns = u128::from(now.as_nanos());
         let base = self.tat.max(now_ns);
-        let edge = now_ns + (burst - 1) * period;
+        let edge = now_ns + gap;
         if base > edge {
+            let next = u64::try_from(base - gap).unwrap_or(u64::MAX);
             return Tokens {
                 count: 0,
                 until: now,
-                next: Some(Instant::from_nanos(base - (burst - 1) * period)),
+                next: Some(Instant::from_nanos(next)),
             };
         }
-        let cap = (limits.rate / 10).max(1);
+        let cap = quota.rate.per_lifetime();
         let most = (edge - base) / period + 1;
-        let count = u32::try_from(most.min(u64::from(want.min(cap)))).expect("fits in u32");
-        self.tat = base + u64::from(count) * period;
+        let count = u32::try_from(most.min(u128::from(want.min(cap)))).expect("fits in u32");
+        self.tat = base + u128::from(count) * period;
         Tokens {
             count,
             until: now + LIFETIME,
@@ -176,10 +248,11 @@ struct Owned {
     held: BTreeMap<u16, u64>,
     granted: u64,
     waiting: VecDeque<(u16, u64)>,
+    blocked: bool,
 }
 
 type Route<K> = Rc<dyn Fn(&K) -> u16>;
-type Rules<K> = Rc<dyn Fn(&K) -> Option<Limits>>;
+type Rules<K> = Rc<dyn Fn(&K) -> Option<Quota>>;
 
 struct Inner<K> {
     owner: Route<K>,
@@ -211,7 +284,7 @@ impl<K: Ord + Clone + Send + 'static> Leases<K> {
     pub fn start(
         ends: Ends<Ask<K>>,
         owner: impl Fn(&K) -> u16 + 'static,
-        limits: impl Fn(&K) -> Option<Limits> + 'static,
+        limits: impl Fn(&K) -> Option<Quota> + 'static,
     ) -> (Self, JoinHandle<()>) {
         let inner = Rc::new(Inner {
             owner: Rc::new(owner),
@@ -269,15 +342,58 @@ impl<K: Ord + Clone + Send + 'static> Leases<K> {
     }
 
     pub async fn take_within(&self, key: &K, wait: Duration) -> Result<Taken, Error> {
+        self.take_as(key, wait, true).await
+    }
+
+    pub async fn take_token(&self, key: &K) -> Result<Taken, Error> {
+        self.take_token_within(key, WAIT).await
+    }
+
+    pub async fn take_token_within(&self, key: &K, wait: Duration) -> Result<Taken, Error> {
+        self.take_as(key, wait, false).await
+    }
+
+    pub fn block(&self, key: &K) {
+        self.send(
+            (self.inner.owner)(key),
+            Ask::Block {
+                key: key.clone(),
+                on: true,
+            },
+        );
+    }
+
+    pub fn unblock(&self, key: &K) {
+        self.send(
+            (self.inner.owner)(key),
+            Ask::Block {
+                key: key.clone(),
+                on: false,
+            },
+        );
+    }
+
+    pub fn blocked(&self, key: &K) -> bool {
+        self.inner
+            .leases
+            .borrow()
+            .get(key)
+            .is_some_and(|l| l.blocked)
+    }
+
+    async fn take_as(&self, key: &K, wait: Duration, slot: bool) -> Result<Taken, Error> {
         let limits = (self.inner.limits)(key).ok_or(Error::Invalid("key"))?;
         let deadline = rt::now() + wait;
         loop {
+            if self.blocked(key) {
+                return Err(Error::Blocked);
+            }
             let now = rt::now();
-            if let Some(taken) = self.try_take(key, limits, now) {
+            if let Some(taken) = self.try_take(key, limits, now, slot) {
                 return Ok(taken);
             }
             let (wake, mut woken) = channel();
-            self.ask(key, limits, now);
+            self.ask(key, limits, now, slot);
             let until = {
                 let mut leases = self.inner.leases.borrow_mut();
                 let lease = leases.get_mut(key).expect("lease made by try_take");
@@ -294,18 +410,19 @@ impl<K: Ord + Clone + Send + 'static> Leases<K> {
     }
 
     pub fn give_back(&self, key: &K, taken: Taken) {
-        let mut leases = self.inner.leases.borrow_mut();
-        let Some(lease) = leases.get_mut(key) else {
-            return;
-        };
-        if let Some(until) = taken.token
-            && let Some(batch) = lease.batches.iter_mut().find(|b| b.0 == until)
         {
-            batch.1 += 1;
+            let mut leases = self.inner.leases.borrow_mut();
+            let Some(lease) = leases.get_mut(key) else {
+                return;
+            };
+            if let Some(until) = taken.token
+                && let Some(batch) = lease.batches.iter_mut().find(|b| b.0 == until)
+            {
+                batch.1 += 1;
+            }
         }
         if taken.slot {
-            lease.used = lease.used.saturating_sub(1);
-            lease.free += 1;
+            self.free(key, 1);
         }
     }
 
@@ -318,7 +435,7 @@ impl<K: Ord + Clone + Send + 'static> Leases<K> {
             let slots = slots.min(lease.used);
             lease.used -= slots;
             lease.free += slots;
-            if lease.recalled && lease.free > 0 {
+            if (lease.recalled || lease.blocked) && lease.free > 0 {
                 lease.recalled = false;
                 std::mem::take(&mut lease.free)
             } else {
@@ -374,13 +491,13 @@ impl<K: Ord + Clone + Send + 'static> Leases<K> {
         self.inner.stats.set(stats);
     }
 
-    fn try_take(&self, key: &K, limits: Limits, now: Instant) -> Option<Taken> {
+    fn try_take(&self, key: &K, limits: Quota, now: Instant, slot: bool) -> Option<Taken> {
         let mut leases = self.inner.leases.borrow_mut();
         let lease = leases.entry(key.clone()).or_insert_with(|| Lease::new(now));
         lease.touched = now;
         let lapsed = lease.lapse(now);
-        let need_token = limits.rate > 0;
-        let need_slot = limits.queued > 0;
+        let need_token = limits.rate.limited();
+        let need_slot = slot && limits.queued > 0;
         let short_tokens = need_token && lease.batches.is_empty();
         let short_slots = need_slot && lease.free == 0;
         let low = (need_token && lease.tokens() <= lease.token_size / 2)
@@ -417,22 +534,22 @@ impl<K: Ord + Clone + Send + 'static> Leases<K> {
             self.count(|s| s.lapsed += lapsed);
         }
         if taken.is_none() || low {
-            self.ask(key, limits, now);
+            self.ask(key, limits, now, slot);
         }
         taken
     }
 
-    fn ask(&self, key: &K, limits: Limits, now: Instant) {
+    fn ask(&self, key: &K, limits: Quota, now: Instant, slot: bool) {
         let open = |sent: Option<Instant>| sent.is_none_or(|at| at + LIFETIME <= now);
         let (tokens, slots) = {
             let mut leases = self.inner.leases.borrow_mut();
             let Some(lease) = leases.get_mut(key) else {
                 return;
             };
-            lease.token_size = lease.token_size.min((limits.rate / 10).max(1));
+            lease.token_size = lease.token_size.min(limits.rate.per_lifetime());
             lease.slot_size = lease.slot_size.min((limits.queued / 8).max(1));
             let have = lease.tokens();
-            let tokens = if limits.rate > 0
+            let tokens = if limits.rate.limited()
                 && open(lease.token_ask)
                 && lease.token_next.is_none_or(|n| n <= now)
                 && have <= lease.token_size / 2
@@ -441,12 +558,15 @@ impl<K: Ord + Clone + Send + 'static> Leases<K> {
             } else {
                 0
             };
-            let slots =
-                if limits.queued > 0 && open(lease.slot_ask) && lease.free <= lease.slot_size / 2 {
-                    (lease.slot_size - lease.free).max(1)
-                } else {
-                    0
-                };
+            let slots = if slot
+                && limits.queued > 0
+                && open(lease.slot_ask)
+                && lease.free <= lease.slot_size / 2
+            {
+                (lease.slot_size - lease.free).max(1)
+            } else {
+                0
+            };
             if tokens > 0 {
                 lease.token_ask = Some(now);
             }
@@ -498,6 +618,57 @@ impl<K: Ord + Clone + Send + 'static> Leases<K> {
                 self.inner.opened.set(self.inner.opened.get() + 1);
                 self.inner.opening.notify();
             }
+            Ask::Block { key, on } => self.block_all(&key, on),
+            Ask::Blocked { key, on } => self.mark(key, on),
+        }
+    }
+
+    fn block_all(&self, key: &K, on: bool) {
+        {
+            let mut owned = self.inner.owned.borrow_mut();
+            let entry = owned.entry(key.clone()).or_default();
+            entry.blocked = on;
+            if on {
+                entry.waiting.clear();
+            }
+        }
+        for core in 0..self.inner.cores {
+            self.send(
+                core,
+                Ask::Blocked {
+                    key: key.clone(),
+                    on,
+                },
+            );
+        }
+        if !on {
+            self.serve(key);
+        }
+    }
+
+    fn mark(&self, key: K, on: bool) {
+        let (back, waiters) = {
+            let mut leases = self.inner.leases.borrow_mut();
+            let lease = leases
+                .entry(key.clone())
+                .or_insert_with(|| Lease::new(rt::now()));
+            lease.blocked = on;
+            lease.token_ask = None;
+            lease.slot_ask = None;
+            let back = if on {
+                lease.recalled = false;
+                lease.slot_size = 1;
+                std::mem::take(&mut lease.free)
+            } else {
+                0
+            };
+            (back, std::mem::take(&mut lease.waiters))
+        };
+        if back > 0 {
+            self.give_slots(key, back);
+        }
+        for wake in waiters {
+            let _ = wake.send(());
         }
     }
 
@@ -505,6 +676,16 @@ impl<K: Ord + Clone + Send + 'static> Leases<K> {
         let Some(limits) = (self.inner.limits)(&key) else {
             return;
         };
+        if self
+            .inner
+            .owned
+            .borrow()
+            .get(&key)
+            .is_some_and(|o| o.blocked)
+        {
+            self.send(from, Ask::Blocked { key, on: true });
+            return;
+        }
         self.serve(&key);
         let now = rt::now();
         let mut recall = false;
