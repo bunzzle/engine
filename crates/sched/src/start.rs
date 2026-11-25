@@ -714,7 +714,7 @@ fn start_leases(
     let (leases, done) = Leases::start(
         ends,
         move |tenant| limit_core(*tenant, shards, cores),
-        move |tenant| rules.borrow().tenant(*tenant).map(|t| t.limits),
+        move |tenant| rules.borrow().tenant(*tenant).map(|t| t.limits.into()),
     );
     leases.restore(spool.open_counts());
     let freed = leases.clone();

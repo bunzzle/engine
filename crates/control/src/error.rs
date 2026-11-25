@@ -9,6 +9,7 @@ pub enum Error {
     Full,
     Refused,
     Busy,
+    Blocked,
     Keys {
         tenant: u32,
         generation: u32,
@@ -24,6 +25,7 @@ impl fmt::Display for Error {
             Self::Full => write!(f, "control records over their budget"),
             Self::Refused => write!(f, "refused"),
             Self::Busy => write!(f, "over the limit, try again later"),
+            Self::Blocked => write!(f, "blocked, try again later"),
             Self::Keys {
                 tenant,
                 generation,
