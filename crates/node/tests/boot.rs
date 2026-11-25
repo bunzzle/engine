@@ -761,13 +761,33 @@ async fn unknown_queues() {
 
 #[test]
 fn admin_creates_lists_and_revokes_keys() {
-    use admin::Code::{Ok, Refused};
-    use admin::Request::{KeyCreate, KeyList, KeyRevoke, PoolSet};
+    use admin::Code::{NotFound, Ok, Refused};
+    use admin::Request::{KeyCreate, KeyList, KeyRevoke, PoolSet, TenantResume, TenantSuspend};
     let driver = created(23);
     let extra = format!("[admin]\nsocket = \"{ADMIN}\"\n");
     let node = booted(&driver, config_with(7, &extra), CORES);
     node.machine.block_on(0, async move {
         drop(serving().await);
+        let key = |tenant, smtp, api, hooks, pool| KeyCreate {
+            tenant,
+            smtp,
+            api,
+            hooks,
+            pool,
+        };
+        assert_eq!(
+            ask(key(7, true, false, false, 0)).await,
+            (NotFound, "tenant 7 not found".into())
+        );
+        assert_eq!(
+            ask(KeyList { tenant: 7, from: 0 }).await,
+            (NotFound, "tenant 7 not found".into())
+        );
+        assert_eq!(
+            ask(KeyRevoke { tenant: 7, id: 1 }).await,
+            (NotFound, "tenant 7 not found".into())
+        );
+
         let pool = admin::PoolSpec {
             id: 1,
             addresses: vec![("192.0.2.1".parse().expect("ip"), 1)],
@@ -775,15 +795,26 @@ fn admin_creates_lists_and_revokes_keys() {
         assert_eq!(ask(PoolSet(pool)).await.0, Ok);
         assert_eq!(ask(tenant(5, &[1])).await.0, Ok);
         assert_eq!(ask(tenant(6, &[1])).await.0, Ok);
+        assert_eq!(ask(TenantSuspend(5)).await.0, Ok);
+        assert_eq!(
+            ask(key(5, true, false, false, 1)).await,
+            (Refused, "tenant 5 is not active".into())
+        );
+        assert_eq!(ask(TenantResume(5)).await.0, Ok);
+        assert_eq!(
+            ask(key(5, false, false, false, 0)).await,
+            (Refused, "invalid scopes".into())
+        );
+        assert_eq!(
+            ask(key(5, false, false, true, 1)).await,
+            (Refused, "invalid scopes".into())
+        );
+        assert_eq!(
+            ask(key(5, true, false, false, 2)).await,
+            (Refused, "invalid pool".into())
+        );
 
-        let first = KeyCreate {
-            tenant: 5,
-            smtp: true,
-            api: true,
-            hooks: false,
-            pool: 1,
-        };
-        let (code, text) = ask(first).await;
+        let (code, text) = ask(key(5, true, true, false, 1)).await;
         assert_eq!(code, Ok);
         let secret = text
             .strip_prefix("key 1 secret ")
@@ -795,15 +826,11 @@ fn admin_creates_lists_and_revokes_keys() {
             (Ok, "key 1 scopes smtp,api pool 1 generation 1\n".into())
         );
 
-        let second = KeyCreate {
-            tenant: 6,
-            smtp: false,
-            api: false,
-            hooks: true,
-            pool: 0,
-        };
-        assert_eq!(ask(second).await.0, Ok);
-        assert_eq!(ask(KeyRevoke { tenant: 5, id: 2 }).await.0, Refused);
+        assert_eq!(ask(key(6, false, false, true, 0)).await.0, Ok);
+        assert_eq!(
+            ask(KeyRevoke { tenant: 5, id: 2 }).await,
+            (NotFound, "key 2 of tenant 5 not found".into())
+        );
         assert_eq!(ask(KeyRevoke { tenant: 5, id: 1 }).await.0, Ok);
         assert_eq!(
             ask(KeyList { tenant: 5, from: 0 }).await,
@@ -811,7 +838,7 @@ fn admin_creates_lists_and_revokes_keys() {
         );
         assert_eq!(
             ask(KeyRevoke { tenant: 5, id: 1 }).await,
-            (Refused, "refused".into())
+            (NotFound, "key 1 of tenant 5 not found".into())
         );
         assert_eq!(
             ask(KeyList { tenant: 6, from: 0 }).await,

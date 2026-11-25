@@ -9,6 +9,7 @@ autotests = false
 
 [dependencies]
 rt = { path = "../rt" }
+sys = { path = "../sys" }
 
 [[test]]
 name = "admin"

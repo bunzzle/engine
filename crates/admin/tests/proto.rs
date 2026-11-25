@@ -184,5 +184,24 @@ fn short_long_or_odd_fields_are_refused() {
     );
     unknown_scopes[6] = 8;
     assert_eq!(Request::decode(&unknown_scopes), Err(Error::Body));
+    for request in [
+        Request::KeyCreate {
+            tenant: 5,
+            smtp: true,
+            api: true,
+            hooks: false,
+            pool: 2,
+        },
+        Request::KeyRevoke { tenant: 5, id: 9 },
+        Request::KeyList { tenant: 5, from: 9 },
+    ] {
+        let short = body(&request.encode());
+        for cut in 2..short.len() {
+            assert_eq!(Request::decode(&short[..cut]), Err(Error::Body), "{cut}");
+        }
+        let mut long = short;
+        long.push(0);
+        assert_eq!(Request::decode(&long), Err(Error::Body));
+    }
     assert_eq!(Request::decode(&[VERSION, 255]), Err(Error::Command));
 }

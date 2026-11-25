@@ -122,20 +122,36 @@ impl<T: Transport + 'static> Ops<T> {
 
     fn keys(&self, tenant: u32, from: u32) -> Reply {
         let table = self.node.table();
-        let lines = table.accesses(tenant).filter(|a| a.id >= from).map(|a| {
-            let line = format!(
-                "key {} scopes {} pool {} generation {}\n",
-                a.id,
-                scope_list(a.scopes),
-                a.pool,
-                a.generation,
-            );
-            (a.id, line)
-        });
+        let Some(current) = table.tenant(tenant).filter(|t| !t.state.deleted()) else {
+            return tenant_not_found(tenant);
+        };
+        let generation = current.generation;
+        let lines = table
+            .accesses(tenant)
+            .filter(move |a| a.id >= from && a.generation == generation)
+            .map(|a| {
+                let line = format!(
+                    "key {} scopes {} pool {} generation {}\n",
+                    a.id,
+                    scope_list(a.scopes),
+                    a.pool,
+                    a.generation,
+                );
+                (a.id, line)
+            });
         Reply::new(Code::Ok, listed(lines, None))
     }
 
     async fn key_create(&self, tenant: u32, scopes: Scopes, pool: u32) -> Reply {
+        {
+            let table = self.node.table();
+            let Some(current) = table.tenant(tenant).filter(|t| !t.state.deleted()) else {
+                return tenant_not_found(tenant);
+            };
+            if current.state != State::Active {
+                return Reply::new(Code::Refused, format!("tenant {tenant} is not active"));
+            }
+        }
         let (access, secret) = match self.node.access_new(tenant, scopes, pool).await {
             Ok(created) => created,
             Err(error) => {
@@ -151,15 +167,35 @@ impl<T: Transport + 'static> Ops<T> {
         let id = access.id;
         eprintln!("admin key create {tenant}: Ok id {id}");
         let secret = std::str::from_utf8(&secret).expect("access tokens are ASCII");
-        Reply::new(Code::Ok, format!("key {id} secret {secret}\n"))
+        let mut text = String::with_capacity(secret.len() + 24);
+        let _ = write!(text, "key {id} secret ");
+        text.push_str(secret);
+        text.push('\n');
+        Reply::new(Code::Ok, text)
     }
 
     async fn key_revoke(&self, tenant: u32, id: u32) -> Reply {
+        {
+            let table = self.node.table();
+            if table
+                .tenant(tenant)
+                .is_none_or(|tenant| tenant.state.deleted())
+            {
+                return tenant_not_found(tenant);
+            }
+            let Some(access) = table.access(id).filter(|a| a.tenant == tenant) else {
+                return key_not_found(tenant, id);
+            };
+            if table.gone(tenant, access.generation) {
+                return key_not_found(tenant, id);
+            }
+        }
         let reply = match self.node.access_revoke(tenant, id).await {
             Ok(removal) => Reply::new(
                 Code::Ok,
                 format!("key {id} revoked, version {}\n", removal.version),
             ),
+            Err(sched::Error::Control(control::Error::Refused)) => key_not_found(tenant, id),
             Err(error) => key_failed(error),
         };
         eprintln!(
@@ -330,6 +366,17 @@ fn scope_list(scopes: Scopes) -> String {
         names.push("hooks");
     }
     names.join(",")
+}
+
+fn tenant_not_found(tenant: u32) -> Reply {
+    Reply::new(Code::NotFound, format!("tenant {tenant} not found"))
+}
+
+fn key_not_found(tenant: u32, id: u32) -> Reply {
+    Reply::new(
+        Code::NotFound,
+        format!("key {id} of tenant {tenant} not found"),
+    )
 }
 
 fn key_failed(error: sched::Error) -> Reply {
