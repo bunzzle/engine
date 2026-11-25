@@ -15,6 +15,9 @@ const POOL_LIST: u8 = 7;
 const QUEUE_LIST: u8 = 8;
 const QUEUE_RETRY: u8 = 9;
 const QUEUE_REBIND: u8 = 10;
+const KEY_CREATE: u8 = 11;
+const KEY_REVOKE: u8 = 12;
+const KEY_LIST: u8 = 13;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
@@ -60,9 +63,34 @@ pub enum Request {
     TenantResume(u32),
     PoolSet(PoolSpec),
     PoolList(u32),
-    QueueList { tenant: u32, from: u32 },
-    QueueRetry { tenant: u32, queue: u32 },
-    QueueRebind { tenant: u32, queue: u32, pool: u32 },
+    QueueList {
+        tenant: u32,
+        from: u32,
+    },
+    QueueRetry {
+        tenant: u32,
+        queue: u32,
+    },
+    QueueRebind {
+        tenant: u32,
+        queue: u32,
+        pool: u32,
+    },
+    KeyCreate {
+        tenant: u32,
+        smtp: bool,
+        api: bool,
+        hooks: bool,
+        pool: u32,
+    },
+    KeyRevoke {
+        tenant: u32,
+        id: u32,
+    },
+    KeyList {
+        tenant: u32,
+        from: u32,
+    },
 }
 
 impl Request {
@@ -136,6 +164,28 @@ impl Request {
                 body.extend_from_slice(&queue.to_be_bytes());
                 body.extend_from_slice(&pool.to_be_bytes());
             }
+            Self::KeyCreate {
+                tenant,
+                smtp,
+                api,
+                hooks,
+                pool,
+            } => {
+                body.push(KEY_CREATE);
+                body.extend_from_slice(&tenant.to_be_bytes());
+                body.push(u8::from(*smtp) | u8::from(*api) << 1 | u8::from(*hooks) << 2);
+                body.extend_from_slice(&pool.to_be_bytes());
+            }
+            Self::KeyRevoke { tenant, id } => {
+                body.push(KEY_REVOKE);
+                body.extend_from_slice(&tenant.to_be_bytes());
+                body.extend_from_slice(&id.to_be_bytes());
+            }
+            Self::KeyList { tenant, from } => {
+                body.push(KEY_LIST);
+                body.extend_from_slice(&tenant.to_be_bytes());
+                body.extend_from_slice(&from.to_be_bytes());
+            }
         }
         framed(&body)
     }
@@ -189,6 +239,28 @@ impl Request {
                 tenant: fields.u32()?,
                 queue: fields.u32()?,
                 pool: fields.u32()?,
+            },
+            KEY_CREATE => {
+                let tenant = fields.u32()?;
+                let scopes = fields.u8()?;
+                if scopes & !7 != 0 {
+                    return Err(Error::Body);
+                }
+                Self::KeyCreate {
+                    tenant,
+                    smtp: scopes & 1 != 0,
+                    api: scopes & 2 != 0,
+                    hooks: scopes & 4 != 0,
+                    pool: fields.u32()?,
+                }
+            }
+            KEY_REVOKE => Self::KeyRevoke {
+                tenant: fields.u32()?,
+                id: fields.u32()?,
+            },
+            KEY_LIST => Self::KeyList {
+                tenant: fields.u32()?,
+                from: fields.u32()?,
             },
             _ => return Err(Error::Command),
         };

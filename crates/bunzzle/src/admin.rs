@@ -17,7 +17,10 @@ pub const USAGE: &str = "usage: bunzzle admin <config> status
        bunzzle admin <config> pool set <id> <ip>=<weight>[,<ip>=<weight>...]
        bunzzle admin <config> queue list <tenant> [from <id>]
        bunzzle admin <config> queue retry <tenant> <queue>
-       bunzzle admin <config> queue rebind <tenant> <queue> <pool>";
+       bunzzle admin <config> queue rebind <tenant> <queue> <pool>
+       bunzzle admin <config> key create <tenant> <scopes> [pool <id>]
+       bunzzle admin <config> key revoke <tenant> <id>
+       bunzzle admin <config> key list <tenant> [from <id>]";
 
 const MAX_ITEMS: usize = 255;
 
@@ -48,6 +51,22 @@ pub fn parse(args: &[String]) -> Option<(&str, Request)> {
             tenant: tenant.parse().ok()?,
             queue: queue.parse().ok()?,
             pool: pool.parse().ok()?,
+        },
+        ["key", "create", tenant, scopes] => key_create(tenant, scopes, 0)?,
+        ["key", "create", tenant, scopes, "pool", pool] => {
+            key_create(tenant, scopes, pool.parse().ok()?)?
+        }
+        ["key", "revoke", tenant, id] => Request::KeyRevoke {
+            tenant: tenant.parse().ok()?,
+            id: id.parse().ok()?,
+        },
+        ["key", "list", tenant] => Request::KeyList {
+            tenant: tenant.parse().ok()?,
+            from: 0,
+        },
+        ["key", "list", tenant, "from", from] => Request::KeyList {
+            tenant: tenant.parse().ok()?,
+            from: from.parse().ok()?,
         },
         ["tenant", "suspend", id] => Request::TenantSuspend(id.parse().ok()?),
         ["tenant", "resume", id] => Request::TenantResume(id.parse().ok()?),
@@ -88,6 +107,31 @@ fn tenant(id: &str, pools: &str, options: &[&str]) -> Option<TenantSpec> {
         }
     }
     Some(spec)
+}
+
+fn key_create(tenant: &str, scopes: &str, pool: u32) -> Option<Request> {
+    let mut smtp = false;
+    let mut api = false;
+    let mut hooks = false;
+    for scope in scopes.split(',') {
+        let seen = match scope {
+            "smtp" => &mut smtp,
+            "api" => &mut api,
+            "hooks" => &mut hooks,
+            _ => return None,
+        };
+        if *seen {
+            return None;
+        }
+        *seen = true;
+    }
+    Some(Request::KeyCreate {
+        tenant: tenant.parse().ok()?,
+        smtp,
+        api,
+        hooks,
+        pool,
+    })
 }
 
 fn list<T>(text: &str, item: impl Fn(&str) -> Option<T>) -> Option<Vec<T>> {
@@ -235,6 +279,38 @@ mod tests {
                 pool: 2
             })
         );
+        assert_eq!(
+            parsed(&["key", "create", "5", "hooks,smtp,api"]),
+            Some(Request::KeyCreate {
+                tenant: 5,
+                smtp: true,
+                api: true,
+                hooks: true,
+                pool: 0,
+            })
+        );
+        assert_eq!(
+            parsed(&["key", "create", "5", "api", "pool", "2"]),
+            Some(Request::KeyCreate {
+                tenant: 5,
+                smtp: false,
+                api: true,
+                hooks: false,
+                pool: 2,
+            })
+        );
+        assert_eq!(
+            parsed(&["key", "revoke", "5", "9"]),
+            Some(Request::KeyRevoke { tenant: 5, id: 9 })
+        );
+        assert_eq!(
+            parsed(&["key", "list", "5"]),
+            Some(Request::KeyList { tenant: 5, from: 0 })
+        );
+        assert_eq!(
+            parsed(&["key", "list", "5", "from", "9"]),
+            Some(Request::KeyList { tenant: 5, from: 9 })
+        );
         assert_eq!(parsed(&["queue", "list"]), None);
         assert_eq!(parsed(&["queue", "retry", "5"]), None);
         assert_eq!(
@@ -287,6 +363,13 @@ mod tests {
             &["pool", "set", "1", "192.0.2.1"],
             &["pool", "set", "1", "192.0.2.1=70000"],
             &["pool", "set", "1", "host=1"],
+            &["key", "create", "5", ""],
+            &["key", "create", "5", "smtp,smtp"],
+            &["key", "create", "5", "smtp,unknown"],
+            &["key", "create", "5", "smtp", "pool"],
+            &["key", "create", "5", "smtp", "pool=2"],
+            &["key", "revoke", "5"],
+            &["key", "list", "5", "from"],
         ] {
             assert_eq!(parsed(bad), None, "{bad:?}");
         }

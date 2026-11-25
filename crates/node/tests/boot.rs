@@ -760,6 +760,68 @@ async fn unknown_queues() {
 }
 
 #[test]
+fn admin_creates_lists_and_revokes_keys() {
+    use admin::Code::{Ok, Refused};
+    use admin::Request::{KeyCreate, KeyList, KeyRevoke, PoolSet};
+    let driver = created(23);
+    let extra = format!("[admin]\nsocket = \"{ADMIN}\"\n");
+    let node = booted(&driver, config_with(7, &extra), CORES);
+    node.machine.block_on(0, async move {
+        drop(serving().await);
+        let pool = admin::PoolSpec {
+            id: 1,
+            addresses: vec![("192.0.2.1".parse().expect("ip"), 1)],
+        };
+        assert_eq!(ask(PoolSet(pool)).await.0, Ok);
+        assert_eq!(ask(tenant(5, &[1])).await.0, Ok);
+        assert_eq!(ask(tenant(6, &[1])).await.0, Ok);
+
+        let first = KeyCreate {
+            tenant: 5,
+            smtp: true,
+            api: true,
+            hooks: false,
+            pool: 1,
+        };
+        let (code, text) = ask(first).await;
+        assert_eq!(code, Ok);
+        let secret = text
+            .strip_prefix("key 1 secret ")
+            .and_then(|text| text.strip_suffix('\n'))
+            .expect("create reply");
+        assert!(secret.starts_with("bz_"));
+        assert_eq!(
+            ask(KeyList { tenant: 5, from: 0 }).await,
+            (Ok, "key 1 scopes smtp,api pool 1 generation 1\n".into())
+        );
+
+        let second = KeyCreate {
+            tenant: 6,
+            smtp: false,
+            api: false,
+            hooks: true,
+            pool: 0,
+        };
+        assert_eq!(ask(second).await.0, Ok);
+        assert_eq!(ask(KeyRevoke { tenant: 5, id: 2 }).await.0, Refused);
+        assert_eq!(ask(KeyRevoke { tenant: 5, id: 1 }).await.0, Ok);
+        assert_eq!(
+            ask(KeyList { tenant: 5, from: 0 }).await,
+            (Ok, String::new())
+        );
+        assert_eq!(
+            ask(KeyRevoke { tenant: 5, id: 1 }).await,
+            (Refused, "refused".into())
+        );
+        assert_eq!(
+            ask(KeyList { tenant: 6, from: 0 }).await,
+            (Ok, "key 2 scopes hooks pool 0 generation 1\n".into())
+        );
+    });
+    stopped(&driver, node);
+}
+
+#[test]
 fn admin_creates_suspends_and_resumes_tenants() {
     use admin::Code::{NotFound, Ok, Refused};
     use admin::Request::{PoolList, PoolSet, TenantList, TenantResume, TenantSuspend};

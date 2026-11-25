@@ -3,7 +3,7 @@ use std::net::IpAddr;
 use std::rc::Rc;
 
 use admin::{Admin, Code, Handler, PoolSpec, Reply, Request, TenantSpec};
-use control::{Limits, Object, Pool, State, Table, Tenant};
+use control::{Limits, Object, Pool, Scopes, State, Table, Tenant};
 use rt::UnixListener;
 use sched::{Node, QueueDone, QueueRefusal, Transport};
 
@@ -58,6 +58,18 @@ impl<T: Transport + 'static> Handler for Ops<T> {
                     done,
                 )
             }
+            Request::KeyCreate {
+                tenant,
+                smtp,
+                api,
+                hooks,
+                pool,
+            } => {
+                self.key_create(tenant, Scopes { smtp, api, hooks }, pool)
+                    .await
+            }
+            Request::KeyRevoke { tenant, id } => self.key_revoke(tenant, id).await,
+            Request::KeyList { tenant, from } => self.keys(tenant, from),
         }
     }
 }
@@ -106,6 +118,56 @@ impl<T: Transport + 'static> Ops<T> {
             )
         });
         Reply::new(Code::Ok, listed(lines, None))
+    }
+
+    fn keys(&self, tenant: u32, from: u32) -> Reply {
+        let table = self.node.table();
+        let lines = table.accesses(tenant).filter(|a| a.id >= from).map(|a| {
+            let line = format!(
+                "key {} scopes {} pool {} generation {}\n",
+                a.id,
+                scope_list(a.scopes),
+                a.pool,
+                a.generation,
+            );
+            (a.id, line)
+        });
+        Reply::new(Code::Ok, listed(lines, None))
+    }
+
+    async fn key_create(&self, tenant: u32, scopes: Scopes, pool: u32) -> Reply {
+        let (access, secret) = match self.node.access_new(tenant, scopes, pool).await {
+            Ok(created) => created,
+            Err(error) => {
+                let reply = key_failed(error);
+                eprintln!(
+                    "admin key create {tenant}: {:?} {}",
+                    reply.code,
+                    reply.text.trim_end()
+                );
+                return reply;
+            }
+        };
+        let id = access.id;
+        eprintln!("admin key create {tenant}: Ok id {id}");
+        let secret = std::str::from_utf8(&secret).expect("access tokens are ASCII");
+        Reply::new(Code::Ok, format!("key {id} secret {secret}\n"))
+    }
+
+    async fn key_revoke(&self, tenant: u32, id: u32) -> Reply {
+        let reply = match self.node.access_revoke(tenant, id).await {
+            Ok(removal) => Reply::new(
+                Code::Ok,
+                format!("key {id} revoked, version {}\n", removal.version),
+            ),
+            Err(error) => key_failed(error),
+        };
+        eprintln!(
+            "admin key revoke {tenant} {id}: {:?} {}",
+            reply.code,
+            reply.text.trim_end()
+        );
+        reply
     }
 
     async fn queues(&self, tenant: u32, from: u32) -> Reply {
@@ -253,6 +315,32 @@ impl<T: Transport + 'static> Ops<T> {
             reply.text.trim_end()
         );
         reply
+    }
+}
+
+fn scope_list(scopes: Scopes) -> String {
+    let mut names = Vec::new();
+    if scopes.smtp {
+        names.push("smtp");
+    }
+    if scopes.api {
+        names.push("api");
+    }
+    if scopes.hooks {
+        names.push("hooks");
+    }
+    names.join(",")
+}
+
+fn key_failed(error: sched::Error) -> Reply {
+    match error {
+        sched::Error::Control(control::Error::Busy) => {
+            Reply::new(Code::Busy, "another change is being written")
+        }
+        sched::Error::Control(error @ (control::Error::Invalid(_) | control::Error::Refused)) => {
+            Reply::new(Code::Refused, error.to_string())
+        }
+        error => Reply::new(Code::Failed, error.to_string()),
     }
 }
 
