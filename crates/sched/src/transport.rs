@@ -37,6 +37,9 @@ pub struct Attempt {
 pub struct TransportStats {
     pub pooled: u64,
     pub dead_hosts: u64,
+    pub window_cuts: u64,
+    pub sites_dead: u64,
+    pub sites_tracked: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

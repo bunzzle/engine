@@ -63,6 +63,9 @@ catalog! {
     RecipientsLater: Counter, "recipients_later", "Recipient attempts put off by local limits or retried at once";
     PooledConnections: Gauge, "pooled_connections", "Open outbound connections kept in the pool";
     PathsDown: Gauge, "paths_down", "Source and remote address pairs marked down";
+    WindowCuts: Counter, "window_cuts", "Connection windows cut after throttle signals";
+    SitesDead: Gauge, "sites_dead", "Sites with a dead connection window";
+    SitesTracked: Gauge, "sites_tracked", "Connection windows tracked for sites";
     TicksLate: Counter, "ticks_late", "Scheduler ticks that ran late";
     SmtpSessions: Gauge, "smtp_sessions", "Open SMTP sessions";
     SmtpRefused: Counter, "smtp_refused", "SMTP connections refused by connection limits";
@@ -183,6 +186,9 @@ impl<T: Transport + 'static> Sources<'_, T> {
         let transport = sched.transport().stats();
         set(Id::PooledConnections, transport.pooled);
         set(Id::PathsDown, transport.dead_hosts);
+        set(Id::WindowCuts, transport.window_cuts);
+        set(Id::SitesDead, transport.sites_dead);
+        set(Id::SitesTracked, transport.sites_tracked);
         let smtp = self.smtp;
         set(
             Id::SmtpSessions,

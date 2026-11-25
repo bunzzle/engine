@@ -58,11 +58,46 @@ impl Rate {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Window {
+    initial: u32,
+    cool: Duration,
+    dead: Duration,
+}
+
+impl Window {
+    pub fn new(initial: u32, cool: Duration, dead: Duration) -> Self {
+        Self {
+            initial,
+            cool,
+            dead,
+        }
+    }
+}
+
+impl Default for Window {
+    fn default() -> Self {
+        Self {
+            initial: 5,
+            cool: Duration::from_secs(60),
+            dead: Duration::from_secs(60),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Signal {
+    Success,
+    Throttle,
+    Failure,
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Quota {
     pub rate: Rate,
     pub burst: u32,
     pub queued: u64,
+    pub window: Option<Window>,
 }
 
 impl From<Limits> for Quota {
@@ -71,6 +106,7 @@ impl From<Limits> for Quota {
             rate: Rate::per_second(limits.rate),
             burst: limits.burst,
             queued: limits.queued,
+            window: None,
         }
     }
 }
@@ -117,6 +153,15 @@ pub enum Ask<K> {
         key: K,
         on: bool,
     },
+    Feedback {
+        key: K,
+        signal: Signal,
+        used: u64,
+    },
+    Shed {
+        key: K,
+        slots: u64,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -132,6 +177,8 @@ pub struct LeaseStats {
     pub busy: u64,
     pub recalls: u64,
     pub returned: u64,
+    pub cuts: u64,
+    pub deaths: u64,
 }
 
 struct Lease {
@@ -145,6 +192,7 @@ struct Lease {
     slot_ask: Option<Instant>,
     recalled: bool,
     blocked: bool,
+    owe: u64,
     touched: Instant,
     waiters: Vec<Sender<()>>,
 }
@@ -162,6 +210,7 @@ impl Lease {
             slot_ask: None,
             recalled: false,
             blocked: false,
+            owe: 0,
             touched: now,
             waiters: Vec::new(),
         }
@@ -242,6 +291,107 @@ impl Gcra {
     }
 }
 
+const SCALE: u64 = 1024;
+const STALE: Duration = Duration::from_mins(10);
+const OWNED_MOST: usize = 100_000;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SiteState {
+    Normal,
+    Dead { until: Instant },
+    Probe,
+}
+
+enum Effect {
+    None,
+    Serve,
+    Cut,
+    Dead,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct SiteWindow {
+    window: u64,
+    cool_until: Instant,
+    failures: u64,
+    state: SiteState,
+    probing: bool,
+    touched: Instant,
+}
+
+impl SiteWindow {
+    fn hear(&mut self, signal: Signal, in_use: u64, limits: &Quota, now: Instant) -> Effect {
+        self.touched = now;
+        self.window = self
+            .window
+            .min(limits.queued.saturating_mul(SCALE))
+            .max(SCALE);
+        let window = limits.window.expect("site has a window");
+        match signal {
+            Signal::Success => {
+                self.failures = 0;
+                match self.state {
+                    SiteState::Probe => {
+                        self.state = SiteState::Normal;
+                        self.window = u64::from(window.initial).min(limits.queued).max(1) * SCALE;
+                    }
+                    SiteState::Normal => {
+                        let busy = in_use.saturating_add(u64::from(window.initial));
+                        if now >= self.cool_until
+                            && self.window < busy.saturating_mul(SCALE)
+                            && self.window < limits.queued.saturating_mul(SCALE)
+                        {
+                            self.window += (SCALE * SCALE / self.window).max(1);
+                        }
+                    }
+                    SiteState::Dead { .. } => return Effect::None,
+                }
+                Effect::Serve
+            }
+            Signal::Throttle => {
+                self.window = if self.state == SiteState::Probe {
+                    SCALE
+                } else {
+                    (self.window / 2).max(SCALE)
+                };
+                self.cool_until = now + window.cool;
+                self.failures = 0;
+                self.state = SiteState::Normal;
+                Effect::Cut
+            }
+            Signal::Failure => {
+                let cohort = (self.window / SCALE).max(1);
+                self.window = self
+                    .window
+                    .saturating_sub(SCALE * SCALE / self.window)
+                    .max(SCALE);
+                self.failures += 1;
+                if self.state == SiteState::Probe || self.failures >= cohort {
+                    self.failures = 0;
+                    self.state = SiteState::Dead {
+                        until: now + window.dead,
+                    };
+                    Effect::Dead
+                } else {
+                    Effect::None
+                }
+            }
+        }
+    }
+
+    fn new(limits: &Quota, now: Instant) -> Self {
+        let window = limits.window.expect("window checked");
+        Self {
+            window: u64::from(window.initial).min(limits.queued).max(1) * SCALE,
+            cool_until: now,
+            failures: 0,
+            state: SiteState::Normal,
+            probing: false,
+            touched: now,
+        }
+    }
+}
+
 #[derive(Default)]
 struct Owned {
     gcra: Gcra,
@@ -249,6 +399,78 @@ struct Owned {
     granted: u64,
     waiting: VecDeque<(u16, u64)>,
     blocked: bool,
+    window: Option<SiteWindow>,
+    used: BTreeMap<u16, u64>,
+}
+
+impl Owned {
+    fn in_use(&self) -> u64 {
+        self.used
+            .iter()
+            .map(|(core, used)| (*used).min(self.held.get(core).copied().unwrap_or(0)))
+            .sum()
+    }
+
+    fn sheds(&self, limits: &Quota) -> Vec<(u16, u64)> {
+        let excess = self.granted.saturating_sub(self.ceiling(limits));
+        let mut left = excess;
+        self.held
+            .iter()
+            .filter(|(_, held)| **held > 0)
+            .map(|(core, held)| {
+                let share = (held * excess).div_ceil(self.granted.max(1));
+                let n = share.min(*held).min(left);
+                left -= n;
+                (*core, n)
+            })
+            .collect()
+    }
+
+    fn probed(&mut self, given: u64) {
+        if let Some(site) = &mut self.window
+            && site.state == SiteState::Probe
+            && given > 0
+        {
+            site.probing = true;
+        }
+    }
+
+    fn site(&mut self, limits: &Quota, now: Instant) -> Option<&mut SiteWindow> {
+        if limits.window.is_some() && limits.queued > 0 {
+            Some(
+                self.window
+                    .get_or_insert_with(|| SiteWindow::new(limits, now)),
+            )
+        } else {
+            None
+        }
+    }
+
+    fn ceiling(&self, limits: &Quota) -> u64 {
+        match &self.window {
+            Some(site) => match site.state {
+                SiteState::Normal => (site.window / SCALE).max(1).min(limits.queued),
+                SiteState::Probe => 1,
+                SiteState::Dead { .. } => 0,
+            },
+            None => limits.queued,
+        }
+    }
+
+    fn dead(&self) -> bool {
+        matches!(&self.window, Some(site) if matches!(site.state, SiteState::Dead { .. }))
+    }
+
+    fn stale(&self, now: Instant, aged: Duration) -> bool {
+        self.granted == 0
+            && self.waiting.is_empty()
+            && !self.blocked
+            && self.gcra.tat <= u128::from(now.as_nanos())
+            && matches!(&self.window, Some(site)
+                if (site.state == SiteState::Probe
+                    || (site.state == SiteState::Normal && now >= site.cool_until))
+                    && now.saturating_duration_since(site.touched) >= aged)
+    }
 }
 
 type Route<K> = Rc<dyn Fn(&K) -> u16>;
@@ -381,6 +603,30 @@ impl<K: Ord + Clone + Send + 'static> Leases<K> {
             .is_some_and(|l| l.blocked)
     }
 
+    pub fn feedback(&self, key: &K, signal: Signal) {
+        self.send(
+            (self.inner.owner)(key),
+            Ask::Feedback {
+                key: key.clone(),
+                signal,
+                used: self.used(key),
+            },
+        );
+    }
+
+    pub fn sites(&self) -> (u64, u64) {
+        let owned = self.inner.owned.borrow();
+        let mut tracked = 0;
+        let mut dead = 0;
+        for entry in owned.values() {
+            if let Some(site) = &entry.window {
+                tracked += 1;
+                dead += u64::from(matches!(site.state, SiteState::Dead { .. }));
+            }
+        }
+        (tracked, dead)
+    }
+
     async fn take_as(&self, key: &K, wait: Duration, slot: bool) -> Result<Taken, Error> {
         let limits = (self.inner.limits)(key).ok_or(Error::Invalid("key"))?;
         let deadline = rt::now() + wait;
@@ -435,11 +681,14 @@ impl<K: Ord + Clone + Send + 'static> Leases<K> {
             let slots = slots.min(lease.used);
             lease.used -= slots;
             lease.free += slots;
+            let pay = lease.owe.min(lease.free);
+            lease.owe = (lease.owe - pay).min(lease.used);
+            lease.free -= pay;
             if (lease.recalled || lease.blocked) && lease.free > 0 {
                 lease.recalled = false;
-                std::mem::take(&mut lease.free)
+                pay + std::mem::take(&mut lease.free)
             } else {
-                0
+                pay
             }
         };
         if back > 0 {
@@ -620,17 +869,83 @@ impl<K: Ord + Clone + Send + 'static> Leases<K> {
             }
             Ask::Block { key, on } => self.block_all(&key, on),
             Ask::Blocked { key, on } => self.mark(key, on),
+            Ask::Feedback { key, signal, used } => self.heard(from, &key, signal, used),
+            Ask::Shed { key, slots } => self.shed(key, slots),
+        }
+    }
+
+    fn heard(&self, from: u16, key: &K, signal: Signal, used: u64) {
+        let Some(limits) = (self.inner.limits)(key) else {
+            return;
+        };
+        if limits.window.is_none() || limits.queued == 0 {
+            return;
+        }
+        let now = rt::now();
+        let effect = {
+            let mut owned = self.inner.owned.borrow_mut();
+            let entry = owned.entry(key.clone()).or_default();
+            entry.used.insert(from, used);
+            let in_use = entry.in_use();
+            let Some(site) = entry.site(&limits, now) else {
+                return;
+            };
+            if matches!(site.state, SiteState::Dead { .. })
+                || (site.state == SiteState::Probe && !site.probing)
+            {
+                return;
+            }
+            site.hear(signal, in_use, &limits, now)
+        };
+        match effect {
+            Effect::None => {}
+            Effect::Serve => self.serve(key),
+            Effect::Cut => {
+                self.count(|s| s.cuts += 1);
+                let sheds = self
+                    .inner
+                    .owned
+                    .borrow()
+                    .get(key)
+                    .map(|entry| entry.sheds(&limits))
+                    .unwrap_or_default();
+                for (core, slots) in sheds {
+                    self.send(
+                        core,
+                        Ask::Shed {
+                            key: key.clone(),
+                            slots,
+                        },
+                    );
+                }
+            }
+            Effect::Dead => {
+                self.count(|s| s.deaths += 1);
+                for core in 0..self.inner.cores {
+                    self.send(
+                        core,
+                        Ask::Blocked {
+                            key: key.clone(),
+                            on: true,
+                        },
+                    );
+                }
+            }
         }
     }
 
     fn block_all(&self, key: &K, on: bool) {
-        {
+        let dead = {
             let mut owned = self.inner.owned.borrow_mut();
             let entry = owned.entry(key.clone()).or_default();
             entry.blocked = on;
             if on {
                 entry.waiting.clear();
             }
+            entry.dead()
+        };
+        if dead {
+            return;
         }
         for core in 0..self.inner.cores {
             self.send(
@@ -681,7 +996,7 @@ impl<K: Ord + Clone + Send + 'static> Leases<K> {
             .owned
             .borrow()
             .get(&key)
-            .is_some_and(|o| o.blocked)
+            .is_some_and(|o| o.blocked || o.dead())
         {
             self.send(from, Ask::Blocked { key, on: true });
             return;
@@ -692,9 +1007,12 @@ impl<K: Ord + Clone + Send + 'static> Leases<K> {
         let grant = {
             let mut owned = self.inner.owned.borrow_mut();
             let entry = owned.entry(key.clone()).or_default();
+            if let Some(site) = entry.site(&limits, now) {
+                site.touched = now;
+            }
             let tokens = (tokens > 0).then(|| entry.gcra.grant(limits, tokens, now));
             let slots = if slots > 0 {
-                let room = limits.queued.saturating_sub(entry.granted);
+                let room = entry.ceiling(&limits).saturating_sub(entry.granted);
                 let given = slots.min(room);
                 if given == 0 {
                     if !entry.waiting.iter().any(|w| w.0 == from) {
@@ -705,6 +1023,7 @@ impl<K: Ord + Clone + Send + 'static> Leases<K> {
                 } else {
                     *entry.held.entry(from).or_default() += given;
                     entry.granted += given;
+                    entry.probed(given);
                     Some(given)
                 }
             } else {
@@ -750,7 +1069,7 @@ impl<K: Ord + Clone + Send + 'static> Leases<K> {
                 return;
             };
             while let Some(&(core, want)) = entry.waiting.front() {
-                let room = limits.queued.saturating_sub(entry.granted);
+                let room = entry.ceiling(&limits).saturating_sub(entry.granted);
                 let given = want.min(room);
                 if given == 0 {
                     break;
@@ -758,6 +1077,7 @@ impl<K: Ord + Clone + Send + 'static> Leases<K> {
                 entry.waiting.pop_front();
                 *entry.held.entry(core).or_default() += given;
                 entry.granted += given;
+                entry.probed(given);
                 grants.push((core, given));
             }
         }
@@ -793,6 +1113,21 @@ impl<K: Ord + Clone + Send + 'static> Leases<K> {
         };
         for wake in waiters {
             let _ = wake.send(());
+        }
+    }
+
+    fn shed(&self, key: K, slots: u64) {
+        let back = {
+            let mut leases = self.inner.leases.borrow_mut();
+            let Some(lease) = leases.get_mut(&key) else {
+                return;
+            };
+            lease.slot_size = (lease.slot_size / 2).max(1);
+            lease.owe = (lease.owe + slots.saturating_sub(lease.free)).min(lease.used);
+            std::mem::take(&mut lease.free)
+        };
+        if back > 0 {
+            self.give_slots(key, back);
         }
     }
 
@@ -838,6 +1173,55 @@ impl<K: Ord + Clone + Send + 'static> Leases<K> {
             }
             for (key, slots) in back {
                 self.give_slots(key, slots);
+            }
+            let mut probe = Vec::new();
+            {
+                let mut owned = self.inner.owned.borrow_mut();
+                for (key, entry) in owned.iter_mut() {
+                    let Some(site) = &mut entry.window else {
+                        continue;
+                    };
+                    if let SiteState::Dead { until } = site.state
+                        && until <= now
+                    {
+                        site.state = SiteState::Probe;
+                        site.probing = false;
+                        site.touched = now;
+                        probe.push((key.clone(), entry.blocked));
+                    }
+                }
+                owned.retain(|_, entry| !entry.stale(now, STALE));
+                let over = owned.len().saturating_sub(OWNED_MOST);
+                if over > 0 {
+                    let mut oldest: Vec<(Instant, K)> = owned
+                        .iter()
+                        .filter(|(_, entry)| entry.stale(now, Duration::ZERO))
+                        .map(|(key, entry)| {
+                            (
+                                entry.window.as_ref().expect("stale has a window").touched,
+                                key.clone(),
+                            )
+                        })
+                        .collect();
+                    oldest.sort_unstable();
+                    for (_, key) in oldest.into_iter().take(over) {
+                        owned.remove(&key);
+                    }
+                }
+            }
+            for (key, blocked) in probe {
+                if !blocked {
+                    for core in 0..self.inner.cores {
+                        self.send(
+                            core,
+                            Ask::Blocked {
+                                key: key.clone(),
+                                on: false,
+                            },
+                        );
+                    }
+                }
+                self.serve(&key);
             }
         }
     }
