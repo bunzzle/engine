@@ -946,3 +946,76 @@ fn admin_creates_suspends_and_resumes_tenants() {
         assert_eq!(tenants, [5, 6]);
     });
 }
+
+#[test]
+fn the_admin_simulation_runs_every_command_and_stops() {
+    use admin::Code::{NotFound, Ok};
+    use admin::Request::{
+        KeyCreate, KeyList, KeyRevoke, PoolList, PoolSet, QueueList, QueueRebind, QueueRetry,
+        Status, TenantList, TenantResume, TenantSuspend,
+    };
+    let driver = created(24);
+    let extra = format!("[admin]\nsocket = \"{ADMIN}\"\n");
+    let node = booted(&driver, config_with(7, &extra), CORES);
+    let machine = &node.machine;
+    machine.block_on(0, async {
+        drop(serving().await);
+        assert_eq!(ask(Status).await.0, Ok);
+        let pool = admin::PoolSpec {
+            id: 1,
+            addresses: vec![("192.0.2.1".parse().expect("ip"), 1)],
+        };
+        assert_eq!(ask(PoolSet(pool)).await.0, Ok);
+        assert_eq!(ask(PoolList(0)).await.0, Ok);
+        assert_eq!(ask(tenant(5, &[1])).await.0, Ok);
+        assert_eq!(ask(TenantList(0)).await.0, Ok);
+        assert_eq!(ask(TenantSuspend(5)).await.0, Ok);
+        assert_eq!(ask(TenantResume(5)).await.0, Ok);
+        let key = KeyCreate {
+            tenant: 5,
+            smtp: true,
+            api: false,
+            hooks: false,
+            pool: 1,
+        };
+        assert_eq!(ask(key).await.0, Ok);
+        assert_eq!(ask(KeyList { tenant: 5, from: 0 }).await.0, Ok);
+        assert_eq!(ask(KeyRevoke { tenant: 5, id: 1 }).await.0, Ok);
+        assert_eq!(ask(QueueList { tenant: 5, from: 0 }).await.0, Ok);
+        assert_eq!(
+            ask(QueueRetry {
+                tenant: 5,
+                queue: 1
+            })
+            .await
+            .0,
+            NotFound
+        );
+        let rebind = QueueRebind {
+            tenant: 5,
+            queue: 1,
+            pool: 1,
+        };
+        assert_eq!(ask(rebind).await.0, NotFound);
+
+        sleep(Duration::from_secs(2)).await;
+        let text = scrape("GET /metrics HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n").await;
+        let total = |family: &str| -> u64 {
+            text.lines()
+                .filter_map(|line| line.strip_prefix(family)?.strip_prefix('{'))
+                .filter_map(|rest| rest.split(' ').nth(1)?.parse::<u64>().ok())
+                .sum()
+        };
+        assert_eq!(total("bunzzle_admin_requests_total"), 13, "{text}");
+        assert_eq!(total("bunzzle_admin_requests_malformed_total"), 0);
+        assert_eq!(total("bunzzle_admin_connections_accepted_total"), 13);
+        assert_eq!(total("bunzzle_admin_connections_refused_total"), 0);
+        assert_eq!(total("bunzzle_admin_connections_full_total"), 0);
+    });
+    stopped(&driver, node);
+    let machine = Machine::new(Rc::clone(&driver), 1, Stalls::default());
+    machine.block_on(0, async {
+        let refused = rt::UnixStream::connect(Path::new(ADMIN)).await;
+        assert!(refused.is_err());
+    });
+}
