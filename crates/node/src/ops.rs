@@ -65,10 +65,19 @@ impl<T: Transport + 'static> Handler for Ops<T> {
                 hooks,
                 pool,
             } => {
-                self.key_create(tenant, Scopes { smtp, api, hooks }, pool)
-                    .await
+                let reply = self
+                    .key_create(tenant, Scopes { smtp, api, hooks }, pool)
+                    .await;
+                if reply.code != Code::Ok {
+                    logged(&format!("key create {tenant}"), &reply);
+                }
+                reply
             }
-            Request::KeyRevoke { tenant, id } => self.key_revoke(tenant, id).await,
+            Request::KeyRevoke { tenant, id } => {
+                let reply = self.key_revoke(tenant, id).await;
+                logged(&format!("key revoke {tenant} {id}"), &reply);
+                reply
+            }
             Request::KeyList { tenant, from } => self.keys(tenant, from),
         }
     }
@@ -154,15 +163,7 @@ impl<T: Transport + 'static> Ops<T> {
         }
         let (access, secret) = match self.node.access_new(tenant, scopes, pool).await {
             Ok(created) => created,
-            Err(error) => {
-                let reply = key_failed(error);
-                eprintln!(
-                    "admin key create {tenant}: {:?} {}",
-                    reply.code,
-                    reply.text.trim_end()
-                );
-                return reply;
-            }
+            Err(error) => return key_failed(error),
         };
         let id = access.id;
         eprintln!("admin key create {tenant}: Ok id {id}");
@@ -190,20 +191,14 @@ impl<T: Transport + 'static> Ops<T> {
                 return key_not_found(tenant, id);
             }
         }
-        let reply = match self.node.access_revoke(tenant, id).await {
+        match self.node.access_revoke(tenant, id).await {
             Ok(removal) => Reply::new(
                 Code::Ok,
                 format!("key {id} revoked, version {}\n", removal.version),
             ),
             Err(sched::Error::Control(control::Error::Refused)) => key_not_found(tenant, id),
             Err(error) => key_failed(error),
-        };
-        eprintln!(
-            "admin key revoke {tenant} {id}: {:?} {}",
-            reply.code,
-            reply.text.trim_end()
-        );
-        reply
+        }
     }
 
     async fn queues(&self, tenant: u32, from: u32) -> Reply {
@@ -366,6 +361,14 @@ fn scope_list(scopes: Scopes) -> String {
         names.push("hooks");
     }
     names.join(",")
+}
+
+fn logged(command: &str, reply: &Reply) {
+    eprintln!(
+        "admin {command}: {:?} {}",
+        reply.code,
+        reply.text.trim_end()
+    );
 }
 
 fn tenant_not_found(tenant: u32) -> Reply {
