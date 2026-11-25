@@ -363,12 +363,12 @@ impl<D: Dns, L: Local> Deliver<D, L> {
             Ok(hosts) => hosts,
             Err((answer, reply)) => return every(answer, reply),
         };
+        let site = site::name(&destination.domain, &hosts, &self.settings.sites);
         let enforced = self.enforce(egress, &domain, (&mut hosts, secure), (end, envelope));
         let (sts, scope) = match enforced.await {
             Ok(enforced) => enforced,
             Err((answer, reply)) => return every(answer, reply),
         };
-        let site = site::name(&destination.domain, &hosts, &self.settings.sites);
         let remote: Remote = (egress, site.into());
         let mut slot = None;
         let mut last = NO_HOST.to_vec();

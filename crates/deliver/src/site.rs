@@ -18,7 +18,7 @@ pub fn name(domain: &str, hosts: &[Name], rules: &[Site]) -> String {
     }
     let joined = names.join(",");
     if joined.len() > LONGEST {
-        domain.to_owned()
+        domain.trim_end_matches('.').to_ascii_lowercase()
     } else {
         joined
     }
@@ -109,6 +109,7 @@ mod tests {
         let joined = names.join(",");
         assert!(joined.len() > LONGEST);
         assert_eq!(name("example.org", &hosts, &[]), "example.org");
+        assert_eq!(name("Example.ORG.", &hosts, &[]), "example.org");
         let short = &hosts[..3];
         let joined: String = short
             .iter()
