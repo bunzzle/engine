@@ -107,6 +107,15 @@ fn every_request_round_trips() {
             queue: 9,
             pool: 2,
         },
+        Request::KeyCreate {
+            tenant: 5,
+            smtp: true,
+            api: false,
+            hooks: true,
+            pool: 2,
+        },
+        Request::KeyRevoke { tenant: 5, id: 9 },
+        Request::KeyList { tenant: 5, from: 9 },
         Request::TenantSuspend(u32::MAX),
         Request::TenantResume(7),
         Request::TenantCreate(TenantSpec {
@@ -163,5 +172,36 @@ fn short_long_or_odd_fields_are_refused() {
     assert_eq!(Request::decode(&odd), Err(Error::Body));
     assert_eq!(Request::decode(&[VERSION, 4, 0, 0, 0]), Err(Error::Body));
     assert_eq!(Request::decode(&[VERSION, 8]), Err(Error::Body));
+    let mut unknown_scopes = body(
+        &Request::KeyCreate {
+            tenant: 5,
+            smtp: true,
+            api: true,
+            hooks: true,
+            pool: 2,
+        }
+        .encode(),
+    );
+    unknown_scopes[6] = 8;
+    assert_eq!(Request::decode(&unknown_scopes), Err(Error::Body));
+    for request in [
+        Request::KeyCreate {
+            tenant: 5,
+            smtp: true,
+            api: true,
+            hooks: false,
+            pool: 2,
+        },
+        Request::KeyRevoke { tenant: 5, id: 9 },
+        Request::KeyList { tenant: 5, from: 9 },
+    ] {
+        let short = body(&request.encode());
+        for cut in 2..short.len() {
+            assert_eq!(Request::decode(&short[..cut]), Err(Error::Body), "{cut}");
+        }
+        let mut long = short;
+        long.push(0);
+        assert_eq!(Request::decode(&long), Err(Error::Body));
+    }
     assert_eq!(Request::decode(&[VERSION, 255]), Err(Error::Command));
 }

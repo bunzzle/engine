@@ -3,7 +3,7 @@ use std::net::IpAddr;
 use std::rc::Rc;
 
 use admin::{Admin, Code, Handler, PoolSpec, Reply, Request, TenantSpec};
-use control::{Limits, Object, Pool, State, Table, Tenant};
+use control::{Limits, Object, Pool, Scopes, State, Table, Tenant};
 use rt::UnixListener;
 use sched::{Node, QueueDone, QueueRefusal, Transport};
 
@@ -58,6 +58,27 @@ impl<T: Transport + 'static> Handler for Ops<T> {
                     done,
                 )
             }
+            Request::KeyCreate {
+                tenant,
+                smtp,
+                api,
+                hooks,
+                pool,
+            } => {
+                let reply = self
+                    .key_create(tenant, Scopes { smtp, api, hooks }, pool)
+                    .await;
+                if reply.code != Code::Ok {
+                    logged(&format!("key create {tenant}"), &reply);
+                }
+                reply
+            }
+            Request::KeyRevoke { tenant, id } => {
+                let reply = self.key_revoke(tenant, id).await;
+                logged(&format!("key revoke {tenant} {id}"), &reply);
+                reply
+            }
+            Request::KeyList { tenant, from } => self.keys(tenant, from),
         }
     }
 }
@@ -106,6 +127,78 @@ impl<T: Transport + 'static> Ops<T> {
             )
         });
         Reply::new(Code::Ok, listed(lines, None))
+    }
+
+    fn keys(&self, tenant: u32, from: u32) -> Reply {
+        let table = self.node.table();
+        let Some(current) = table.tenant(tenant).filter(|t| !t.state.deleted()) else {
+            return tenant_not_found(tenant);
+        };
+        let generation = current.generation;
+        let lines = table
+            .accesses(tenant)
+            .filter(move |a| a.id >= from && a.generation == generation)
+            .map(|a| {
+                let line = format!(
+                    "key {} scopes {} pool {} generation {}\n",
+                    a.id,
+                    scope_list(a.scopes),
+                    a.pool,
+                    a.generation,
+                );
+                (a.id, line)
+            });
+        Reply::new(Code::Ok, listed(lines, None))
+    }
+
+    async fn key_create(&self, tenant: u32, scopes: Scopes, pool: u32) -> Reply {
+        {
+            let table = self.node.table();
+            let Some(current) = table.tenant(tenant).filter(|t| !t.state.deleted()) else {
+                return tenant_not_found(tenant);
+            };
+            if current.state != State::Active {
+                return Reply::new(Code::Refused, format!("tenant {tenant} is not active"));
+            }
+        }
+        let (access, secret) = match self.node.access_new(tenant, scopes, pool).await {
+            Ok(created) => created,
+            Err(error) => return key_failed(error),
+        };
+        let id = access.id;
+        eprintln!("admin key create {tenant}: Ok id {id}");
+        let secret = std::str::from_utf8(&secret).expect("access tokens are ASCII");
+        let mut text = String::with_capacity(secret.len() + 24);
+        let _ = write!(text, "key {id} secret ");
+        text.push_str(secret);
+        text.push('\n');
+        Reply::new(Code::Ok, text)
+    }
+
+    async fn key_revoke(&self, tenant: u32, id: u32) -> Reply {
+        {
+            let table = self.node.table();
+            if table
+                .tenant(tenant)
+                .is_none_or(|tenant| tenant.state.deleted())
+            {
+                return tenant_not_found(tenant);
+            }
+            let Some(access) = table.access(id).filter(|a| a.tenant == tenant) else {
+                return key_not_found(tenant, id);
+            };
+            if table.gone(tenant, access.generation) {
+                return key_not_found(tenant, id);
+            }
+        }
+        match self.node.access_revoke(tenant, id).await {
+            Ok(removal) => Reply::new(
+                Code::Ok,
+                format!("key {id} revoked, version {}\n", removal.version),
+            ),
+            Err(sched::Error::Control(control::Error::Refused)) => key_not_found(tenant, id),
+            Err(error) => key_failed(error),
+        }
     }
 
     async fn queues(&self, tenant: u32, from: u32) -> Reply {
@@ -253,6 +346,51 @@ impl<T: Transport + 'static> Ops<T> {
             reply.text.trim_end()
         );
         reply
+    }
+}
+
+fn scope_list(scopes: Scopes) -> String {
+    let mut names = Vec::new();
+    if scopes.smtp {
+        names.push("smtp");
+    }
+    if scopes.api {
+        names.push("api");
+    }
+    if scopes.hooks {
+        names.push("hooks");
+    }
+    names.join(",")
+}
+
+fn logged(command: &str, reply: &Reply) {
+    eprintln!(
+        "admin {command}: {:?} {}",
+        reply.code,
+        reply.text.trim_end()
+    );
+}
+
+fn tenant_not_found(tenant: u32) -> Reply {
+    Reply::new(Code::NotFound, format!("tenant {tenant} not found"))
+}
+
+fn key_not_found(tenant: u32, id: u32) -> Reply {
+    Reply::new(
+        Code::NotFound,
+        format!("key {id} of tenant {tenant} not found"),
+    )
+}
+
+fn key_failed(error: sched::Error) -> Reply {
+    match error {
+        sched::Error::Control(control::Error::Busy) => {
+            Reply::new(Code::Busy, "another change is being written")
+        }
+        sched::Error::Control(error @ (control::Error::Invalid(_) | control::Error::Refused)) => {
+            Reply::new(Code::Refused, error.to_string())
+        }
+        error => Reply::new(Code::Failed, error.to_string()),
     }
 }
 

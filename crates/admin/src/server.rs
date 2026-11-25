@@ -135,8 +135,19 @@ async fn session<H: Handler>(stream: &UnixStream, handler: &H, state: &Shared) {
                 Reply::new(Code::Refused, error.to_string())
             }
         };
-        let written = timeout(IDLE, stream.write_all(Buf::from_slice(&reply.encode()))).await;
-        if !matches!(written, Ok((Ok(()), _))) {
+        let mut encoded = reply.encode();
+        let written = timeout(IDLE, stream.write_all(Buf::from_slice(&encoded))).await;
+        let sent = match written {
+            Ok((result, mut buf)) => {
+                sys::mem::wipe(&mut buf);
+                result.is_ok()
+            }
+            Err(_) => false,
+        };
+        sys::mem::wipe(&mut encoded);
+        let mut text = reply.text.into_bytes();
+        sys::mem::wipe(&mut text);
+        if !sent {
             return;
         }
     }
