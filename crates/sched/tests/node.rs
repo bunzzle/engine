@@ -248,6 +248,7 @@ impl Transport for Simulated {
                         answer,
                         reply: Vec::new(),
                         event: None,
+                        bounced: None,
                     }
                 })
                 .collect();
@@ -274,6 +275,7 @@ impl Transport for Simulated {
                     answer,
                     reply,
                     event: None,
+                    bounced: None,
                 }
             })
             .collect()

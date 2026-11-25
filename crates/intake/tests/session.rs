@@ -123,6 +123,7 @@ fn answered(claimed: &[Claimed], answer: Answer) -> Vec<Answered> {
             answer,
             reply: Vec::new(),
             event: None,
+            bounced: None,
         })
         .collect()
 }

@@ -272,6 +272,10 @@ pub struct Opener {
 }
 
 impl Opener {
+    pub fn generation(&self) -> u32 {
+        self.generation
+    }
+
     pub async fn searching(mut self, keys: &dyn Keys) -> Self {
         self.search = keys
             .search(self.tenant, self.generation)

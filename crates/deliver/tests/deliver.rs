@@ -399,6 +399,8 @@ fn answers_each_recipient() {
         ]
     );
     assert_eq!(reply(&outcomes[1]), "550 5.1.1 no such user");
+    let gone: Vec<bool> = outcomes.iter().map(|o| o.gone).collect();
+    assert_eq!(gone, [false, true, false, false, false]);
     assert_eq!(seen.borrow().bodies.len(), 1);
 }
 
@@ -454,6 +456,8 @@ fn transaction_replies_answer_everyone() {
         ),
         ("250 2.1.0 ok", "554 5.7.1 spam", Answer::Failed),
         ("250 2.1.0 ok", "451 4.3.0 try later", TEMPORARY),
+        ("550 5.1.1 no such user", "250 2.0.0 queued", Answer::Failed),
+        ("250 2.1.0 ok", "550 5.1.1 no such user", Answer::Failed),
     ];
     for (mail, done, want) in cases {
         let outcomes = run(async move {
@@ -472,6 +476,7 @@ fn transaction_replies_answer_everyone() {
             .await
         });
         assert_eq!(answers(&outcomes), [want, want], "{mail} / {done}");
+        assert!(outcomes.iter().all(|o| !o.gone), "{mail} / {done}");
     }
 }
 

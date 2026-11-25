@@ -349,6 +349,7 @@ pub struct Transaction {
     expect: Vec<Expect>,
     mail: Option<Response>,
     answers: Vec<Option<Answer>>,
+    at_rcpt: Vec<bool>,
     reusable: bool,
 }
 
@@ -364,6 +365,7 @@ impl Transaction {
             expect: Vec::new(),
             mail: None,
             answers: vec![None; rcpts.len()],
+            at_rcpt: vec![false; rcpts.len()],
             reusable: true,
         })
     }
@@ -410,6 +412,7 @@ impl Transaction {
                 Step::Done
             }
             Expect::Rcpt(i) => {
+                self.at_rcpt[i] = !response.positive();
                 self.answers[i] = Some(if response.positive() {
                     Answer::Accepted
                 } else {
@@ -491,6 +494,10 @@ impl Transaction {
 
     pub fn answers(&self) -> Vec<Option<Answer>> {
         self.answers.clone()
+    }
+
+    pub fn refused_at_rcpt(&self) -> Vec<bool> {
+        self.at_rcpt.clone()
     }
 
     pub fn mail_refused(&self) -> Option<&Response> {

@@ -53,6 +53,13 @@ pub struct Answered {
     pub answer: Answer,
     pub reply: Vec<u8>,
     pub event: Option<Written>,
+    pub bounced: Option<Bounced>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Bounced {
+    pub generation: u32,
+    pub address: Box<str>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

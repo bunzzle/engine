@@ -16,9 +16,9 @@ use keys::{BatchSettings, Batches, SearchKeys, Working};
 use rt::sim::{Config, Disk, Faults, Machine, SimDriver, Stalls, check};
 use rt::{JoinHandle, Runtime, sleep, spawn, timeout};
 use sched::{
-    Answer, Answered, Attempt, Batched, Clock, Draft, Keys, Kind, Limits, Meshes, Node, OwnStats,
-    Parts, QueueDone, QueueRefusal, Reason, Refusal, Running, Settings, Transport, Unsealable,
-    Unwrapped,
+    Answer, Answered, Attempt, Batched, Bounced, Clock, Draft, Keys, Kind, Limits, Meshes, Node,
+    OwnStats, Parts, QueueDone, QueueRefusal, Reason, Refusal, Running, Settings, Transport,
+    Unsealable, Unwrapped,
 };
 use spool::{Body, Head, HeadClear, Message, MessageId, SLICE, Slice};
 use store::{Client, DataFile, Options, SLOT_SIZE, Setup, boot};
@@ -80,6 +80,7 @@ struct World {
     rebinds: u64,
     taken: BTreeMap<u32, u64>,
     counted: BTreeMap<u32, u64>,
+    bounces: Vec<(u32, Box<str>, bool)>,
 }
 
 type Shared = Rc<RefCell<World>>;
@@ -271,11 +272,23 @@ impl Transport for Simulated {
                 if matches!(answer, Answer::Delivered | Answer::Failed) {
                     world.finals.insert(key(attempt.message, c.recipient));
                 }
+                let bounced = (answer == Answer::Failed).then(|| {
+                    let id = attempt.message;
+                    let address: Box<str> =
+                        format!("gone{}x{}x{}@example.org", id.shard, id.key, c.recipient).into();
+                    let live = !self.below(4).is_multiple_of(4);
+                    world.bounces.push((attempt.tenant, address.clone(), live));
+                    Bounced {
+                        generation: if live { 1 } else { 2 },
+                        address,
+                    }
+                });
                 Answered {
                     recipient: c.recipient,
                     answer,
                     reply: Vec::new(),
                     event: None,
+                    bounced,
                 }
             })
             .collect()
@@ -655,6 +668,8 @@ struct Session {
     versions: BTreeSet<u64>,
     tables: BTreeSet<String>,
     leaked: u64,
+    bounced: u64,
+    bounce_wrong: u64,
 }
 
 fn start(
@@ -832,6 +847,7 @@ fn session(
     let Some((runnings, shards)) = start(&machine, booted.starts, driver, world, cores) else {
         return Session::default();
     };
+    world.borrow_mut().bounces.clear();
     started(&world.borrow());
     let running = Rc::new(Cell::new(true));
     let nodes = world.borrow().nodes.clone();
@@ -883,7 +899,8 @@ fn session(
             unless_halted(Rc::clone(&power), wind),
         )
         .await;
-        let session = observe(&nodes, finished);
+        let mut session = observe(&nodes, finished);
+        bounce_check(&power, &watched, &nodes, &mut session).await;
         let stop = async move {
             ticker.await;
             for node in &nodes {
@@ -901,6 +918,65 @@ fn session(
     })
 }
 
+async fn bounce_check(
+    power: &Rc<SimDriver>,
+    world: &Shared,
+    nodes: &[Node<Simulated>],
+    session: &mut Session,
+) {
+    let bounces = std::mem::take(&mut world.borrow_mut().bounces);
+    let checked = Rc::new(Cell::new(None));
+    let check = {
+        let checked = Rc::clone(&checked);
+        let nodes = nodes.to_vec();
+        async move {
+            let want = u64::try_from(bounces.len()).expect("fits");
+            while nodes
+                .iter()
+                .map(|n| n.sched().bounced() + n.sched().bounce_failed())
+                .sum::<u64>()
+                < want
+            {
+                sleep(Duration::from_millis(100)).await;
+            }
+            checked.set(bounces_checked(&nodes[0], bounces).await);
+        }
+    };
+    let _ = timeout(
+        Duration::from_secs(600),
+        unless_halted(Rc::clone(power), check),
+    )
+    .await;
+    if let Some((bounced, wrong)) = checked.get() {
+        session.bounced = bounced;
+        session.bounce_wrong = wrong;
+    }
+}
+
+async fn bounces_checked(
+    node: &Node<Simulated>,
+    bounces: Vec<(u32, Box<str>, bool)>,
+) -> Option<(u64, u64)> {
+    let (mut suppressed, mut wrong) = (0, 0);
+    for (tenant, address, live) in bounces {
+        let other = tenant % 3 + 1;
+        let mine = node.suppressions().get(tenant, &address).await.ok()?;
+        let theirs = node.suppressions().get(other, &address).await.ok()?;
+        let right = theirs.is_none()
+            && if live {
+                mine.is_some_and(|s| s.reason == Reason::Bounce && s.until.is_none())
+            } else {
+                mine.is_none()
+            };
+        if !right {
+            wrong += 1;
+        } else if live {
+            suppressed += 1;
+        }
+    }
+    Some((suppressed, wrong))
+}
+
 fn verify(seed: u64, world: &World, run: &Session) {
     assert!(run.finished, "seed {seed}: not every message finished");
     assert_eq!(run.refused, 0, "seed {seed}: enqueue refused");
@@ -912,6 +988,8 @@ fn verify(seed: u64, world: &World, run: &Session) {
         "seed {seed}: attempt in the wrong queue"
     );
     assert_eq!(world.wrong, 0, "seed {seed}: queue entry does not match");
+    assert_eq!(run.bounce_wrong, 0, "seed {seed}: bounce suppression wrong");
+    assert!(run.bounced > 0, "seed {seed}: no bounce suppressed");
     assert_eq!(world.clashes, 0, "seed {seed}: one name, two ids");
     assert_eq!(world.over, 0, "seed {seed}: queued over the limit");
     assert!(world.attempts > 0, "seed {seed}: nothing attempted");

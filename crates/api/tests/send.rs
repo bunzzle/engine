@@ -120,6 +120,7 @@ impl Transport for Idle {
                     answer: Answer::Delivered,
                     reply: Vec::new(),
                     event: prepared.opener.event(c.recipient, c.stamp, &body).ok(),
+                    bounced: None,
                 }
             })
             .collect()

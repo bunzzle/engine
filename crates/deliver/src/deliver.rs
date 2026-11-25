@@ -10,8 +10,8 @@ use control::{KIND_RPT, KIND_STS, Leases};
 use dns::{Found, Name, Record, Type};
 use rt::{Ends, Instant, JoinHandle, now, timeout, wall_ms};
 use sched::{
-    Answer, Answered, Attempt, Body, Destination, Envelope, EventBody, EventKind, Kind, OwnStats,
-    Recipient, ReportMail, Reported, Required, Restore, Ret, Transport, TransportStats,
+    Answer, Answered, Attempt, Body, Bounced, Destination, Envelope, EventBody, EventKind, Kind,
+    OwnStats, Recipient, ReportMail, Reported, Required, Restore, Ret, Transport, TransportStats,
 };
 use smtp::client::{
     self, Answer as Reply, Capabilities, Dots, Mail, Rcpt, Refused, Response, Step, Transaction,
@@ -72,6 +72,7 @@ pub struct Outcome {
     pub recipient: u32,
     pub answer: Answer,
     pub reply: Vec<u8>,
+    pub gone: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -677,41 +678,22 @@ impl<D: Dns, L: Local> Deliver<D, L> {
             .transact(&mut link.conn, &mut transaction, message)
             .await;
         let finished = run.is_ok();
-        let answers = transaction.answers();
-        let delivered = finished && answers.iter().any(|a| a == &Some(Reply::Accepted));
-        let mut closing = false;
-        let (done, lost) = match &run {
-            Ok(last) => {
-                closing = last.as_ref().is_some_and(|r| r.code == 421);
-                (last.as_ref().map(Response::text), Lost::Closed)
-            }
-            Err(lost) => (None, *lost),
+        let (done, lost, mut closing) = match &run {
+            Ok(last) => (
+                last.as_ref().map(Response::text),
+                Lost::Closed,
+                last.as_ref().is_some_and(|r| r.code == 421),
+            ),
+            Err(lost) => (None, *lost, false),
         };
-        let outcomes = message
-            .recipients
-            .iter()
-            .zip(answers)
-            .map(|((recipient, _), answer)| {
-                let (answer, reply) = match answer {
-                    Some(Reply::Accepted) if finished => (
-                        Answer::Delivered,
-                        done.clone().unwrap_or_default().into_bytes(),
-                    ),
-                    Some(Reply::Refused(r)) => {
-                        closing |= r.code == 421;
-                        (classify::answer(&r), r.text().into_bytes())
-                    }
-                    Some(Reply::Again(r)) if delivered => (Answer::Later(0), r.text().into_bytes()),
-                    Some(Reply::Again(r)) => (TEMPORARY, r.text().into_bytes()),
-                    _ => (TEMPORARY, lost.text().to_vec()),
-                };
-                Outcome {
-                    recipient: *recipient,
-                    answer,
-                    reply,
-                }
-            })
-            .collect();
+        let (outcomes, refused_closing) = transacted(
+            message.recipients,
+            &transaction,
+            finished,
+            done.as_deref(),
+            lost,
+        );
+        closing |= refused_closing;
         link.used += 1;
         if finished && transaction.reusable() && !closing && link.used < self.settings.reuse {
             self.pool.park(key.clone(), link).await;
@@ -1106,12 +1088,9 @@ impl<D: Dns, L: Local> Transport for Deliver<D, L> {
                 let (answer, reply) = outcome.map_or((TEMPORARY, Lost::Closed.text()), |o| {
                     (o.answer, o.reply.as_slice())
                 });
-                let address = prepared
-                    .recipients
-                    .iter()
-                    .find(|(r, _)| *r == c.recipient)
-                    .map(|(_, r)| r.address.as_bytes().to_vec())
-                    .unwrap_or_default();
+                let found = address_of(&prepared.recipients, c.recipient);
+                let bounced = bounced(found, outcome, prepared.opener.generation());
+                let address = found.map(|a| a.as_bytes().to_vec()).unwrap_or_default();
                 let event = EventKind::of(answer).and_then(|kind| {
                     let body = EventBody {
                         kind,
@@ -1131,6 +1110,7 @@ impl<D: Dns, L: Local> Transport for Deliver<D, L> {
                         .seal_reply(c.recipient, c.stamp, reply)
                         .unwrap_or_default(),
                     event,
+                    bounced,
                 }
             })
             .collect()
@@ -1162,6 +1142,62 @@ fn finished(
     all(recipients, TEMPORARY, &last)
 }
 
+fn address_of(recipients: &[(u32, Recipient)], recipient: u32) -> Option<&str> {
+    recipients
+        .iter()
+        .find(|(r, _)| *r == recipient)
+        .map(|(_, r)| r.address.as_str())
+}
+
+fn bounced(address: Option<&str>, outcome: Option<&Outcome>, generation: u32) -> Option<Bounced> {
+    address
+        .filter(|_| outcome.is_some_and(|o| o.gone && o.answer == Answer::Failed))
+        .map(|address| Bounced {
+            generation,
+            address: address.into(),
+        })
+}
+
+fn transacted(
+    recipients: &[(u32, Recipient)],
+    transaction: &Transaction,
+    finished: bool,
+    done: Option<&str>,
+    lost: Lost,
+) -> (Vec<Outcome>, bool) {
+    let answers = transaction.answers();
+    let delivered = finished && answers.iter().any(|a| a == &Some(Reply::Accepted));
+    let mut closing = false;
+    let outcomes = recipients
+        .iter()
+        .zip(answers)
+        .zip(transaction.refused_at_rcpt())
+        .map(|(((recipient, _), answer), at_rcpt)| {
+            let gone = at_rcpt && matches!(&answer, Some(Reply::Refused(r)) if classify::gone(r));
+            let (answer, reply) = match answer {
+                Some(Reply::Accepted) if finished => (
+                    Answer::Delivered,
+                    done.unwrap_or_default().as_bytes().to_vec(),
+                ),
+                Some(Reply::Refused(r)) => {
+                    closing |= r.code == 421;
+                    (classify::answer(&r), r.text().into_bytes())
+                }
+                Some(Reply::Again(r)) if delivered => (Answer::Later(0), r.text().into_bytes()),
+                Some(Reply::Again(r)) => (TEMPORARY, r.text().into_bytes()),
+                _ => (TEMPORARY, lost.text().to_vec()),
+            };
+            Outcome {
+                recipient: *recipient,
+                answer,
+                reply,
+                gone,
+            }
+        })
+        .collect();
+    (outcomes, closing)
+}
+
 fn all(recipients: &[(u32, Recipient)], answer: Answer, reply: &[u8]) -> Vec<Outcome> {
     recipients
         .iter()
@@ -1169,6 +1205,7 @@ fn all(recipients: &[(u32, Recipient)], answer: Answer, reply: &[u8]) -> Vec<Out
             recipient: *recipient,
             answer,
             reply: reply.to_vec(),
+            gone: false,
         })
         .collect()
 }
@@ -1247,9 +1284,48 @@ async fn body(conn: &mut Conn, message: &mut Message<'_>, limit: Duration) -> Re
 
 #[cfg(test)]
 mod tests {
-    use sched::Required;
+    use sched::{Answer, Bounced, Kind, Recipient, Required};
 
-    use super::honoured;
+    use super::{Outcome, address_of, bounced, honoured};
+
+    #[test]
+    fn only_a_gone_failure_names_its_own_address_and_generation() {
+        let recipients: Vec<(u32, Recipient)> = [(4, "a@example.com"), (9, "b@example.com")]
+            .into_iter()
+            .map(|(r, address)| {
+                let recipient = Recipient {
+                    address: address.to_owned(),
+                    ..Recipient::default()
+                };
+                (r, recipient)
+            })
+            .collect();
+        let outcome = |answer, gone| Outcome {
+            recipient: 9,
+            answer,
+            reply: Vec::new(),
+            gone,
+        };
+        let gone = outcome(Answer::Failed, true);
+        assert_eq!(
+            bounced(address_of(&recipients, 9), Some(&gone), 7),
+            Some(Bounced {
+                generation: 7,
+                address: "b@example.com".into(),
+            })
+        );
+        assert_eq!(address_of(&recipients, 4), Some("a@example.com"));
+        assert_eq!(address_of(&recipients, 5), None);
+        assert_eq!(bounced(None, Some(&gone), 7), None);
+        assert_eq!(bounced(address_of(&recipients, 9), None, 7), None);
+        for other in [
+            outcome(Answer::Failed, false),
+            outcome(Answer::Deferred(Kind::Temporary), true),
+            outcome(Answer::Delivered, true),
+        ] {
+            assert_eq!(bounced(address_of(&recipients, 9), Some(&other), 7), None);
+        }
+    }
 
     #[test]
     fn only_the_report_tenant_keeps_tls_optional() {

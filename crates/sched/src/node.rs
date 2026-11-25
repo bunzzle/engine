@@ -13,13 +13,14 @@ use spool::{
 };
 
 use crate::clock::Clock;
+use crate::error::Refusal;
 use crate::lanes::{Entry, Lanes, Limits, QueueId, Take, Waiting, ranges};
 use crate::policy::{Answer, BACKOFF, Kind, clamp, delay, report_retry};
 use crate::sealing::{Keys, Unsealable};
 use crate::sign::{Outgoing, Signing, expiry_events};
 use crate::start::Node;
 use crate::status::{HookReport, REPORT_CHUNK, Reports};
-use crate::transport::{Answered, Attempt, Claimed, Destination, Transport};
+use crate::transport::{Answered, Attempt, Bounced, Claimed, Destination, Transport};
 use crate::unopened::{Action, Breaker, UnopenedStats, action};
 
 const HOLD: u64 = 3_600_000;
@@ -29,6 +30,9 @@ const UNROUTED: u64 = 30_000;
 const DAMAGED_TRIES: u8 = 3;
 const DAMAGED_KEPT: usize = 4096;
 const UPKEEP: u64 = 60_000;
+const BOUNCE_TRIES: u8 = 4;
+const BOUNCE_WAIT: u64 = 100;
+const BOUNCE_MOST: usize = 256;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct AnswerStats {
@@ -202,6 +206,9 @@ struct Inner<T> {
     refused: Cell<u64>,
     unreadable: Cell<u64>,
     unrouted: Cell<u64>,
+    bounced: Cell<u64>,
+    bounce_failed: Cell<u64>,
+    bouncing: Cell<usize>,
     answers: Cell<AnswerStats>,
     watched: RefCell<BTreeMap<u32, TenantStats>>,
     damaged: RefCell<BTreeMap<MessageId, u8>>,
@@ -283,6 +290,9 @@ impl<T: Transport + 'static> Sched<T> {
             refused: Cell::new(0),
             unreadable: Cell::new(0),
             unrouted: Cell::new(0),
+            bounced: Cell::new(0),
+            bounce_failed: Cell::new(0),
+            bouncing: Cell::new(0),
             answers: Cell::default(),
             watched: RefCell::new(
                 watched
@@ -384,6 +394,14 @@ impl<T: Transport + 'static> Sched<T> {
 
     pub fn unrouted(&self) -> u64 {
         self.inner.unrouted.get()
+    }
+
+    pub fn bounced(&self) -> u64 {
+        self.inner.bounced.get()
+    }
+
+    pub fn bounce_failed(&self) -> u64 {
+        self.inner.bounce_failed.get()
     }
 
     pub fn unsigned(&self) -> u64 {
@@ -853,6 +871,7 @@ impl<T: Transport + 'static> Sched<T> {
             }
             claimed = open;
         }
+        self.bounce(route.tenant, &claimed, &mut by_recipient);
         let reports = claimed
             .iter()
             .map(|c| {
@@ -999,6 +1018,61 @@ impl<T: Transport + 'static> Sched<T> {
         if let Some(stats) = self.inner.watched.borrow_mut().get_mut(&tenant) {
             stats.answers.count(answer);
         }
+    }
+
+    fn bounce(&self, tenant: u32, claimed: &[Claimed], by_recipient: &mut BTreeMap<u32, Answered>) {
+        let mut bounced = Vec::new();
+        for c in claimed {
+            if let Some(a) = by_recipient.get_mut(&c.recipient)
+                && a.answer == Answer::Failed
+                && let Some(b) = a.bounced.take()
+            {
+                bounced.push(b);
+            }
+        }
+        if bounced.is_empty() {
+            return;
+        }
+        let failed = &self.inner.bounce_failed;
+        let node = self.inner.node.get().and_then(Weak::upgrade);
+        let busy = self.inner.bouncing.get() >= BOUNCE_MOST;
+        let Some(node) = node.filter(|_| !busy && !self.closed()) else {
+            failed.set(failed.get() + bounced.len() as u64);
+            return;
+        };
+        let suppressions = node.suppressions.clone();
+        drop(node);
+        let sched = self.clone();
+        let bouncing = &self.inner.bouncing;
+        bouncing.set(bouncing.get() + 1);
+        drop(spawn(async move {
+            for Bounced {
+                generation,
+                address,
+            } in bounced
+            {
+                let mut tries = 0;
+                let added = loop {
+                    if sched.closed() {
+                        break Err(Refusal::Failed);
+                    }
+                    match suppressions.bounce(tenant, generation, &address).await {
+                        Err(refusal) if refusal.temporary() && tries < BOUNCE_TRIES => {
+                            tries += 1;
+                            rt::sleep(std::time::Duration::from_millis(BOUNCE_WAIT << tries)).await;
+                        }
+                        done => break done,
+                    }
+                };
+                let counter = match added {
+                    Ok(()) => &sched.inner.bounced,
+                    Err(_) => &sched.inner.bounce_failed,
+                };
+                counter.set(counter.get() + 1);
+            }
+            let bouncing = &sched.inner.bouncing;
+            bouncing.set(bouncing.get() - 1);
+        }));
     }
 
     fn unroute(&self, route: Route, claimed: &[Claimed]) {
