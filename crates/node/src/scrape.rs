@@ -72,6 +72,12 @@ catalog! {
     ApiRefused: Counter, "api_refused", "API connections refused by connection limits";
     ApiForwarded: Counter, "api_forwarded", "API requests forwarded to another core";
     ApiServed: Counter, "api_served", "API requests served for another core";
+    AdminAccepted: Counter, "admin_connections_accepted", "Admin connections accepted";
+    AdminRefused: Counter, "admin_connections_refused", "Admin connections refused by the peer list";
+    AdminFull: Counter, "admin_connections_full", "Admin connections refused because the session limit was reached";
+    AdminRequests: Counter, "admin_requests", "Admin requests answered";
+    AdminMalformed: Counter, "admin_requests_malformed", "Admin requests that could not be decoded";
+    AdminSessions: Gauge, "admin_sessions", "Open admin sessions";
     GuardSessions: Gauge, "guard_sessions", "Sessions held by the connection guard";
     GuardReservedBytes: Gauge, "guard_reserved_bytes", "Memory reserved by sessions";
     GuardPeakReservedBytes: Gauge, "guard_peak_reserved_bytes", "Highest memory reserved by sessions since start";
@@ -151,6 +157,7 @@ pub(crate) struct Sources<'a, T> {
     pub guard: &'a Guard,
     pub keys: &'a Keyring,
     pub api: Option<&'a api::Api>,
+    pub admin: Option<&'a admin::Admin>,
 }
 
 impl<T: Transport + 'static> Sources<'_, T> {
@@ -200,6 +207,15 @@ impl<T: Transport + 'static> Sources<'_, T> {
             set(Id::ApiRefused, api.refused() + api.ended(End::Refused));
             set(Id::ApiForwarded, api.forwarded());
             set(Id::ApiServed, api.served());
+        }
+        if let Some(admin) = self.admin {
+            let stats = admin.stats();
+            set(Id::AdminAccepted, stats.accepted);
+            set(Id::AdminRefused, stats.refused);
+            set(Id::AdminFull, stats.full);
+            set(Id::AdminRequests, stats.requests);
+            set(Id::AdminMalformed, stats.malformed);
+            set(Id::AdminSessions, wide(admin.sessions()));
         }
         let guard = self.guard.stats();
         set(Id::GuardSessions, wide(guard.sessions));

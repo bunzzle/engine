@@ -249,6 +249,7 @@ pub async fn run<T: Transport + 'static>(
         guard: &up.guard,
         keys: &up.keys,
         api: apis.as_ref(),
+        admin: admin.as_ref(),
     };
     let publishing = scrape::publishing(metrics, index, sources);
     let stopping = stop(watched, &orders, &peers, cores);
