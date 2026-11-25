@@ -44,6 +44,23 @@ pub struct Reporter {
     pub submitter: String,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Site {
+    pub name: String,
+    pub suffixes: Vec<String>,
+}
+
+impl Site {
+    pub fn matches(&self, host: &str) -> bool {
+        self.suffixes.iter().any(|suffix| {
+            host == suffix
+                || host
+                    .strip_suffix(suffix.as_str())
+                    .is_some_and(|head| head.ends_with('.'))
+        })
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Settings {
     pub ehlo: String,
@@ -63,6 +80,7 @@ pub struct Settings {
     pub tlsrpt: bool,
     pub report_tenant: Option<u32>,
     pub reporter: Reporter,
+    pub sites: Vec<Site>,
 }
 
 impl Settings {
@@ -85,6 +103,7 @@ impl Settings {
             tlsrpt: false,
             report_tenant: None,
             reporter: Reporter::default(),
+            sites: Vec::new(),
         }
     }
 }

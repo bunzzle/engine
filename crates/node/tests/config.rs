@@ -360,6 +360,62 @@ fn deliver_allow_rejects_a_bad_cidr() {
 }
 
 #[test]
+fn deliver_site_rules_are_read() {
+    let text = format!(
+        "{MINIMAL}[deliver]\n[[deliver.site]]\nname = \"google\"\nsuffix = [\"Google.COM\", \"googlemail.com\"]\n[[deliver.site]]\nname = \"microsoft\"\nsuffix = [\"outlook.com\"]\n"
+    );
+    let config = parse(&text).expect("config");
+    assert_eq!(
+        config.delivery.settings.sites,
+        [
+            deliver::Site {
+                name: "google".into(),
+                suffixes: ["google.com", "googlemail.com"].map(str::to_owned).into(),
+            },
+            deliver::Site {
+                name: "microsoft".into(),
+                suffixes: ["outlook.com"].map(str::to_owned).into(),
+            },
+        ]
+    );
+}
+
+#[test]
+fn deliver_site_rules_are_checked() {
+    let base = format!("{MINIMAL}[deliver]\n");
+    let cases = [
+        (
+            "[[deliver.site]]\nname = \"google\"\nsuffix = []\n",
+            "`suffix` must list at least one host name",
+        ),
+        (
+            "[[deliver.site]]\nname = \"google\"\nsuffix = [\"goo..gle.com\"]\n",
+            "`suffix` must list host names",
+        ),
+        (
+            "[[deliver.site]]\nname = \"google\"\nsuffix = [\"google.com\"]\n[[deliver.site]]\nname = \"google\"\nsuffix = [\"gmail.com\"]\n",
+            "`name` is listed twice",
+        ),
+        (
+            "[[deliver.site]]\nname = \"\"\nsuffix = [\"google.com\"]\n",
+            "`name` must be between 1 and 255 bytes",
+        ),
+        (
+            "[[deliver.site]]\nsuffix = [\"google.com\"]\n",
+            "missing `name`",
+        ),
+        (
+            "[[deliver.site]]\nname = \"google\"\nsuffix = [\"google.com\"]\nextra = 1\n",
+            "`extra` is not a known setting",
+        ),
+    ];
+    for (section, want) in cases {
+        let text = error(&format!("{base}{section}"));
+        assert!(text.contains(want), "{section}: {text}");
+    }
+}
+
+#[test]
 fn mistakes_are_refused_with_their_place() {
     assert_eq!(
         error(&MINIMAL.replace("id = 7", "id = 7\nport = 25")),
