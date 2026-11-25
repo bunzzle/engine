@@ -92,7 +92,7 @@ pub struct Script {
     pub ehlo: String,
     pub starttls: bool,
     pub inject: bool,
-    pub mail: &'static str,
+    pub mail: Rc<RefCell<&'static str>>,
     pub rcpt: Rc<dyn Fn(&str) -> String>,
     pub done: &'static str,
     pub stalls: Rc<Cell<u32>>,
@@ -111,7 +111,7 @@ impl Script {
             ehlo,
             starttls: extensions.contains(&"STARTTLS"),
             inject: false,
-            mail: "250 2.1.0 ok",
+            mail: Rc::new(RefCell::new("250 2.1.0 ok")),
             rcpt: Rc::new(|_| "250 2.1.5 ok".to_owned()),
             done: "250 2.0.0 queued",
             stalls: Rc::default(),
@@ -280,7 +280,8 @@ async fn session(io: TcpStream, script: Script, seen: Rc<RefCell<Seen>>, accepto
             }
             "MAIL" => {
                 accepted = 0;
-                io.write(script.mail).await;
+                let reply = *script.mail.borrow();
+                io.write(reply).await;
             }
             "RCPT" => {
                 let address = command

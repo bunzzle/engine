@@ -6,7 +6,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
-use control::{KIND_RPT, KIND_STS, Leases};
+use control::{KIND_RPT, KIND_STS, Leases, Signal};
 use dns::{Found, Name, Record, Type};
 use rt::{Ends, Instant, JoinHandle, now, timeout, wall_ms};
 use sched::{
@@ -369,12 +369,10 @@ impl<D: Dns, L: Local> Deliver<D, L> {
             Ok(enforced) => enforced,
             Err((answer, reply)) => return every(answer, reply),
         };
-        let remote: Remote = (egress, site.into());
+        let remote: Remote = (egress, site.clone().into());
         let mut slot = None;
         let mut last = NO_HOST.to_vec();
-        let mut tried = 0;
-        let mut others = false;
-        let mut refused = 0;
+        let (mut tried, mut others, mut refused) = (0, false, 0);
         'hosts: for host in &hosts {
             let (kept, target, dnssec) = match self
                 .kept(host, egress, end, deadline, &destination.egress)
@@ -420,6 +418,7 @@ impl<D: Dns, L: Local> Deliver<D, L> {
                 let key = Key {
                     egress,
                     domain: destination.domain.clone(),
+                    site: site.clone().into(),
                     host: host.clone(),
                     remote: ip,
                     level: need.level(),
@@ -616,6 +615,12 @@ impl<D: Dns, L: Local> Deliver<D, L> {
         u64::try_from(self.settings.wait.as_millis()).unwrap_or(0)
     }
 
+    fn feedback(&self, remote: &Remote, signal: Signal) {
+        if let Some(leases) = &self.leases {
+            leases.feedback(remote, signal);
+        }
+    }
+
     async fn session(
         &self,
         end: Instant,
@@ -638,7 +643,7 @@ impl<D: Dns, L: Local> Deliver<D, L> {
                     Err(()) => return Tried::Busy,
                 }
             }
-            match self.open(end, key, need, scope).await {
+            match self.open(end, key, need, scope, remote).await {
                 Ok((conn, caps)) => Link {
                     conn,
                     caps,
@@ -680,6 +685,26 @@ impl<D: Dns, L: Local> Deliver<D, L> {
             .transact(&mut link.conn, &mut transaction, message)
             .await;
         let finished = run.is_ok();
+        let mut throttled = false;
+        if let Ok(last) = &run {
+            throttled = transaction
+                .answers()
+                .into_iter()
+                .flatten()
+                .filter_map(|answer| match answer {
+                    Reply::Refused(reply) | Reply::Again(reply) => Some(reply),
+                    Reply::Accepted => None,
+                })
+                .chain(transaction.mail_refused().cloned())
+                .chain(last.clone())
+                .any(|reply| classify::kind(&reply) == Kind::Throttled);
+            if throttled {
+                self.feedback(remote, Signal::Throttle);
+                self.pool.close(key.egress, &key.site).await;
+            } else {
+                self.feedback(remote, Signal::Success);
+            }
+        }
         let (done, lost, mut closing) = match &run {
             Ok(last) => (
                 last.as_ref().map(Response::text),
@@ -695,7 +720,7 @@ impl<D: Dns, L: Local> Deliver<D, L> {
             done.as_deref(),
             lost,
         );
-        closing |= refused_closing;
+        closing |= refused_closing || throttled;
         link.used += 1;
         if finished && transaction.reusable() && !closing && link.used < self.settings.reuse {
             self.pool.park(key.clone(), link).await;
@@ -736,6 +761,7 @@ impl<D: Dns, L: Local> Deliver<D, L> {
         key: &Key,
         need: &Need,
         scope: &Scope,
+        remote: &Remote,
     ) -> Result<(Conn, Capabilities), Vec<u8>> {
         let failed = |result| {
             let detail = failure(result, key.egress, Some(&key.host), Some(key.remote));
@@ -747,16 +773,24 @@ impl<D: Dns, L: Local> Deliver<D, L> {
             Ok(conn) => conn,
             Err(lost) => {
                 self.mark_dead(key.egress, key.remote);
+                self.feedback(remote, Signal::Failure);
                 return Err(lost.text().to_vec());
             }
         };
         match conn.response(t.banner).await {
             Ok(banner) if banner.code == 220 => {}
-            failed => return Err(next(conn, failed).await),
+            failed => {
+                let busy = matches!(&failed, Ok(reply) if reply.code / 100 == 4);
+                self.refused(key, remote, &failed, busy).await;
+                return Err(next(conn, failed).await);
+            }
         }
         let mut caps = match self.hello(&mut conn).await {
             Ok(caps) => caps,
-            Err(failed) => return Err(next(conn, failed).await),
+            Err(failed) => {
+                self.refused(key, remote, &failed, false).await;
+                return Err(next(conn, failed).await);
+            }
         };
         let required = key.level != Level::Any;
         if !caps.starttls {
@@ -777,6 +811,7 @@ impl<D: Dns, L: Local> Deliver<D, L> {
                 conn = match conn.starttls(&self.tls, &name, verify, t.starttls).await {
                     Ok(conn) => conn,
                     Err(lost) => {
+                        self.feedback(remote, Signal::Failure);
                         if let Lost::Tls(refused) = lost
                             && let Some(result) = refused_type(refused)
                         {
@@ -792,12 +827,18 @@ impl<D: Dns, L: Local> Deliver<D, L> {
                 }
                 caps = match self.hello(&mut conn).await {
                     Ok(caps) => caps,
-                    Err(failed) => return Err(next(conn, failed).await),
+                    Err(failed) => {
+                        self.refused(key, remote, &failed, false).await;
+                        return Err(next(conn, failed).await);
+                    }
                 };
             }
             Ok(reply) if required => {
                 if reply.code >= 500 {
                     failed(ResultType::StarttlsNotSupported);
+                }
+                if classify::kind(&reply) == Kind::Throttled {
+                    self.refused(key, remote, &Ok(reply.clone()), true).await;
                 }
                 return Err(next(conn, Ok(reply)).await);
             }
@@ -806,9 +847,31 @@ impl<D: Dns, L: Local> Deliver<D, L> {
                     failed(ResultType::StarttlsNotSupported);
                 }
             }
-            Err(lost) => return Err(lost.text().to_vec()),
+            Err(lost) => {
+                self.feedback(remote, Signal::Failure);
+                return Err(lost.text().to_vec());
+            }
         }
         Ok((conn, caps))
+    }
+
+    async fn refused(
+        &self,
+        key: &Key,
+        remote: &Remote,
+        failed: &Result<Response, Lost>,
+        busy: bool,
+    ) {
+        let throttled = match failed {
+            Ok(reply) => busy || classify::kind(reply) == Kind::Throttled,
+            Err(_) => false,
+        };
+        if throttled {
+            self.feedback(remote, Signal::Throttle);
+            self.pool.close(key.egress, &key.site).await;
+        } else {
+            self.feedback(remote, Signal::Failure);
+        }
     }
 
     fn is_dead(&self, egress: IpAddr, remote: IpAddr) -> bool {
@@ -974,9 +1037,14 @@ impl<D: Dns, L: Local> Transport for Deliver<D, L> {
 
     fn stats(&self) -> TransportStats {
         let wide = |n: usize| u64::try_from(n).unwrap_or(u64::MAX);
+        let leases = self.leases.as_ref();
+        let (tracked, dead) = leases.map_or((0, 0), Leases::sites);
         TransportStats {
             pooled: wide(self.pooled()),
             dead_hosts: wide(self.dead_hosts()),
+            window_cuts: leases.map_or(0, |l| l.stats().cuts),
+            sites_dead: dead,
+            sites_tracked: tracked,
         }
     }
 

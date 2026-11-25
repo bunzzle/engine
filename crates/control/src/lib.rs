@@ -14,7 +14,8 @@ pub use access::{Grant, Scope, Scopes, TOKEN, Token};
 pub use cache::{Cache, CacheStats};
 pub use error::Error;
 pub use leases::{
-    Ask, Gcra, IDLE, LIFETIME, LeaseStats, Leases, Quota, Rate, Taken, Tokens, WAIT, limit_core,
+    Ask, Gcra, IDLE, LIFETIME, LeaseStats, Leases, Quota, Rate, Signal, Taken, Tokens, WAIT,
+    Window, limit_core,
 };
 pub use names::{Call, Loaded as LoadedQueues, Naming, NamingStats, Queues, Unnamed};
 pub use queue::{

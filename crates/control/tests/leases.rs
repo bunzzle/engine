@@ -3,7 +3,9 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
-use control::{Ask, Error, Gcra, LIFETIME, Leases, Limits, Quota, Rate, Taken, limit_core};
+use control::{
+    Ask, Error, Gcra, LIFETIME, Leases, Limits, Quota, Rate, Signal, Taken, Window, limit_core,
+};
 use rt::sim::{Config, Machine, SimDriver, Stalls, check};
 use rt::{Instant, JoinHandle, Mesh, Runtime, sleep, spawn};
 
@@ -19,15 +21,43 @@ const LIMIT: u64 = 400;
 const SLOW: u32 = 4;
 const PERIOD: Duration = Duration::from_secs(10);
 
+const SITE: u32 = 5;
+const ONE: u32 = 6;
+const COOL: u32 = 7;
+const DEADLY: u32 = 8;
+
+fn site(window: Window) -> Quota {
+    Quota {
+        rate: Rate::NONE,
+        burst: 0,
+        queued: LIMIT,
+        window: Some(window),
+    }
+}
+
 fn quota(key: u32) -> Option<Quota> {
     if key == SLOW {
         return Some(Quota {
             rate: Rate::per_minute(6),
             burst: 1,
             queued: LIMIT,
+            window: None,
         });
     }
-    limits(key).map(Quota::from)
+    match key {
+        SITE | DEADLY => Some(site(Window::default())),
+        ONE => Some(site(Window::new(
+            1,
+            Duration::from_secs(60),
+            Duration::from_secs(60),
+        ))),
+        COOL => Some(site(Window::new(
+            5,
+            Duration::from_mins(20),
+            Duration::from_secs(60),
+        ))),
+        _ => limits(key).map(Quota::from),
+    }
 }
 
 fn limits(tenant: u32) -> Option<Limits> {
@@ -490,6 +520,7 @@ fn rates_below_one_per_second_never_mean_no_limit() {
             rate: Rate::per(1, Duration::MAX),
             burst,
             queued: 0,
+            window: None,
         };
         let mut gcra = Gcra::default();
         let mut granted = 0;
@@ -504,6 +535,7 @@ fn rates_below_one_per_second_never_mean_no_limit() {
         rate: Rate::per_hour(2),
         burst: 1,
         queued: 0,
+        window: None,
     };
     let mut gcra = Gcra::default();
     assert_eq!(gcra.grant(hourly, 5, start).count, 1);
@@ -631,4 +663,325 @@ fn blocked(seed: u64) {
 #[test]
 fn a_blocked_key_refuses_takes_on_every_core_until_unblocked() {
     check(0..8, blocked);
+}
+
+fn with_single<T: 'static>(test: impl AsyncFnOnce(Leases<u32>) -> T + 'static) -> T {
+    let sim = Rc::new(SimDriver::new(11, Config::default()));
+    Runtime::new(sim).block_on(async move {
+        let mesh = Mesh::<Ask<u32>>::new(1);
+        let ends = mesh.take(0).expect("ends");
+        let (leases, done) = Leases::start(ends, |_| 0, |t| quota(*t));
+        let out = test(leases.clone()).await;
+        leases.close();
+        done.await;
+        out
+    })
+}
+
+#[test]
+fn a_window_grows_on_success_only_up_to_granted_plus_initial() {
+    with_single(async |leases: Leases<u32>| {
+        let mut held = Vec::new();
+        held.push(leases.take(&ONE).await.expect("first slot"));
+        for _ in 0..50 {
+            leases.feedback(&ONE, Signal::Success);
+        }
+        sleep(Duration::from_millis(50)).await;
+        assert_eq!(leases.granted(&ONE), 1, "no demand, no new slots");
+        held.push(leases.take(&ONE).await.expect("window grew to two"));
+        sleep(Duration::from_millis(50)).await;
+        assert_eq!(leases.granted(&ONE), 2);
+        for _ in 0..50 {
+            leases.feedback(&ONE, Signal::Success);
+        }
+        sleep(Duration::from_millis(50)).await;
+        assert_eq!(leases.granted(&ONE), 3, "grew one more on success");
+        for _ in 0..50 {
+            leases.feedback(&ONE, Signal::Success);
+        }
+        sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            leases.granted(&ONE),
+            3,
+            "growth stops at granted plus initial"
+        );
+        held.push(leases.take(&ONE).await.expect("third slot"));
+        assert!(
+            matches!(leases.take(&ONE).await, Err(Error::Busy)),
+            "two in use plus an initial of one"
+        );
+        drop(held);
+    });
+}
+
+#[test]
+fn a_throttle_halves_the_window_recalls_free_slots_and_stops_growth_while_cooling() {
+    let node = Node::start(13);
+    let leases = node.leases.clone();
+    let owner = usize::from(limit_core(SITE, SHARDS, CORES));
+    let other = (owner + 1) % usize::from(CORES);
+    node.machine.block_on(other, async move {
+        let lease = &leases[other];
+        let mut held = Vec::new();
+        for _ in 0..5 {
+            held.push(lease.take(&SITE).await.expect("slot"));
+        }
+        for _ in 0..200 {
+            lease.feedback(&SITE, Signal::Success);
+        }
+        sleep(Duration::from_millis(100)).await;
+        for _ in 0..5 {
+            held.push(lease.take(&SITE).await.expect("grown slot"));
+        }
+        assert!(lease.held(&SITE) > 5, "the window grew past five");
+        for _ in 0..200 {
+            lease.feedback(&SITE, Signal::Success);
+        }
+        sleep(Duration::from_millis(100)).await;
+        let all = lease.held(&SITE);
+        lease.free(&SITE, all);
+        lease.feedback(&SITE, Signal::Throttle);
+        sleep(Duration::from_millis(100)).await;
+        assert_eq!(lease.held(&SITE), 0, "recall took the free slots");
+        assert_eq!(leases[owner].stats().cuts, 1);
+        assert_eq!(leases[owner].granted(&SITE), 0);
+        for _ in 0..5 {
+            held.push(lease.take(&SITE).await.expect("slot after the cut"));
+        }
+        let mut drained = 0;
+        while let Ok(slot) = lease.take_within(&SITE, Duration::from_millis(50)).await {
+            held.push(slot);
+            drained += 1;
+            assert!(drained <= 10, "the cut window caps the slots");
+        }
+        for _ in 0..200 {
+            lease.feedback(&SITE, Signal::Success);
+        }
+        sleep(Duration::from_millis(100)).await;
+        assert!(
+            matches!(lease.take(&SITE).await, Err(Error::Busy)),
+            "no growth while cooling"
+        );
+        sleep(Duration::from_secs(61)).await;
+        for _ in 0..200 {
+            lease.feedback(&SITE, Signal::Success);
+        }
+        sleep(Duration::from_millis(100)).await;
+        held.push(lease.take(&SITE).await.expect("growth after the cool"));
+        drop(held);
+    });
+    node.stop();
+}
+
+#[test]
+fn a_failed_cohort_marks_the_site_dead_until_one_probe_decides() {
+    with_single(async |leases: Leases<u32>| {
+        let taken = leases.take(&SITE).await.expect("slot");
+        for _ in 0..10 {
+            leases.feedback(&SITE, Signal::Failure);
+        }
+        sleep(Duration::from_millis(50)).await;
+        assert!(matches!(leases.take(&SITE).await, Err(Error::Blocked)));
+        assert_eq!(leases.stats().deaths, 1);
+        assert_eq!(leases.sites(), (1, 1));
+        leases.give_back(&SITE, taken);
+        sleep(Duration::from_millis(50)).await;
+        assert_eq!(leases.granted(&SITE), 0);
+        sleep(Duration::from_secs(62)).await;
+        let deadline = rt::now() + Duration::from_secs(5);
+        while leases.blocked(&SITE) && rt::now() < deadline {
+            sleep(Duration::from_millis(10)).await;
+        }
+        assert!(!leases.blocked(&SITE));
+        let probe = leases.take(&SITE).await.expect("one probe slot");
+        assert!(matches!(leases.take(&SITE).await, Err(Error::Busy)));
+        leases.feedback(&SITE, Signal::Success);
+        sleep(Duration::from_millis(50)).await;
+        let mut held = vec![probe];
+        for _ in 0..4 {
+            held.push(
+                leases
+                    .take(&SITE)
+                    .await
+                    .expect("back at the initial window"),
+            );
+        }
+        assert!(matches!(leases.take(&SITE).await, Err(Error::Busy)));
+        drop(held);
+        leases.free(&SITE, 5);
+        for _ in 0..10 {
+            leases.feedback(&SITE, Signal::Failure);
+        }
+        sleep(Duration::from_millis(50)).await;
+        assert!(matches!(leases.take(&SITE).await, Err(Error::Blocked)));
+        assert_eq!(leases.stats().deaths, 2);
+        sleep(Duration::from_millis(50)).await;
+        assert_eq!(leases.granted(&SITE), 0);
+        sleep(Duration::from_secs(62)).await;
+        let deadline = rt::now() + Duration::from_secs(5);
+        while leases.blocked(&SITE) && rt::now() < deadline {
+            sleep(Duration::from_millis(10)).await;
+        }
+        leases.take(&SITE).await.expect("probe slot again");
+        leases.feedback(&SITE, Signal::Failure);
+        sleep(Duration::from_millis(50)).await;
+        assert!(
+            matches!(leases.take(&SITE).await, Err(Error::Blocked)),
+            "a failed probe starts a new dead spell"
+        );
+        assert_eq!(leases.stats().deaths, 3);
+    });
+}
+
+#[test]
+fn a_manual_block_survives_the_end_of_a_dead_window() {
+    with_single(async |leases: Leases<u32>| {
+        leases.take(&SITE).await.expect("slot");
+        for _ in 0..10 {
+            leases.feedback(&SITE, Signal::Failure);
+        }
+        sleep(Duration::from_millis(50)).await;
+        assert!(leases.blocked(&SITE));
+        leases.block(&SITE);
+        leases.free(&SITE, 1);
+        sleep(Duration::from_secs(62)).await;
+        sleep(Duration::from_millis(100)).await;
+        assert!(leases.blocked(&SITE), "the manual block stays");
+        assert!(matches!(leases.take(&SITE).await, Err(Error::Blocked)));
+        leases.unblock(&SITE);
+        sleep(Duration::from_millis(100)).await;
+        assert!(!leases.blocked(&SITE));
+        leases.take(&SITE).await.expect("probe slot after unblock");
+    });
+}
+
+#[test]
+fn an_idle_window_is_dropped_unless_cooling_or_dead() {
+    with_single(async |leases: Leases<u32>| {
+        leases.take(&SITE).await.expect("slot");
+        leases.free(&SITE, 1);
+        leases.take(&COOL).await.expect("slot");
+        leases.free(&COOL, 1);
+        leases.feedback(&COOL, Signal::Throttle);
+        leases.take(&DEADLY).await.expect("slot");
+        leases.free(&DEADLY, 1);
+        for _ in 0..10 {
+            leases.feedback(&DEADLY, Signal::Failure);
+        }
+        sleep(Duration::from_millis(100)).await;
+        assert_eq!(leases.sites(), (3, 1));
+        sleep(Duration::from_secs(630)).await;
+        assert_eq!(
+            leases.sites(),
+            (2, 0),
+            "only the idle normal window dropped"
+        );
+        sleep(Duration::from_secs(90)).await;
+        assert_eq!(leases.sites(), (1, 0), "the idle probe dropped");
+        sleep(Duration::from_mins(9)).await;
+        assert_eq!(
+            leases.sites(),
+            (0, 0),
+            "the cooled window dropped once the cool-down passed"
+        );
+    });
+}
+
+#[test]
+fn a_throttled_probe_restarts_at_a_window_of_one() {
+    with_single(async |leases: Leases<u32>| {
+        leases.take(&SITE).await.expect("slot");
+        for _ in 0..10 {
+            leases.feedback(&SITE, Signal::Failure);
+        }
+        leases.free(&SITE, 1);
+        sleep(Duration::from_secs(62)).await;
+        let deadline = rt::now() + Duration::from_secs(5);
+        while leases.blocked(&SITE) && rt::now() < deadline {
+            sleep(Duration::from_millis(10)).await;
+        }
+        let probe = leases.take(&SITE).await.expect("probe slot");
+        leases.feedback(&SITE, Signal::Throttle);
+        leases.give_back(&SITE, probe);
+        sleep(Duration::from_millis(50)).await;
+        assert_eq!(leases.stats().cuts, 1);
+        leases.take(&SITE).await.expect("window of one");
+        assert!(matches!(leases.take(&SITE).await, Err(Error::Busy)));
+    });
+}
+
+#[test]
+fn a_manual_unblock_does_not_end_a_dead_window() {
+    with_single(async |leases: Leases<u32>| {
+        leases.take(&SITE).await.expect("slot");
+        leases.block(&SITE);
+        for _ in 0..10 {
+            leases.feedback(&SITE, Signal::Failure);
+        }
+        leases.free(&SITE, 1);
+        sleep(Duration::from_millis(50)).await;
+        leases.unblock(&SITE);
+        sleep(Duration::from_millis(100)).await;
+        assert!(leases.blocked(&SITE), "still dead");
+        assert!(matches!(leases.take(&SITE).await, Err(Error::Blocked)));
+        sleep(Duration::from_secs(62)).await;
+        let deadline = rt::now() + Duration::from_secs(5);
+        while leases.blocked(&SITE) && rt::now() < deadline {
+            sleep(Duration::from_millis(10)).await;
+        }
+        assert!(!leases.blocked(&SITE));
+        leases.take(&SITE).await.expect("probe slot");
+    });
+}
+
+#[test]
+fn a_cut_takes_back_slots_in_use_as_they_finish() {
+    with_single(async |leases: Leases<u32>| {
+        let mut held = Vec::new();
+        for _ in 0..5 {
+            held.push(leases.take(&SITE).await.expect("slot"));
+        }
+        leases.feedback(&SITE, Signal::Throttle);
+        sleep(Duration::from_millis(50)).await;
+        assert_eq!(leases.stats().cuts, 1);
+        held.clear();
+        for _ in 0..5 {
+            leases.free(&SITE, 1);
+            sleep(Duration::from_millis(10)).await;
+        }
+        sleep(Duration::from_millis(50)).await;
+        let mut again = Vec::new();
+        for _ in 0..2 {
+            again.push(leases.take(&SITE).await.expect("within the cut window"));
+        }
+        assert!(
+            matches!(leases.take(&SITE).await, Err(Error::Busy)),
+            "only two slots after cutting five"
+        );
+        assert_eq!(leases.granted(&SITE), 2);
+    });
+}
+
+#[test]
+fn feedback_before_the_probe_slot_is_ignored() {
+    with_single(async |leases: Leases<u32>| {
+        leases.take(&SITE).await.expect("slot");
+        for _ in 0..10 {
+            leases.feedback(&SITE, Signal::Failure);
+        }
+        sleep(Duration::from_secs(62)).await;
+        let deadline = rt::now() + Duration::from_secs(5);
+        while leases.blocked(&SITE) && rt::now() < deadline {
+            sleep(Duration::from_millis(10)).await;
+        }
+        leases.feedback(&SITE, Signal::Failure);
+        leases.free(&SITE, 1);
+        sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            leases.stats().deaths,
+            1,
+            "a late failure does not end the probe"
+        );
+        leases.take(&SITE).await.expect("probe slot");
+    });
 }

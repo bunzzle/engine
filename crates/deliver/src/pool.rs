@@ -4,7 +4,7 @@ use std::net::IpAddr;
 use std::rc::Rc;
 use std::time::Duration;
 
-use control::{Ask, Leases, Quota, Rate, siphash};
+use control::{Ask, Leases, Quota, Rate, Window, siphash};
 use dns::Name;
 use rt::{Ends, JoinHandle, sleep, spawn};
 use smtp::client::Capabilities;
@@ -27,6 +27,7 @@ pub fn limits(
                 rate: Rate::NONE,
                 burst: 0,
                 queued: u64::from(connections),
+                window: Some(Window::default()),
             })
         },
     )
@@ -70,6 +71,7 @@ pub(crate) enum Level {
 pub(crate) struct Key {
     pub(crate) egress: IpAddr,
     pub(crate) domain: Box<str>,
+    pub(crate) site: Box<str>,
     pub(crate) host: Name,
     pub(crate) remote: IpAddr,
     pub(crate) level: Level,
@@ -125,6 +127,29 @@ impl Pool {
         let mut parked = self.parked.borrow_mut();
         let id = parked.links.get(key)?.last()?.0;
         parked.remove(key, id)
+    }
+
+    pub(crate) async fn close(&self, egress: IpAddr, site: &str) {
+        let links = {
+            let mut parked = self.parked.borrow_mut();
+            let keys: Vec<Key> = parked
+                .links
+                .keys()
+                .filter(|key| key.egress == egress && &*key.site == site)
+                .cloned()
+                .collect();
+            let mut links = Vec::new();
+            for key in keys {
+                if let Some(list) = parked.links.remove(&key) {
+                    parked.count -= list.len();
+                    links.extend(list.into_iter().map(|(_, link)| link));
+                }
+            }
+            links
+        };
+        for link in links {
+            link.conn.quit().await;
+        }
     }
 
     pub(crate) fn egress(&self, domain: &str, allowed: &[(IpAddr, u16)]) -> Option<IpAddr> {

@@ -462,7 +462,7 @@ fn transaction_replies_answer_everyone() {
     for (mail, done, want) in cases {
         let outcomes = run(async move {
             let mut script = Script::new(&["PIPELINING", "ENHANCEDSTATUSCODES"]);
-            script.mail = mail;
+            *script.mail.borrow_mut() = mail;
             script.done = done;
             serve(MX1, script);
             let deliver = deliverer(zone(), settings());
@@ -1325,6 +1325,82 @@ fn closes_after_421() {
         seen
     });
     assert_eq!(seen.borrow().connections, 2);
+}
+
+#[test]
+fn a_421_to_mail_cuts_the_window_and_closes_parked_links() {
+    let (cuts, pooled, connections) = run(async {
+        let script = Script::new(&[]);
+        let mail = Rc::clone(&script.mail);
+        let seen = serve(MX1, script);
+        let zone = zone();
+        zone.set(
+            "example.net",
+            Type::Mx,
+            mx(&[(20, "mx2.example.com"), (10, "mx1.example.com")]),
+        );
+        let mesh = Mesh::new(1);
+        let (leases, _done) = limits(mesh.take(0).expect("ends"), 100, [7; 16]);
+        let deliver = limited(zone, settings(), Some(leases.clone()));
+        let outcomes = simple(&deliver, "example.com").await;
+        assert_eq!(answers(&outcomes), [Answer::Delivered]);
+        assert_eq!(deliver.pooled(), 1);
+        *mail.borrow_mut() = "421 4.7.0 too busy";
+        let outcomes = simple(&deliver, "example.net").await;
+        assert_eq!(answers(&outcomes), [Answer::Deferred(Kind::Throttled)]);
+        sleep(Duration::from_millis(50)).await;
+        (
+            leases.stats().cuts,
+            deliver.pooled(),
+            seen.borrow().connections,
+        )
+    });
+    assert_eq!(cuts, 1);
+    assert_eq!(pooled, 0, "the throttle closed the parked link");
+    assert_eq!(connections, 2);
+}
+
+#[test]
+fn a_throttled_recipient_does_not_park_the_link() {
+    let (cuts, pooled) = run(async {
+        let mut script = Script::new(&[]);
+        script.rcpt = Rc::new(|_| "451 4.7.28 unusual rate".to_owned());
+        serve(MX1, script);
+        let mesh = Mesh::new(1);
+        let (leases, _done) = limits(mesh.take(0).expect("ends"), 100, [7; 16]);
+        let deliver = limited(zone(), settings(), Some(leases.clone()));
+        let outcomes = simple(&deliver, "example.com").await;
+        assert_eq!(answers(&outcomes), [Answer::Deferred(Kind::Throttled)]);
+        sleep(Duration::from_millis(50)).await;
+        (leases.stats().cuts, deliver.pooled())
+    });
+    assert_eq!(cuts, 1);
+    assert_eq!(pooled, 0, "a throttled link is not parked");
+}
+
+#[test]
+fn a_5xx_banner_counts_a_failure_against_the_site() {
+    let (deaths, later) = run(async {
+        let mut script = Script::new(&[]);
+        script.banner = "554 5.7.1 go away";
+        serve(MX1, script);
+        let zone = Zone::default();
+        zone.set("example.com", Type::Mx, mx(&[(10, "mx1.example.com")]));
+        zone.set("mx1.example.com", Type::A, a(&[MX1]));
+        let mesh = Mesh::new(1);
+        let (leases, _done) = limits(mesh.take(0).expect("ends"), 100, [7; 16]);
+        let deliver = limited(zone, settings(), Some(leases.clone()));
+        for _ in 0..4 {
+            let outcomes = simple(&deliver, "example.com").await;
+            assert_eq!(answers(&outcomes), [TEMPORARY]);
+            sleep(Duration::from_millis(50)).await;
+        }
+        let deaths = leases.stats().deaths;
+        let later = simple(&deliver, "example.com").await;
+        (deaths, later)
+    });
+    assert_eq!(deaths, 1);
+    assert!(matches!(answers(&later).as_slice(), [Answer::Later(_)]));
 }
 
 #[test]
