@@ -1601,6 +1601,64 @@ fn a_connect_rate_holds_a_second_connection() {
 }
 
 #[test]
+fn a_paused_site_skips_parked_links() {
+    let (later, resumed, seen) = run(async {
+        let seen = serve(MX1, Script::new(&["PIPELINING"]));
+        let sites = vec![site_rule(None, None, None)];
+        let mesh = Mesh::new(1);
+        let (leases, _done) = limits(mesh.take(0).expect("ends"), 100, &sites, &[], [7; 16]);
+        let mut settings = settings();
+        settings.sites = sites;
+        let deliver = limited(zone(), settings, Some(leases));
+        let first = simple(&deliver, "example.com").await;
+        assert_eq!(answers(&first), [Answer::Delivered]);
+        assert_eq!(deliver.pooled(), 1);
+        let before = commands(&seen).len();
+        assert!(deliver.pause_site(EGRESS, "example", true));
+        sleep(Duration::from_millis(50)).await;
+        let later = simple(&deliver, "example.com").await;
+        assert_eq!(commands(&seen).len(), before);
+        assert!(deliver.pause_site(EGRESS, "example", false));
+        sleep(Duration::from_millis(50)).await;
+        let resumed = simple(&deliver, "example.com").await;
+        (later, resumed, seen)
+    });
+    assert_eq!(answers(&later), [Answer::Later(5000)]);
+    assert_eq!(reply(&later[0]), "451 4.4.5 Connection limit reached");
+    assert_eq!(answers(&resumed), [Answer::Delivered]);
+    assert_eq!(seen.borrow().connections, 1);
+}
+
+#[test]
+fn a_paused_site_with_a_held_slot_opens_no_connection() {
+    let driver = Rc::new(SimDriver::new(7, Config::default()));
+    let net = Rc::clone(&driver);
+    let (outcomes, connections) = Runtime::new(driver).block_on(async move {
+        net.set_reachable(MX1, false);
+        let seen = serve(MX2, Script::new(&[]));
+        let sites = vec![site_rule(None, None, None)];
+        let mesh = Mesh::new(1);
+        let (leases, _done) = limits(mesh.take(0).expect("ends"), 100, &sites, &[], [7; 16]);
+        let mut settings = settings();
+        settings.sites = sites;
+        let zone = zone();
+        zone.set("mx1.example.com", Type::A, a(&[MX1, MX2]));
+        let deliver = Rc::new(limited(zone, settings, Some(leases)));
+        let pausing = Rc::clone(&deliver);
+        let pauser = spawn(async move {
+            sleep(Duration::from_secs(1)).await;
+            pausing.pause_site(EGRESS, "example", true);
+        });
+        let outcomes = simple(&deliver, "example.com").await;
+        pauser.await;
+        (outcomes, seen.borrow().connections)
+    });
+    assert_eq!(answers(&outcomes), [Answer::Later(5000)]);
+    assert_eq!(reply(&outcomes[0]), "451 4.4.5 Connection limit reached");
+    assert_eq!(connections, 0);
+}
+
+#[test]
 fn a_connect_rate_holds_the_next_address_after_a_refused_connect() {
     let (outcomes, connections) = run(async {
         let seen = serve(MX2, Script::new(&[]));
