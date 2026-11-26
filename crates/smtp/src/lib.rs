@@ -3,6 +3,7 @@ mod body;
 pub mod client;
 mod command;
 pub mod reply;
+pub mod report;
 mod server;
 
 pub use body::{Decoder, Fault, TEXT_LINE};
