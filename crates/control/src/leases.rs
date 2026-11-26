@@ -1,5 +1,6 @@
 use std::cell::{Cell, OnceCell, RefCell};
 use std::collections::{BTreeMap, VecDeque};
+use std::net::IpAddr;
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -162,6 +163,11 @@ pub enum Ask<K> {
         key: K,
         slots: u64,
     },
+    Dead {
+        egress: IpAddr,
+        remote: IpAddr,
+        until: Instant,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -294,6 +300,7 @@ impl Gcra {
 const SCALE: u64 = 1024;
 const STALE: Duration = Duration::from_mins(10);
 const OWNED_MOST: usize = 100_000;
+const DEAD_MOST: usize = 10_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SiteState {
@@ -486,6 +493,8 @@ struct Inner<K> {
     closed: Cell<bool>,
     tick: Notify,
     cores: u16,
+    core: u16,
+    dead: RefCell<BTreeMap<(IpAddr, IpAddr), Instant>>,
     opened: Cell<u16>,
     opening: Notify,
 }
@@ -518,6 +527,8 @@ impl<K: Ord + Clone + Send + 'static> Leases<K> {
             closed: Cell::new(false),
             tick: Notify::default(),
             cores: ends.cores(),
+            core: ends.index(),
+            dead: RefCell::new(BTreeMap::new()),
             opened: Cell::new(0),
             opening: Notify::default(),
         });
@@ -625,6 +636,52 @@ impl<K: Ord + Clone + Send + 'static> Leases<K> {
             }
         }
         (tracked, dead)
+    }
+
+    pub fn is_dead(&self, egress: IpAddr, remote: IpAddr) -> bool {
+        let now = rt::now();
+        let mut dead = self.inner.dead.borrow_mut();
+        match dead.get(&(egress, remote)) {
+            Some(until) if *until > now => true,
+            Some(_) => {
+                dead.remove(&(egress, remote));
+                false
+            }
+            None => false,
+        }
+    }
+
+    pub fn mark_dead(&self, egress: IpAddr, remote: IpAddr, until: Instant) {
+        {
+            let now = rt::now();
+            let mut dead = self.inner.dead.borrow_mut();
+            if dead.get(&(egress, remote)).is_some_and(|at| *at > now) {
+                return;
+            }
+            if dead.len() >= DEAD_MOST {
+                dead.retain(|_, at| *at > now);
+            }
+            if dead.len() >= DEAD_MOST {
+                return;
+            }
+            dead.insert((egress, remote), until);
+        }
+        for core in 0..self.inner.cores {
+            if core != self.inner.core {
+                self.send(
+                    core,
+                    Ask::Dead {
+                        egress,
+                        remote,
+                        until,
+                    },
+                );
+            }
+        }
+    }
+
+    pub fn dead_hosts(&self) -> usize {
+        self.inner.dead.borrow().len()
     }
 
     async fn take_as(&self, key: &K, wait: Duration, slot: bool) -> Result<Taken, Error> {
@@ -871,6 +928,26 @@ impl<K: Ord + Clone + Send + 'static> Leases<K> {
             Ask::Blocked { key, on } => self.mark(key, on),
             Ask::Feedback { key, signal, used } => self.heard(from, &key, signal, used),
             Ask::Shed { key, slots } => self.shed(key, slots),
+            Ask::Dead {
+                egress,
+                remote,
+                until,
+            } => self.heard_dead(egress, remote, until),
+        }
+    }
+
+    fn heard_dead(&self, egress: IpAddr, remote: IpAddr, until: Instant) {
+        let now = rt::now();
+        let mut dead = self.inner.dead.borrow_mut();
+        if let Some(at) = dead.get_mut(&(egress, remote)) {
+            *at = (*at).max(until);
+        } else {
+            if dead.len() >= DEAD_MOST {
+                dead.retain(|_, at| *at > now);
+            }
+            if dead.len() < DEAD_MOST {
+                dead.insert((egress, remote), until);
+            }
         }
     }
 

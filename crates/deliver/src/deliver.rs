@@ -233,7 +233,10 @@ impl<D: Dns, L: Local> Deliver<D, L> {
     }
 
     pub fn dead_hosts(&self) -> usize {
-        self.dead.borrow().len()
+        match &self.leases {
+            Some(leases) => leases.dead_hosts(),
+            None => self.dead.borrow().len(),
+        }
     }
 
     pub fn policies(&self) -> usize {
@@ -870,11 +873,15 @@ impl<D: Dns, L: Local> Deliver<D, L> {
             self.feedback(remote, Signal::Throttle);
             self.pool.close(key.egress, &key.site).await;
         } else {
+            self.mark_dead(key.egress, key.remote);
             self.feedback(remote, Signal::Failure);
         }
     }
 
     fn is_dead(&self, egress: IpAddr, remote: IpAddr) -> bool {
+        if let Some(leases) = &self.leases {
+            return leases.is_dead(egress, remote);
+        }
         let mut dead = self.dead.borrow_mut();
         match dead.get(&(egress, remote)) {
             Some(until) if *until > now() => true,
@@ -887,6 +894,10 @@ impl<D: Dns, L: Local> Deliver<D, L> {
     }
 
     fn mark_dead(&self, egress: IpAddr, remote: IpAddr) {
+        if let Some(leases) = &self.leases {
+            leases.mark_dead(egress, remote, now() + self.settings.dead);
+            return;
+        }
         let now = now();
         let mut dead = self.dead.borrow_mut();
         if dead.len() >= DEAD_MOST {

@@ -1,4 +1,5 @@
 use std::cell::RefCell;
+use std::net::{IpAddr, Ipv4Addr};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
@@ -663,6 +664,70 @@ fn blocked(seed: u64) {
 #[test]
 fn a_blocked_key_refuses_takes_on_every_core_until_unblocked() {
     check(0..8, blocked);
+}
+
+#[test]
+fn a_dead_host_is_seen_on_every_core_until_it_expires() {
+    let node = Node::start(6);
+    let leases = node.leases.clone();
+    let egress = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+    let remote = IpAddr::V4(Ipv4Addr::new(10, 0, 1, 1));
+    node.machine.block_on(0, async move {
+        leases[0].mark_dead(egress, remote, rt::now() + Duration::from_secs(60));
+        sleep(Duration::from_millis(50)).await;
+        for lease in &leases {
+            assert!(lease.is_dead(egress, remote));
+            assert_eq!(lease.dead_hosts(), 1);
+        }
+        leases[0].mark_dead(egress, remote, rt::now() + Duration::from_mins(100));
+        sleep(Duration::from_millis(50)).await;
+        for lease in &leases {
+            assert!(lease.is_dead(egress, remote));
+        }
+        sleep(Duration::from_secs(61)).await;
+        for lease in &leases {
+            assert!(
+                !lease.is_dead(egress, remote),
+                "a repeat mark was not sent, so the first until holds"
+            );
+            assert_eq!(lease.dead_hosts(), 0);
+        }
+        leases[2].mark_dead(egress, remote, rt::now() + Duration::from_secs(60));
+        sleep(Duration::from_millis(50)).await;
+        for lease in &leases {
+            assert!(lease.is_dead(egress, remote));
+        }
+    });
+    node.stop();
+}
+
+#[test]
+fn dead_marks_stop_at_the_cap() {
+    let node = Node::start(7);
+    let leases = node.leases.clone();
+    node.machine.block_on(0, async move {
+        let egress = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+        let until = rt::now() + Duration::from_secs(3_600);
+        for n in 0..10_000_u32 {
+            let remote = IpAddr::V4(Ipv4Addr::new(
+                10,
+                1,
+                u8::try_from(n / 256).expect("octet"),
+                u8::try_from(n % 256).expect("octet"),
+            ));
+            leases[0].mark_dead(egress, remote, until);
+        }
+        let extra = IpAddr::V4(Ipv4Addr::new(10, 9, 9, 9));
+        leases[0].mark_dead(egress, extra, until);
+        assert_eq!(leases[0].dead_hosts(), 10_000);
+        assert!(!leases[0].is_dead(egress, extra));
+        sleep(Duration::from_millis(100)).await;
+        for lease in &leases[1..] {
+            assert_eq!(lease.dead_hosts(), 10_000);
+            assert!(!lease.is_dead(egress, extra));
+        }
+    });
+    node.stop();
 }
 
 fn with_single<T: 'static>(test: impl AsyncFnOnce(Leases<u32>) -> T + 'static) -> T {
