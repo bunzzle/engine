@@ -64,6 +64,7 @@ catalog! {
     PooledConnections: Gauge, "pooled_connections", "Open outbound connections kept in the pool";
     PathsDown: Gauge, "paths_down", "Source and remote address pairs marked down";
     WindowCuts: Counter, "window_cuts", "Connection windows cut after throttle signals";
+    WarmupSkips: Counter, "warmup_skips", "Egress addresses skipped at their warm-up daily cap";
     SitesDead: Gauge, "sites_dead", "Sites with a dead connection window";
     SitesTracked: Gauge, "sites_tracked", "Connection windows tracked for sites";
     TicksLate: Counter, "ticks_late", "Scheduler ticks that ran late";
@@ -187,6 +188,7 @@ impl<T: Transport + 'static> Sources<'_, T> {
         set(Id::PooledConnections, transport.pooled);
         set(Id::PathsDown, transport.dead_hosts);
         set(Id::WindowCuts, transport.window_cuts);
+        set(Id::WarmupSkips, transport.warmup_skips);
         set(Id::SitesDead, transport.sites_dead);
         set(Id::SitesTracked, transport.sites_tracked);
         let smtp = self.smtp;

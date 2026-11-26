@@ -6,7 +6,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
-use control::{KIND_RPT, KIND_STS, Leases, Signal};
+use control::{KIND_RPT, KIND_STS, Leases, Rate, Signal};
 use dns::{Found, Name, Record, Type};
 use rt::{Ends, Instant, JoinHandle, now, timeout, wall_ms};
 use sched::{
@@ -41,6 +41,7 @@ const DEAD_MOST: usize = 10_000;
 const TEMPORARY: Answer = Answer::Deferred(Kind::Temporary);
 
 const NO_EGRESS: &[u8] = b"451 4.3.0 No egress address";
+const WARMING: &[u8] = b"451 4.4.5 Egress warm-up cap reached";
 const BAD_DOMAIN: &[u8] = b"550 5.1.2 Recipient domain is not valid";
 const NO_DOMAIN: &[u8] = b"550 5.1.2 Recipient domain does not exist";
 const NULL_MX: &[u8] = b"556 5.1.10 Recipient domain does not accept mail";
@@ -94,10 +95,12 @@ pub struct Deliver<D, L = Bind> {
     own: Own<L>,
     last: Cell<Option<IpAddr>>,
     dead: RefCell<BTreeMap<(IpAddr, IpAddr), Instant>>,
+    capped: RefCell<BTreeMap<IpAddr, Instant>>,
     ehlo: Vec<u8>,
     helo: Vec<u8>,
     random: Cell<u64>,
     turn: Cell<u64>,
+    warmup_skips: Cell<u64>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -182,6 +185,7 @@ enum Kept {
 enum Tried {
     Next(Vec<u8>),
     Busy,
+    Warming,
     Done(Vec<Outcome>),
 }
 
@@ -221,10 +225,12 @@ impl<D: Dns, L: Local> Deliver<D, L> {
             own: Own::new(local),
             last: Cell::new(None),
             dead: RefCell::new(BTreeMap::new()),
+            capped: RefCell::new(BTreeMap::new()),
             ehlo,
             helo,
             random: Cell::new(seed | 1),
             turn: Cell::new(0),
+            warmup_skips: Cell::new(0),
         })
     }
 
@@ -349,10 +355,9 @@ impl<D: Dns, L: Local> Deliver<D, L> {
         let end = now() + deadline;
         let recipients = message.recipients;
         let every = |answer, reply: &[u8]| all(recipients, answer, reply);
-        let pooled = self.pool.egress(&destination.domain, &destination.egress);
-        let egress = pooled.or_else(|| self.egress(&destination.egress));
-        let Some(egress) = egress else {
-            return every(TEMPORARY, NO_EGRESS);
+        let egress = match self.egress(recipients, destination) {
+            Ok(egress) => egress,
+            Err(outcomes) => return outcomes,
         };
         self.last.set(Some(egress));
         let envelope = message.envelope;
@@ -432,6 +437,7 @@ impl<D: Dns, L: Local> Deliver<D, L> {
                 {
                     Tried::Done(outcomes) => return outcomes,
                     Tried::Busy => return every(Answer::Later(self.wait()), BUSY),
+                    Tried::Warming => return every(Answer::Later(self.wait()), WARMING),
                     Tried::Next(reply) => {
                         others |= reply != REQUIRETLS;
                         last = reply;
@@ -669,6 +675,27 @@ impl<D: Dns, L: Local> Deliver<D, L> {
         }
     }
 
+    async fn allowed(
+        &self,
+        end: Instant,
+        key: &Key,
+        rule: Option<&Site>,
+        link: Link,
+    ) -> Result<Link, Tried> {
+        let Ok(token) = self.warm_token(end, key.egress).await else {
+            self.pool.park(key.clone(), link).await;
+            return Err(Tried::Warming);
+        };
+        if !self.held(end, key, rule).await {
+            return Ok(link);
+        }
+        if let (Some(leases), Some(taken)) = (&self.leases, token) {
+            leases.give_back(&Remote::Egress(key.egress), taken);
+        }
+        self.pool.park(key.clone(), link).await;
+        Err(Tried::Busy)
+    }
+
     async fn session(
         &self,
         end: Instant,
@@ -678,7 +705,7 @@ impl<D: Dns, L: Local> Deliver<D, L> {
         slot: &mut Option<Slot>,
         message: &mut Message<'_>,
     ) -> Tried {
-        let mut link = match self.reuse(key, end).await {
+        let link = match self.reuse(key, end).await {
             Some(link) => {
                 drop(slot.take());
                 link
@@ -716,10 +743,10 @@ impl<D: Dns, L: Local> Deliver<D, L> {
                 return Tried::Done(all(message.recipients, Answer::Failed, text));
             }
         };
-        if self.held(end, key, rule).await {
-            self.pool.park(key.clone(), link).await;
-            return Tried::Busy;
-        }
+        let mut link = match self.allowed(end, key, rule, link).await {
+            Ok(link) => link,
+            Err(tried) => return tried,
+        };
         let run = self
             .transact(&mut link.conn, &mut transaction, message)
             .await;
@@ -1003,22 +1030,99 @@ impl<D: Dns, L: Local> Deliver<D, L> {
         }
     }
 
-    fn egress(&self, egress: &[(IpAddr, u16)]) -> Option<IpAddr> {
+    fn egress(
+        &self,
+        recipients: &[(u32, Recipient)],
+        destination: &Destination,
+    ) -> Result<IpAddr, Vec<Outcome>> {
+        let every = |answer, reply: &[u8]| all(recipients, answer, reply);
+        let pooled = self.pool.egress(&destination.domain, &destination.egress);
+        let candidates = self.candidates(pooled, &destination.egress);
+        if candidates.is_empty() {
+            return Err(every(TEMPORARY, NO_EGRESS));
+        }
+        let mut capped = 0;
+        for candidate in candidates {
+            if self.is_capped(candidate) {
+                capped += 1;
+                continue;
+            }
+            return Ok(candidate);
+        }
+        self.warmup_skips.set(self.warmup_skips.get() + capped);
+        Err(every(Answer::Later(self.wait()), WARMING))
+    }
+
+    fn is_capped(&self, ip: IpAddr) -> bool {
+        let mut capped = self.capped.borrow_mut();
+        match capped.get(&ip) {
+            Some(until) if *until > now() => true,
+            Some(_) => {
+                capped.remove(&ip);
+                false
+            }
+            None => false,
+        }
+    }
+
+    async fn warm_token(&self, end: Instant, ip: IpAddr) -> Result<Option<control::Taken>, ()> {
+        let Some(warmup) = self
+            .settings
+            .warmups
+            .iter()
+            .find(|warmup| warmup.egress == ip)
+        else {
+            return Ok(None);
+        };
+        let Some(leases) = &self.leases else {
+            return Ok(None);
+        };
+        let taken = leases
+            .take_token_within(&Remote::Egress(ip), left(end, self.settings.wait))
+            .await;
+        match taken {
+            Ok(taken) => Ok(Some(taken)),
+            Err(control::Error::Invalid(_)) => Ok(None),
+            Err(_) => {
+                let period = warmup
+                    .cap(wall_ms() / 86_400_000)
+                    .and_then(|cap| Rate::per(cap, Duration::from_hours(24)).period())
+                    .unwrap_or(Duration::from_mins(1));
+                self.capped.borrow_mut().insert(ip, now() + period);
+                self.warmup_skips.set(self.warmup_skips.get() + 1);
+                Err(())
+            }
+        }
+    }
+
+    fn candidates(&self, pooled: Option<IpAddr>, egress: &[(IpAddr, u16)]) -> Vec<IpAddr> {
+        let mut out = Vec::new();
+        if let Some(ip) = pooled {
+            out.push(ip);
+        }
         let total: u64 = egress.iter().map(|(_, weight)| u64::from(*weight)).sum();
         if total == 0 {
-            return None;
+            return out;
         }
         let turn = self.turn.get();
         self.turn.set(turn.wrapping_add(1));
         let mut at = turn % total;
-        egress.iter().find_map(|(ip, weight)| {
+        let mut start = 0;
+        for (index, (_, weight)) in egress.iter().enumerate() {
             let weight = u64::from(*weight);
             if at < weight {
-                return Some(*ip);
+                start = index;
+                break;
             }
             at -= weight;
-            None
-        })
+        }
+        for offset in 0..egress.len() {
+            let (ip, weight) = &egress[(start + offset) % egress.len()];
+            if *weight > 0 && !out.contains(ip) {
+                out.push(*ip);
+            }
+        }
+        out
     }
 
     fn pick(&self, n: usize) -> usize {
@@ -1099,6 +1203,7 @@ impl<D: Dns, L: Local> Transport for Deliver<D, L> {
             pooled: wide(self.pooled()),
             dead_hosts: wide(self.dead_hosts()),
             window_cuts: leases.map_or(0, |l| l.stats().cuts),
+            warmup_skips: self.warmup_skips.get(),
             sites_dead: dead,
             sites_tracked: tracked,
         }

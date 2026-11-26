@@ -124,6 +124,7 @@ pub struct Seen {
     pub connections: u32,
     pub commands: Vec<String>,
     pub bodies: Vec<Vec<u8>>,
+    pub sources: Vec<IpAddr>,
     pub tls: bool,
 }
 
@@ -167,8 +168,11 @@ pub fn serve(ip: IpAddr, script: Script) -> Rc<RefCell<Seen>> {
         let listener = TcpListener::bind(SocketAddr::new(ip, 25), 16)
             .await
             .expect("bind");
-        while let Ok((io, _)) = listener.accept().await {
-            shared.borrow_mut().connections += 1;
+        while let Ok((io, peer)) = listener.accept().await {
+            let mut seen = shared.borrow_mut();
+            seen.connections += 1;
+            seen.sources.push(peer.ip());
+            drop(seen);
             drop(spawn(session(
                 io,
                 script.clone(),

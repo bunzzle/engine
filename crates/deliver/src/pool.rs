@@ -10,22 +10,25 @@ use rt::{Ends, JoinHandle, sleep, spawn};
 use smtp::client::Capabilities;
 
 use crate::conn::Conn;
-use crate::settings::Site;
+use crate::settings::{Site, Warmup};
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Remote {
     Site(IpAddr, Box<str>),
     Send(IpAddr, Box<str>),
+    Egress(IpAddr),
 }
 
 pub fn limits(
     ends: Ends<Ask<Remote>>,
     connections: u32,
     sites: &[Site],
+    warmups: &[Warmup],
     key: [u8; 16],
 ) -> (Leases<Remote>, JoinHandle<()>) {
     let cores = ends.cores();
     let rules: Vec<Site> = sites.to_vec();
+    let warmups: Vec<Warmup> = warmups.to_vec();
     Leases::start(
         ends,
         move |remote| owner(&key, remote, cores),
@@ -50,14 +53,25 @@ pub fn limits(
                     window: None,
                 })
             }
+            Remote::Egress(ip) => {
+                let warmup = warmups.iter().find(|warmup| warmup.egress == *ip)?;
+                let cap = warmup.cap(rt::wall_ms() / 86_400_000)?;
+                Some(Quota {
+                    rate: Rate::per(cap, Duration::from_hours(24)),
+                    burst: (cap / 24).max(1),
+                    queued: 0,
+                    window: None,
+                })
+            }
         },
     )
 }
 
 fn owner(key: &[u8; 16], remote: &Remote, cores: u16) -> u16 {
     let (tag, ip, site) = match remote {
-        Remote::Site(ip, site) => (0u8, ip, site),
-        Remote::Send(ip, site) => (1u8, ip, site),
+        Remote::Site(ip, site) => (0u8, ip, &**site),
+        Remote::Send(ip, site) => (1u8, ip, &**site),
+        Remote::Egress(ip) => (2u8, ip, ""),
     };
     let mut data = vec![tag];
     match ip {

@@ -450,6 +450,84 @@ fn deliver_site_rules_are_checked() {
 }
 
 #[test]
+fn deliver_warmup_schedules_are_read() {
+    let text = format!(
+        "{MINIMAL}[deliver]\n[[deliver.warmup]]\negress = \"192.0.2.10\"\nfrom = \"2026-11-26\"\ncaps = [100, 200, 400]\n[[deliver.warmup]]\negress = \"2001:db8::7\"\nfrom = \"1970-01-01\"\n"
+    );
+    let config = parse(&text).expect("config");
+    assert_eq!(
+        config.delivery.settings.warmups,
+        [
+            deliver::Warmup {
+                egress: "192.0.2.10".parse().expect("ip"),
+                from: 20_783,
+                caps: vec![100, 200, 400],
+            },
+            deliver::Warmup {
+                egress: "2001:db8::7".parse().expect("ip"),
+                from: 0,
+                caps: deliver::default_caps(),
+            },
+        ]
+    );
+}
+
+#[test]
+fn deliver_warmup_rules_are_checked() {
+    let base = format!("{MINIMAL}[deliver]\n");
+    let cases = [
+        (
+            "[[deliver.warmup]]\negress = \"mx.example\"\nfrom = \"2026-01-01\"\n",
+            "`egress` must be an IP address",
+        ),
+        (
+            "[[deliver.warmup]]\negress = \"ff02::1\"\nfrom = \"2026-01-01\"\n",
+            "`egress` must be a unicast address",
+        ),
+        (
+            "[[deliver.warmup]]\negress = \"192.0.2.1\"\nfrom = \"2026-01-01\"\n[[deliver.warmup]]\negress = \"192.0.2.1\"\nfrom = \"2026-02-01\"\n",
+            "`egress` is listed twice",
+        ),
+        (
+            "[[deliver.warmup]]\negress = \"192.0.2.1\"\nfrom = \"2026-02-30\"\n",
+            "`from` must be a date like 2026-01-31",
+        ),
+        (
+            "[[deliver.warmup]]\negress = \"192.0.2.1\"\nfrom = \"2026-1-5\"\n",
+            "`from` must be a date like 2026-01-31",
+        ),
+        (
+            "[[deliver.warmup]]\negress = \"192.0.2.1\"\nfrom = \"1969-12-31\"\n",
+            "`from` must be a date like 2026-01-31",
+        ),
+        (
+            "[[deliver.warmup]]\negress = \"192.0.2.1\"\nfrom = 20260131\n",
+            "`from`",
+        ),
+        (
+            "[[deliver.warmup]]\negress = \"192.0.2.1\"\nfrom = \"2026-01-01\"\ncaps = []\n",
+            "`caps` must list 1 to 365 daily caps",
+        ),
+        (
+            "[[deliver.warmup]]\negress = \"192.0.2.1\"\nfrom = \"2026-01-01\"\ncaps = [0]\n",
+            "`caps` must be between 1 and 1000000000",
+        ),
+        (
+            "[[deliver.warmup]]\negress = \"192.0.2.1\"\nfrom = \"2026-01-01\"\ncaps = [1000000001]\n",
+            "`caps` must be between 1 and 1000000000",
+        ),
+        (
+            "[[deliver.warmup]]\negress = \"192.0.2.1\"\nfrom = \"2026-01-01\"\nextra = 1\n",
+            "`extra` is not a known setting",
+        ),
+    ];
+    for (section, want) in cases {
+        let text = error(&format!("{base}{section}"));
+        assert!(text.contains(want), "{section}: {text}");
+    }
+}
+
+#[test]
 fn mistakes_are_refused_with_their_place() {
     assert_eq!(
         error(&MINIMAL.replace("id = 7", "id = 7\nport = 25")),
