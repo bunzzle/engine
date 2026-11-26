@@ -273,3 +273,41 @@ fn no_prefix_panics() {
         }
     }
 }
+
+fn expected() -> Report {
+    Report::Bounces(vec![bounce(
+        (5, 1, 1),
+        Some("gone@example.org"),
+        Some("gone@example.org"),
+        "550 5.1.1 user unknown",
+    )])
+}
+
+#[test]
+fn long_folded_header_is_skipped() {
+    let mut m = b"X-Long: ".to_vec();
+    for _ in 0..200 {
+        m.extend_from_slice(b"abcdefghijklmnopqrstuvwxyz\r\n\t");
+    }
+    m.extend_from_slice(b"end\r\n");
+    m.extend_from_slice(&dsn_crlf());
+    assert_eq!(parse(&m), expected());
+}
+
+#[test]
+fn over_cap_field_is_skipped() {
+    let mut m = b"X-Huge: ".to_vec();
+    m.extend(std::iter::repeat_n(b'a', 70_000));
+    m.extend_from_slice(b"\r\n");
+    m.extend_from_slice(&dsn_crlf());
+    assert_eq!(parse(&m), expected());
+}
+
+#[test]
+fn boundary_with_trailing_space() {
+    let text = String::from_utf8(dsn_crlf()).expect("ascii");
+    let padded = text
+        .replace("--mx-42\r\n", "--mx-42 \t\r\n")
+        .replace("--mx-42--\r\n", "--mx-42-- \r\n");
+    assert_eq!(parse(padded.as_bytes()), expected());
+}

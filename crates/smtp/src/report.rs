@@ -13,7 +13,7 @@ pub struct Bounce {
     pub diagnostic: String,
 }
 
-const MAX_FIELD: usize = 998;
+const MAX_FIELD: usize = 65_536;
 const MAX_BLOCKS: usize = 1000;
 const MAX_DIAG: usize = 1024;
 
@@ -90,7 +90,8 @@ fn parse_fields(data: &[u8]) -> Option<Vec<(String, String)>> {
             return Some(());
         }
         if cur.len() > MAX_FIELD {
-            return None;
+            cur.clear();
+            return Some(());
         }
         let text = String::from_utf8_lossy(cur);
         if let Some((name, value)) = text.split_once(':') {
@@ -181,6 +182,7 @@ fn split_parts<'a>(body: &'a [u8], boundary: &str) -> Vec<&'a [u8]> {
         let Ok(text) = std::str::from_utf8(line) else {
             return;
         };
+        let text = text.trim_end_matches([' ', '\t']);
         if text == delim || text == close {
             if let Some(s) = start.take() {
                 parts.push(&body[s..at]);
