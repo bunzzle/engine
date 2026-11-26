@@ -514,6 +514,7 @@ impl Update {
                 body[4] = h.state.code();
                 body[5] = h.events;
                 body[6] = h.version;
+                body[7] = u8::from(h.events == OLD_ALL_EVENTS);
                 body[12..16].copy_from_slice(&h.tenant.to_le_bytes());
                 body[16..24].copy_from_slice(&h.previous_until.to_le_bytes());
                 out.extend_from_slice(&body);
@@ -710,18 +711,20 @@ fn domain(id: u32, rest: &[u8], secret: &[u8]) -> Option<Domain> {
 }
 
 fn hook(id: u32, rest: &[u8], secret: &[u8]) -> Option<Hook> {
-    if rest.len() != HOOK || rest[7..12] != [0; 5] {
+    if rest.len() != HOOK || rest[8..12] != [0; 4] {
         return None;
     }
+    let events = match (rest[7], rest[5]) {
+        (0, OLD_ALL_EVENTS) => ALL_EVENTS,
+        (0, events) | (1, events @ OLD_ALL_EVENTS) => events,
+        _ => return None,
+    };
     Some(Hook {
         id,
         tenant: u32_at(rest, 12)?,
         generation: u32_at(rest, 0)?,
         state: HookState::from_code(rest[4])?,
-        events: match rest[5] {
-            OLD_ALL_EVENTS => ALL_EVENTS,
-            events => events,
-        },
+        events,
         version: rest[6],
         previous_until: u64::from_le_bytes(rest[16..24].try_into().ok()?),
         url: str::from_utf8(secret).ok()?.into(),

@@ -201,7 +201,7 @@ fn kinds(value: &[u8]) -> Result<Vec<EventKind>, Problem> {
             .find(|k| event_kind_name(*k).as_bytes() == part)
             .ok_or_else(|| {
                 Problem::bad_request(
-                    "`type` takes delivered, deferred, failed, expired, canceled or suppressed",
+                    "`type` takes delivered, deferred, failed, expired, canceled, suppressed, bounced or complained",
                 )
             })?;
         if !out.contains(&kind) {

@@ -156,7 +156,31 @@ fn hook_masks_cover_report_kinds_and_old_all_grows() {
         };
         found
     };
-    assert_eq!(seal(0x3f).events, ALL_EVENTS);
+    assert_eq!(seal(0x3f).events, 0x3f);
+    let old = Update {
+        version: 1,
+        object: Object::Hook(Hook {
+            events: 0x3f,
+            ..hook(3, 4)
+        }),
+    };
+    let mut clear = old.encode();
+    let marker = clear.len() - 40 + 16 + 7;
+    assert_eq!(clear[marker], 1);
+    clear[marker] = 0;
+    let Some(Update {
+        object: Object::Hook(upgraded),
+        ..
+    }) = Update::decode_sealed(&clear, &old.secret())
+    else {
+        panic!("old hook decodes");
+    };
+    assert_eq!(upgraded.events, ALL_EVENTS);
+    clear[marker] = 2;
+    assert_eq!(Update::decode_sealed(&clear, &old.secret()), None);
+    clear[marker] = 1;
+    clear[marker - 2] = 0x07;
+    assert_eq!(Update::decode_sealed(&clear, &old.secret()), None);
     assert_eq!(seal(0b1100_0001).events, 0b1100_0001);
     let complaints = seal(0b1000_0000);
     assert!(complaints.wants(7));

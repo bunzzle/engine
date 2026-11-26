@@ -362,3 +362,28 @@ fn refusal(error: &sched::Error) -> Problem {
         _ => Problem::unavailable(),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use sched::{EventKind, event_kind_name};
+
+    use super::EVENTS;
+
+    #[test]
+    fn hook_bits_follow_the_event_kind_order() {
+        let kinds = [
+            EventKind::Delivered,
+            EventKind::Deferred,
+            EventKind::Failed,
+            EventKind::Expired,
+            EventKind::Canceled,
+            EventKind::Suppressed,
+            EventKind::Bounced,
+            EventKind::Complained,
+        ];
+        assert_eq!(kinds.len(), EVENTS.len());
+        for kind in kinds {
+            assert_eq!(EVENTS[kind as usize], event_kind_name(kind));
+        }
+    }
+}
