@@ -75,13 +75,6 @@ fn hook_records_round_trip_sealed_and_are_checked() {
         ),
         (
             Hook {
-                events: 0x40,
-                ..good.clone()
-            },
-            "events",
-        ),
-        (
-            Hook {
                 version: 0,
                 ..good.clone()
             },
@@ -141,4 +134,32 @@ fn hook_urls_are_https_with_a_host_name() {
     ] {
         assert!(!hook_url_ok(url), "{url}");
     }
+}
+
+#[test]
+fn hook_masks_cover_report_kinds_and_old_all_grows() {
+    let seal = |events| {
+        let update = Update {
+            version: 1,
+            object: Object::Hook(Hook {
+                events,
+                ..hook(3, 4)
+            }),
+        };
+        let clear = update.encode();
+        let Some(Update {
+            object: Object::Hook(found),
+            ..
+        }) = Update::decode_sealed(&clear, &update.secret())
+        else {
+            panic!("hook decodes");
+        };
+        found
+    };
+    assert_eq!(seal(0x3f).events, ALL_EVENTS);
+    assert_eq!(seal(0b1100_0001).events, 0b1100_0001);
+    let complaints = seal(0b1000_0000);
+    assert!(complaints.wants(7));
+    assert!(!complaints.wants(6));
+    assert!(!complaints.wants(0));
 }

@@ -19,6 +19,8 @@ pub enum Kind {
     Expired,
     Canceled,
     Suppressed,
+    Bounced,
+    Complained,
 }
 
 impl Kind {
@@ -39,6 +41,8 @@ impl Kind {
             Self::Expired => 4,
             Self::Canceled => 5,
             Self::Suppressed => 6,
+            Self::Bounced => 7,
+            Self::Complained => 8,
         }
     }
 
@@ -50,6 +54,8 @@ impl Kind {
             4 => Self::Expired,
             5 => Self::Canceled,
             6 => Self::Suppressed,
+            7 => Self::Bounced,
+            8 => Self::Complained,
             _ => return None,
         })
     }
@@ -246,5 +252,30 @@ mod tests {
         assert_eq!(record.entry.payload, payload);
         record.entry.value.pop();
         assert!(!add_lost(&mut record, 1));
+    }
+
+    #[test]
+    fn report_kinds_have_fixed_codes_and_names() {
+        for (kind, code, name) in [
+            (Kind::Bounced, 7, "bounced"),
+            (Kind::Complained, 8, "complained"),
+        ] {
+            assert_eq!(kind.code(), code);
+            assert_eq!(Kind::from_code(code), Some(kind));
+            assert_eq!(crate::json::kind_name(kind), name);
+            let event = Event {
+                generation: 1,
+                time: 2,
+                kind,
+                lost: 0,
+                message: MessageId::from_bytes([1; 16]),
+                recipient: 3,
+                stamp: Stamp { boot: 1, write: 1 },
+                batch: 4,
+                day: 5,
+            };
+            assert_eq!(Event::decode(&event.encode()), Some(event));
+        }
+        assert_eq!(Kind::from_code(9), None);
     }
 }

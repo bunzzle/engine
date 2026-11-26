@@ -23,13 +23,15 @@ const NAMES: [&str; 8] = [
     "limit",
     "after",
 ];
-const KINDS: [EventKind; 6] = [
+const KINDS: [EventKind; 8] = [
     EventKind::Delivered,
     EventKind::Deferred,
     EventKind::Failed,
     EventKind::Expired,
     EventKind::Canceled,
     EventKind::Suppressed,
+    EventKind::Bounced,
+    EventKind::Complained,
 ];
 
 pub(crate) async fn read<T: Transport + 'static>(

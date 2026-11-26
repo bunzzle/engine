@@ -12,13 +12,15 @@ use crate::server::Stop;
 
 const MAX_BODY: u64 = 8 * 1024;
 const TAG: [u8; 2] = *b"wh";
-const EVENTS: [&str; 6] = [
+const EVENTS: [&str; 8] = [
     "delivered",
     "deferred",
     "failed",
     "expired",
     "canceled",
     "suppressed",
+    "bounced",
+    "complained",
 ];
 
 enum Path<'a> {

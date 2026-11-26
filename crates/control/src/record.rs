@@ -25,7 +25,8 @@ pub const MAX_SELECTOR: usize = 63;
 pub const MAX_PUBLIC: usize = 1024;
 pub const MAX_BLOB: usize = 3072;
 pub const MAX_URL: usize = 2048;
-pub const ALL_EVENTS: u8 = 0x3f;
+pub const ALL_EVENTS: u8 = 0xff;
+const OLD_ALL_EVENTS: u8 = 0x3f;
 
 const FORMAT: u8 = 1;
 const HEAD: usize = 16;
@@ -421,7 +422,7 @@ impl Object {
                 if h.tenant == SYSTEM {
                     return Err(Error::Invalid("tenant id"));
                 }
-                if h.events == 0 || h.events & !ALL_EVENTS != 0 {
+                if h.events == 0 {
                     return Err(Error::Invalid("events"));
                 }
                 if h.version == 0 || (h.previous_until != 0 && h.version == 1) {
@@ -717,7 +718,10 @@ fn hook(id: u32, rest: &[u8], secret: &[u8]) -> Option<Hook> {
         tenant: u32_at(rest, 12)?,
         generation: u32_at(rest, 0)?,
         state: HookState::from_code(rest[4])?,
-        events: rest[5],
+        events: match rest[5] {
+            OLD_ALL_EVENTS => ALL_EVENTS,
+            events => events,
+        },
         version: rest[6],
         previous_until: u64::from_le_bytes(rest[16..24].try_into().ok()?),
         url: str::from_utf8(secret).ok()?.into(),

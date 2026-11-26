@@ -18,12 +18,8 @@ pub struct HookChange {
     pub enabled: Option<bool>,
 }
 
-fn events(mask: u8) -> Result<u8, Error> {
-    match mask {
-        0 => Ok(ALL_EVENTS),
-        mask if mask & !ALL_EVENTS == 0 => Ok(mask),
-        _ => Err(control::Error::Invalid("events").into()),
-    }
+fn events(mask: u8) -> u8 {
+    if mask == 0 { ALL_EVENTS } else { mask }
 }
 
 fn url(url: &str) -> Result<Box<str>, Error> {
@@ -37,7 +33,7 @@ fn url(url: &str) -> Result<Box<str>, Error> {
 impl<T: Transport + 'static> Node<T> {
     pub async fn hook_new(&self, tenant: u32, address: &str, mask: u8) -> Result<Hook, Error> {
         let address = url(address)?;
-        let mask = events(mask)?;
+        let mask = events(mask);
         let node = self.clone();
         rt::spawn(async move {
             let mut held = node.hold()?;
@@ -68,7 +64,7 @@ impl<T: Transport + 'static> Node<T> {
         change: HookChange,
     ) -> Result<Hook, Error> {
         let address = change.url.as_deref().map(url).transpose()?;
-        let mask = change.events.map(events).transpose()?;
+        let mask = change.events.map(events);
         let node = self.clone();
         rt::spawn(async move {
             let mut held = node.hold()?;
