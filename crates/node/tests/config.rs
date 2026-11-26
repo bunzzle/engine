@@ -391,6 +391,14 @@ fn deliver_site_limits_are_read() {
 }
 
 #[test]
+fn deliver_site_name_cannot_look_like_a_host() {
+    let text = format!(
+        "{MINIMAL}[deliver]\n[[deliver.site]]\nname = \"mx1.example.com\"\nsuffix = [\"google.com\"]\n"
+    );
+    assert!(error(&text).contains("must hold only letters, digits and `-`"));
+}
+
+#[test]
 fn deliver_site_burst_needs_a_rate() {
     let text = format!(
         "{MINIMAL}[deliver]\n[[deliver.site]]\nname = \"google\"\nsuffix = [\"google.com\"]\nburst = 20\n"

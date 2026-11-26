@@ -401,6 +401,9 @@ fn sites(table: &mut Table, sites: &mut Vec<deliver::Site>) -> Result<(), Error>
         if text.is_empty() || text.len() > 255 {
             return Err(name.error("must be between 1 and 255 bytes"));
         }
+        if !text.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') {
+            return Err(name.error("must hold only letters, digits and `-`"));
+        }
         if sites.iter().any(|site| site.name == text) {
             return Err(name.error("is listed twice"));
         }
