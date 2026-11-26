@@ -1,5 +1,6 @@
 use std::net::IpAddr;
 
+use control::SiteHealth;
 use spool::{MessageId, Stamp};
 
 use crate::events::Written;
@@ -49,6 +50,18 @@ pub struct OwnStats {
     pub ipv6_off: bool,
     pub unclear: u64,
     pub partly_refused: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SiteRow {
+    pub egress: IpAddr,
+    pub site: Box<str>,
+    pub window: u64,
+    pub limit: u64,
+    pub in_use: u64,
+    pub health: SiteHealth,
+    pub paused: bool,
+    pub rate: Option<u32>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -112,5 +125,14 @@ pub trait Transport {
 
     fn stats(&self) -> TransportStats {
         TransportStats::default()
+    }
+
+    fn sites(&self) -> Vec<SiteRow> {
+        Vec::new()
+    }
+
+    fn pause_site(&self, egress: IpAddr, site: &str, on: bool) -> bool {
+        let _ = (egress, site, on);
+        false
     }
 }

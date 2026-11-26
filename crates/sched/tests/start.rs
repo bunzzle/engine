@@ -8,8 +8,8 @@ use std::task::Poll;
 use std::time::Duration;
 
 use control::{
-    Created, KeyError, KeySource, Limits as TenantLimits, Name, Naming, Object, Pool, Ready, State,
-    Tenant,
+    Created, KeyError, KeySource, Limits as TenantLimits, Name, Naming, Object, Pool, Ready,
+    SiteHealth, State, Tenant,
 };
 use crypto::{BatchKey, Secret, Tenant as Root, TenantKeys, Wrap, day_public, open_batch};
 use keys::{BatchSettings, Batches, SearchKeys, Working};
@@ -17,8 +17,8 @@ use rt::sim::{Config, Disk, Faults, Machine, SimDriver, Stalls, check};
 use rt::{JoinHandle, Runtime, sleep, spawn, timeout};
 use sched::{
     Answer, Answered, Attempt, Batched, Bounced, Clock, Draft, Keys, Kind, Limits, Meshes, Node,
-    OwnStats, Parts, QueueDone, QueueRefusal, Reason, Refusal, Running, Settings, Transport,
-    Unsealable, Unwrapped,
+    OwnStats, Parts, QueueDone, QueueRefusal, Reason, Refusal, Running, SITE_PAGE, Settings,
+    SiteRow, Transport, Unsealable, Unwrapped,
 };
 use spool::{Body, Head, HeadClear, Message, MessageId, SLICE, Slice};
 use store::{Client, DataFile, Options, SLOT_SIZE, Setup, boot};
@@ -292,6 +292,34 @@ impl Transport for Simulated {
                 }
             })
             .collect()
+    }
+
+    fn sites(&self) -> Vec<SiteRow> {
+        (0..300_u32)
+            .map(|n| {
+                let n = n * 2 + u32::from(self.core);
+                SiteRow {
+                    egress: IpAddr::V4(Ipv4Addr::new(
+                        10,
+                        0,
+                        0,
+                        u8::try_from(self.core).expect("core") + 1,
+                    )),
+                    site: format!("site-{n:05}.example").into(),
+                    window: 5,
+                    limit: 400,
+                    in_use: u64::from(n % 7),
+                    health: SiteHealth::Normal,
+                    paused: n % 11 == 0,
+                    rate: (n % 3 == 0).then_some(1_000),
+                }
+            })
+            .collect()
+    }
+
+    fn pause_site(&self, egress: IpAddr, site: &str, on: bool) -> bool {
+        let _ = (egress, site, on);
+        true
     }
 }
 
@@ -1401,4 +1429,48 @@ async fn queue_admin(nodes: Vec<Node<Simulated>>, _shard: u16) {
 #[test]
 fn admin_queue_commands_stay_inside_the_tenant() {
     on_two_cores(6, queue_admin);
+}
+
+async fn site_admin(nodes: Vec<Node<Simulated>>, _shard: u16) {
+    let node = &nodes[0];
+    let page = node.site_list(None).await.expect("list");
+    assert_eq!(page.rows.len(), SITE_PAGE);
+    let keys: Vec<(Box<str>, IpAddr)> = page
+        .rows
+        .iter()
+        .map(|row| (row.site.clone(), row.egress))
+        .collect();
+    let mut sorted = keys.clone();
+    sorted.sort();
+    assert_eq!(keys, sorted, "rows from both cores merged in order");
+    let next = page.next.expect("600 rows over two cores page");
+    assert!(
+        next > keys[SITE_PAGE - 1],
+        "next is the first row not shown"
+    );
+    assert!(!keys.contains(&next));
+    assert!(node.site_pause(next.1, &next.0, true));
+    let rest = node.site_list(Some(next.clone())).await.expect("next page");
+    assert_eq!(rest.next, None);
+    assert_eq!(rest.rows.len(), 600 - SITE_PAGE);
+    assert!(
+        rest.rows
+            .iter()
+            .all(|row| (&row.site, row.egress) >= (&next.0, next.1))
+    );
+    let rest_keys: Vec<(Box<str>, IpAddr)> = rest
+        .rows
+        .iter()
+        .map(|row| (row.site.clone(), row.egress))
+        .collect();
+    let mut sorted = rest_keys.clone();
+    sorted.sort();
+    assert_eq!(rest_keys, sorted);
+    let all: BTreeSet<(Box<str>, IpAddr)> = keys.into_iter().chain(rest_keys).collect();
+    assert_eq!(all.len(), 600, "pages together hold every row once");
+}
+
+#[test]
+fn admin_site_list_merges_and_pages_rows_from_every_core() {
+    on_two_cores(7, site_admin);
 }

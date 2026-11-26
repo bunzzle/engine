@@ -5,7 +5,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use control::{
-    Ask, Error, Gcra, LIFETIME, Leases, Limits, Quota, Rate, Signal, Taken, Window, limit_core,
+    Ask, Error, Gcra, LIFETIME, Leases, Limits, Quota, Rate, Signal, SiteHealth, Taken, Window,
+    limit_core,
 };
 use rt::sim::{Config, Machine, SimDriver, Stalls, check};
 use rt::{Instant, JoinHandle, Mesh, Runtime, sleep, spawn};
@@ -1041,6 +1042,62 @@ fn a_cut_takes_back_slots_in_use_as_they_finish() {
             "only two slots after cutting five"
         );
         assert_eq!(leases.granted(&SITE), 2);
+    });
+}
+
+#[test]
+fn a_site_view_shows_after_feedback() {
+    with_single(async |leases: Leases<u32>| {
+        assert_eq!(leases.site_views(), []);
+        let held = leases.take(&SITE).await.expect("slot");
+        leases.feedback(&SITE, Signal::Success);
+        sleep(Duration::from_millis(50)).await;
+        let views = leases.site_views();
+        assert_eq!(views.len(), 1);
+        let view = &views[0];
+        assert_eq!(view.key, SITE);
+        assert_eq!(view.window, 5, "the initial window");
+        assert_eq!(view.limit, LIMIT);
+        assert_eq!(view.in_use, 1);
+        assert_eq!(view.health, SiteHealth::Normal);
+        assert!(!view.paused);
+        assert!(held.slot);
+    });
+}
+
+#[test]
+fn a_blocked_site_view_shows_paused_without_a_window() {
+    with_single(async |leases: Leases<u32>| {
+        assert_eq!(leases.site_views(), []);
+        leases.block(&SITE);
+        sleep(Duration::from_millis(50)).await;
+        let views = leases.site_views();
+        assert_eq!(views.len(), 1);
+        let view = &views[0];
+        assert_eq!(view.key, SITE);
+        assert_eq!(view.window, 0, "no window yet");
+        assert_eq!(view.limit, LIMIT);
+        assert_eq!(view.in_use, 0);
+        assert!(view.paused);
+        assert_eq!(view.health, SiteHealth::Normal);
+        leases.unblock(&SITE);
+        sleep(Duration::from_millis(50)).await;
+        assert!(leases.site_views().is_empty(), "unblocked and unwatched");
+    });
+}
+
+#[test]
+fn a_dead_site_view_shows_dead() {
+    with_single(async |leases: Leases<u32>| {
+        leases.take(&SITE).await.expect("slot");
+        for _ in 0..10 {
+            leases.feedback(&SITE, Signal::Failure);
+        }
+        sleep(Duration::from_millis(50)).await;
+        let views = leases.site_views();
+        assert_eq!(views.len(), 1);
+        assert_eq!(views[0].health, SiteHealth::Dead);
+        assert!(!views[0].paused, "a death is not a manual pause");
     });
 }
 

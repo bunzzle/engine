@@ -1,5 +1,6 @@
 use std::cell::{Cell, OnceCell, RefCell};
 use std::collections::BTreeMap;
+use std::net::IpAddr;
 use std::rc::{Rc, Weak};
 use std::time::Duration;
 
@@ -9,9 +10,10 @@ use rt::{Ends, JoinHandle, Peers, Sender, channel, spawn, timeout};
 use crate::lanes::{QueueId, Waiting};
 use crate::node::queue_core;
 use crate::start::{Inner, Node};
-use crate::transport::Transport;
+use crate::transport::{SiteRow, Transport};
 
 pub const QUEUE_PAGE: usize = 200;
+pub const SITE_PAGE: usize = 500;
 const ANSWER: Duration = Duration::from_secs(60);
 
 pub struct Desk(Message);
@@ -36,11 +38,16 @@ enum Request {
         queue: QueueId,
         pool: u32,
     },
+    Sites {
+        from: Option<(Box<str>, IpAddr)>,
+        limit: usize,
+    },
 }
 
 enum Answer {
     Listed(Vec<Row>),
     Done(Result<Done, QueueRefusal>),
+    Sites(Vec<SiteRow>),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -57,6 +64,12 @@ pub struct Row {
 pub struct QueuePage {
     pub rows: Vec<Row>,
     pub next: Option<QueueId>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SitePage {
+    pub rows: Vec<SiteRow>,
+    pub next: Option<(Box<str>, IpAddr)>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -178,8 +191,21 @@ impl<T: Transport + 'static> Desks<T> {
                 queue,
                 pool,
             } => Answer::Done(rebound(&node, tenant, queue, pool).await),
+            Request::Sites { from, limit } => Answer::Sites(sited(&node, from.as_ref(), limit)),
         }
     }
+}
+
+fn sited<T: Transport + 'static>(
+    node: &Node<T>,
+    from: Option<&(Box<str>, IpAddr)>,
+    limit: usize,
+) -> Vec<SiteRow> {
+    let mut rows = node.inner.sched.transport().sites();
+    rows.retain(|row| from.is_none_or(|(site, egress)| (&row.site, row.egress) >= (site, *egress)));
+    rows.sort_by(|a, b| (&a.site, a.egress).cmp(&(&b.site, b.egress)));
+    rows.truncate(limit);
+    rows
 }
 
 fn listed<T: Transport + 'static>(
@@ -334,6 +360,45 @@ impl<T: Transport + 'static> Node<T> {
             },
         )
         .await
+    }
+
+    pub async fn site_list(
+        &self,
+        from: Option<(Box<str>, IpAddr)>,
+    ) -> Result<SitePage, QueueRefusal> {
+        let desks = &self.inner.desks;
+        let asked: Vec<_> = (0..desks.cores)
+            .map(|core| {
+                desks.send(
+                    core,
+                    Request::Sites {
+                        from: from.clone(),
+                        limit: SITE_PAGE + 1,
+                    },
+                )
+            })
+            .collect();
+        let mut rows = Vec::new();
+        let mut failed = false;
+        for asked in asked {
+            match desks.answer(asked).await {
+                Some(Answer::Sites(found)) => rows.extend(found),
+                _ => failed = true,
+            }
+        }
+        if failed {
+            return Err(QueueRefusal::Unanswered);
+        }
+        rows.sort_by(|a, b| (&a.site, a.egress).cmp(&(&b.site, b.egress)));
+        let next = rows
+            .get(SITE_PAGE)
+            .map(|row| (row.site.clone(), row.egress));
+        rows.truncate(SITE_PAGE);
+        Ok(SitePage { rows, next })
+    }
+
+    pub fn site_pause(&self, egress: IpAddr, site: &str, on: bool) -> bool {
+        self.inner.sched.transport().pause_site(egress, site, on)
     }
 
     async fn ask_owner(&self, queue: QueueId, request: Request) -> Result<Done, QueueRefusal> {
