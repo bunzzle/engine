@@ -3,7 +3,7 @@ use std::net::IpAddr;
 use std::rc::Rc;
 
 use admin::{Admin, Code, Handler, PoolSpec, Reply, Request, TenantSpec};
-use control::{Limits, Object, Pool, Scopes, State, Table, Tenant};
+use control::{Limits, Object, Pool, Scopes, SiteHealth, State, Table, Tenant};
 use rt::UnixListener;
 use sched::{Node, QueueDone, QueueRefusal, Transport};
 
@@ -79,6 +79,9 @@ impl<T: Transport + 'static> Handler for Ops<T> {
                 reply
             }
             Request::KeyList { tenant, from } => self.keys(tenant, from),
+            Request::SiteList { from } => self.sites(from).await,
+            Request::SitePause { egress, site } => self.site_switch(&site, egress, true),
+            Request::SiteResume { egress, site } => self.site_switch(&site, egress, false),
         }
     }
 }
@@ -228,6 +231,58 @@ impl<T: Transport + 'static> Ops<T> {
             (row.id, line)
         });
         Reply::new(Code::Ok, listed(lines, page.next))
+    }
+
+    async fn sites(&self, from: Option<(String, IpAddr)>) -> Reply {
+        let page = match self
+            .node
+            .site_list(from.map(|(site, egress)| (site.into_boxed_str(), egress)))
+            .await
+        {
+            Ok(page) => page,
+            Err(refusal) => return refused(0, 0, refusal),
+        };
+        let mut text = String::new();
+        let mut cut = None;
+        for row in &page.rows {
+            let state = if row.paused {
+                "paused"
+            } else {
+                match row.health {
+                    SiteHealth::Normal => "normal",
+                    SiteHealth::Probe => "probe",
+                    SiteHealth::Dead => "dead",
+                }
+            };
+            let rate = row
+                .rate
+                .map_or_else(|| "none".to_owned(), |rate| format!("{rate}/h"));
+            let line = format!(
+                "site {} egress {} window {} limit {} in-use {} state {} rate {}\n",
+                row.site, row.egress, row.window, row.limit, row.in_use, state, rate,
+            );
+            if text.len() + line.len() > LIST_BYTES {
+                cut = Some((row.site.clone(), row.egress));
+                break;
+            }
+            text.push_str(&line);
+        }
+        if let Some((site, egress)) = cut.or(page.next) {
+            let _ = writeln!(text, "more from {site} {egress}");
+        }
+        Reply::new(Code::Ok, text)
+    }
+
+    fn site_switch(&self, site: &str, egress: IpAddr, on: bool) -> Reply {
+        let verb = if on { "pause" } else { "resume" };
+        let reply = if self.node.site_pause(egress, site, on) {
+            let done = if on { "paused" } else { "resumed" };
+            Reply::new(Code::Ok, format!("site {site} egress {egress} {done}\n"))
+        } else {
+            Reply::new(Code::Refused, "site control is off")
+        };
+        logged(&format!("site {verb} {egress} {site}"), &reply);
+        reply
     }
 
     async fn create(&self, spec: TenantSpec) -> Reply {

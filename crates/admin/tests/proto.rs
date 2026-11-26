@@ -138,6 +138,21 @@ fn every_request_round_trips() {
             id: 2,
             addresses: Vec::new(),
         }),
+        Request::SiteList { from: None },
+        Request::SiteList {
+            from: Some(("example.com".to_owned(), "192.0.2.1".parse().expect("ip"))),
+        },
+        Request::SiteList {
+            from: Some(("münchen.de".to_owned(), "2001:db8::1".parse().expect("ip"))),
+        },
+        Request::SitePause {
+            egress: "192.0.2.1".parse().expect("ip"),
+            site: "example.com".to_owned(),
+        },
+        Request::SiteResume {
+            egress: "2001:db8::1".parse().expect("ip"),
+            site: "example.com".to_owned(),
+        },
     ];
     for request in requests {
         assert_eq!(Request::decode(&body(&request.encode())), Ok(request));
@@ -194,6 +209,17 @@ fn short_long_or_odd_fields_are_refused() {
         },
         Request::KeyRevoke { tenant: 5, id: 9 },
         Request::KeyList { tenant: 5, from: 9 },
+        Request::SiteList {
+            from: Some(("example.com".to_owned(), "192.0.2.1".parse().expect("ip"))),
+        },
+        Request::SitePause {
+            egress: "192.0.2.1".parse().expect("ip"),
+            site: "example.com".to_owned(),
+        },
+        Request::SiteResume {
+            egress: "2001:db8::1".parse().expect("ip"),
+            site: "example.com".to_owned(),
+        },
     ] {
         let short = body(&request.encode());
         for cut in 2..short.len() {
@@ -203,5 +229,20 @@ fn short_long_or_odd_fields_are_refused() {
         long.push(0);
         assert_eq!(Request::decode(&long), Err(Error::Body));
     }
+    assert_eq!(Request::decode(&[VERSION, 14, 2]), Err(Error::Body));
+    assert_eq!(Request::decode(&[VERSION, 14, 1, 0]), Err(Error::Body));
+    assert_eq!(
+        Request::decode(&[VERSION, 15, 4, 192, 0, 2, 1, 0]),
+        Err(Error::Body)
+    );
+    let mut bad_utf8 = body(
+        &Request::SitePause {
+            egress: "192.0.2.1".parse().expect("ip"),
+            site: "example.com".to_owned(),
+        }
+        .encode(),
+    );
+    bad_utf8[8] = 0xff;
+    assert_eq!(Request::decode(&bad_utf8), Err(Error::Body));
     assert_eq!(Request::decode(&[VERSION, 255]), Err(Error::Command));
 }

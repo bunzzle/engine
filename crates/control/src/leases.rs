@@ -309,6 +309,23 @@ enum SiteState {
     Probe,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SiteHealth {
+    Normal,
+    Probe,
+    Dead,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SiteView<K> {
+    pub key: K,
+    pub window: u64,
+    pub limit: u64,
+    pub in_use: u64,
+    pub health: SiteHealth,
+    pub paused: bool,
+}
+
 enum Effect {
     None,
     Serve,
@@ -462,6 +479,15 @@ impl Owned {
             },
             None => limits.queued,
         }
+    }
+
+    fn unused(&self) -> bool {
+        self.window.is_none()
+            && !self.blocked
+            && self.granted == 0
+            && self.waiting.is_empty()
+            && self.held.values().all(|n| *n == 0)
+            && self.gcra == Gcra::default()
     }
 
     fn dead(&self) -> bool {
@@ -636,6 +662,39 @@ impl<K: Ord + Clone + Send + 'static> Leases<K> {
             }
         }
         (tracked, dead)
+    }
+
+    pub fn site_views(&self) -> Vec<SiteView<K>> {
+        let owned = self.inner.owned.borrow();
+        let mut views = Vec::new();
+        for (key, entry) in owned.iter() {
+            let limits = (self.inner.limits)(key);
+            if entry.window.is_none()
+                && !(entry.blocked && limits.is_some_and(|q| q.window.is_some()))
+            {
+                continue;
+            }
+            let (window, health) = match &entry.window {
+                Some(site) => (
+                    (site.window / SCALE).max(1),
+                    match site.state {
+                        SiteState::Normal => SiteHealth::Normal,
+                        SiteState::Probe => SiteHealth::Probe,
+                        SiteState::Dead { .. } => SiteHealth::Dead,
+                    },
+                ),
+                None => (0, SiteHealth::Normal),
+            };
+            views.push(SiteView {
+                key: key.clone(),
+                window,
+                limit: limits.map_or(0, |q| q.queued),
+                in_use: entry.in_use(),
+                health,
+                paused: entry.blocked,
+            });
+        }
+        views
     }
 
     pub fn is_dead(&self, egress: IpAddr, remote: IpAddr) -> bool {
@@ -1029,6 +1088,12 @@ impl<K: Ord + Clone + Send + 'static> Leases<K> {
             }
             entry.dead()
         };
+        if !on {
+            let mut owned = self.inner.owned.borrow_mut();
+            if owned.get(key).is_some_and(Owned::unused) {
+                owned.remove(key);
+            }
+        }
         if dead {
             return;
         }

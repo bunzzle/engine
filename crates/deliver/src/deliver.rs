@@ -11,7 +11,8 @@ use dns::{Found, Name, Record, Type};
 use rt::{Ends, Instant, JoinHandle, now, timeout, wall_ms};
 use sched::{
     Answer, Answered, Attempt, Body, Bounced, Destination, Envelope, EventBody, EventKind, Kind,
-    OwnStats, Recipient, ReportMail, Reported, Required, Restore, Ret, Transport, TransportStats,
+    OwnStats, Recipient, ReportMail, Reported, Required, Restore, Ret, SiteRow, Transport,
+    TransportStats,
 };
 use smtp::client::{
     self, Answer as Reply, Capabilities, Dots, Mail, Rcpt, Refused, Response, Step, Transaction,
@@ -641,6 +642,10 @@ impl<D: Dns, L: Local> Deliver<D, L> {
         if self.is_dead(key.egress, key.remote) {
             return Err(Tried::Next(DEAD.to_vec()));
         }
+        if self.leases.as_ref().is_some_and(|l| l.blocked(remote)) {
+            drop(slot.take());
+            return Err(Tried::Busy);
+        }
         if slot.is_none() {
             match self.slot(remote, end).await {
                 Ok(taken) => *slot = taken,
@@ -705,7 +710,13 @@ impl<D: Dns, L: Local> Deliver<D, L> {
         slot: &mut Option<Slot>,
         message: &mut Message<'_>,
     ) -> Tried {
-        let link = match self.reuse(key, end).await {
+        let paused = self.leases.as_ref().is_some_and(|l| l.blocked(remote));
+        let reused = if paused {
+            None
+        } else {
+            self.reuse(key, end).await
+        };
+        let link = match reused {
             Some(link) => {
                 drop(slot.take());
                 link
@@ -1207,6 +1218,50 @@ impl<D: Dns, L: Local> Transport for Deliver<D, L> {
             sites_dead: dead,
             sites_tracked: tracked,
         }
+    }
+
+    fn sites(&self) -> Vec<SiteRow> {
+        let Some(leases) = &self.leases else {
+            return Vec::new();
+        };
+        leases
+            .site_views()
+            .into_iter()
+            .filter_map(|view| {
+                let Remote::Site(egress, name) = view.key else {
+                    return None;
+                };
+                let rate = self
+                    .settings
+                    .sites
+                    .iter()
+                    .find(|rule| rule.name == *name)
+                    .and_then(|rule| rule.rate);
+                Some(SiteRow {
+                    egress,
+                    site: name,
+                    window: view.window,
+                    limit: view.limit,
+                    in_use: view.in_use,
+                    health: view.health,
+                    paused: view.paused,
+                    rate,
+                })
+            })
+            .collect()
+    }
+
+    fn pause_site(&self, egress: IpAddr, site: &str, on: bool) -> bool {
+        let Some(leases) = &self.leases else {
+            return false;
+        };
+        let key = Remote::Site(egress, site.into());
+        if on {
+            leases.block(&key);
+        } else {
+            leases.unblock(&key);
+        }
+        true
     }
 
     fn restore(&self, restore: Restore) -> impl Future<Output = ()> {

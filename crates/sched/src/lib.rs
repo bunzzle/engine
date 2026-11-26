@@ -32,7 +32,10 @@ mod tally;
 mod transport;
 mod unopened;
 
-pub use admin::{Desk, Done as QueueDone, QUEUE_PAGE, QueuePage, QueueRefusal, Row as QueueRow};
+pub use admin::{
+    Desk, Done as QueueDone, QUEUE_PAGE, QueuePage, QueueRefusal, Row as QueueRow, SITE_PAGE,
+    SitePage,
+};
 pub use clock::Clock;
 pub use cursor::{Cursor, drop_cursor, read_cursor, write_cursor};
 pub use envelope::{Envelope, Recipient, Required, Ret, decode_slice, encode_slice};
@@ -82,7 +85,7 @@ pub use suppress::{
 };
 pub use system::{Done, RecordStats, Records, Restore, Saved, Unsaved};
 pub use transport::{
-    Answered, Attempt, Bounced, Claimed, Destination, OwnStats, ReportMail, Reported, Transport,
-    TransportStats,
+    Answered, Attempt, Bounced, Claimed, Destination, OwnStats, ReportMail, Reported, SiteRow,
+    Transport, TransportStats,
 };
 pub use unopened::{Action, DROPS_PER_MINUTE, UnopenedStats, action};
