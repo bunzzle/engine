@@ -651,6 +651,17 @@ impl<D: Dns, L: Local> Deliver<D, L> {
                 Ok(taken) => *slot = taken,
                 Err(()) => return Err(Tried::Busy),
             }
+        } else if let Some(leases) = &self.leases {
+            match leases
+                .take_token_within(remote, left(end, self.settings.wait))
+                .await
+            {
+                Ok(_) | Err(control::Error::Invalid(_)) => {}
+                Err(_) => {
+                    drop(slot.take());
+                    return Err(Tried::Busy);
+                }
+            }
         }
         match self.open(end, key, need, scope, remote).await {
             Ok((conn, caps)) => Ok(Link {
