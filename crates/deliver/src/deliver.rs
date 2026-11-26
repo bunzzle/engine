@@ -642,6 +642,10 @@ impl<D: Dns, L: Local> Deliver<D, L> {
         if self.is_dead(key.egress, key.remote) {
             return Err(Tried::Next(DEAD.to_vec()));
         }
+        if self.leases.as_ref().is_some_and(|l| l.blocked(remote)) {
+            drop(slot.take());
+            return Err(Tried::Busy);
+        }
         if slot.is_none() {
             match self.slot(remote, end).await {
                 Ok(taken) => *slot = taken,
