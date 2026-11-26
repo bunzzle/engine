@@ -1617,8 +1617,8 @@ fn without_a_site_rule_behaviour_is_unchanged() {
 
 #[test]
 fn a_warming_egress_skips_to_the_next_address_at_its_daily_cap() {
-    let (first, second, only, skips) = run(async {
-        serve(MX1, Script::new(&["PIPELINING"]));
+    let (first, second, only, skips, seen) = run(async {
+        let seen = serve(MX1, Script::new(&["PIPELINING"]));
         let mesh = Mesh::new(1);
         let warmups = vec![Warmup {
             egress: EGRESS,
@@ -1649,13 +1649,16 @@ fn a_warming_egress_skips_to_the_next_address_at_its_daily_cap() {
         .await;
         let only = simple(&deliver, "example.com").await;
         let skips = deliver.stats().warmup_skips;
-        (first, second, only, skips)
+        (first, second, only, skips, seen)
     });
     assert_eq!(answers(&first), [Answer::Delivered]);
     assert_eq!(answers(&second), [Answer::Delivered]);
     assert_eq!(answers(&only), [Answer::Later(5000)]);
     assert_eq!(reply(&only[0]), "451 4.4.5 Egress warm-up cap reached");
     assert_eq!(skips, 2);
+    let seen = seen.borrow();
+    assert_eq!(seen.connections, 2);
+    assert_eq!(seen.sources, [EGRESS, EGRESS2]);
 }
 
 #[test]
