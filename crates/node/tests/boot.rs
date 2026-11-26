@@ -738,25 +738,6 @@ fn tenant(id: u32, pools: &[u32]) -> admin::Request {
     })
 }
 
-fn base64(bytes: &[u8]) -> String {
-    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
-    for chunk in bytes.chunks(3) {
-        let n = chunk
-            .iter()
-            .enumerate()
-            .fold(0_u32, |n, (i, b)| n | u32::from(*b) << (16 - 8 * i));
-        for i in 0..4 {
-            if i <= chunk.len() {
-                out.push(char::from(TABLE[(n >> (18 - 6 * i)) as usize & 63]));
-            } else {
-                out.push('=');
-            }
-        }
-    }
-    out
-}
-
 fn tls_client() -> Arc<ClientConfig> {
     let mut roots = RootCertStore::empty();
     roots
@@ -836,7 +817,7 @@ impl Smtp {
         let mut plain = vec![0];
         plain.extend_from_slice(b"user\0");
         plain.extend_from_slice(token.as_bytes());
-        self.command(&format!("AUTH PLAIN {}", base64(&plain)))
+        self.command(&format!("AUTH PLAIN {}", dkim::base64::encode(&plain)))
             .await
     }
 }
@@ -991,16 +972,8 @@ fn an_admin_key_signs_in_until_revoked() {
         assert!(secret.starts_with("bz_"));
         let tls = tls_client();
 
-        let mut granted = String::new();
-        for _ in 0..20 {
-            let reply = Smtp::connect(&tls).await.login(&secret).await;
-            if reply.starts_with("235 ") {
-                granted = reply;
-                break;
-            }
-            sleep(Duration::from_millis(100)).await;
-        }
-        assert!(granted.starts_with("235 "), "{granted}");
+        let reply = Smtp::connect(&tls).await.login(&secret).await;
+        assert!(reply.starts_with("235 "), "{reply}");
 
         let (code, text) = ask(key(false, true, 0)).await;
         assert_eq!(code, Ok);
@@ -1009,16 +982,8 @@ fn an_admin_key_signs_in_until_revoked() {
         assert!(reply.starts_with("535 "), "{reply}");
 
         assert_eq!(ask(KeyRevoke { tenant: 5, id: 1 }).await.0, Ok);
-        let mut refused = String::new();
-        for _ in 0..20 {
-            let reply = Smtp::connect(&tls).await.login(&secret).await;
-            if reply.starts_with("535 ") {
-                refused = reply;
-                break;
-            }
-            sleep(Duration::from_millis(100)).await;
-        }
-        assert!(refused.starts_with("535 "), "{refused}");
+        let reply = Smtp::connect(&tls).await.login(&secret).await;
+        assert!(reply.starts_with("535 "), "{reply}");
     });
     stopped(&driver, node);
 }
