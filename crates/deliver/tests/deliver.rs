@@ -1204,6 +1204,112 @@ fn skips_a_dead_host_for_a_while() {
 }
 
 #[test]
+fn a_5xx_banner_marks_the_host_dead() {
+    let (outcomes, seen) = run(async {
+        let mut script = Script::new(&[]);
+        script.banner = "554 5.7.1 go away";
+        let seen = serve(MX1, script);
+        let deliver = deliverer(one_mx(MX1), settings());
+        let refused = simple(&deliver, "example.com").await;
+        assert_eq!(answers(&refused), [TEMPORARY]);
+        assert_eq!(reply(&refused[0]), "554 5.7.1 go away");
+        assert_eq!(deliver.dead_hosts(), 1);
+        (simple(&deliver, "example.com").await, seen)
+    });
+    assert_eq!(answers(&outcomes), [TEMPORARY]);
+    assert_eq!(
+        reply(&outcomes[0]),
+        "451 4.4.1 Mail server recently unreachable"
+    );
+    assert_eq!(seen.borrow().connections, 1);
+}
+
+#[test]
+fn a_failed_ehlo_marks_the_host_dead() {
+    let (outcomes, seen) = run(async {
+        let mut script = Script::new(&[]);
+        script.ehlo = "550 5.7.1 no".to_owned();
+        let seen = serve(MX1, script);
+        let deliver = deliverer(one_mx(MX1), settings());
+        let refused = simple(&deliver, "example.com").await;
+        assert_eq!(answers(&refused), [TEMPORARY]);
+        assert_eq!(reply(&refused[0]), "550 5.7.1 no");
+        assert_eq!(deliver.dead_hosts(), 1);
+        (simple(&deliver, "example.com").await, seen)
+    });
+    assert_eq!(answers(&outcomes), [TEMPORARY]);
+    assert_eq!(
+        reply(&outcomes[0]),
+        "451 4.4.1 Mail server recently unreachable"
+    );
+    assert_eq!(seen.borrow().connections, 1);
+}
+
+#[test]
+fn a_4xx_banner_does_not_mark_the_host_dead() {
+    let seen = run(async {
+        let mut script = Script::new(&[]);
+        script.banner = "450 4.3.2 try later";
+        let seen = serve(MX1, script);
+        let deliver = deliverer(one_mx(MX1), settings());
+        for _ in 0..3 {
+            let outcomes = simple(&deliver, "example.com").await;
+            assert_eq!(answers(&outcomes), [TEMPORARY]);
+            assert_eq!(reply(&outcomes[0]), "450 4.3.2 try later");
+        }
+        assert_eq!(deliver.dead_hosts(), 0);
+        seen
+    });
+    assert_eq!(seen.borrow().connections, 3);
+}
+
+#[test]
+fn a_4xx_ehlo_does_not_mark_the_host_dead() {
+    let seen = run(async {
+        let mut script = Script::new(&[]);
+        script.ehlo = "451 4.3.0 later".to_owned();
+        let seen = serve(MX1, script);
+        let deliver = deliverer(one_mx(MX1), settings());
+        for _ in 0..2 {
+            let outcomes = simple(&deliver, "example.com").await;
+            assert_eq!(answers(&outcomes), [TEMPORARY]);
+            assert_eq!(reply(&outcomes[0]), "451 4.3.0 later");
+        }
+        assert_eq!(deliver.dead_hosts(), 0);
+        seen
+    });
+    assert_eq!(seen.borrow().connections, 2);
+}
+
+#[test]
+fn a_5xx_banner_marks_the_host_dead_through_leases() {
+    let (outcomes, seen, hosts) = run(async {
+        let mut script = Script::new(&[]);
+        script.banner = "554 5.7.1 go away";
+        let seen = serve(MX1, script);
+        let mesh = Mesh::new(1);
+        let (leases, _done) = limits(mesh.take(0).expect("ends"), 100, [7; 16]);
+        let deliver = limited(one_mx(MX1), settings(), Some(leases.clone()));
+        let refused = simple(&deliver, "example.com").await;
+        assert_eq!(answers(&refused), [TEMPORARY]);
+        assert_eq!(reply(&refused[0]), "554 5.7.1 go away");
+        assert_eq!(leases.dead_hosts(), 1);
+        (
+            simple(&deliver, "example.com").await,
+            seen,
+            deliver.dead_hosts(),
+        )
+    });
+    assert_eq!(answers(&outcomes), [TEMPORARY]);
+    assert_eq!(
+        reply(&outcomes[0]),
+        "451 4.4.1 Mail server recently unreachable"
+    );
+    assert_eq!(hosts, 1);
+    assert_eq!(seen.borrow().connections, 1);
+}
+
+#[test]
 fn waits_for_a_free_connection() {
     let (busy, waited, freed) = run(async {
         let script = Script::new(&["PIPELINING"]);
@@ -1389,7 +1495,9 @@ fn a_5xx_banner_counts_a_failure_against_the_site() {
         zone.set("mx1.example.com", Type::A, a(&[MX1]));
         let mesh = Mesh::new(1);
         let (leases, _done) = limits(mesh.take(0).expect("ends"), 100, [7; 16]);
-        let deliver = limited(zone, settings(), Some(leases.clone()));
+        let mut settings = settings();
+        settings.dead = Duration::ZERO;
+        let deliver = limited(zone, settings, Some(leases.clone()));
         for _ in 0..4 {
             let outcomes = simple(&deliver, "example.com").await;
             assert_eq!(answers(&outcomes), [TEMPORARY]);
