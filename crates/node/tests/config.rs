@@ -513,6 +513,10 @@ fn deliver_warmup_rules_are_checked() {
             "`caps` must be between 1 and 1000000000",
         ),
         (
+            "[[deliver.warmup]]\negress = \"192.0.2.1\"\nfrom = \"2026-01-01\"\ncaps = [1000000001]\n",
+            "`caps` must be between 1 and 1000000000",
+        ),
+        (
             "[[deliver.warmup]]\negress = \"192.0.2.1\"\nfrom = \"2026-01-01\"\nextra = 1\n",
             "`extra` is not a known setting",
         ),

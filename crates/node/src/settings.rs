@@ -534,7 +534,7 @@ fn caps(entry: &Entry) -> Result<Vec<u32>, Error> {
         };
         let cap = u32::try_from(*number)
             .ok()
-            .filter(|cap| *cap >= 1)
+            .filter(|cap| (1..=1_000_000_000).contains(cap))
             .ok_or_else(|| entry.error("must be between 1 and 1000000000"))?;
         caps.push(cap);
     }
