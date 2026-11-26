@@ -153,16 +153,28 @@ fn boundary_of(value: &str) -> Option<String> {
         if name.trim().eq_ignore_ascii_case("boundary") {
             let val = val.trim();
             let val = match val.strip_prefix('"').and_then(|v| v.strip_suffix('"')) {
-                Some(inner) => inner,
-                None => val,
+                Some(inner) => unquote(inner),
+                None => val.to_string(),
             };
             if val.is_empty() {
                 return None;
             }
-            return Some(val.to_string());
+            return Some(val);
         }
     }
     None
+}
+
+fn unquote(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => out.extend(chars.next()),
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 fn split_parts<'a>(body: &'a [u8], boundary: &str) -> Vec<&'a [u8]> {
@@ -292,7 +304,10 @@ fn parse_dsn(body: &[u8]) -> Report {
 }
 
 fn parse_status(value: &str) -> Option<(u8, u16, u16)> {
-    let token = value.trim_start().split([' ', '(']).next()?;
+    let token = value
+        .trim_start()
+        .split(|c: char| c.is_ascii_whitespace() || c == '(')
+        .next()?;
     let mut parts = token.split('.');
     let a: u8 = parts.next()?.parse().ok()?;
     let b: u16 = parts.next()?.parse().ok()?;

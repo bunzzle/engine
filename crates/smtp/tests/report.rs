@@ -311,3 +311,22 @@ fn boundary_with_trailing_space() {
         .replace("--mx-42--\r\n", "--mx-42-- \r\n");
     assert_eq!(parse(padded.as_bytes()), expected());
 }
+
+#[test]
+fn quoted_pair_in_boundary() {
+    let text = String::from_utf8(dsn_crlf()).expect("ascii");
+    let m = text.replace("boundary=\"mx-42\"", "boundary=\"mx\\-42\"");
+    assert_eq!(parse(m.as_bytes()), expected());
+}
+
+#[test]
+fn tab_before_status_comment() {
+    let text = String::from_utf8(dsn_crlf()).expect("ascii");
+    for status in [
+        "Status: 5.1.1\t(permanent)\r\n",
+        "Status: 5.1.1\r\n\t(permanent)\r\n",
+    ] {
+        let m = text.replace("Status: 5.1.1\r\n", status);
+        assert_eq!(parse(m.as_bytes()), expected());
+    }
+}
