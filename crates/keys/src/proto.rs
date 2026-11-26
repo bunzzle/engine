@@ -5,7 +5,8 @@ use crate::Error;
 pub const MAX_FRAME: usize = 4096;
 use crate::SEARCH_KEYS;
 const _: () = assert!(SEARCH_KEYS <= u8::MAX as usize);
-const _: () = assert!(HEAD + 122 + 16 * SEARCH_KEYS <= MAX_FRAME);
+const _: () = assert!(HEAD + KEYS_BODY + 16 * SEARCH_KEYS <= MAX_FRAME);
+const KEYS_BODY: usize = 138;
 const HEAD: usize = 9;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -83,6 +84,7 @@ pub enum Answer {
         version: u8,
         data: Secret<32>,
         hash: Secret<16>,
+        ret: Secret<16>,
         today: [u8; 32],
         tomorrow: [u8; 32],
         search: Vec<Secret<16>>,
@@ -438,6 +440,7 @@ impl Answer {
                 version,
                 data,
                 hash,
+                ret,
                 today,
                 tomorrow,
                 search,
@@ -450,6 +453,7 @@ impl Answer {
                     std::slice::from_ref(version),
                     data.expose(),
                     hash.expose(),
+                    ret.expose(),
                     today,
                     tomorrow,
                     &count,
@@ -491,6 +495,7 @@ impl Answer {
                 version: r.u8()?,
                 data: r.secret()?,
                 hash: r.secret()?,
+                ret: r.secret()?,
                 today: r.array()?,
                 tomorrow: r.array()?,
                 search: {
@@ -522,7 +527,7 @@ impl Answer {
         HEAD + match self {
             Self::Done => 0,
             Self::Hello { .. } => 85,
-            Self::Keys { search, .. } => 122 + 16 * search.len(),
+            Self::Keys { search, .. } => KEYS_BODY + 16 * search.len(),
             Self::Key(_) => 32,
             Self::Dkim { public, blob } => 4 + public.len() + blob.len(),
             Self::Signature(signature) => 2 + signature.len(),
@@ -681,6 +686,7 @@ mod tests {
                 version: 1,
                 data: Secret::new([3; 32]),
                 hash: Secret::new([4; 16]),
+                ret: Secret::new([0x52; 16]),
                 today: [5; 32],
                 tomorrow: [6; 32],
                 search: Vec::new(),
@@ -691,6 +697,7 @@ mod tests {
                 version: 1,
                 data: Secret::new([3; 32]),
                 hash: Secret::new([4; 16]),
+                ret: Secret::new([0x52; 16]),
                 today: [5; 32],
                 tomorrow: [6; 32],
                 search: (0..8).map(|n| Secret::new([n; 16])).collect(),
@@ -727,6 +734,7 @@ mod tests {
             version: 1,
             data: Secret::new([3; 32]),
             hash: Secret::new([4; 16]),
+            ret: Secret::new([0x52; 16]),
             today: [5; 32],
             tomorrow: [6; 32],
             search: (0..9).map(|n| Secret::new([n; 16])).collect(),

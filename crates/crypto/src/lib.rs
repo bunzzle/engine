@@ -9,6 +9,7 @@ mod seal;
 mod secret;
 mod stream;
 mod tenant;
+mod verp;
 mod wrap;
 
 pub use dkim::{DKIM_LABEL, DkimAlg, DkimKey, dkim_label};
@@ -22,4 +23,5 @@ pub use seal::{DataKey, OVERHEAD};
 pub use secret::{Plain, Secret};
 pub use stream::{ChunkKey, Opener, Sealer, TAG};
 pub use tenant::{Tenant, day_public, day_secret, next_day, ratchet, search_key};
+pub use verp::{ANY, TOKEN_TEXT, Token};
 pub use wrap::{WRAP, Wrap, open_batch, seal_batch};

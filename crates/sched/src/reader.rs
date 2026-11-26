@@ -673,6 +673,7 @@ mod tests {
                 &crypto::Secret::new([1; 32]),
                 1,
                 crypto::Secret::new([hash; 16]),
+                crypto::Secret::new([hash ^ 0xff; 16]),
             )
         };
         let (one, two) = (keys(1, 3), keys(2, 4));
