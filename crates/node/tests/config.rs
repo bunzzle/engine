@@ -368,14 +368,11 @@ fn deliver_site_rules_are_read() {
     assert_eq!(
         config.delivery.settings.sites,
         [
-            deliver::Site {
-                name: "google".into(),
-                suffixes: ["google.com", "googlemail.com"].map(str::to_owned).into(),
-            },
-            deliver::Site {
-                name: "microsoft".into(),
-                suffixes: ["outlook.com"].map(str::to_owned).into(),
-            },
+            deliver::Site::new(
+                "google",
+                ["google.com", "googlemail.com"].map(str::to_owned).into()
+            ),
+            deliver::Site::new("microsoft", ["outlook.com"].map(str::to_owned).into()),
         ]
     );
 }

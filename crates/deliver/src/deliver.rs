@@ -29,7 +29,7 @@ use crate::owners::{OwnerStats, Owners, State};
 use crate::pool::{Key, Level, Link, Pool, Remote, Slot};
 use crate::report::{Applied, Report, ResultType, Rua, rua};
 use crate::results::{Failure, ResultStats, Results, Scope, Taken};
-use crate::settings::{EightBit, Settings};
+use crate::settings::{EightBit, Settings, Site};
 use crate::site;
 use crate::sts::{Got, Mode, PolicyStats, Sts};
 use crate::upload::upload;
@@ -349,10 +349,8 @@ impl<D: Dns, L: Local> Deliver<D, L> {
         let end = now() + deadline;
         let recipients = message.recipients;
         let every = |answer, reply: &[u8]| all(recipients, answer, reply);
-        let egress = self
-            .pool
-            .egress(&destination.domain, &destination.egress)
-            .or_else(|| self.egress(&destination.egress));
+        let pooled = self.pool.egress(&destination.domain, &destination.egress);
+        let egress = pooled.or_else(|| self.egress(&destination.egress));
         let Some(egress) = egress else {
             return every(TEMPORARY, NO_EGRESS);
         };
@@ -367,20 +365,22 @@ impl<D: Dns, L: Local> Deliver<D, L> {
             Err((answer, reply)) => return every(answer, reply),
         };
         let site = site::name(&destination.domain, &hosts, &self.settings.sites);
+        let rule = self.settings.sites.iter().find(|rule| rule.name == site);
         let enforced = self.enforce(egress, &domain, (&mut hosts, secure), (end, envelope));
         let (sts, scope) = match enforced.await {
             Ok(enforced) => enforced,
             Err((answer, reply)) => return every(answer, reply),
         };
-        let remote: Remote = (egress, site.clone().into());
+        let remote = Remote::Site(egress, site.clone().into());
+        let send = (rule, &remote);
         let mut slot = None;
         let mut last = NO_HOST.to_vec();
         let (mut tried, mut others, mut refused) = (0, false, 0);
         'hosts: for host in &hosts {
-            let (kept, target, dnssec) = match self
+            let found = self
                 .kept(host, egress, end, deadline, &destination.egress)
-                .await
-            {
+                .await;
+            let (kept, target, dnssec) = match found {
                 Kept::Found {
                     ips,
                     target,
@@ -427,7 +427,7 @@ impl<D: Dns, L: Local> Deliver<D, L> {
                     level: need.level(),
                 };
                 match self
-                    .session(end, &key, (&need, &scope), &remote, &mut slot, &mut message)
+                    .session(end, &key, (&need, &scope), send, &mut slot, &mut message)
                     .await
                 {
                     Tried::Done(outcomes) => return outcomes,
@@ -624,37 +624,69 @@ impl<D: Dns, L: Local> Deliver<D, L> {
         }
     }
 
-    async fn session(
+    async fn fresh(
         &self,
         end: Instant,
         key: &Key,
         (need, scope): (&Need, &Scope),
         remote: &Remote,
         slot: &mut Option<Slot>,
+    ) -> Result<Link, Tried> {
+        if self.is_dead(key.egress, key.remote) {
+            return Err(Tried::Next(DEAD.to_vec()));
+        }
+        if slot.is_none() {
+            match self.slot(remote, end).await {
+                Ok(taken) => *slot = taken,
+                Err(()) => return Err(Tried::Busy),
+            }
+        }
+        match self.open(end, key, need, scope, remote).await {
+            Ok((conn, caps)) => Ok(Link {
+                conn,
+                caps,
+                used: 0,
+                _slot: slot.take(),
+            }),
+            Err(reply) => Err(Tried::Next(reply)),
+        }
+    }
+
+    async fn held(&self, end: Instant, key: &Key, rule: Option<&Site>) -> bool {
+        let (Some(leases), Some(rule)) = (&self.leases, rule) else {
+            return false;
+        };
+        if rule.rate.is_none() {
+            return false;
+        }
+        let send = Remote::Send(key.egress, key.site.clone());
+        match leases
+            .take_token_within(&send, left(end, self.settings.wait))
+            .await
+        {
+            Ok(_) | Err(control::Error::Invalid(_)) => false,
+            Err(_) => true,
+        }
+    }
+
+    async fn session(
+        &self,
+        end: Instant,
+        key: &Key,
+        (need, scope): (&Need, &Scope),
+        (rule, remote): (Option<&Site>, &Remote),
+        slot: &mut Option<Slot>,
         message: &mut Message<'_>,
     ) -> Tried {
-        let mut link = if let Some(link) = self.reuse(key, end).await {
-            drop(slot.take());
-            link
-        } else {
-            if self.is_dead(key.egress, key.remote) {
-                return Tried::Next(DEAD.to_vec());
+        let mut link = match self.reuse(key, end).await {
+            Some(link) => {
+                drop(slot.take());
+                link
             }
-            if slot.is_none() {
-                match self.slot(remote, end).await {
-                    Ok(taken) => *slot = taken,
-                    Err(()) => return Tried::Busy,
-                }
-            }
-            match self.open(end, key, need, scope, remote).await {
-                Ok((conn, caps)) => Link {
-                    conn,
-                    caps,
-                    used: 0,
-                    _slot: slot.take(),
-                },
-                Err(reply) => return Tried::Next(reply),
-            }
+            None => match self.fresh(end, key, (need, scope), remote, slot).await {
+                Ok(link) => link,
+                Err(tried) => return tried,
+            },
         };
         let caps = link.caps;
         let envelope = message.envelope;
@@ -684,6 +716,10 @@ impl<D: Dns, L: Local> Deliver<D, L> {
                 return Tried::Done(all(message.recipients, Answer::Failed, text));
             }
         };
+        if self.held(end, key, rule).await {
+            self.pool.park(key.clone(), link).await;
+            return Tried::Busy;
+        }
         let run = self
             .transact(&mut link.conn, &mut transaction, message)
             .await;
@@ -725,7 +761,10 @@ impl<D: Dns, L: Local> Deliver<D, L> {
         );
         closing |= refused_closing || throttled;
         link.used += 1;
-        if finished && transaction.reusable() && !closing && link.used < self.settings.reuse {
+        let reuse = rule
+            .and_then(|rule| rule.reuse)
+            .unwrap_or(self.settings.reuse);
+        if finished && transaction.reusable() && !closing && link.used < reuse {
             self.pool.park(key.clone(), link).await;
         } else if finished && !closing {
             link.conn.quit().await;

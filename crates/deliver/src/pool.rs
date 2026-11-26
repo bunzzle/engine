@@ -10,35 +10,61 @@ use rt::{Ends, JoinHandle, sleep, spawn};
 use smtp::client::Capabilities;
 
 use crate::conn::Conn;
+use crate::settings::Site;
 
-pub type Remote = (IpAddr, Box<str>);
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Remote {
+    Site(IpAddr, Box<str>),
+    Send(IpAddr, Box<str>),
+}
 
 pub fn limits(
     ends: Ends<Ask<Remote>>,
     connections: u32,
+    sites: &[Site],
     key: [u8; 16],
 ) -> (Leases<Remote>, JoinHandle<()>) {
     let cores = ends.cores();
+    let rules: Vec<Site> = sites.to_vec();
     Leases::start(
         ends,
         move |remote| owner(&key, remote, cores),
-        move |_| {
-            Some(Quota {
-                rate: Rate::NONE,
-                burst: 0,
+        move |remote| match remote {
+            Remote::Site(_, name) => Some(Quota {
+                rate: rules
+                    .iter()
+                    .find(|rule| rule.name == **name)
+                    .and_then(|rule| rule.connect_rate)
+                    .map_or(Rate::NONE, Rate::per_minute),
+                burst: 1,
                 queued: u64::from(connections),
                 window: Some(Window::default()),
-            })
+            }),
+            Remote::Send(_, name) => {
+                let rule = rules.iter().find(|rule| rule.name == **name)?;
+                let rate = rule.rate?;
+                Some(Quota {
+                    rate: Rate::per_hour(rate),
+                    burst: rule.burst.max(1),
+                    queued: 0,
+                    window: None,
+                })
+            }
         },
     )
 }
 
-fn owner(key: &[u8; 16], (ip, domain): &Remote, cores: u16) -> u16 {
-    let mut data = match ip {
-        IpAddr::V4(v4) => v4.octets().to_vec(),
-        IpAddr::V6(v6) => v6.octets().to_vec(),
+fn owner(key: &[u8; 16], remote: &Remote, cores: u16) -> u16 {
+    let (tag, ip, site) = match remote {
+        Remote::Site(ip, site) => (0u8, ip, site),
+        Remote::Send(ip, site) => (1u8, ip, site),
     };
-    data.extend_from_slice(domain.as_bytes());
+    let mut data = vec![tag];
+    match ip {
+        IpAddr::V4(v4) => data.extend_from_slice(&v4.octets()),
+        IpAddr::V6(v6) => data.extend_from_slice(&v6.octets()),
+    }
+    data.extend_from_slice(site.as_bytes());
     u16::try_from(siphash(key, &data) % u64::from(cores.max(1))).unwrap_or(0)
 }
 

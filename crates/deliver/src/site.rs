@@ -39,10 +39,10 @@ mod tests {
     }
 
     fn rule(name: &str, suffixes: &[&str]) -> Site {
-        Site {
-            name: name.to_owned(),
-            suffixes: suffixes.iter().map(|s| s.to_ascii_lowercase()).collect(),
-        }
+        Site::new(
+            name,
+            suffixes.iter().map(|s| s.to_ascii_lowercase()).collect(),
+        )
     }
 
     #[test]

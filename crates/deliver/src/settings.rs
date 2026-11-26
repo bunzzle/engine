@@ -48,9 +48,24 @@ pub struct Reporter {
 pub struct Site {
     pub name: String,
     pub suffixes: Vec<String>,
+    pub rate: Option<u32>,
+    pub burst: u32,
+    pub connect_rate: Option<u32>,
+    pub reuse: Option<u32>,
 }
 
 impl Site {
+    pub fn new(name: impl Into<String>, suffixes: Vec<String>) -> Self {
+        Self {
+            name: name.into(),
+            suffixes,
+            rate: None,
+            burst: 1,
+            connect_rate: None,
+            reuse: None,
+        }
+    }
+
     pub fn matches(&self, host: &str) -> bool {
         self.suffixes.iter().any(|suffix| {
             host == suffix

@@ -31,7 +31,8 @@ pub fn deliver(path: &Path) -> Result<(), Error> {
     let pem = roots.clone();
     launch(config, certs, pem, move |core| {
         let ends = mesh.take(core).ok_or("delivery mesh already taken")?;
-        let (leases, limits) = deliver::limits(ends, delivery.connections, key);
+        let (leases, limits) =
+            deliver::limits(ends, delivery.connections, &delivery.settings.sites, key);
         drop(limits);
         let seed = Secret::<32>::random().map_err(|_| "no random source")?;
         let resolver = Resolver::new(dns.clone(), &seed);

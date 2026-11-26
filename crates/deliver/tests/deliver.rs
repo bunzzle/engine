@@ -13,7 +13,7 @@ use common::{Script, Seen, Zone, policy, policy_server, serve, serve_policy};
 use control::Leases;
 use deliver::{
     Applied, Applies, Cidr, Deliver, Detail, EightBit, Local, Message, Outcome, OwnStats, Remote,
-    ResultType, Settings, Taken, limits,
+    ResultType, Settings, Site, Taken, limits,
 };
 use dns::{Found, Name, Record, Type};
 use rt::sim::{Config, SimDriver};
@@ -1288,7 +1288,7 @@ fn a_5xx_banner_marks_the_host_dead_through_leases() {
         script.banner = "554 5.7.1 go away";
         let seen = serve(MX1, script);
         let mesh = Mesh::new(1);
-        let (leases, _done) = limits(mesh.take(0).expect("ends"), 100, [7; 16]);
+        let (leases, _done) = limits(mesh.take(0).expect("ends"), 100, &[], [7; 16]);
         let deliver = limited(one_mx(MX1), settings(), Some(leases.clone()));
         let refused = simple(&deliver, "example.com").await;
         assert_eq!(answers(&refused), [TEMPORARY]);
@@ -1316,7 +1316,7 @@ fn waits_for_a_free_connection() {
         script.stalls.set(1);
         serve(MX1, script);
         let mesh = Mesh::new(1);
-        let (leases, _done) = limits(mesh.take(0).expect("ends"), 1, [7; 16]);
+        let (leases, _done) = limits(mesh.take(0).expect("ends"), 1, &[], [7; 16]);
         let mut settings = settings();
         settings.deadline = Duration::from_secs(20);
         settings.wait = Duration::from_secs(1);
@@ -1352,7 +1352,7 @@ fn domains_with_the_same_mx_share_a_connection_limit() {
         );
         zone.set("example.org", Type::Mx, mx(&[(10, "mx1.example.com")]));
         let mesh = Mesh::new(1);
-        let (leases, _done) = limits(mesh.take(0).expect("ends"), 1, [7; 16]);
+        let (leases, _done) = limits(mesh.take(0).expect("ends"), 1, &[], [7; 16]);
         let mut settings = settings();
         settings.deadline = Duration::from_secs(20);
         settings.wait = Duration::from_millis(200);
@@ -1446,7 +1446,7 @@ fn a_421_to_mail_cuts_the_window_and_closes_parked_links() {
             mx(&[(20, "mx2.example.com"), (10, "mx1.example.com")]),
         );
         let mesh = Mesh::new(1);
-        let (leases, _done) = limits(mesh.take(0).expect("ends"), 100, [7; 16]);
+        let (leases, _done) = limits(mesh.take(0).expect("ends"), 100, &[], [7; 16]);
         let deliver = limited(zone, settings(), Some(leases.clone()));
         let outcomes = simple(&deliver, "example.com").await;
         assert_eq!(answers(&outcomes), [Answer::Delivered]);
@@ -1473,7 +1473,7 @@ fn a_throttled_recipient_does_not_park_the_link() {
         script.rcpt = Rc::new(|_| "451 4.7.28 unusual rate".to_owned());
         serve(MX1, script);
         let mesh = Mesh::new(1);
-        let (leases, _done) = limits(mesh.take(0).expect("ends"), 100, [7; 16]);
+        let (leases, _done) = limits(mesh.take(0).expect("ends"), 100, &[], [7; 16]);
         let deliver = limited(zone(), settings(), Some(leases.clone()));
         let outcomes = simple(&deliver, "example.com").await;
         assert_eq!(answers(&outcomes), [Answer::Deferred(Kind::Throttled)]);
@@ -1494,7 +1494,7 @@ fn a_5xx_banner_counts_a_failure_against_the_site() {
         zone.set("example.com", Type::Mx, mx(&[(10, "mx1.example.com")]));
         zone.set("mx1.example.com", Type::A, a(&[MX1]));
         let mesh = Mesh::new(1);
-        let (leases, _done) = limits(mesh.take(0).expect("ends"), 100, [7; 16]);
+        let (leases, _done) = limits(mesh.take(0).expect("ends"), 100, &[], [7; 16]);
         let mut settings = settings();
         settings.dead = Duration::ZERO;
         let deliver = limited(zone, settings, Some(leases.clone()));
@@ -1509,6 +1509,110 @@ fn a_5xx_banner_counts_a_failure_against_the_site() {
     });
     assert_eq!(deaths, 1);
     assert!(matches!(answers(&later).as_slice(), [Answer::Later(_)]));
+}
+
+fn site_rule(rate: Option<u32>, connect_rate: Option<u32>, reuse: Option<u32>) -> Site {
+    Site {
+        name: "example".to_owned(),
+        suffixes: vec!["example.com".to_owned()],
+        rate,
+        burst: 1,
+        connect_rate,
+        reuse,
+    }
+}
+
+#[test]
+fn a_site_rate_holds_messages_over_the_limit() {
+    let (first, second, seen) = run(async {
+        let seen = serve(MX1, Script::new(&["PIPELINING"]));
+        let sites = vec![site_rule(Some(1), None, None)];
+        let mesh = Mesh::new(1);
+        let (leases, _done) = limits(mesh.take(0).expect("ends"), 100, &sites, [7; 16]);
+        let mut settings = settings();
+        settings.sites = sites;
+        let deliver = limited(zone(), settings, Some(leases));
+        let first = simple(&deliver, "example.com").await;
+        let second = simple(&deliver, "example.com").await;
+        (first, second, seen)
+    });
+    assert_eq!(answers(&first), [Answer::Delivered]);
+    assert_eq!(answers(&second), [Answer::Later(5000)]);
+    let mail = commands(&seen)
+        .iter()
+        .filter(|c| c.starts_with("MAIL"))
+        .count();
+    assert_eq!(mail, 1);
+}
+
+#[test]
+fn a_held_message_keeps_its_reused_link_parked() {
+    let (second, pooled, connections) = run(async {
+        let seen = serve(MX1, Script::new(&["PIPELINING"]));
+        let sites = vec![site_rule(Some(1), None, None)];
+        let mesh = Mesh::new(1);
+        let (leases, _done) = limits(mesh.take(0).expect("ends"), 100, &sites, [7; 16]);
+        let mut settings = settings();
+        settings.sites = sites;
+        let deliver = limited(zone(), settings, Some(leases));
+        let first = simple(&deliver, "example.com").await;
+        assert_eq!(answers(&first), [Answer::Delivered]);
+        let second = simple(&deliver, "example.com").await;
+        (second, deliver.pooled(), seen.borrow().connections)
+    });
+    assert_eq!(answers(&second), [Answer::Later(5000)]);
+    assert_eq!(pooled, 1);
+    assert_eq!(connections, 1);
+}
+
+#[test]
+fn a_site_reuse_opens_a_new_connection_per_message() {
+    let seen = run(async {
+        let seen = serve(MX1, Script::new(&[]));
+        let mut settings = settings();
+        settings.sites = vec![site_rule(None, None, Some(1))];
+        let deliver = deliverer(zone(), settings);
+        for _ in 0..3 {
+            let outcomes = simple(&deliver, "example.com").await;
+            assert_eq!(answers(&outcomes), [Answer::Delivered]);
+        }
+        seen
+    });
+    assert_eq!(seen.borrow().connections, 3);
+}
+
+#[test]
+fn a_connect_rate_holds_a_second_connection() {
+    let (first, second, connections) = run(async {
+        let seen = serve(MX1, Script::new(&[]));
+        let sites = vec![site_rule(None, Some(1), Some(1))];
+        let mesh = Mesh::new(1);
+        let (leases, _done) = limits(mesh.take(0).expect("ends"), 100, &sites, [7; 16]);
+        let mut settings = settings();
+        settings.sites = sites;
+        let deliver = limited(zone(), settings, Some(leases));
+        let first = simple(&deliver, "example.com").await;
+        let second = simple(&deliver, "example.com").await;
+        (first, second, seen.borrow().connections)
+    });
+    assert_eq!(answers(&first), [Answer::Delivered]);
+    assert_eq!(answers(&second), [Answer::Later(5000)]);
+    assert_eq!(connections, 1);
+}
+
+#[test]
+fn without_a_site_rule_behaviour_is_unchanged() {
+    let (outcomes, connections) = run(async {
+        let seen = serve(MX1, Script::new(&["PIPELINING"]));
+        let mesh = Mesh::new(1);
+        let (leases, _done) = limits(mesh.take(0).expect("ends"), 100, &[], [7; 16]);
+        let deliver = limited(zone(), settings(), Some(leases));
+        let mut outcomes = simple(&deliver, "example.com").await;
+        outcomes.extend(simple(&deliver, "example.com").await);
+        (outcomes, seen.borrow().connections)
+    });
+    assert_eq!(answers(&outcomes), [Answer::Delivered; 2]);
+    assert_eq!(connections, 1);
 }
 
 #[test]

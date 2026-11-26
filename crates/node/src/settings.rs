@@ -417,10 +417,7 @@ fn sites(table: &mut Table, sites: &mut Vec<deliver::Site>) -> Result<(), Error>
             return Err(suffix.error("must list at least one host name"));
         }
         rule.finish()?;
-        sites.push(deliver::Site {
-            name: text.to_owned(),
-            suffixes,
-        });
+        sites.push(deliver::Site::new(text.to_owned(), suffixes));
     }
     Ok(())
 }
