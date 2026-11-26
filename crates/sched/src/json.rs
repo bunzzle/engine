@@ -42,5 +42,7 @@ pub fn kind_name(kind: Kind) -> &'static str {
         Kind::Expired => "expired",
         Kind::Canceled => "canceled",
         Kind::Suppressed => "suppressed",
+        Kind::Bounced => "bounced",
+        Kind::Complained => "complained",
     }
 }

@@ -12,13 +12,15 @@ use crate::server::Stop;
 
 const MAX_BODY: u64 = 8 * 1024;
 const TAG: [u8; 2] = *b"wh";
-const EVENTS: [&str; 6] = [
+const EVENTS: [&str; 8] = [
     "delivered",
     "deferred",
     "failed",
     "expired",
     "canceled",
     "suppressed",
+    "bounced",
+    "complained",
 ];
 
 enum Path<'a> {
@@ -358,5 +360,30 @@ fn refusal(error: &sched::Error) -> Problem {
             "endpoint or secret limit reached",
         ),
         _ => Problem::unavailable(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use sched::{EventKind, event_kind_name};
+
+    use super::EVENTS;
+
+    #[test]
+    fn hook_bits_follow_the_event_kind_order() {
+        let kinds = [
+            EventKind::Delivered,
+            EventKind::Deferred,
+            EventKind::Failed,
+            EventKind::Expired,
+            EventKind::Canceled,
+            EventKind::Suppressed,
+            EventKind::Bounced,
+            EventKind::Complained,
+        ];
+        assert_eq!(kinds.len(), EVENTS.len());
+        for kind in kinds {
+            assert_eq!(EVENTS[kind as usize], event_kind_name(kind));
+        }
     }
 }

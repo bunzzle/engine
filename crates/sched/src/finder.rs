@@ -119,7 +119,7 @@ impl Query {
 }
 
 fn bit(kind: Kind) -> u8 {
-    1 << kind.code()
+    1 << (kind.code() - 1)
 }
 
 #[derive(Clone, Debug)]
@@ -407,6 +407,19 @@ mod tests {
         assert!(!query.verified(&event(1), b"bob@example.org"));
         let all = Query::new(Field::Domain, b"example.com", &[], 10, 20).expect("query");
         assert!(all.wants(&found(15, Kind::Suppressed)));
+        assert!(all.wants(&found(15, Kind::Complained)));
+        let reports = Query::new(
+            Field::Message,
+            &[7; 16],
+            &[Kind::Bounced, Kind::Complained],
+            10,
+            20,
+        )
+        .expect("query");
+        assert!(reports.wants(&found(15, Kind::Bounced)));
+        assert!(reports.wants(&found(15, Kind::Complained)));
+        assert!(!reports.wants(&found(15, Kind::Delivered)));
+        assert!(!reports.wants(&found(15, Kind::Suppressed)));
     }
 
     #[test]

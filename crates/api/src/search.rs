@@ -23,13 +23,15 @@ const NAMES: [&str; 8] = [
     "limit",
     "after",
 ];
-const KINDS: [EventKind; 6] = [
+const KINDS: [EventKind; 8] = [
     EventKind::Delivered,
     EventKind::Deferred,
     EventKind::Failed,
     EventKind::Expired,
     EventKind::Canceled,
     EventKind::Suppressed,
+    EventKind::Bounced,
+    EventKind::Complained,
 ];
 
 pub(crate) async fn read<T: Transport + 'static>(
@@ -199,7 +201,7 @@ fn kinds(value: &[u8]) -> Result<Vec<EventKind>, Problem> {
             .find(|k| event_kind_name(*k).as_bytes() == part)
             .ok_or_else(|| {
                 Problem::bad_request(
-                    "`type` takes delivered, deferred, failed, expired, canceled or suppressed",
+                    "`type` takes delivered, deferred, failed, expired, canceled, suppressed, bounced or complained",
                 )
             })?;
         if !out.contains(&kind) {

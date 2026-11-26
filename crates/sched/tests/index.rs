@@ -4132,7 +4132,6 @@ fn webhook_endpoints_are_made_changed_rotated_and_removed_on_the_control_core() 
             control.hook_new(1, "http://hooks.example.org/", 0).await,
             "url",
         );
-        hook_refused(control.hook_new(1, at, 0x40).await, "events");
         let made = control.hook_new(1, at, 0).await.expect("new");
         assert_eq!((made.id, made.events, made.version), (1, ALL_EVENTS, 1));
         assert_eq!(made.state, HookState::Active);
