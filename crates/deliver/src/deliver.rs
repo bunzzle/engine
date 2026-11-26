@@ -356,26 +356,50 @@ impl<D: Dns, L: Local> Deliver<D, L> {
         let end = now() + deadline;
         let recipients = message.recipients;
         let every = |answer, reply: &[u8]| all(recipients, answer, reply);
-        let egress = match self.egress(recipients, destination) {
-            Ok(egress) => egress,
-            Err(outcomes) => return outcomes,
-        };
-        self.last.set(Some(egress));
+        let mut tries = destination.egress.len() + 1;
+        loop {
+            let egress = match self.egress(recipients, destination) {
+                Ok(egress) => egress,
+                Err(outcomes) => return outcomes,
+            };
+            self.last.set(Some(egress));
+            tries = tries.saturating_sub(1);
+            match self
+                .attempt(destination, egress, end, deadline, &mut message)
+                .await
+            {
+                Ok(outcomes) => return outcomes,
+                Err(()) if tries > 0 => {}
+                Err(()) => return every(Answer::Later(self.wait()), WARMING),
+            }
+        }
+    }
+
+    async fn attempt(
+        &self,
+        destination: &Destination,
+        egress: IpAddr,
+        end: Instant,
+        deadline: Duration,
+        message: &mut Message<'_>,
+    ) -> Result<Vec<Outcome>, ()> {
+        let recipients = message.recipients;
+        let every = |answer, reply: &[u8]| all(recipients, answer, reply);
         let envelope = message.envelope;
         let Ok(domain) = Name::parse(&destination.domain) else {
-            return every(Answer::Failed, BAD_DOMAIN);
+            return Ok(every(Answer::Failed, BAD_DOMAIN));
         };
         let mut pick = |n| self.pick(n);
         let (mut hosts, secure) = match self.hosts(&domain, deadline, &mut pick).await {
             Ok(hosts) => hosts,
-            Err((answer, reply)) => return every(answer, reply),
+            Err((answer, reply)) => return Ok(every(answer, reply)),
         };
         let site = site::name(&destination.domain, &hosts, &self.settings.sites);
         let rule = self.settings.sites.iter().find(|rule| rule.name == site);
         let enforced = self.enforce(egress, &domain, (&mut hosts, secure), (end, envelope));
         let (sts, scope) = match enforced.await {
             Ok(enforced) => enforced,
-            Err((answer, reply)) => return every(answer, reply),
+            Err((answer, reply)) => return Ok(every(answer, reply)),
         };
         let remote = Remote::Site(egress, site.clone().into());
         let send = (rule, &remote);
@@ -433,12 +457,12 @@ impl<D: Dns, L: Local> Deliver<D, L> {
                     level: need.level(),
                 };
                 match self
-                    .session(end, &key, (&need, &scope), send, &mut slot, &mut message)
+                    .session(end, &key, (&need, &scope), send, &mut slot, message)
                     .await
                 {
-                    Tried::Done(outcomes) => return outcomes,
-                    Tried::Busy => return every(Answer::Later(self.wait()), BUSY),
-                    Tried::Warming => return every(Answer::Later(self.wait()), WARMING),
+                    Tried::Done(outcomes) => return Ok(outcomes),
+                    Tried::Busy => return Ok(every(Answer::Later(self.wait()), BUSY)),
+                    Tried::Warming => return Err(()),
                     Tried::Next(reply) => {
                         others |= reply != REQUIRETLS;
                         last = reply;
@@ -448,7 +472,12 @@ impl<D: Dns, L: Local> Deliver<D, L> {
         }
         let refused =
             refused == hosts.len() && !hosts.is_empty() && one_family(egress, &destination.egress);
-        finished(recipients, envelope.required, end, (refused, others, last))
+        Ok(finished(
+            recipients,
+            envelope.required,
+            end,
+            (refused, others, last),
+        ))
     }
 
     async fn hosts(

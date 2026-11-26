@@ -1680,8 +1680,7 @@ fn a_warming_egress_skips_to_the_next_address_at_its_daily_cap() {
         (first, second, third, only, skips, seen)
     });
     assert_eq!(answers(&first), [Answer::Delivered]);
-    assert_eq!(answers(&second), [Answer::Later(5000)]);
-    assert_eq!(reply(&second[0]), "451 4.4.5 Egress warm-up cap reached");
+    assert_eq!(answers(&second), [Answer::Delivered]);
     assert_eq!(answers(&third), [Answer::Delivered]);
     assert_eq!(answers(&only), [Answer::Later(5000)]);
     assert_eq!(reply(&only[0]), "451 4.4.5 Egress warm-up cap reached");
