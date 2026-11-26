@@ -30,5 +30,9 @@ tls = { path = "../tls" }
 name = "node"
 path = "tests/main.rs"
 
+[[test]]
+name = "boot"
+path = "tests/boot.rs"
+
 [lints]
 workspace = true
