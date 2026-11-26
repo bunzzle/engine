@@ -732,6 +732,35 @@ fn dead_marks_stop_at_the_cap() {
 }
 
 #[test]
+fn the_dead_cap_admits_new_hosts_once_old_marks_expire() {
+    let node = Node::start(9);
+    let leases = node.leases.clone();
+    node.machine.block_on(0, async move {
+        let egress = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+        for n in 0..10_000_u32 {
+            let remote = IpAddr::V4(Ipv4Addr::new(
+                10,
+                1,
+                u8::try_from(n / 256).expect("octet"),
+                u8::try_from(n % 256).expect("octet"),
+            ));
+            leases[0].mark_dead(egress, remote, Duration::from_secs(1));
+        }
+        assert_eq!(leases[0].dead_hosts(), 10_000);
+        sleep(Duration::from_secs(2)).await;
+        let extra = IpAddr::V4(Ipv4Addr::new(10, 9, 9, 9));
+        leases[0].mark_dead(egress, extra, Duration::from_secs(3_600));
+        assert_eq!(leases[0].dead_hosts(), 1);
+        assert!(leases[0].is_dead(egress, extra));
+        sleep(Duration::from_millis(100)).await;
+        for lease in &leases[1..] {
+            assert!(lease.is_dead(egress, extra));
+        }
+    });
+    node.stop();
+}
+
+#[test]
 fn a_zero_ttl_marks_nothing_on_any_core() {
     let node = Node::start(8);
     let leases = node.leases.clone();
