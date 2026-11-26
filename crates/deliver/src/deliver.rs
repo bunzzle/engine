@@ -873,7 +873,13 @@ impl<D: Dns, L: Local> Deliver<D, L> {
             self.feedback(remote, Signal::Throttle);
             self.pool.close(key.egress, &key.site).await;
         } else {
-            self.mark_dead(key.egress, key.remote);
+            let dead = match failed {
+                Ok(reply) => reply.code / 100 == 5,
+                Err(_) => true,
+            };
+            if dead {
+                self.mark_dead(key.egress, key.remote);
+            }
             self.feedback(remote, Signal::Failure);
         }
     }

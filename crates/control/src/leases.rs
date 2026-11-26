@@ -652,6 +652,9 @@ impl<K: Ord + Clone + Send + 'static> Leases<K> {
     }
 
     pub fn mark_dead(&self, egress: IpAddr, remote: IpAddr, ttl: Duration) {
+        if ttl.is_zero() {
+            return;
+        }
         {
             let now = rt::now();
             let until = now + ttl;
@@ -938,6 +941,9 @@ impl<K: Ord + Clone + Send + 'static> Leases<K> {
     }
 
     fn heard_dead(&self, egress: IpAddr, remote: IpAddr, ttl: Duration) {
+        if ttl.is_zero() {
+            return;
+        }
         let now = rt::now();
         let until = now + ttl;
         let mut dead = self.inner.dead.borrow_mut();

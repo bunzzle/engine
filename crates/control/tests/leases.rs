@@ -730,6 +730,23 @@ fn dead_marks_stop_at_the_cap() {
     node.stop();
 }
 
+#[test]
+fn a_zero_ttl_marks_nothing_on_any_core() {
+    let node = Node::start(8);
+    let leases = node.leases.clone();
+    let egress = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+    let remote = IpAddr::V4(Ipv4Addr::new(10, 0, 1, 1));
+    node.machine.block_on(0, async move {
+        leases[0].mark_dead(egress, remote, Duration::ZERO);
+        sleep(Duration::from_millis(50)).await;
+        for lease in &leases {
+            assert_eq!(lease.dead_hosts(), 0);
+            assert!(!lease.is_dead(egress, remote));
+        }
+    });
+    node.stop();
+}
+
 fn with_single<T: 'static>(test: impl AsyncFnOnce(Leases<u32>) -> T + 'static) -> T {
     let sim = Rc::new(SimDriver::new(11, Config::default()));
     Runtime::new(sim).block_on(async move {
