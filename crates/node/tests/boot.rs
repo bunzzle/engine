@@ -948,6 +948,38 @@ fn admin_creates_suspends_and_resumes_tenants() {
 }
 
 #[test]
+fn admin_lists_and_pauses_sites() {
+    use admin::Code::{Ok, Refused};
+    use admin::Request::{SiteList, SitePause, SiteResume};
+    let driver = created(25);
+    let extra = format!("[admin]\nsocket = \"{ADMIN}\"\n");
+    let node = booted(&driver, config_with(7, &extra), CORES);
+    node.machine.block_on(0, async move {
+        drop(serving().await);
+        assert_eq!(ask(SiteList { from: None }).await, (Ok, String::new()));
+        let egress = "192.0.2.1".parse().expect("ip");
+        let site = || "example.com".to_owned();
+        assert_eq!(
+            ask(SitePause {
+                egress,
+                site: site()
+            })
+            .await,
+            (Refused, "site control is off".into())
+        );
+        assert_eq!(
+            ask(SiteResume {
+                egress,
+                site: site()
+            })
+            .await,
+            (Refused, "site control is off".into())
+        );
+    });
+    stopped(&driver, node);
+}
+
+#[test]
 fn the_admin_simulation_runs_every_command_and_stops() {
     use admin::Code::{NotFound, Ok};
     use admin::Request::{

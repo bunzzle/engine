@@ -18,6 +18,9 @@ const QUEUE_REBIND: u8 = 10;
 const KEY_CREATE: u8 = 11;
 const KEY_REVOKE: u8 = 12;
 const KEY_LIST: u8 = 13;
+const SITE_LIST: u8 = 14;
+const SITE_PAUSE: u8 = 15;
+const SITE_RESUME: u8 = 16;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
@@ -91,6 +94,17 @@ pub enum Request {
         tenant: u32,
         from: u32,
     },
+    SiteList {
+        from: Option<(String, IpAddr)>,
+    },
+    SitePause {
+        egress: IpAddr,
+        site: String,
+    },
+    SiteResume {
+        egress: IpAddr,
+        site: String,
+    },
 }
 
 impl Request {
@@ -127,16 +141,7 @@ impl Request {
                 body.extend_from_slice(&spec.id.to_be_bytes());
                 body.push(u8::try_from(spec.addresses.len()).expect("at most 255 addresses"));
                 for (ip, weight) in &spec.addresses {
-                    match ip {
-                        IpAddr::V4(v4) => {
-                            body.push(4);
-                            body.extend_from_slice(&v4.octets());
-                        }
-                        IpAddr::V6(v6) => {
-                            body.push(6);
-                            body.extend_from_slice(&v6.octets());
-                        }
-                    }
+                    push_ip(&mut body, ip);
                     body.extend_from_slice(&weight.to_be_bytes());
                 }
             }
@@ -186,6 +191,19 @@ impl Request {
                 body.extend_from_slice(&tenant.to_be_bytes());
                 body.extend_from_slice(&from.to_be_bytes());
             }
+            Self::SiteList { from } => {
+                body.push(SITE_LIST);
+                match from {
+                    None => body.push(0),
+                    Some((site, ip)) => {
+                        body.push(1);
+                        push_site(&mut body, site);
+                        push_ip(&mut body, ip);
+                    }
+                }
+            }
+            Self::SitePause { egress, site } => encode_site(&mut body, SITE_PAUSE, egress, site),
+            Self::SiteResume { egress, site } => encode_site(&mut body, SITE_RESUME, egress, site),
         }
         framed(&body)
     }
@@ -262,6 +280,22 @@ impl Request {
                 tenant: fields.u32()?,
                 from: fields.u32()?,
             },
+            SITE_LIST => {
+                let from = match fields.u8()? {
+                    0 => None,
+                    1 => Some((fields.site()?, fields.ip()?)),
+                    _ => return Err(Error::Body),
+                };
+                Self::SiteList { from }
+            }
+            SITE_PAUSE => Self::SitePause {
+                egress: fields.ip()?,
+                site: fields.site()?,
+            },
+            SITE_RESUME => Self::SiteResume {
+                egress: fields.ip()?,
+                site: fields.site()?,
+            },
             _ => return Err(Error::Command),
         };
         if !fields.0.is_empty() {
@@ -303,6 +337,41 @@ impl Fields<'_> {
             _ => Err(Error::Body),
         }
     }
+
+    fn site(&mut self) -> Result<String, Error> {
+        let len = usize::from(self.u8()?);
+        if len == 0 || self.0.len() < len {
+            return Err(Error::Body);
+        }
+        let (bytes, rest) = self.0.split_at(len);
+        let site = std::str::from_utf8(bytes).map_err(|_| Error::Body)?;
+        self.0 = rest;
+        Ok(site.to_owned())
+    }
+}
+
+fn push_ip(body: &mut Vec<u8>, ip: &IpAddr) {
+    match ip {
+        IpAddr::V4(v4) => {
+            body.push(4);
+            body.extend_from_slice(&v4.octets());
+        }
+        IpAddr::V6(v6) => {
+            body.push(6);
+            body.extend_from_slice(&v6.octets());
+        }
+    }
+}
+
+fn push_site(body: &mut Vec<u8>, site: &str) {
+    body.push(u8::try_from(site.len()).expect("site fits in a byte"));
+    body.extend_from_slice(site.as_bytes());
+}
+
+fn encode_site(body: &mut Vec<u8>, command: u8, egress: &IpAddr, site: &str) {
+    body.push(command);
+    push_ip(body, egress);
+    push_site(body, site);
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

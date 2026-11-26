@@ -20,7 +20,10 @@ pub const USAGE: &str = "usage: bunzzle admin <config> status
        bunzzle admin <config> queue rebind <tenant> <queue> <pool>
        bunzzle admin <config> key create <tenant> <scopes> [pool <id>]
        bunzzle admin <config> key revoke <tenant> <id>
-       bunzzle admin <config> key list <tenant> [from <id>]";
+       bunzzle admin <config> key list <tenant> [from <id>]
+       bunzzle admin <config> site list [from <site> <ip>]
+       bunzzle admin <config> site pause <egress> <site>
+       bunzzle admin <config> site resume <egress> <site>";
 
 const MAX_ITEMS: usize = 255;
 
@@ -67,6 +70,18 @@ pub fn parse(args: &[String]) -> Option<(&str, Request)> {
         ["key", "list", tenant, "from", from] => Request::KeyList {
             tenant: tenant.parse().ok()?,
             from: from.parse().ok()?,
+        },
+        ["site", "list"] => Request::SiteList { from: None },
+        ["site", "list", "from", site, ip] => Request::SiteList {
+            from: Some((site_name(site)?, ip.parse().ok()?)),
+        },
+        ["site", "pause", egress, site] => Request::SitePause {
+            egress: egress.parse().ok()?,
+            site: site_name(site)?,
+        },
+        ["site", "resume", egress, site] => Request::SiteResume {
+            egress: egress.parse().ok()?,
+            site: site_name(site)?,
         },
         ["tenant", "suspend", id] => Request::TenantSuspend(id.parse().ok()?),
         ["tenant", "resume", id] => Request::TenantResume(id.parse().ok()?),
@@ -137,6 +152,10 @@ fn key_create(tenant: &str, scopes: &str, pool: u32) -> Option<Request> {
 fn list<T>(text: &str, item: impl Fn(&str) -> Option<T>) -> Option<Vec<T>> {
     let items: Vec<T> = text.split(',').map(item).collect::<Option<_>>()?;
     (items.len() <= MAX_ITEMS).then_some(items)
+}
+
+fn site_name(name: &str) -> Option<String> {
+    (!name.is_empty() && u8::try_from(name.len()).is_ok()).then(|| name.to_owned())
 }
 
 pub fn exit(reply: &Reply) -> ExitCode {
@@ -348,6 +367,34 @@ mod tests {
     }
 
     #[test]
+    fn parses_site_commands() {
+        assert_eq!(
+            parsed(&["site", "list"]),
+            Some(Request::SiteList { from: None })
+        );
+        assert_eq!(
+            parsed(&["site", "list", "from", "example.com", "192.0.2.1"]),
+            Some(Request::SiteList {
+                from: Some(("example.com".to_owned(), "192.0.2.1".parse().expect("ip")))
+            })
+        );
+        assert_eq!(
+            parsed(&["site", "pause", "192.0.2.1", "example.com"]),
+            Some(Request::SitePause {
+                egress: "192.0.2.1".parse().expect("ip"),
+                site: "example.com".to_owned(),
+            })
+        );
+        assert_eq!(
+            parsed(&["site", "resume", "2001:db8::1", "example.com"]),
+            Some(Request::SiteResume {
+                egress: "2001:db8::1".parse().expect("ip"),
+                site: "example.com".to_owned(),
+            })
+        );
+    }
+
+    #[test]
     fn refuses_bad_commands() {
         for bad in [
             &[][..],
@@ -370,11 +417,21 @@ mod tests {
             &["key", "create", "5", "smtp", "pool=2"],
             &["key", "revoke", "5"],
             &["key", "list", "5", "from"],
+            &["site", "list", "from", "example.com"],
+            &["site", "list", "from", "example.com", "host"],
+            &["site", "list", "from", "", "192.0.2.1"],
+            &["site", "pause", "host", "example.com"],
+            &["site", "pause", "192.0.2.1"],
+            &["site", "pause", "192.0.2.1", ""],
+            &["site", "resume", "192.0.2.999", "example.com"],
+            &["site", "resume", "192.0.2.1"],
         ] {
             assert_eq!(parsed(bad), None, "{bad:?}");
         }
         let many: Vec<String> = (0..256).map(|n| n.to_string()).collect();
         assert_eq!(parsed(&["tenant", "create", "7", &many.join(",")]), None);
+        let long = "a".repeat(256);
+        assert_eq!(parsed(&["site", "pause", "192.0.2.1", &long]), None);
         assert_eq!(parse(&[]), None);
     }
 
