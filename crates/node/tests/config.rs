@@ -378,6 +378,35 @@ fn deliver_site_rules_are_read() {
 }
 
 #[test]
+fn deliver_site_limits_are_read() {
+    let text = format!(
+        "{MINIMAL}[deliver]\n[[deliver.site]]\nname = \"google\"\nsuffix = [\"google.com\"]\nrate = 3600\nburst = 20\nconnect_rate = 30\nreuse = 50\n"
+    );
+    let config = parse(&text).expect("config");
+    let site = &config.delivery.settings.sites[0];
+    assert_eq!(
+        (site.rate, site.burst, site.connect_rate, site.reuse),
+        (Some(3600), 20, Some(30), Some(50))
+    );
+}
+
+#[test]
+fn deliver_site_burst_needs_a_rate() {
+    let text = format!(
+        "{MINIMAL}[deliver]\n[[deliver.site]]\nname = \"google\"\nsuffix = [\"google.com\"]\nburst = 20\n"
+    );
+    assert!(error(&text).contains("`burst` needs `rate`"));
+}
+
+#[test]
+fn deliver_site_rate_must_be_positive() {
+    let text = format!(
+        "{MINIMAL}[deliver]\n[[deliver.site]]\nname = \"google\"\nsuffix = [\"google.com\"]\nrate = 0\n"
+    );
+    assert!(error(&text).contains("`rate`"));
+}
+
+#[test]
 fn deliver_site_rules_are_checked() {
     let base = format!("{MINIMAL}[deliver]\n");
     let cases = [

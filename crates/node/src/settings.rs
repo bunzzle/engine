@@ -416,8 +416,18 @@ fn sites(table: &mut Table, sites: &mut Vec<deliver::Site>) -> Result<(), Error>
         if suffixes.is_empty() {
             return Err(suffix.error("must list at least one host name"));
         }
+        let mut site = deliver::Site::new(text.to_owned(), suffixes);
+        site.rate = optional(&mut rule, "rate", 1, 1_000_000_000)?;
+        if let Some(entry) = rule.take("burst") {
+            if site.rate.is_none() {
+                return Err(entry.error("needs `rate`"));
+            }
+            site.burst = int(&entry, 1, 1_000_000)?;
+        }
+        site.connect_rate = optional(&mut rule, "connect_rate", 1, 1_000_000)?;
+        site.reuse = optional(&mut rule, "reuse", 1, 1_000_000)?;
         rule.finish()?;
-        sites.push(deliver::Site::new(text.to_owned(), suffixes));
+        sites.push(site);
     }
     Ok(())
 }
@@ -620,6 +630,18 @@ fn private(ip: IpAddr) -> bool {
 fn int<N: TryFrom<u64>>(entry: &Entry, min: u64, max: u64) -> Result<N, Error> {
     let value = entry.number(min, max)?;
     N::try_from(value).map_err(|_| entry.error("is out of range"))
+}
+
+fn optional<N: TryFrom<u64>>(
+    table: &mut Table,
+    key: &str,
+    min: u64,
+    max: u64,
+) -> Result<Option<N>, Error> {
+    table
+        .take(key)
+        .map(|entry| int(&entry, min, max))
+        .transpose()
 }
 
 fn number<N: TryFrom<u64>>(
