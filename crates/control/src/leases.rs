@@ -166,7 +166,7 @@ pub enum Ask<K> {
     Dead {
         egress: IpAddr,
         remote: IpAddr,
-        until: Instant,
+        ttl: Duration,
     },
 }
 
@@ -651,9 +651,10 @@ impl<K: Ord + Clone + Send + 'static> Leases<K> {
         }
     }
 
-    pub fn mark_dead(&self, egress: IpAddr, remote: IpAddr, until: Instant) {
+    pub fn mark_dead(&self, egress: IpAddr, remote: IpAddr, ttl: Duration) {
         {
             let now = rt::now();
+            let until = now + ttl;
             let mut dead = self.inner.dead.borrow_mut();
             if dead.get(&(egress, remote)).is_some_and(|at| *at > now) {
                 return;
@@ -673,7 +674,7 @@ impl<K: Ord + Clone + Send + 'static> Leases<K> {
                     Ask::Dead {
                         egress,
                         remote,
-                        until,
+                        ttl,
                     },
                 );
             }
@@ -931,13 +932,14 @@ impl<K: Ord + Clone + Send + 'static> Leases<K> {
             Ask::Dead {
                 egress,
                 remote,
-                until,
-            } => self.heard_dead(egress, remote, until),
+                ttl,
+            } => self.heard_dead(egress, remote, ttl),
         }
     }
 
-    fn heard_dead(&self, egress: IpAddr, remote: IpAddr, until: Instant) {
+    fn heard_dead(&self, egress: IpAddr, remote: IpAddr, ttl: Duration) {
         let now = rt::now();
+        let until = now + ttl;
         let mut dead = self.inner.dead.borrow_mut();
         if let Some(at) = dead.get_mut(&(egress, remote)) {
             *at = (*at).max(until);

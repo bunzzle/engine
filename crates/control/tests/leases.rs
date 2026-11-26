@@ -673,13 +673,13 @@ fn a_dead_host_is_seen_on_every_core_until_it_expires() {
     let egress = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
     let remote = IpAddr::V4(Ipv4Addr::new(10, 0, 1, 1));
     node.machine.block_on(0, async move {
-        leases[0].mark_dead(egress, remote, rt::now() + Duration::from_secs(60));
+        leases[0].mark_dead(egress, remote, Duration::from_secs(60));
         sleep(Duration::from_millis(50)).await;
         for lease in &leases {
             assert!(lease.is_dead(egress, remote));
             assert_eq!(lease.dead_hosts(), 1);
         }
-        leases[0].mark_dead(egress, remote, rt::now() + Duration::from_mins(100));
+        leases[0].mark_dead(egress, remote, Duration::from_mins(100));
         sleep(Duration::from_millis(50)).await;
         for lease in &leases {
             assert!(lease.is_dead(egress, remote));
@@ -692,7 +692,7 @@ fn a_dead_host_is_seen_on_every_core_until_it_expires() {
             );
             assert_eq!(lease.dead_hosts(), 0);
         }
-        leases[2].mark_dead(egress, remote, rt::now() + Duration::from_secs(60));
+        leases[2].mark_dead(egress, remote, Duration::from_secs(60));
         sleep(Duration::from_millis(50)).await;
         for lease in &leases {
             assert!(lease.is_dead(egress, remote));
@@ -707,7 +707,7 @@ fn dead_marks_stop_at_the_cap() {
     let leases = node.leases.clone();
     node.machine.block_on(0, async move {
         let egress = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
-        let until = rt::now() + Duration::from_secs(3_600);
+        let ttl = Duration::from_secs(3_600);
         for n in 0..10_000_u32 {
             let remote = IpAddr::V4(Ipv4Addr::new(
                 10,
@@ -715,10 +715,10 @@ fn dead_marks_stop_at_the_cap() {
                 u8::try_from(n / 256).expect("octet"),
                 u8::try_from(n % 256).expect("octet"),
             ));
-            leases[0].mark_dead(egress, remote, until);
+            leases[0].mark_dead(egress, remote, ttl);
         }
         let extra = IpAddr::V4(Ipv4Addr::new(10, 9, 9, 9));
-        leases[0].mark_dead(egress, extra, until);
+        leases[0].mark_dead(egress, extra, ttl);
         assert_eq!(leases[0].dead_hosts(), 10_000);
         assert!(!leases[0].is_dead(egress, extra));
         sleep(Duration::from_millis(100)).await;

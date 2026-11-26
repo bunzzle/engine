@@ -895,7 +895,7 @@ impl<D: Dns, L: Local> Deliver<D, L> {
 
     fn mark_dead(&self, egress: IpAddr, remote: IpAddr) {
         if let Some(leases) = &self.leases {
-            leases.mark_dead(egress, remote, now() + self.settings.dead);
+            leases.mark_dead(egress, remote, self.settings.dead);
             return;
         }
         let now = now();
