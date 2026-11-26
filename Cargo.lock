@@ -256,6 +256,7 @@ dependencies = [
  "control",
  "crypto",
  "deliver",
+ "dkim",
  "dns",
  "http",
  "intake",

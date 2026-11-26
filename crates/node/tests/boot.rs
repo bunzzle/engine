@@ -5,13 +5,18 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
+use intake::Conn;
 use keys::{Audit, Server, Settings, Vault};
 use node::{Config, Error, Plan, naming, parse, run};
 use rt::sim::{Config as SimConfig, Machine, SimDriver, Stalls, check};
 use rt::{Buf, JoinHandle, Signal, TcpStream, UnixListener, sleep, spawn, timeout};
 use sched::{Answered, Attempt, OwnStats, Transport};
 use store::{Committer, DataFile, Options, SLOT_SIZE, Setup, boot};
-use tls::{Certs, simulated};
+use tls::rustls::client::Resumption;
+use tls::rustls::pki_types::pem::PemObject;
+use tls::rustls::pki_types::{CertificateDer, ServerName};
+use tls::rustls::{ClientConfig, ClientConnection, RootCertStore};
+use tls::{Certs, Clock as TlsClock, Stream, simulated};
 
 const PATH: &str = "/data/store";
 const KEYS: &str = "/keys";
@@ -31,6 +36,7 @@ const OPTIONS: Options = Options {
 };
 const CHAIN: &[u8] = include_bytes!("data/a.pem");
 const KEY: &[u8] = include_bytes!("data/a.key");
+const CA: &[u8] = include_bytes!("data/ca.pem");
 
 struct Idle;
 
@@ -732,6 +738,90 @@ fn tenant(id: u32, pools: &[u32]) -> admin::Request {
     })
 }
 
+fn tls_client() -> Arc<ClientConfig> {
+    let mut roots = RootCertStore::empty();
+    roots
+        .add(CertificateDer::from_pem_slice(CA).expect("ca"))
+        .expect("root");
+    let mut config = ClientConfig::builder_with_provider(simulated(105))
+        .with_protocol_versions(&[&tls::rustls::version::TLS13])
+        .expect("versions")
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    config.resumption = Resumption::disabled();
+    config.time_provider = Arc::new(TlsClock);
+    Arc::new(config)
+}
+
+async fn handshake(io: TcpStream, tls: &Arc<ClientConfig>) -> Stream {
+    let name = ServerName::try_from("mail.test").expect("name");
+    let conn = ClientConnection::new(Arc::clone(tls), name).expect("client");
+    let mut stream = Stream::new(io, conn.into());
+    stream.handshake().await.expect("handshake");
+    stream
+}
+
+struct Smtp {
+    conn: Conn,
+    input: Vec<u8>,
+    tls: Arc<ClientConfig>,
+}
+
+impl Smtp {
+    async fn connect(tls: &Arc<ClientConfig>) -> Self {
+        let io = TcpStream::connect(smtp()).await.expect("connect");
+        let mut smtp = Self {
+            conn: Conn::plain(io),
+            input: Vec::new(),
+            tls: Arc::clone(tls),
+        };
+        assert!(smtp.reply().await.starts_with("220 "));
+        smtp
+    }
+
+    async fn send(&mut self, data: &[u8]) {
+        self.conn.write_all(data).await.expect("write");
+    }
+
+    async fn reply(&mut self) -> String {
+        loop {
+            if let Some(end) = self.input.windows(2).position(|w| w == b"\r\n") {
+                let line: Vec<u8> = self.input.drain(..end + 2).collect();
+                let line = String::from_utf8(line).expect("ascii");
+                if line.as_bytes().get(3) != Some(&b'-') {
+                    return line.trim_end().to_string();
+                }
+                continue;
+            }
+            let mut more = Vec::new();
+            match self.conn.read(&mut more).await {
+                Ok(0) | Err(_) => return String::new(),
+                Ok(_) => self.input.extend_from_slice(&more),
+            }
+        }
+    }
+
+    async fn command(&mut self, line: &str) -> String {
+        self.send(format!("{line}\r\n").as_bytes()).await;
+        self.reply().await
+    }
+
+    async fn login(mut self, token: &str) -> String {
+        assert!(self.command("EHLO client.test").await.starts_with("250 "));
+        assert!(self.command("STARTTLS").await.starts_with("220 "));
+        let Conn::Plain { io, .. } = self.conn else {
+            unreachable!()
+        };
+        self.conn = Conn::tls(handshake(io, &self.tls).await);
+        assert!(self.command("EHLO client.test").await.starts_with("250 "));
+        let mut plain = vec![0];
+        plain.extend_from_slice(b"user\0");
+        plain.extend_from_slice(token.as_bytes());
+        self.command(&format!("AUTH PLAIN {}", dkim::base64::encode(&plain)))
+            .await
+    }
+}
+
 async fn unknown_queues() {
     use admin::Code::{NotFound, Ok};
     use admin::Request::{QueueList, QueueRebind, QueueRetry};
@@ -844,6 +934,112 @@ fn admin_creates_lists_and_revokes_keys() {
             ask(KeyList { tenant: 6, from: 0 }).await,
             (Ok, "key 2 scopes hooks pool 0 generation 1\n".into())
         );
+    });
+    stopped(&driver, node);
+}
+
+#[test]
+fn an_admin_key_signs_in_until_revoked() {
+    use admin::Code::Ok;
+    use admin::Request::{KeyCreate, KeyRevoke, PoolSet};
+    let driver = created(26);
+    let extra = format!("[admin]\nsocket = \"{ADMIN}\"\n");
+    let node = booted(&driver, config_with(7, &extra), CORES);
+    node.machine.block_on(0, async move {
+        drop(serving().await);
+        let pool = admin::PoolSpec {
+            id: 1,
+            addresses: vec![("192.0.2.1".parse().expect("ip"), 1)],
+        };
+        assert_eq!(ask(PoolSet(pool)).await.0, Ok);
+        assert_eq!(ask(tenant(5, &[1])).await.0, Ok);
+        let key = |smtp, hooks, pool| KeyCreate {
+            tenant: 5,
+            smtp,
+            api: false,
+            hooks,
+            pool,
+        };
+        let secret_of = |id: u32, text: String| {
+            text.strip_prefix(&format!("key {id} secret "))
+                .and_then(|text| text.strip_suffix('\n'))
+                .expect("create reply")
+                .to_owned()
+        };
+        let (code, text) = ask(key(true, false, 1)).await;
+        assert_eq!(code, Ok);
+        let secret = secret_of(1, text);
+        assert!(secret.starts_with("bz_"));
+        let tls = tls_client();
+
+        let reply = Smtp::connect(&tls).await.login(&secret).await;
+        assert!(reply.starts_with("235 "), "{reply}");
+
+        let (code, text) = ask(key(false, true, 0)).await;
+        assert_eq!(code, Ok);
+        let hooks_only = secret_of(2, text);
+        let reply = Smtp::connect(&tls).await.login(&hooks_only).await;
+        assert!(reply.starts_with("535 "), "{reply}");
+
+        assert_eq!(ask(KeyRevoke { tenant: 5, id: 1 }).await.0, Ok);
+        let reply = Smtp::connect(&tls).await.login(&secret).await;
+        assert!(reply.starts_with("535 "), "{reply}");
+    });
+    stopped(&driver, node);
+}
+
+#[test]
+fn key_list_pages_by_bytes() {
+    use admin::Code::Ok;
+    use admin::Request::{KeyCreate, KeyList, PoolSet};
+    const TOTAL: u32 = 1700;
+    let driver = created(27);
+    let extra = format!("[admin]\nsocket = \"{ADMIN}\"\n");
+    let node = booted(&driver, config_with(7, &extra), CORES);
+    node.machine.block_on(0, async move {
+        drop(serving().await);
+        let pool = admin::PoolSpec {
+            id: 1,
+            addresses: vec![("192.0.2.1".parse().expect("ip"), 1)],
+        };
+        assert_eq!(ask(PoolSet(pool)).await.0, Ok);
+        assert_eq!(ask(tenant(5, &[1])).await.0, Ok);
+        for _ in 0..TOTAL {
+            let key = KeyCreate {
+                tenant: 5,
+                smtp: true,
+                api: false,
+                hooks: false,
+                pool: 1,
+            };
+            assert_eq!(ask(key).await.0, Ok);
+        }
+        let ids = |page: &str| -> Vec<u32> {
+            page.lines()
+                .filter_map(|line| line.strip_prefix("key "))
+                .map(|rest| {
+                    rest.split(' ')
+                        .next()
+                        .and_then(|id| id.parse().ok())
+                        .expect("key id")
+                })
+                .collect()
+        };
+        let first = ask(KeyList { tenant: 5, from: 0 }).await.1;
+        let more = first.lines().last().expect("page");
+        let from: u32 = more
+            .strip_prefix("more from ")
+            .expect("paged")
+            .parse()
+            .expect("id");
+        let head = ids(&first);
+        assert_eq!(head.len() + 1, usize::try_from(from).expect("fits"));
+        let second = ask(KeyList { tenant: 5, from }).await.1;
+        assert!(!second.contains("more from"), "{second}");
+        let mut listed = head;
+        listed.extend(ids(&second));
+        let expected: Vec<u32> = (1..=TOTAL).collect();
+        assert_eq!(listed, expected);
     });
     stopped(&driver, node);
 }
