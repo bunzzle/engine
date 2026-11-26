@@ -368,16 +368,50 @@ fn deliver_site_rules_are_read() {
     assert_eq!(
         config.delivery.settings.sites,
         [
-            deliver::Site {
-                name: "google".into(),
-                suffixes: ["google.com", "googlemail.com"].map(str::to_owned).into(),
-            },
-            deliver::Site {
-                name: "microsoft".into(),
-                suffixes: ["outlook.com"].map(str::to_owned).into(),
-            },
+            deliver::Site::new(
+                "google",
+                ["google.com", "googlemail.com"].map(str::to_owned).into()
+            ),
+            deliver::Site::new("microsoft", ["outlook.com"].map(str::to_owned).into()),
         ]
     );
+}
+
+#[test]
+fn deliver_site_limits_are_read() {
+    let text = format!(
+        "{MINIMAL}[deliver]\n[[deliver.site]]\nname = \"google\"\nsuffix = [\"google.com\"]\nrate = 3600\nburst = 20\nconnect_rate = 30\nreuse = 50\n"
+    );
+    let config = parse(&text).expect("config");
+    let site = &config.delivery.settings.sites[0];
+    assert_eq!(
+        (site.rate, site.burst, site.connect_rate, site.reuse),
+        (Some(3600), 20, Some(30), Some(50))
+    );
+}
+
+#[test]
+fn deliver_site_name_cannot_look_like_a_host() {
+    let text = format!(
+        "{MINIMAL}[deliver]\n[[deliver.site]]\nname = \"mx1.example.com\"\nsuffix = [\"google.com\"]\n"
+    );
+    assert!(error(&text).contains("must hold only letters, digits and `-`"));
+}
+
+#[test]
+fn deliver_site_burst_needs_a_rate() {
+    let text = format!(
+        "{MINIMAL}[deliver]\n[[deliver.site]]\nname = \"google\"\nsuffix = [\"google.com\"]\nburst = 20\n"
+    );
+    assert!(error(&text).contains("`burst` needs `rate`"));
+}
+
+#[test]
+fn deliver_site_rate_must_be_positive() {
+    let text = format!(
+        "{MINIMAL}[deliver]\n[[deliver.site]]\nname = \"google\"\nsuffix = [\"google.com\"]\nrate = 0\n"
+    );
+    assert!(error(&text).contains("`rate`"));
 }
 
 #[test]
