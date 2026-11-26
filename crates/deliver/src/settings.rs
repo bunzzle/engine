@@ -77,6 +77,24 @@ impl Site {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Warmup {
+    pub egress: IpAddr,
+    pub from: u64,
+    pub caps: Vec<u32>,
+}
+
+impl Warmup {
+    pub fn cap(&self, today: u64) -> Option<u32> {
+        let index = usize::try_from(today.saturating_sub(self.from)).unwrap_or(usize::MAX);
+        self.caps.get(index).copied()
+    }
+}
+
+pub fn default_caps() -> Vec<u32> {
+    (0..12).map(|day| 50u32 << day).collect()
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Settings {
     pub ehlo: String,
     pub port: u16,
@@ -96,6 +114,7 @@ pub struct Settings {
     pub report_tenant: Option<u32>,
     pub reporter: Reporter,
     pub sites: Vec<Site>,
+    pub warmups: Vec<Warmup>,
 }
 
 impl Settings {
@@ -119,6 +138,44 @@ impl Settings {
             report_tenant: None,
             reporter: Reporter::default(),
             sites: Vec::new(),
+            warmups: Vec::new(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::{IpAddr, Ipv4Addr};
+
+    use super::{Warmup, default_caps};
+
+    fn warmup(caps: Vec<u32>) -> Warmup {
+        Warmup {
+            egress: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+            from: 100,
+            caps,
+        }
+    }
+
+    #[test]
+    fn default_caps_double_from_fifty_for_twelve_days() {
+        let caps = default_caps();
+        assert_eq!(caps.len(), 12);
+        assert_eq!(caps[0], 50);
+        assert_eq!(caps[11], 102_400);
+        for pair in caps.windows(2) {
+            assert_eq!(pair[1], pair[0] * 2);
+        }
+    }
+
+    #[test]
+    fn cap_follows_the_schedule_from_the_start_day() {
+        let warmup = warmup(vec![7, 14, 28]);
+        assert_eq!(warmup.cap(99), Some(7));
+        assert_eq!(warmup.cap(100), Some(7));
+        assert_eq!(warmup.cap(101), Some(14));
+        assert_eq!(warmup.cap(102), Some(28));
+        assert_eq!(warmup.cap(103), None);
+        assert_eq!(warmup.cap(u64::MAX), None);
     }
 }

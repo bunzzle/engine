@@ -41,6 +41,7 @@ const DEAD_MOST: usize = 10_000;
 const TEMPORARY: Answer = Answer::Deferred(Kind::Temporary);
 
 const NO_EGRESS: &[u8] = b"451 4.3.0 No egress address";
+const WARMING: &[u8] = b"451 4.4.5 Egress warm-up cap reached";
 const BAD_DOMAIN: &[u8] = b"550 5.1.2 Recipient domain is not valid";
 const NO_DOMAIN: &[u8] = b"550 5.1.2 Recipient domain does not exist";
 const NULL_MX: &[u8] = b"556 5.1.10 Recipient domain does not accept mail";
@@ -98,6 +99,7 @@ pub struct Deliver<D, L = Bind> {
     helo: Vec<u8>,
     random: Cell<u64>,
     turn: Cell<u64>,
+    warmup_skips: Cell<u64>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -225,6 +227,7 @@ impl<D: Dns, L: Local> Deliver<D, L> {
             helo,
             random: Cell::new(seed | 1),
             turn: Cell::new(0),
+            warmup_skips: Cell::new(0),
         })
     }
 
@@ -349,10 +352,9 @@ impl<D: Dns, L: Local> Deliver<D, L> {
         let end = now() + deadline;
         let recipients = message.recipients;
         let every = |answer, reply: &[u8]| all(recipients, answer, reply);
-        let pooled = self.pool.egress(&destination.domain, &destination.egress);
-        let egress = pooled.or_else(|| self.egress(&destination.egress));
-        let Some(egress) = egress else {
-            return every(TEMPORARY, NO_EGRESS);
+        let egress = match self.egress(recipients, destination, end).await {
+            Ok(egress) => egress,
+            Err(outcomes) => return outcomes,
         };
         self.last.set(Some(egress));
         let envelope = message.envelope;
@@ -1003,22 +1005,78 @@ impl<D: Dns, L: Local> Deliver<D, L> {
         }
     }
 
-    fn egress(&self, egress: &[(IpAddr, u16)]) -> Option<IpAddr> {
+    async fn egress(
+        &self,
+        recipients: &[(u32, Recipient)],
+        destination: &Destination,
+        end: Instant,
+    ) -> Result<IpAddr, Vec<Outcome>> {
+        let every = |answer, reply: &[u8]| all(recipients, answer, reply);
+        let pooled = self.pool.egress(&destination.domain, &destination.egress);
+        let candidates = self.candidates(pooled, &destination.egress);
+        if candidates.is_empty() {
+            return Err(every(TEMPORARY, NO_EGRESS));
+        }
+        for candidate in candidates {
+            if !self.warming(candidate, end).await {
+                return Ok(candidate);
+            }
+        }
+        Err(every(Answer::Later(self.wait()), WARMING))
+    }
+
+    async fn warming(&self, ip: IpAddr, end: Instant) -> bool {
+        if !self
+            .settings
+            .warmups
+            .iter()
+            .any(|warmup| warmup.egress == ip)
+        {
+            return false;
+        }
+        let Some(leases) = &self.leases else {
+            return false;
+        };
+        let taken = leases
+            .take_token_within(&Remote::Egress(ip), left(end, self.settings.wait))
+            .await;
+        match taken {
+            Ok(_) | Err(control::Error::Invalid(_)) => false,
+            Err(_) => {
+                self.warmup_skips.set(self.warmup_skips.get() + 1);
+                true
+            }
+        }
+    }
+
+    fn candidates(&self, pooled: Option<IpAddr>, egress: &[(IpAddr, u16)]) -> Vec<IpAddr> {
+        let mut out = Vec::new();
+        if let Some(ip) = pooled {
+            out.push(ip);
+        }
         let total: u64 = egress.iter().map(|(_, weight)| u64::from(*weight)).sum();
         if total == 0 {
-            return None;
+            return out;
         }
         let turn = self.turn.get();
         self.turn.set(turn.wrapping_add(1));
         let mut at = turn % total;
-        egress.iter().find_map(|(ip, weight)| {
+        let mut start = 0;
+        for (index, (_, weight)) in egress.iter().enumerate() {
             let weight = u64::from(*weight);
             if at < weight {
-                return Some(*ip);
+                start = index;
+                break;
             }
             at -= weight;
-            None
-        })
+        }
+        for offset in 0..egress.len() {
+            let (ip, weight) = &egress[(start + offset) % egress.len()];
+            if *weight > 0 && !out.contains(ip) {
+                out.push(*ip);
+            }
+        }
+        out
     }
 
     fn pick(&self, n: usize) -> usize {
@@ -1099,6 +1157,7 @@ impl<D: Dns, L: Local> Transport for Deliver<D, L> {
             pooled: wide(self.pooled()),
             dead_hosts: wide(self.dead_hosts()),
             window_cuts: leases.map_or(0, |l| l.stats().cuts),
+            warmup_skips: self.warmup_skips.get(),
             sites_dead: dead,
             sites_tracked: tracked,
         }

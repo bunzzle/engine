@@ -29,5 +29,5 @@ pub use pool::{Remote, limits};
 pub use report::{Applied, Applies, Detail, MAILTO, Report, ResultType, Rua};
 pub use results::{ResultStats, Taken};
 pub use sched::OwnStats;
-pub use settings::{EightBit, Reporter, Settings, Site, Timeouts};
+pub use settings::{EightBit, Reporter, Settings, Site, Timeouts, Warmup, default_caps};
 pub use sts::PolicyStats;
