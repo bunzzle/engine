@@ -391,6 +391,7 @@ fn deliver(mut table: Table, delivery: &mut Delivery, roots: bool) -> Result<(),
     t.body = duration(&mut table, "body_timeout", t.body)?;
     t.final_reply = duration(&mut table, "final_timeout", t.final_reply)?;
     sites(&mut table, &mut settings.sites)?;
+    warmups(&mut table, &mut settings.warmups)?;
     table.finish()
 }
 
@@ -433,6 +434,111 @@ fn sites(table: &mut Table, sites: &mut Vec<deliver::Site>) -> Result<(), Error>
         sites.push(site);
     }
     Ok(())
+}
+
+fn warmups(table: &mut Table, warmups: &mut Vec<deliver::Warmup>) -> Result<(), Error> {
+    for mut rule in table.tables("warmup") {
+        let entry = rule.require("egress")?;
+        let egress = entry
+            .str()?
+            .parse::<IpAddr>()
+            .map_err(|_| entry.error("must be an IP address"))?;
+        if egress.is_unspecified() || egress.is_multicast() {
+            return Err(entry.error("must be a unicast address"));
+        }
+        if warmups.iter().any(|warmup| warmup.egress == egress) {
+            return Err(entry.error("is listed twice"));
+        }
+        let from = rule.require("from")?;
+        let day = unix_day(&from)?;
+        let caps = match rule.take("caps") {
+            Some(entry) => caps(&entry)?,
+            None => deliver::default_caps(),
+        };
+        rule.finish()?;
+        warmups.push(deliver::Warmup {
+            egress,
+            from: day,
+            caps,
+        });
+    }
+    Ok(())
+}
+
+fn unix_day(entry: &Entry) -> Result<u64, Error> {
+    let text = entry.str()?;
+    let date = || entry.error("must be a date like 2026-01-31");
+    let Some((year, rest)) = text.split_once('-') else {
+        return Err(date());
+    };
+    let Some((month, day)) = rest.split_once('-') else {
+        return Err(date());
+    };
+    if year.len() != 4
+        || month.len() != 2
+        || day.len() != 2
+        || !text.bytes().all(|b| b == b'-' || b.is_ascii_digit())
+    {
+        return Err(date());
+    }
+    let year: i64 = year.parse().map_err(|_| date())?;
+    let month: i64 = month.parse().map_err(|_| date())?;
+    let day: i64 = day.parse().map_err(|_| date())?;
+    if year < 1970 || !(1..=12).contains(&month) {
+        return Err(date());
+    }
+    let leaps = u64::try_from(year).map_err(|_| date())?;
+    let leap = leaps.is_multiple_of(4) && (!leaps.is_multiple_of(100) || leaps.is_multiple_of(400));
+    let days = [
+        31,
+        if leap { 29 } else { 28 },
+        31,
+        30,
+        31,
+        30,
+        31,
+        31,
+        30,
+        31,
+        30,
+        31,
+    ];
+    let last = days[usize::try_from(month - 1).map_err(|_| date())?];
+    if day < 1 || day > last {
+        return Err(date());
+    }
+    u64::try_from(days_from_civil(year, month, day)).map_err(|_| date())
+}
+
+fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
+    let year = year - i64::from(month <= 2);
+    let era = year.div_euclid(400);
+    let yoe = year - era * 400;
+    let mp = (month + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+fn caps(entry: &Entry) -> Result<Vec<u32>, Error> {
+    let config::Value::Array(items) = entry.value() else {
+        return Err(entry.error("must list 1 to 365 daily caps"));
+    };
+    if items.is_empty() || items.len() > 365 {
+        return Err(entry.error("must list 1 to 365 daily caps"));
+    }
+    let mut caps = Vec::with_capacity(items.len());
+    for item in items {
+        let config::Value::Int(number) = item else {
+            return Err(entry.error("must be between 1 and 1000000000"));
+        };
+        let cap = u32::try_from(*number)
+            .ok()
+            .filter(|cap| *cap >= 1)
+            .ok_or_else(|| entry.error("must be between 1 and 1000000000"))?;
+        caps.push(cap);
+    }
+    Ok(caps)
 }
 
 fn intake(mut table: Table, session: &mut intake::Config) -> Result<(), Error> {
