@@ -10,6 +10,7 @@ struct Held {
     generation: u32,
     data: DataKey,
     hash: Secret<16>,
+    ret: Secret<16>,
 }
 
 impl TenantKeys {
@@ -19,12 +20,14 @@ impl TenantKeys {
         data: &Secret<32>,
         version: u8,
         hash: Secret<16>,
+        ret: Secret<16>,
     ) -> Self {
         Self(Arc::new(Held {
             tenant,
             generation,
             data: DataKey::new(data, version),
             hash,
+            ret,
         }))
     }
 
@@ -35,6 +38,7 @@ impl TenantKeys {
             &root.data_secret(generation, version),
             version,
             root.hash_key(generation),
+            root.return_key(generation),
         )
     }
 
@@ -48,6 +52,10 @@ impl TenantKeys {
 
     pub fn hash_key(&self) -> &Secret<16> {
         &self.0.hash
+    }
+
+    pub fn return_key(&self) -> &Secret<16> {
+        &self.0.ret
     }
 
     pub fn seal(&self, label: &[u8], clear: &[u8]) -> Result<Vec<u8>, Error> {
@@ -104,5 +112,8 @@ mod tests {
         drop(keys);
         assert_eq!((held.tenant(), held.generation()), (4, 2));
         assert!(*held.hash_key() == root.hash_key(2));
+        assert!(*held.return_key() == root.return_key(2));
+        assert!(*held.return_key() != root.return_key(3));
+        assert_ne!(held.return_key().expose(), held.hash_key().expose());
     }
 }

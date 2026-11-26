@@ -198,6 +198,7 @@ fn keys_answer(keys: Keys) -> Answer {
         version: keys.version,
         data: keys.data,
         hash: keys.hash,
+        ret: keys.ret,
         today: keys.today,
         tomorrow: keys.tomorrow,
         search: keys.search,

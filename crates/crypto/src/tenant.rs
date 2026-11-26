@@ -22,6 +22,10 @@ impl Tenant {
         self.0.expand(&[b"hash", &generation.to_le_bytes()])
     }
 
+    pub fn return_key(&self, generation: u32) -> Secret<16> {
+        self.0.expand(&[b"return", &generation.to_le_bytes()])
+    }
+
     pub fn dkim_key(&self, generation: u32, version: u8) -> DataKey {
         let key = self
             .0
@@ -122,6 +126,10 @@ mod tests {
         assert_eq!(
             hex(tenant.hash_key(1).expose()),
             "bd7f2bae6ff8c12b0d35b5e12a9ebeb7"
+        );
+        assert_eq!(
+            hex(tenant.return_key(1).expose()),
+            "586d6e5b4584547bb771be1722872632"
         );
         assert_eq!(
             hex(tenant.hook_secret(1, 3, 2).expose()),

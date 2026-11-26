@@ -140,6 +140,7 @@ async fn fake(host: u8, keys: (Secret<16>, Secret<16>), mode: Fake) -> Rc<Cell<u
                                 version: 1,
                                 data: Secret::new([5; 32]),
                                 hash: Secret::new([6; 16]),
+                                ret: Secret::new([0x52; 16]),
                                 today: [7; 32],
                                 tomorrow: [8; 32],
                                 search: (0..match mode {
@@ -201,6 +202,15 @@ fn tenant_keys_open_once_on_first_use_and_stay_cached() {
         assert!(crypto::id_key(&naming) == hello(1).await.1);
         let system = ring.system().expect("system keys");
         assert_eq!((system.tenant(), system.generation()), (0, 0));
+        assert_ne!(system.return_key().expose(), system.hash_key().expose());
+        let other = Ring::new(hosts(&[1]).0, settings());
+        assert!(other.open(4, 1).await.is_ok());
+        let other = other.system().expect("system keys");
+        assert_ne!(system.return_key().expose(), other.return_key().expose());
+        assert_ne!(
+            opened[0].keys.return_key().expose(),
+            opened[0].keys.hash_key().expose()
+        );
         let zero = [&0u32.to_le_bytes()[..], &0u32.to_le_bytes()].concat();
         let kept = system.seal(&zero, b"policy").expect("seal");
         assert_eq!(system.open(&zero, &kept).expect("open"), b"policy");
@@ -393,7 +403,9 @@ fn a_changed_id_key_fails_the_ring_for_good() {
         fake(3, (naming, Secret::new([0; 16])), Fake::Closes).await;
         let (connect, _) = hosts(&[2, 3]);
         let ring = Ring::new(connect, settings());
-        assert!(ring.open(4, 1).await.is_ok());
+        let working = ring.open(4, 1).await.expect("open");
+        assert_eq!(working.keys.return_key().expose(), &[0x52; 16]);
+        assert_eq!(working.keys.hash_key().expose(), &[6; 16]);
         sleep(Duration::from_millis(200)).await;
         assert_eq!(ring.open(4, 2).await.err(), Some(Fault::Failed));
         assert!(ring.failed());

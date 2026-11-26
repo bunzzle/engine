@@ -7,7 +7,7 @@ use crate::{Error, Prk, Secret};
 
 pub const ID_TEXT: usize = 26;
 
-const ALPHABET: &[u8; 32] = b"abcdefghijklmnopqrstuvwxyz234567";
+pub(crate) const ALPHABET: &[u8; 32] = b"abcdefghijklmnopqrstuvwxyz234567";
 
 pub fn id_key(naming: &Secret<16>) -> Secret<16> {
     let mut prk = Secret::new([0; 32]);
@@ -29,9 +29,22 @@ impl Ids {
         })
     }
 
-    pub fn encode(&self, id: &[u8; 16]) -> String {
+    pub fn hide(&self, id: &[u8; 16]) -> [u8; 16] {
         let mut block = *id;
         self.encrypting.encrypt(&mut block).expect("one aes block");
+        block
+    }
+
+    pub fn reveal(&self, block: &[u8; 16]) -> Option<[u8; 16]> {
+        let mut block = *block;
+        self.decrypting
+            .decrypt(&mut block, DecryptionContext::None)
+            .ok()?;
+        Some(block)
+    }
+
+    pub fn encode(&self, id: &[u8; 16]) -> String {
+        let block = self.hide(id);
         let n = u128::from_be_bytes(block);
         let last = (n << 2) as usize & 31;
         (0..ID_TEXT - 1)
@@ -56,11 +69,7 @@ impl Ids {
                 return None;
             };
         }
-        let mut block = n.to_be_bytes();
-        self.decrypting
-            .decrypt(&mut block, DecryptionContext::None)
-            .ok()?;
-        Some(block)
+        self.reveal(&n.to_be_bytes())
     }
 }
 

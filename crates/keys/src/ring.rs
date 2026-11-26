@@ -783,6 +783,7 @@ impl Ring {
                 version,
                 data,
                 hash,
+                ret,
                 today,
                 tomorrow,
                 search,
@@ -795,7 +796,7 @@ impl Ring {
                 }
                 self.saw_day(day);
                 Ok(Working {
-                    keys: TenantKeys::new(tenant, generation, &data, version, hash),
+                    keys: TenantKeys::new(tenant, generation, &data, version, hash, ret),
                     day,
                     oldest,
                     today,
@@ -906,7 +907,14 @@ impl Ring {
             if let Some((key, known_ids, _)) = known.as_ref() {
                 !(*key == naming && *known_ids == ids)
             } else {
-                let system = TenantKeys::new(SYSTEM, 0, &system, version, system_hash);
+                let ret = match Secret::random() {
+                    Ok(ret) => ret,
+                    Err(error) => {
+                        client.close();
+                        return Err(Error::Crypto(error));
+                    }
+                };
+                let system = TenantKeys::new(SYSTEM, 0, &system, version, system_hash, ret);
                 *known = Some((naming, ids, system));
                 false
             }
