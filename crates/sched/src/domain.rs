@@ -47,6 +47,9 @@ impl<T: Transport + 'static> Node<T> {
                 if !known || domain.generation != generation {
                     return Err(control::Error::Refused.into());
                 }
+                if domain.return_path && domain.state != Verification::Verified {
+                    return Err(control::Error::Invalid("return path").into());
+                }
                 if domain.state == Verification::Verified && !control::verifiable(&domain.name) {
                     return Err(control::Error::Invalid("public suffix").into());
                 }
