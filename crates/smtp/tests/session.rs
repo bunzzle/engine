@@ -130,6 +130,7 @@ fn bytes_before_the_greeting_or_after_ehlo_close_the_session() {
         message: LIMIT,
         implicit: true,
         messages: MESSAGES,
+        mx: false,
     });
     server.input(b"EHLO x\r\n");
     assert!(matches!(server.poll(), Some(smtp::Event::Close)));

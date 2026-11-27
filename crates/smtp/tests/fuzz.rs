@@ -85,8 +85,11 @@ fn script(rng: &mut Rng) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
     (flushes, messages)
 }
 
-fn run(flushes: &[Vec<u8>], mut split: Option<&mut Rng>) -> Client {
-    let mut client = Client::new(true);
+fn run(flushes: &[Vec<u8>], split: Option<&mut Rng>) -> Client {
+    feed(Client::new(true), flushes, split)
+}
+
+fn feed(mut client: Client, flushes: &[Vec<u8>], mut split: Option<&mut Rng>) -> Client {
     for flush in flushes {
         let mut rest = flush.as_slice();
         while !rest.is_empty() {
@@ -221,6 +224,38 @@ fn random_bytes_never_panic() {
         flushes.extend(flushes_of(&mut rng, &bytes));
         let client = run(&flushes, Some(&mut rng));
         well_formed(&client.output);
+        for message in &client.messages {
+            clean(message);
+        }
+    }
+}
+
+#[test]
+fn random_bytes_never_panic_in_mx_mode() {
+    for mut rng in cases(4_000) {
+        let len = rng.below(400);
+        let bytes: Vec<u8> = (0..len)
+            .map(|_| {
+                if rng.below(3) == 0 {
+                    b"\r\n.: <>"[rng.below(7)]
+                } else {
+                    rng.next().to_le_bytes()[0]
+                }
+            })
+            .collect();
+        let mut flushes = vec![b"EHLO c\r\n".to_vec()];
+        flushes.push(b"MAIL FROM:<>\r\nRCPT TO:<b@example.org>\r\n".to_vec());
+        if rng.below(2) == 0 {
+            flushes.push(b"RCPT TO:<c@example.org>\r\nDATA\r\n".to_vec());
+        }
+        flushes.extend(flushes_of(&mut rng, &bytes));
+        let client = feed(Client::mx(rng.below(2) == 0), &flushes, Some(&mut rng));
+        well_formed(&client.output);
+        assert!(!client.server.authenticated());
+        assert!(client.log.iter().all(|l| l != "auth"));
+        for line in client.log.iter().filter(|l| l.starts_with("rcpt ")) {
+            assert_eq!(line.split(' ').count(), 2, "{line}");
+        }
         for message in &client.messages {
             clean(message);
         }

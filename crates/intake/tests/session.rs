@@ -12,9 +12,12 @@ use std::time::Duration;
 use aws_lc_rs::digest::{Digest, SHA256};
 use aws_lc_rs::signature::{ED25519, RSA_PKCS1_2048_8192_SHA256, UnparsedPublicKey};
 use control::{Domain, Object, Pool, Scopes, State, Tenant, Verification};
-use crypto::{DkimAlg, Ids};
+use crypto::{DkimAlg, Ids, Token};
 use dkim::BodyHash;
-use intake::{Config as SessionConfig, Conn, End, Guard, Limits, Listener, data_hold, listen};
+use intake::{
+    Config as SessionConfig, Conn, End, Guard, LOADS, Limits, Listener, Reports, data_hold, listen,
+    message_limit,
+};
 use keys::{
     Audit, BatchSettings, Client as KeyClient, Connect, Ring, RingSettings, Server as KeyServer,
     Settings as KeySettings, Vault,
@@ -48,6 +51,7 @@ const KEYS_AT: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 9
 const HOST: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 1);
 const SUBMIT: u16 = 587;
 const IMPLICIT: u16 = 465;
+const MX: u16 = 25;
 const CA: &[u8] = include_bytes!("data/ca.pem");
 const CERT: &[u8] = include_bytes!("data/a.pem");
 const KEY: &str = "302e020100300506032b65700422042098cded488e5305ce6644e0188d522eac4a19a7722043c25e621026562f2dda6d";
@@ -500,6 +504,7 @@ async fn listen_with(node: &Node<Idle>, seed: u64, config: SessionConfig, guard:
             Rc::clone(&config),
             guard.clone(),
             implicit,
+            None,
         ));
     }
     Ports(listeners)
@@ -1242,4 +1247,235 @@ async fn refusal(port: u16) -> String {
         .expect("ascii")
         .trim_end()
         .to_string()
+}
+
+async fn listen_mx(
+    node: &Node<Idle>,
+    seed: u64,
+    port: u16,
+    loads: usize,
+) -> (Listener, Rc<Reports>) {
+    let config = SessionConfig::new("mx1.example.net".into());
+    listen_mx_with(node, seed, port, loads, (config, Limits::default())).await
+}
+
+async fn listen_mx_with(
+    node: &Node<Idle>,
+    seed: u64,
+    port: u16,
+    loads: usize,
+    (config, limits): (SessionConfig, Limits),
+) -> (Listener, Rc<Reports>) {
+    let socket = TcpListener::bind(SocketAddr::from((HOST, port)), 64)
+        .await
+        .expect("bind");
+    let reports = Rc::new(Reports::new(loads));
+    let listener = listen(
+        node.clone(),
+        socket,
+        acceptor(seed),
+        Rc::new(config),
+        guard(limits),
+        false,
+        Some(Rc::clone(&reports)),
+    );
+    (listener, reports)
+}
+
+fn public_id(node: &Node<Idle>, node_id: u32) -> [u8; 16] {
+    let id = MessageId {
+        node: node_id,
+        shard: 0,
+        key: 7,
+    };
+    hidden(node, id.bytes())
+}
+
+fn hidden(node: &Node<Idle>, raw: [u8; 16]) -> [u8; 16] {
+    Ids::new(&node.ids().expect("ids")).expect("ids").hide(&raw)
+}
+
+async fn rcpt(port: u16, tls: &Arc<ClientConfig>, to: &str) -> String {
+    let mut smtp = Smtp::connect(port, tls).await;
+    assert!(smtp.command("EHLO relay.test").await.starts_with("250 "));
+    assert!(smtp.command("MAIL FROM:<>").await.starts_with("250 "));
+    let reply = smtp.command(&format!("RCPT TO:<{to}>")).await;
+    assert!(smtp.command("QUIT").await.starts_with("221 "));
+    reply
+}
+
+#[test]
+fn mx_accepts_only_verified_return_path_tokens() {
+    check(0..2, |seed| {
+        let driver = Rc::new(SimDriver::with_disk(seed, Config::default(), created(seed)));
+        let cluster = started(&driver, 2).expect("start");
+        let nodes = cluster.nodes.clone();
+        cluster.run(async move {
+            prepare(&nodes).await;
+            let control = control_of(&nodes);
+            let other = nodes.iter().find(|n| !n.controls()).expect("second core");
+            let (listening, reports) = listen_mx(control, seed, MX, LOADS).await;
+            let (capped, _) = listen_mx(other, seed, MX + 1, 0).await;
+            let tls = client_config(simulated(seed + 100));
+            let own = control.spool().node();
+            let first = control.load_keys(1, 1).await.expect("keys");
+            let second = control.load_keys(2, 1).await.expect("keys");
+            let token = Token::sign(&first, 0, public_id(control, own)).text();
+            let good = format!("b{token}@bounces.example.org");
+
+            let mut smtp = Smtp::connect(MX, &tls).await;
+            assert!(smtp.command("EHLO relay.test").await.starts_with("250 "));
+            assert!(
+                smtp.command("AUTH PLAIN AHVzZXIAeA==")
+                    .await
+                    .starts_with("502 ")
+            );
+            assert!(smtp.command("MAIL FROM:<>").await.starts_with("250 "));
+            let reply = smtp.command(&format!("RCPT TO:<{good}>")).await;
+            assert!(reply.starts_with("250 "), "{reply}");
+            let reply = smtp.command(&format!("RCPT TO:<{good}>")).await;
+            assert!(reply.starts_with("452 4.5.3"), "{reply}");
+            let size = usize::try_from(message_limit(control)).expect("fits") * 9 / 10;
+            assert!(size > intake::KEEP, "limit {size}");
+            let report = vec![b'x'; size * 70 / 72];
+            let mut body = b"Subject: report\r\n\r\n".to_vec();
+            for line in report.chunks(70) {
+                body.extend_from_slice(line);
+                body.extend_from_slice(b"\r\n");
+            }
+            let reply = smtp.data(&body).await;
+            assert!(reply.starts_with("451 4.3.0"), "{reply}");
+            assert!(smtp.command("QUIT").await.starts_with("221 "));
+
+            let swapped = Token::sign(&second, 0, public_id(control, own)).text();
+            let swapped = format!("b{}{}@x.example", &token[..7], &swapped[7..]);
+            let mut flipped = token.clone().into_bytes();
+            let last = flipped.len() - 1;
+            flipped[last] = if flipped[last] == b'a' { b'b' } else { b'a' };
+            let flipped = format!("b{}@x.example", String::from_utf8(flipped).expect("ascii"));
+            let foreign = Token::sign(&first, 0, public_id(control, own + 1)).text();
+            let refused = [
+                "postmaster@example.org".to_owned(),
+                format!("c{token}@x.example"),
+                format!("b{}@x.example", &token[1..]),
+                flipped,
+                swapped,
+                format!("b{foreign}@x.example"),
+            ];
+            for to in &refused {
+                let reply = rcpt(MX, &tls, to).await;
+                assert!(reply.starts_with("550 5.1.1"), "{to}: {reply}");
+            }
+            let upper = format!("b{}@x.example", token.to_ascii_uppercase());
+            assert!(rcpt(MX, &tls, &upper).await.starts_with("250 "));
+
+            let pending = Token::sign(&second, 0, public_id(control, own)).text();
+            assert!(other.load_ids().await.is_some());
+            assert!(other.cached_keys(2, 1).is_none());
+            let reply = rcpt(MX + 1, &tls, &format!("b{pending}@x.example")).await;
+            assert!(reply.starts_with("451 4.3.2"), "{reply}");
+
+            let mut suspended = tenant(2);
+            if let Object::Tenant(t) = &mut suspended {
+                t.state = State::Suspended;
+            }
+            control.write(suspended).await.expect("suspend");
+            until("suspended", || {
+                control
+                    .table()
+                    .tenant(2)
+                    .is_some_and(|t| t.state == State::Suspended)
+            })
+            .await;
+            let reply = rcpt(MX, &tls, &format!("b{pending}@x.example")).await;
+            assert!(reply.starts_with("250 "), "{reply}");
+
+            let stats = reports.stats();
+            assert_eq!(stats.accepted, 3, "seed {seed}");
+            assert_eq!(stats.refused, 6, "seed {seed}");
+            assert_eq!(stats.held, 1, "seed {seed}");
+            assert_eq!(listening.ended(End::Io), 0, "seed {seed}");
+            listening.close().await;
+            capped.close().await;
+        });
+        cluster.stop();
+    });
+}
+
+#[test]
+fn mx_sessions_have_their_own_limits_and_no_auth_deadline() {
+    check(0..2, |seed| {
+        let driver = Rc::new(SimDriver::with_disk(seed, Config::default(), created(seed)));
+        let cluster = started(&driver, 2).expect("start");
+        let nodes = cluster.nodes.clone();
+        cluster.run(async move {
+            prepare(&nodes).await;
+            let control = control_of(&nodes);
+            let mut config = SessionConfig::new("mx1.example.net".into());
+            config.auth = Duration::from_secs(1);
+            let (listening, reports) =
+                listen_mx_with(control, seed, MX, LOADS, (config, Limits::default())).await;
+            let small = Limits {
+                budget: 1 << 20,
+                ..Limits::default()
+            };
+            let config = SessionConfig::new("mx1.example.net".into());
+            let (tight, _) = listen_mx_with(control, seed, MX + 1, LOADS, (config, small)).await;
+            let tls = client_config(simulated(seed + 100));
+            let own = control.spool().node();
+            let keys = control.load_keys(2, 1).await.expect("keys");
+            let token = Token::sign(&keys, 0, public_id(control, own)).text();
+            let upper = format!("B{}@x.example", token.to_ascii_uppercase());
+
+            let mut smtp = Smtp::connect(MX, &tls).await;
+            assert!(smtp.command("EHLO relay.test").await.starts_with("250 "));
+            sleep(Duration::from_secs(3)).await;
+            assert!(smtp.command("NOOP").await.starts_with("250 "));
+            assert!(smtp.command("MAIL FROM:<>").await.starts_with("250 "));
+            let reply = smtp.command(&format!("RCPT TO:<{upper}>")).await;
+            assert!(reply.starts_with("250 "), "{reply}");
+            let body = b"Subject: report\r\n\r\nfailed\r\n";
+            smtp.send(format!("BDAT {} LAST\r\n", body.len()).as_bytes())
+                .await;
+            smtp.send(body).await;
+            let reply = smtp.reply().await;
+            assert!(reply.starts_with("451 4.3.0"), "{reply}");
+            assert!(smtp.command("QUIT").await.starts_with("221 "));
+
+            let mut raw = MessageId {
+                node: own,
+                shard: 0,
+                key: 7,
+            }
+            .bytes();
+            raw[6] = 1;
+            let reserved = Token::sign(&keys, 0, hidden(control, raw)).text();
+            let reply = rcpt(MX, &tls, &format!("b{reserved}@x.example")).await;
+            assert!(reply.starts_with("550 5.1.1"), "{reply}");
+
+            let mut smtp = Smtp::connect(MX + 1, &tls).await;
+            assert!(smtp.command("EHLO relay.test").await.starts_with("250 "));
+            assert!(smtp.command("MAIL FROM:<>").await.starts_with("250 "));
+            let reply = smtp.command(&format!("RCPT TO:<b{token}@x.example>")).await;
+            assert!(reply.starts_with("250 "), "{reply}");
+            let reply = smtp.command("DATA").await;
+            assert!(reply.starts_with("451 4.3.2"), "{reply}");
+            assert!(smtp.command("QUIT").await.starts_with("221 "));
+
+            control.delete_tenant(2).await.expect("delete");
+            until("deleting", || {
+                control.table().tenant(2).is_none_or(|t| t.state.deleted())
+            })
+            .await;
+            let reply = rcpt(MX, &tls, &format!("b{token}@x.example")).await;
+            assert!(reply.starts_with("550 5.1.1"), "{reply}");
+
+            let stats = reports.stats();
+            assert_eq!((stats.accepted, stats.held), (1, 1), "seed {seed}");
+            assert_eq!(listening.ended(End::Timeout), 0, "seed {seed}");
+            listening.close().await;
+            tight.close().await;
+        });
+        cluster.stop();
+    });
 }

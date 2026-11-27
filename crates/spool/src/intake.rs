@@ -160,6 +160,10 @@ impl Spool {
         self.inner.limits
     }
 
+    pub fn node(&self) -> u32 {
+        self.inner.node
+    }
+
     pub fn chunk(&self) -> usize {
         self.inner.bounds.chunk
     }

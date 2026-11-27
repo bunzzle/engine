@@ -68,11 +68,13 @@ fn minimal_config_takes_defaults() {
     assert_eq!(config.session.name, "mx.example.org");
     assert_eq!(config.session.drain, Duration::from_secs(30));
     assert_eq!(config.limits, intake::Limits::default());
+    assert_eq!(config.mx, intake::Limits::default());
     assert_eq!(
         config.listen,
         [Listen {
             address: "0.0.0.0:25".parse().expect("address"),
             implicit: false,
+            mx: false,
         }]
     );
     assert_eq!(
@@ -97,6 +99,10 @@ fn every_setting_is_read() {
 address = "[::]:465"
 mode = "implicit"
 
+[[listen]]
+address = "[::]:2525"
+mx = true
+
 [intake]
 lifetime = "2h"
 messages = 50
@@ -117,6 +123,10 @@ leak = "30s"
 entries = 1_000
 budget = "16MiB"
 ask = "2s"
+
+[mx]
+sessions = 300
+budget = "32MiB"
 
 "#
     )
@@ -166,8 +176,11 @@ ask = "2s"
         )
     );
     assert_eq!((limits.entries, limits.budget), (1000, 16 << 20));
-    assert_eq!(config.listen.len(), 2);
-    assert!(config.listen[1].implicit);
+    assert_eq!(config.listen.len(), 3);
+    assert!(config.listen[1].implicit && !config.listen[1].mx);
+    assert!(config.listen[2].mx && !config.listen[2].implicit);
+    assert_eq!((config.mx.sessions, config.mx.budget), (300, 32 << 20));
+    assert_eq!(config.mx.per_net, intake::Limits::default().per_net);
 }
 
 #[test]
@@ -960,4 +973,19 @@ fn admin_settings_are_read() {
     );
     assert!(error(&format!("{MINIMAL}[admin]\n")).contains("socket"));
     assert!(error(&format!("{MINIMAL}[admin]\nsocket = \"/a\"\nother = 1\n")).contains("other"));
+}
+
+#[test]
+fn mx_listen_flag_must_be_a_boolean() {
+    assert_eq!(
+        error(&format!("{MINIMAL}mx = \"yes\"\n")),
+        "line 21, column 1: `mx` must be a boolean, found a string"
+    );
+    assert_eq!(
+        error(&format!("{MINIMAL}[mx]\nbudget = \"1MiB\"\n")),
+        format!(
+            "line 22, column 1: `budget` must be between {} and 1099511627776 bytes",
+            intake::HOLD
+        )
+    );
 }

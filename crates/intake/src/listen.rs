@@ -14,6 +14,7 @@ use tls::Acceptor;
 
 use crate::conn::Conn;
 use crate::guard::{Guard, Refused};
+use crate::mx::{self, Reports};
 use crate::session::{Config, End, serve};
 
 const ENDS: usize = 7;
@@ -78,16 +79,34 @@ pub fn listen<T: Transport + 'static>(
     config: Rc<Config>,
     guard: Guard,
     implicit: bool,
+    reports: Option<Rc<Reports>>,
 ) -> Listener {
     let (drain, gate) = (config.drain, guard.clone());
     Listener::start(socket, gate, drain, move |io, ip, count| {
-        let (node, acceptor, config, guard) = (
+        let (node, acceptor, config, guard, reports) = (
             node.clone(),
             Rc::clone(&acceptor),
             Rc::clone(&config),
             guard.clone(),
+            reports.clone(),
         );
-        async move { session(&node, &acceptor, io, &config, &guard, ip, implicit, count).await }
+        async move {
+            let peer = Peer {
+                ip,
+                implicit,
+                count,
+            };
+            session(
+                &node,
+                &acceptor,
+                io,
+                &config,
+                &guard,
+                peer,
+                reports.as_deref(),
+            )
+            .await
+        }
     })
 }
 
@@ -152,16 +171,25 @@ async fn accept_or_stop(
     .await
 }
 
-#[allow(clippy::too_many_arguments)]
+#[derive(Clone, Copy)]
+struct Peer {
+    ip: IpAddr,
+    implicit: bool,
+    count: usize,
+}
+
 async fn session<T: Transport + 'static>(
     node: &Node<T>,
     acceptor: &Acceptor,
     io: TcpStream,
     config: &Config,
     guard: &Guard,
-    ip: IpAddr,
-    implicit: bool,
-    count: usize,
+    Peer {
+        ip,
+        implicit,
+        count,
+    }: Peer,
+    reports: Option<&Reports>,
 ) -> End {
     let net = match guard.open(ip).await {
         Ok(net) => net,
@@ -188,7 +216,10 @@ async fn session<T: Transport + 'static>(
     } else {
         Conn::plain(io)
     };
-    serve(node, acceptor, conn, config, guard, (ip, net), count).await
+    match reports {
+        Some(reports) => mx::serve(node, acceptor, conn, config, guard, net, reports).await,
+        None => serve(node, acceptor, conn, config, guard, (ip, net), count).await,
+    }
 }
 
 async fn until_closed(shared: &Shared, id: usize, work: impl Future<Output = End>) -> Option<End> {

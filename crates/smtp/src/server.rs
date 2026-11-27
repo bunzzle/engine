@@ -22,6 +22,7 @@ pub struct Config {
     pub message: u64,
     pub implicit: bool,
     pub messages: u32,
+    pub mx: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -457,7 +458,14 @@ impl Server {
         }
         let mut lines = vec![self.config.name.clone(), "PIPELINING".into()];
         lines.push("ENHANCEDSTATUSCODES".into());
-        if self.tls {
+        if self.config.mx {
+            lines.push("8BITMIME".into());
+            lines.push("CHUNKING".into());
+            lines.push(format!("SIZE {}", self.config.message));
+            if !self.tls {
+                lines.push("STARTTLS".into());
+            }
+        } else if self.tls {
             lines.push("8BITMIME".into());
             lines.push("CHUNKING".into());
             lines.push(format!("SIZE {}", self.config.message));
@@ -487,6 +495,9 @@ impl Server {
     }
 
     fn auth_command(&mut self, mechanism: &[u8], initial: Option<&[u8]>) {
+        if self.config.mx {
+            return self.send(&reply::NOT_IMPLEMENTED);
+        }
         if self.hello != Hello::Ehlo || self.authenticated || self.transaction.is_some() {
             return self.send(&reply::SEQUENCE);
         }
@@ -575,10 +586,10 @@ impl Server {
         if self.hello == Hello::None || self.transaction.is_some() {
             return self.send(&reply::SEQUENCE);
         }
-        if !self.tls {
+        if !self.config.mx && !self.tls {
             return self.send(&reply::TLS_FIRST);
         }
-        if !self.authenticated {
+        if !self.config.mx && !self.authenticated {
             return self.send(&reply::AUTH_FIRST);
         }
         let path = match address::path(args) {
@@ -612,8 +623,10 @@ impl Server {
                 _ => return self.send(&reply::PARAMETER),
             }
         }
-        let Some(from) = path.mailbox else {
-            return self.send(&reply::NULL_SENDER);
+        let from = match path.mailbox {
+            Some(from) => from,
+            None if self.config.mx => String::new(),
+            None => return self.send(&reply::NULL_SENDER),
         };
         self.events.push_back(Event::Mail { from, size, body });
         self.mode = Mode::Wait(Wait::Mail);
@@ -636,6 +649,12 @@ impl Server {
         let mut addresses = Vec::new();
         let mut found = self.recipient(first);
         loop {
+            let full = self.config.mx
+                && (!addresses.is_empty()
+                    || self.transaction.as_ref().is_some_and(|t| t.recipients > 0));
+            if full && found.is_ok() {
+                found = Err(reply::TOO_MANY_RECIPIENTS);
+            }
             match found {
                 Ok(address) => {
                     addresses.push(address);
