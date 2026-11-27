@@ -1,9 +1,9 @@
 use std::cell::{Cell, OnceCell};
 
-use control::KeyError;
+use control::{KeyError, Verification};
 use crypto::{Ids, Token};
 use rt::{Instant, now, timeout};
-use sched::{Node, Transport};
+use sched::{Node, RETURN_PREFIX, Transport};
 use smtp::{Event, Reply, Server, reply};
 use tls::Acceptor;
 
@@ -92,21 +92,35 @@ impl Reports {
         node: &Node<T>,
         address: &str,
     ) -> Result<Token, Reply> {
-        let (local, _) = address.rsplit_once('@').ok_or(UNKNOWN)?;
+        let (local, domain) = address.rsplit_once('@').ok_or(UNKNOWN)?;
         let text = local.strip_prefix(['b', 'B']).ok_or(UNKNOWN)?;
         let token = Token::parse(text.as_bytes()).ok_or(UNKNOWN)?;
+        let generation = {
+            let table = node.table();
+            let generation = table
+                .tenant(token.tenant)
+                .filter(|tenant| !tenant.state.deleted())
+                .map(|tenant| tenant.generation)
+                .ok_or(UNKNOWN)?;
+            let (prefix, name) = domain.split_once('.').ok_or(UNKNOWN)?;
+            if !prefix.eq_ignore_ascii_case(RETURN_PREFIX)
+                || !table.domains(token.tenant).any(|record| {
+                    record.return_path
+                        && record.state == Verification::Verified
+                        && record.generation == generation
+                        && name.eq_ignore_ascii_case(&record.name)
+                })
+            {
+                return Err(UNKNOWN);
+            }
+            generation
+        };
         let ids = self.ids(node).await?;
         let raw = ids.reveal(&token.id).ok_or(UNKNOWN)?;
         let ours = u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]) == node.spool().node();
         if !ours || raw[6..8] != [0, 0] {
             return Err(UNKNOWN);
         }
-        let generation = node
-            .table()
-            .tenant(token.tenant)
-            .filter(|tenant| !tenant.state.deleted())
-            .map(|tenant| tenant.generation)
-            .ok_or(UNKNOWN)?;
         let keys = if let Some(keys) = node.cached_keys(token.tenant, generation) {
             keys
         } else {

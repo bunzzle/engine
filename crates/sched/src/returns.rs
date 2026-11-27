@@ -3,7 +3,7 @@ use crypto::{ANY, TOKEN_TEXT, TenantKeys, Token};
 
 use crate::Envelope;
 
-pub(crate) const RETURN_PREFIX: &str = "bounce";
+pub const RETURN_PREFIX: &str = "bounce";
 
 pub(crate) fn return_sender(
     table: &Table,

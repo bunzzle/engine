@@ -66,6 +66,7 @@ pub use requests::{
     Begun, DAY, INLINE_IDS, KIND_REQUEST, REQUEST_SHAPE, RequestInputs, Requests, Ticket,
     retain_request,
 };
+pub use returns::RETURN_PREFIX;
 pub use sealing::{
     Batched, Deleted, HookSecret, Keys, LABEL_BODY, LABEL_EVENT, LABEL_HEAD, LABEL_REPLY,
     LABEL_SLICE, Loaded, Made, Oldest, Opener, Sealing, Searched, Signed, Unsealable, Unwrapped,
