@@ -42,7 +42,7 @@ pub async fn check(resolver: &Resolver, name: &str, hosts: &[Name]) -> Result<()
     let spf_count = records
         .iter()
         .filter(|record| {
-            matches!(record, Record::Txt(text) if text
+            matches!(record, Record::Txt(value) if value
                 .split(|&byte| byte == b' ')
                 .next()
                 .is_some_and(|version| version.eq_ignore_ascii_case(b"v=spf1")))

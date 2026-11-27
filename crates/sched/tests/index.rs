@@ -296,13 +296,14 @@ async fn answer(attempt: Attempt) -> Vec<Answered> {
     });
     let prepared = attempt.outgoing.prepare().await;
     if let Some(probe) = RETURN_PROBE.with_borrow_mut(Option::take) {
-        let prepared = match &prepared {
-            Ok(prepared) => prepared,
-            Err(fault @ Fault::Keys) if HOOK_KEYS_DOWN.with(Cell::get) => {
-                RETURN_PROBE.set(Some(probe));
-                return fault.answers(&attempt.recipients);
-            }
-            Err(_) => panic!("return-path message failed to prepare"),
+        if let Err(fault @ Fault::Keys) = &prepared
+            && HOOK_KEYS_DOWN.with(Cell::get)
+        {
+            RETURN_PROBE.set(Some(probe));
+            return fault.answers(&attempt.recipients);
+        }
+        let Ok(prepared) = &prepared else {
+            panic!("return-path message failed to prepare");
         };
         let recipients = prepared
             .recipients
