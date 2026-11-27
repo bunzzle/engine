@@ -4,6 +4,7 @@ mod error;
 mod native;
 mod ops;
 mod report;
+pub mod returns;
 mod scrape;
 mod settings;
 mod socket;

@@ -9,6 +9,7 @@ fn domain(id: u32, tenant: u32, name: &str, state: Verification) -> Domain {
         tenant,
         generation: 1,
         state,
+        return_path: false,
         rsa: 0,
         ed25519: 0,
         name: name.into(),
@@ -29,6 +30,7 @@ fn tenant(id: u32, generation: u32) -> Object {
 #[test]
 fn domain_records_round_trip_sealed_and_are_checked() {
     let good = Domain {
+        return_path: true,
         rsa: 4,
         ed25519: 9,
         ..domain(3, 2, "mail.example.org", Verification::Verified)
@@ -37,29 +39,35 @@ fn domain_records_round_trip_sealed_and_are_checked() {
         good.clone(),
         domain(1, 2, "example.org", Verification::Unverified),
     ] {
+        let flag = u8::from(object.return_path);
         let update = Update {
             version: 5,
             object: Object::Domain(object),
         };
         let clear = update.encode();
         assert_eq!(clear.len(), 40);
+        assert_eq!(clear[16 + 5..16 + 8], [flag, 0, 0]);
         assert_eq!(
             Update::decode_sealed(&clear, &update.secret()),
             Some(update.clone())
         );
         assert_eq!(Update::decode(&clear), None);
         assert_eq!(Update::decode_sealed(&clear, b"Example.org"), None);
-        for at in [16 + 4, 16 + 5, 16 + 21] {
+        for at in [16 + 4, 16 + 6, 16 + 7, 16 + 21] {
             let mut bad = clear.clone();
             bad[at] = 3;
             assert_eq!(Update::decode_sealed(&bad, &update.secret()), None);
         }
+        let mut bad = clear;
+        bad[16 + 5] = 2;
+        assert_eq!(Update::decode_sealed(&bad, &update.secret()), None);
     }
     let label = Object::Domain(good.clone()).sealed().expect("sealed");
     assert_eq!((label.tenant, label.kind, label.id), (2, 7, 3));
     for (bad, what) in [
         (
             Domain {
+                return_path: false,
                 id: 0,
                 ..good.clone()
             },
@@ -67,6 +75,7 @@ fn domain_records_round_trip_sealed_and_are_checked() {
         ),
         (
             Domain {
+                return_path: false,
                 tenant: 0,
                 ..good.clone()
             },
@@ -74,6 +83,7 @@ fn domain_records_round_trip_sealed_and_are_checked() {
         ),
         (
             Domain {
+                return_path: false,
                 name: "Example.org".into(),
                 ..good.clone()
             },
@@ -81,6 +91,7 @@ fn domain_records_round_trip_sealed_and_are_checked() {
         ),
         (
             Domain {
+                return_path: false,
                 name: "".into(),
                 ..good.clone()
             },
@@ -88,10 +99,19 @@ fn domain_records_round_trip_sealed_and_are_checked() {
         ),
         (
             Domain {
+                return_path: false,
                 rsa: 9,
                 ..good.clone()
             },
             "dkim keys",
+        ),
+        (
+            Domain {
+                return_path: true,
+                state: Verification::Unverified,
+                ..good.clone()
+            },
+            "return path",
         ),
     ] {
         assert!(matches!(
@@ -100,6 +120,7 @@ fn domain_records_round_trip_sealed_and_are_checked() {
         ));
     }
     Object::Domain(Domain {
+        return_path: false,
         rsa: 0,
         ed25519: 0,
         ..good
@@ -131,6 +152,7 @@ fn a_domain_covers_itself_and_its_subdomains_only() {
     }
     assert!(
         Domain {
+            return_path: false,
             rsa: 4,
             ..d.clone()
         }
@@ -148,14 +170,17 @@ fn senders_take_the_longest_verified_domain_of_the_current_generation() {
             tenant(1, 2),
             tenant(2, 1),
             Object::Domain(Domain {
+                return_path: false,
                 generation: 2,
                 ..domain(1, 1, "example.org", Verification::Verified)
             }),
             Object::Domain(Domain {
+                return_path: false,
                 generation: 2,
                 ..domain(2, 1, "mail.example.org", Verification::Verified)
             }),
             Object::Domain(Domain {
+                return_path: false,
                 generation: 2,
                 ..domain(3, 1, "news.example.org", Verification::Unverified)
             }),
@@ -174,6 +199,45 @@ fn senders_take_the_longest_verified_domain_of_the_current_generation() {
     assert_eq!(sender(3, "example.org"), None);
     assert_eq!(table.domains(1).count(), 4);
     assert!(table.domain(2, 1).is_none());
+}
+
+#[test]
+fn return_paths_require_the_flag_on_the_longest_verified_domain() {
+    let mut table = Table::default();
+    table.load(Snapshot {
+        version: 1,
+        objects: vec![
+            tenant(1, 2),
+            tenant(2, 1),
+            Object::Domain(Domain {
+                generation: 2,
+                return_path: true,
+                ..domain(1, 1, "example.org", Verification::Verified)
+            }),
+            Object::Domain(Domain {
+                generation: 2,
+                return_path: true,
+                ..domain(2, 1, "mail.example.org", Verification::Verified)
+            }),
+            Object::Domain(Domain {
+                generation: 2,
+                return_path: false,
+                ..domain(3, 1, "news.example.org", Verification::Verified)
+            }),
+            Object::Domain(Domain {
+                generation: 2,
+                return_path: false,
+                ..domain(4, 1, "new.example.org", Verification::Unverified)
+            }),
+            Object::Domain(domain(5, 1, "old.example.org", Verification::Verified)),
+        ],
+    });
+    let return_path = |tenant, name: &str| table.return_path(tenant, name).map(|d| d.id);
+    assert_eq!(return_path(1, "a.mail.example.org"), Some(2));
+    assert_eq!(return_path(1, "a.news.example.org"), None);
+    assert_eq!(return_path(1, "new.example.org"), Some(1));
+    assert_eq!(return_path(1, "old.example.org"), Some(1));
+    assert_eq!(return_path(2, "mail.example.org"), None);
 }
 
 #[test]

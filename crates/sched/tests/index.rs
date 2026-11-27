@@ -13,7 +13,10 @@ use control::{
     ALL_EVENTS, Created, Dkim, Domain, Hook, HookState, KeyError, KeySource, Naming, Object, Pool,
     Ready, Scope, Scopes, State, Table, Tenant, Verification,
 };
-use crypto::{BatchKey, DkimAlg, Secret, Tenant as Root, TenantKeys, Wrap, day_public, open_batch};
+use crypto::{
+    ANY, BatchKey, DkimAlg, Ids, Secret, Tenant as Root, TenantKeys, Token, Wrap, day_public,
+    open_batch,
+};
 use index::{Entry, Op};
 use keys::{
     Audit, BatchSettings, Batches, Client as KeyClient, Connect, Ring, RingSettings, SearchKeys,
@@ -23,14 +26,14 @@ use rt::sim::{Config, Disk, Faults, Machine, Rng, SimDriver, Stalls, check};
 use rt::{JoinHandle, Runtime, TcpListener, TcpStream, sleep, spawn, timeout};
 use sched::{
     Answer, Answered, Attempt, Batched, Begun, Call, CallStats, Clock, Cursor, DAY, DayKeys,
-    Deliver, Draft, EVENT_DAYS, EVENT_SHAPE, EVENT_VALUE, Event, EventBody, EventKind, Fault,
-    Found, Hash, HookChange, HookStats, KIND_EVENT, KIND_REQUEST, KIND_SEARCH, KIND_SUPPRESS,
-    Keyring, Keys, MAX_HOOKS, MAX_REPLY, Meshes, Node, Outcome, Parts, ROTATION_MS, ReadError,
-    Reason, Recipient, Refusal, Restore, Running, SEARCH_VALUE, SHAPE, SearchField, SearchQuery,
-    Searched, Sending, Settings, Suppression, Ticket, Transport, Unsealable, Unwrapped,
-    drop_cursor, encode_slice, event_record, event_sealed, event_sequence, normalize, punycode,
-    read_cursor, retain, retain_event, retain_request, retain_search, retired_events,
-    search_event_key, search_hash, search_key, write_cursor,
+    Deliver, Draft, EVENT_DAYS, EVENT_SHAPE, EVENT_VALUE, Envelope, Event, EventBody, EventKind,
+    Fault, Found, Hash, HookChange, HookStats, KIND_EVENT, KIND_REQUEST, KIND_SEARCH,
+    KIND_SUPPRESS, Keyring, Keys, MAX_HOOKS, MAX_REPLY, Made, Meshes, Node, Outcome, Parts,
+    ROTATION_MS, ReadError, Reason, Recipient, Refusal, Restore, Ret, Running, SEARCH_VALUE, SHAPE,
+    SearchField, SearchQuery, Searched, Sending, Settings, Signed, Suppression, Ticket, Transport,
+    Unsealable, Unwrapped, drop_cursor, encode_slice, event_record, event_sealed, event_sequence,
+    normalize, punycode, read_cursor, retain, retain_event, retain_request, retain_search,
+    retired_events, search_event_key, search_hash, search_key, write_cursor,
 };
 use spool::{Body, Head, HeadClear, Message, MessageId, SLICE, Slice, Stamp};
 use store::{Client, Committer, DataFile, IndexStamp, Options, SLOT_SIZE, Setup, Tiering, boot};
@@ -62,6 +65,11 @@ const NO_CREATE: u32 = 198;
 
 impl KeySource for Toy {
     fn get(&self, tenant: u32, generation: u32) -> Option<TenantKeys> {
+        RETURN_PROBE.with_borrow_mut(|probe| {
+            if let Some(probe) = probe {
+                probe.lookups.cached += 1;
+            }
+        });
         if tenant == KEYLESS || HOOK_KEYS_DOWN.with(Cell::get) {
             return None;
         }
@@ -81,6 +89,11 @@ impl KeySource for Toy {
     }
 
     fn ready(&self, tenant: u32, generation: u32) -> Ready<'_> {
+        RETURN_PROBE.with_borrow_mut(|probe| {
+            if let Some(probe) = probe {
+                probe.lookups.ready += 1;
+            }
+        });
         let missing = if tenant == KEYLESS {
             KeyError::Unavailable
         } else {
@@ -138,6 +151,26 @@ fn search_entries(
 }
 
 impl Keys for Toy {
+    fn ids(&self) -> Option<Secret<16>> {
+        RETURN_PROBE.with_borrow_mut(|probe| {
+            probe.as_mut().map(|probe| {
+                probe.lookups.ids += 1;
+                Secret::new(RETURN_IDS)
+            })
+        })
+    }
+
+    fn dkim_new(&self, _: u32, _: u32, _: u32, _: DkimAlg) -> Made<'_> {
+        let made =
+            RETURN_PROBE.with_borrow(|probe| probe.as_ref().map(|_| (vec![1; 32], vec![2; 16])));
+        Box::pin(std::future::ready(made.ok_or(KeyError::Unavailable)))
+    }
+
+    fn sign(&self, _: u32, _: u32, _: u32, _: DkimAlg, _: [u8; 32]) -> Signed<'_> {
+        let signature = RETURN_PROBE.with_borrow(|probe| probe.as_ref().map(|_| vec![3; 64]));
+        Box::pin(std::future::ready(signature.ok_or(KeyError::Unavailable)))
+    }
+
     fn search(&self, tenant: u32, generation: u32) -> Searched<'_> {
         let keys = self.get(tenant, generation).map(|_| {
             DayKeys::new(
@@ -212,6 +245,7 @@ thread_local! {
     static KEYS_DOWN_ON_GONE: Cell<bool> = const { Cell::new(false) };
     static UNWRAP_DOWN: Cell<bool> = const { Cell::new(false) };
     static LISTED: RefCell<BTreeMap<[u8; 16], Vec<String>>> = const { RefCell::new(BTreeMap::new()) };
+    static RETURN_PROBE: RefCell<Option<ReturnProbe>> = const { RefCell::new(None) };
 }
 
 type Given = (MessageId, u32, u16, EventKind);
@@ -219,6 +253,30 @@ type Given = (MessageId, u32, u16, EventKind);
 struct Answers {
     clock: Clock,
     given: Vec<Given>,
+}
+
+const RETURN_IDS: [u8; 16] = [27; 16];
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ReturnLookups {
+    cached: u32,
+    ready: u32,
+    ids: u32,
+}
+
+struct ReturnProbe {
+    prepared: rt::Sender<PreparedReturn>,
+    lookups: ReturnLookups,
+    deliver: bool,
+}
+
+#[derive(Debug)]
+struct PreparedReturn {
+    message: MessageId,
+    sender: String,
+    ret: Ret,
+    recipients: Vec<u32>,
+    lookups: ReturnLookups,
 }
 
 fn mix(mut x: u64) -> u64 {
@@ -232,7 +290,42 @@ async fn answer(attempt: Attempt) -> Vec<Answered> {
     let Some(clock) = ANSWERS.with_borrow(|a| a.as_ref().map(|a| a.clock)) else {
         return Vec::new();
     };
-    let opener = match attempt.outgoing.prepare().await {
+    RETURN_PROBE.with_borrow_mut(|probe| {
+        if let Some(probe) = probe {
+            probe.lookups = ReturnLookups::default();
+        }
+    });
+    let prepared = attempt.outgoing.prepare().await;
+    let deliver = if let Some(probe) = RETURN_PROBE.with_borrow_mut(Option::take) {
+        if let Err(fault @ Fault::Keys) = &prepared
+            && HOOK_KEYS_DOWN.with(Cell::get)
+        {
+            RETURN_PROBE.set(Some(probe));
+            return fault.answers(&attempt.recipients);
+        }
+        let Ok(prepared) = &prepared else {
+            panic!("return-path message failed to prepare");
+        };
+        let recipients = prepared
+            .recipients
+            .iter()
+            .map(|(index, _)| *index)
+            .collect();
+        probe
+            .prepared
+            .send(PreparedReturn {
+                message: attempt.message,
+                sender: prepared.envelope.sender.clone(),
+                ret: prepared.envelope.ret,
+                recipients,
+                lookups: probe.lookups,
+            })
+            .expect("return-path observer");
+        probe.deliver
+    } else {
+        false
+    };
+    let opener = match prepared {
         Ok(prepared) => prepared.opener,
         Err(Fault::Format(opener) | Fault::Recipients(opener) | Fault::Signer(opener)) => opener,
         Err(_) => return Vec::new(),
@@ -243,6 +336,7 @@ async fn answer(attempt: Attempt) -> Vec<Answered> {
         let roll =
             mix(attempt.message.key ^ u64::from(c.recipient) << 32 ^ u64::from(attempts)) % 4;
         let (answer, kind) = match roll {
+            _ if deliver => (Answer::Delivered, EventKind::Delivered),
             0 | 1 => (Answer::Delivered, EventKind::Delivered),
             2 => (Answer::Failed, EventKind::Failed),
             _ if attempts >= 3 => (Answer::Delivered, EventKind::Delivered),
@@ -1456,6 +1550,21 @@ async fn accept_listed(
     addresses: &[&str],
     expiry: u64,
 ) -> (MessageId, [u8; spool::WRAP]) {
+    let (draft, message) =
+        listed_with_head(node, shard, addresses, expiry, &[1; 10], b"Subject: hi\r\n").await;
+    let (id, wrap) = (message.id, message.head.wrap);
+    node.accept(draft, message).await.expect("accept");
+    (id, wrap)
+}
+
+async fn listed_with_head(
+    node: &Node<Idle>,
+    shard: u16,
+    addresses: &[&str],
+    expiry: u64,
+    envelope: &[u8],
+    headers: &[u8],
+) -> (Draft, Message) {
     let mut draft = node.draft(1, None).expect("draft");
     for address in addresses {
         node.recipient(&mut draft, address)
@@ -1469,9 +1578,8 @@ async fn accept_listed(
         ..HeadClear::default()
     };
     let head = sealing
-        .head(clear, expiry, &[1; 10], b"Subject: hi\r\n")
+        .head(clear, expiry, envelope, headers)
         .expect("head");
-    let wrap = head.wrap;
     let body = sealing.inline_body(&[1; 30]).expect("body");
     let listed: Vec<Recipient> = addresses
         .iter()
@@ -1495,8 +1603,331 @@ async fn accept_listed(
     };
     let listed = addresses.iter().map(|a| (*a).to_owned()).collect();
     LISTED.with_borrow_mut(|l| l.insert(id.bytes(), listed));
-    node.accept(draft, message).await.expect("accept");
-    (id, wrap)
+    (draft, message)
+}
+
+const RETURN_SENDER: &str = "sender@news.example.org";
+
+fn prepared_return(return_path: bool, addresses: &'static [&'static str]) -> PreparedReturn {
+    prepared_return_with_outage(return_path, "example.org", addresses, None)
+}
+
+#[derive(Clone, Copy)]
+enum ReturnOutage {
+    RetryFor(Duration),
+    DuringDelivery,
+}
+
+struct RestoreReturnKeys;
+
+impl Drop for RestoreReturnKeys {
+    fn drop(&mut self) {
+        HOOK_KEYS_DOWN.set(false);
+    }
+}
+
+fn prepared_return_with_outage(
+    return_path: bool,
+    name: &str,
+    addresses: &'static [&'static str],
+    key_outage: Option<ReturnOutage>,
+) -> PreparedReturn {
+    let _reset_keys = key_outage.map(|_| RestoreReturnKeys);
+    let driver = Rc::new(SimDriver::with_disk(47, Config::default(), created(47)));
+    let cluster = started(&driver, 1);
+    let nodes = cluster.nodes.clone();
+    let name = name.to_owned();
+    cluster.run(async move {
+        let deadline = match key_outage {
+            Some(ReturnOutage::RetryFor(outage)) => outage + Duration::from_secs(60),
+            _ => Duration::from_secs(30),
+        };
+        timeout(deadline, async move {
+            ready(&nodes).await;
+            let node = &nodes[0];
+            let (observe, mut observed) = rt::channel();
+            RETURN_PROBE.with_borrow_mut(|probe| {
+                *probe = Some(ReturnProbe {
+                    prepared: observe,
+                    lookups: ReturnLookups::default(),
+                    deliver: matches!(key_outage, Some(ReturnOutage::DuringDelivery)),
+                });
+            });
+            let selector = "s1";
+            let alg = DkimAlg::Ed25519Sha256;
+            let key = node.dkim_new(1, alg, &name, selector).await.expect("dkim");
+            let domain = node.domain_new(1, &name).await.expect("domain");
+            let domain = node
+                .domain_write(Domain {
+                    state: Verification::Verified,
+                    ed25519: key.id,
+                    ..domain
+                })
+                .await
+                .expect("verify domain");
+            if return_path {
+                node.return_path_set(1, domain.id, true)
+                    .await
+                    .expect("enable return path");
+            }
+            let sender = format!("sender@news.{name}");
+            let from = format!("From: {sender}\r\n").into_bytes();
+            let envelope = Envelope {
+                sender,
+                signatures: vec![(key.id, alg)],
+                ret: Ret::Full,
+                ..Envelope::default()
+            }
+            .encode()
+            .expect("envelope");
+            let received = b"Received: by test\r\n";
+            let signature = dkim::unsigned(
+                &dkim::Template {
+                    alg,
+                    domain: &name,
+                    selector,
+                    time: 1,
+                    expiry: 2,
+                },
+                &dkim::parse(&from).expect("from"),
+                &[0; 32],
+            )
+            .expect("unsigned signature");
+            let headers = [received.as_slice(), &signature, &from].concat();
+            let shard = owned_shard(node).await;
+            answering(&nodes);
+            let (draft, message) =
+                listed_with_head(node, shard, addresses, u64::MAX / 2, &envelope, &headers).await;
+            let id = message.id;
+            if key_outage.is_some() {
+                HOOK_KEYS_DOWN.set(true);
+            }
+            node.accept(draft, message).await.expect("accept");
+            if let Some(ReturnOutage::RetryFor(outage)) = key_outage {
+                sleep(outage).await;
+                assert!(
+                    observed.try_recv().is_none(),
+                    "prepared while keys were missing"
+                );
+                assert_eq!(node.spool().messages_of(1), [id]);
+                assert!(node.sched().answers().later >= 3, "expected key retries");
+                HOOK_KEYS_DOWN.set(false);
+            }
+            let prepared = observed.recv().await.expect("prepared return path");
+            assert_eq!(prepared.message, id);
+            if matches!(key_outage, Some(ReturnOutage::DuringDelivery)) {
+                drained(&nodes).await;
+                let answers = node.sched().answers();
+                assert_eq!(answers.delivered + answers.failed, 1);
+                assert_eq!(answers.deferred, 0);
+                assert_eq!(answers.later, 0);
+            }
+            prepared
+        })
+        .await
+        .expect("timed out preparing return path")
+    })
+}
+
+fn verified_return(prepared: &PreparedReturn) -> Token {
+    let (local, domain) = prepared.sender.split_once('@').expect("sender address");
+    assert_eq!(domain, "bounce.example.org");
+    let text = local.strip_prefix('b').expect("token prefix");
+    let token = Token::parse(text.as_bytes()).expect("token");
+    let keys = Toy::default().get(1, 1).expect("tenant keys");
+    assert!(token.verify(&keys));
+    let ids = Ids::new(&Secret::new(RETURN_IDS)).expect("node ids");
+    assert_eq!(ids.reveal(&token.id), Some(prepared.message.bytes()));
+    token
+}
+
+#[test]
+fn return_path_binds_the_only_recipient() {
+    let prepared = prepared_return(true, &["one@example.net"]);
+    assert_eq!(prepared.recipients, [0]);
+    assert_eq!(verified_return(&prepared).recipient, 0);
+}
+
+#[test]
+fn return_path_uses_any_for_a_batch() {
+    let prepared = prepared_return(true, &["one@example.net", "two@example.net"]);
+    assert_eq!(prepared.recipients, [0, 1]);
+    assert_eq!(verified_return(&prepared).recipient, ANY);
+}
+
+#[test]
+fn return_path_requests_headers_only_for_rewritten_mail() {
+    let rewritten = prepared_return(true, &["one@example.net"]);
+    assert_eq!(rewritten.ret, Ret::Headers);
+
+    let unchanged = prepared_return(false, &["one@example.net"]);
+    assert_eq!(unchanged.ret, Ret::Full);
+}
+
+#[test]
+fn return_path_retries_when_keys_are_missing() {
+    let prepared = prepared_return_with_outage(
+        true,
+        "example.org",
+        &["one@example.net"],
+        Some(ReturnOutage::RetryFor(Duration::from_secs(100))),
+    );
+    assert_eq!(verified_return(&prepared).recipient, 0);
+    assert_eq!(prepared.ret, Ret::Headers);
+}
+
+#[test]
+fn return_path_keeps_sender_when_rewrite_is_too_long_and_keys_are_missing() {
+    let name = format!(
+        "{}.{}.{}.com",
+        "a".repeat(63),
+        "b".repeat(63),
+        "c".repeat(59)
+    );
+    assert_eq!(
+        sched::RETURN_PREFIX.len() + name.len() + crypto::TOKEN_TEXT + 3,
+        255
+    );
+    let prepared = prepared_return_with_outage(
+        true,
+        &name,
+        &["one@example.net"],
+        Some(ReturnOutage::DuringDelivery),
+    );
+    assert_eq!(prepared.sender, format!("sender@news.{name}"));
+    assert_eq!(prepared.ret, Ret::Full);
+    assert_eq!(prepared.recipients, [0]);
+    assert_eq!(
+        prepared.lookups,
+        ReturnLookups {
+            cached: 1,
+            ..ReturnLookups::default()
+        }
+    );
+}
+
+#[test]
+fn return_path_skips_key_lookups_for_an_unflagged_domain() {
+    let prepared = prepared_return(false, &["one@example.net"]);
+    assert_eq!(prepared.sender, RETURN_SENDER);
+    assert_eq!(
+        prepared.lookups,
+        ReturnLookups {
+            cached: 1,
+            ..ReturnLookups::default()
+        }
+    );
+}
+
+fn return_path_test(test: impl AsyncFnOnce(&Node<Idle>, Domain) + 'static) {
+    let driver = Rc::new(SimDriver::with_disk(45, Config::default(), created(45)));
+    let cluster = started_with_keys(&driver, 1);
+    let nodes = cluster.nodes.clone();
+    cluster.run(async move {
+        timeout(Duration::from_secs(30), async {
+            keys_listening().await;
+            ready(&nodes).await;
+            let node = &nodes[0];
+            let domain = node.domain_new(1, "example.org").await.expect("domain");
+            test(node, domain).await;
+        })
+        .await
+        .expect("return path test in time");
+    });
+}
+
+#[test]
+fn domain_write_refuses_to_enable_return_path() {
+    return_path_test(async |node, domain| {
+        let verified = node
+            .domain_write(Domain {
+                state: Verification::Verified,
+                ..domain
+            })
+            .await
+            .expect("verify domain");
+        domain_refused(
+            node.domain_write(Domain {
+                return_path: true,
+                ..verified.clone()
+            })
+            .await,
+            "return path",
+        );
+        assert_eq!(node.table().domain(1, verified.id), Some(&verified));
+    });
+}
+
+#[test]
+fn domain_write_refuses_to_disable_return_path() {
+    return_path_test(async |node, domain| {
+        let id = domain.id;
+        node.domain_write(Domain {
+            state: Verification::Verified,
+            ..domain
+        })
+        .await
+        .expect("verify domain");
+        let enabled = node.return_path_set(1, id, true).await.expect("enable");
+        domain_refused(
+            node.domain_write(Domain {
+                return_path: false,
+                ..enabled.clone()
+            })
+            .await,
+            "return path",
+        );
+        assert_eq!(node.table().domain(1, id), Some(&enabled));
+    });
+}
+
+#[test]
+fn return_path_set_refuses_to_enable_an_unverified_domain() {
+    return_path_test(async |node, domain| {
+        domain_refused(
+            node.return_path_set(1, domain.id, true).await,
+            "return path",
+        );
+        assert_eq!(node.table().domain(1, domain.id), Some(&domain));
+    });
+}
+
+#[test]
+fn return_path_set_changes_only_the_flag() {
+    return_path_test(async |node, domain| {
+        let rsa = node
+            .dkim_new(1, DkimAlg::RsaSha256, &domain.name, "r1")
+            .await
+            .expect("rsa key");
+        let ed25519 = node
+            .dkim_new(1, DkimAlg::Ed25519Sha256, &domain.name, "e1")
+            .await
+            .expect("ed25519 key");
+        let verified = node
+            .domain_write(Domain {
+                state: Verification::Verified,
+                rsa: rsa.id,
+                ed25519: ed25519.id,
+                ..domain
+            })
+            .await
+            .expect("verify domain");
+        let id = verified.id;
+        let enabled = node.return_path_set(1, id, true).await.expect("enable");
+        assert_eq!(
+            enabled,
+            Domain {
+                return_path: true,
+                ..verified.clone()
+            }
+        );
+        assert_eq!(node.table().domain(1, id), Some(&enabled));
+        assert_eq!(
+            node.return_path_set(1, id, false).await.expect("disable"),
+            verified
+        );
+        assert_eq!(node.table().domain(1, id), Some(&verified));
+    });
 }
 
 #[test]
@@ -3930,6 +4361,7 @@ async fn bad_domain_writes(control: &Node<Idle>, made: &Domain, suffix: Domain, 
     domain_refused(
         control
             .domain_write(Domain {
+                return_path: false,
                 state: Verification::Verified,
                 ..suffix
             })
@@ -3940,6 +4372,7 @@ async fn bad_domain_writes(control: &Node<Idle>, made: &Domain, suffix: Domain, 
         domain_refused(
             control
                 .domain_write(Domain {
+                    return_path: false,
                     rsa,
                     ed25519,
                     ..made.clone()
@@ -3951,6 +4384,7 @@ async fn bad_domain_writes(control: &Node<Idle>, made: &Domain, suffix: Domain, 
     domain_refused(
         control
             .domain_write(Domain {
+                return_path: false,
                 name: "example.net".into(),
                 ..made.clone()
             })
@@ -3960,6 +4394,7 @@ async fn bad_domain_writes(control: &Node<Idle>, made: &Domain, suffix: Domain, 
     domain_refused(
         control
             .domain_write(Domain {
+                return_path: false,
                 tenant: 2,
                 ..made.clone()
             })
@@ -4001,6 +4436,7 @@ fn sender_domains_pick_their_keys_and_keep_named_keys() {
         bad_domain_writes(control, &made, suffix, [ed.id, rsa.id, elsewhere.id]).await;
         let verified = control
             .domain_write(Domain {
+                return_path: false,
                 state: Verification::Verified,
                 rsa: rsa.id,
                 ed25519: ed.id,
@@ -4027,7 +4463,11 @@ fn sender_domains_pick_their_keys_and_keep_named_keys() {
         ));
         control.dkim_remove(1, elsewhere.id).await.expect("remove");
         let unsigned = control
-            .domain_write(Domain { rsa: 0, ..verified })
+            .domain_write(Domain {
+                return_path: false,
+                rsa: 0,
+                ..verified
+            })
             .await
             .expect("write");
         domain_everywhere(&nodes, &unsigned).await;

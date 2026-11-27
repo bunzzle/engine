@@ -336,6 +336,7 @@ async fn verify_domain(control: &Node<Idle>, tenant: u32, name: &str, rsa: u32, 
     let domain = control.domain_new(tenant, name).await.expect("domain");
     control
         .domain_write(Domain {
+            return_path: false,
             state: Verification::Verified,
             rsa,
             ed25519,

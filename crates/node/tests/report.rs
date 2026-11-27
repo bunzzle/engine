@@ -141,6 +141,7 @@ async fn prepare(node: &Node<Capture>) {
         .expect("dkim");
     let domain = node.domain_new(1, "sender.example").await.expect("domain");
     node.domain_write(Domain {
+        return_path: false,
         state: Verification::Verified,
         ed25519: key.id,
         ..domain
