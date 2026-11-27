@@ -51,10 +51,14 @@ fn cname(target: &str) -> packets::Rr {
     packets::rr(QUERY, 5, 300, packets::wire(target))
 }
 
-fn txt(text: &[u8]) -> [packets::Rr; 2] {
-    let mut data = vec![u8::try_from(text.len()).expect("short TXT")];
-    data.extend_from_slice(text);
-    [cname(HOST), packets::rr(HOST, Type::Txt.code(), 300, data)]
+fn txt(texts: &[&[u8]]) -> Vec<packets::Rr> {
+    let mut answers = vec![cname(HOST)];
+    answers.extend(texts.iter().map(|text| {
+        let mut data = vec![u8::try_from(text.len()).expect("short TXT")];
+        data.extend_from_slice(text);
+        packets::rr(HOST, Type::Txt.code(), 300, data)
+    }));
+    answers
 }
 
 async fn respond(socket: &UdpSocket, kind: Type, answers: &[packets::Rr]) {
@@ -67,7 +71,7 @@ async fn respond(socket: &UdpSocket, kind: Type, answers: &[packets::Rr]) {
     assert_eq!(sent.expect("reply"), packet.len());
 }
 
-async fn serve(mx: Vec<packets::Rr>, txt: Option<[packets::Rr; 2]>) -> JoinHandle<()> {
+async fn serve(mx: Vec<packets::Rr>, txt: Option<Vec<packets::Rr>>) -> JoinHandle<()> {
     let socket = UdpSocket::bind(DNS_AT).await.expect("bind DNS");
     spawn(async move {
         timeout(WAIT, async {
@@ -81,7 +85,7 @@ async fn serve(mx: Vec<packets::Rr>, txt: Option<[packets::Rr; 2]>) -> JoinHandl
     })
 }
 
-fn refused(mx: Vec<packets::Rr>, txt: Option<[packets::Rr; 2]>, reason: Refused) {
+fn refused(mx: Vec<packets::Rr>, txt: Option<Vec<packets::Rr>>, reason: Refused) {
     sim(async move {
         let server = serve(mx, txt).await;
         let hosts = [host(), Name::parse(QUERY).expect("host")];
@@ -107,8 +111,36 @@ fn cname_without_mx_is_refused() {
 }
 
 #[test]
+fn cname_with_null_mx_is_refused() {
+    let null_mx = packets::rr(HOST, Type::Mx.code(), 300, packets::mx(0, "."));
+    refused(vec![cname(HOST), null_mx], None, Refused::Mx);
+}
+
+#[test]
 fn cname_without_spf_is_refused() {
-    refused(vec![cname(HOST), mx(HOST)], Some(txt(b"v=")), Refused::Spf);
+    refused(
+        vec![cname(HOST), mx(HOST)],
+        Some(txt(&[b"v="])),
+        Refused::Spf,
+    );
+}
+
+#[test]
+fn cname_with_spf10_is_refused() {
+    refused(
+        vec![cname(HOST), mx(HOST)],
+        Some(txt(&[b"v=spf10 -all"])),
+        Refused::Spf,
+    );
+}
+
+#[test]
+fn cname_with_two_spf_records_is_refused() {
+    refused(
+        vec![cname(HOST), mx(HOST)],
+        Some(txt(&[b"v=spf1 -all", b"V=SpF1"])),
+        Refused::Spf,
+    );
 }
 
 struct Idle;
@@ -253,7 +285,7 @@ fn only_verified_domains_can_enable_and_disable_needs_no_dns() {
             })
             .await
             .expect("verify");
-        let server = serve(vec![cname(HOST), mx(HOST)], Some(txt(b"V=SpF1 -all"))).await;
+        let server = serve(vec![cname(HOST), mx(HOST)], Some(txt(&[b"V=SpF1 -all"]))).await;
         let enabled = enable(&node, &dns, &[host()], 1, id).await.expect("enable");
         server.await;
         assert_eq!(

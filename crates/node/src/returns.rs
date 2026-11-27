@@ -21,8 +21,12 @@ pub async fn check(resolver: &Resolver, name: &str, hosts: &[Name]) -> Result<()
         .lookup(&name, Type::Mx)
         .await
         .map_err(|_| Refused::Dns)?;
-    if !matches!(&mx.found, Found::Records(records) if records.iter().any(|r| matches!(r, Record::Mx { .. })))
-    {
+    let Found::Records(records) = &mx.found else {
+        return Err(Refused::Mx);
+    };
+    if !records.iter().any(|record| {
+        matches!(record, Record::Mx { preference, exchange } if *preference != 0 || !exchange.is_root())
+    }) {
         return Err(Refused::Mx);
     }
     if mx.name == name || !hosts.contains(&mx.name) {
@@ -32,13 +36,23 @@ pub async fn check(resolver: &Resolver, name: &str, hosts: &[Name]) -> Result<()
         .lookup(&name, Type::Txt)
         .await
         .map_err(|_| Refused::Dns)?;
-    let prefix = b"v=spf1";
-    match &txt.found {
-        Found::Records(records) if records.iter().any(|record| {
-            matches!(record, Record::Txt(text) if text.get(..prefix.len()).is_some_and(|start| start.eq_ignore_ascii_case(prefix)))
-        }) => Ok(()),
-        _ => Err(Refused::Spf),
+    let Found::Records(records) = &txt.found else {
+        return Err(Refused::Spf);
+    };
+    let spf_count = records
+        .iter()
+        .filter(|record| {
+            matches!(record, Record::Txt(text) if text
+                .split(|&byte| byte == b' ')
+                .next()
+                .is_some_and(|version| version.eq_ignore_ascii_case(b"v=spf1")))
+        })
+        .take(2)
+        .count();
+    if spf_count != 1 {
+        return Err(Refused::Spf);
     }
+    Ok(())
 }
 
 pub async fn enable<T: Transport + 'static>(
