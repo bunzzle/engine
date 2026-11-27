@@ -267,6 +267,7 @@ struct ReturnLookups {
 struct ReturnProbe {
     prepared: rt::Sender<PreparedReturn>,
     lookups: ReturnLookups,
+    deliver: bool,
 }
 
 #[derive(Debug)]
@@ -295,7 +296,7 @@ async fn answer(attempt: Attempt) -> Vec<Answered> {
         }
     });
     let prepared = attempt.outgoing.prepare().await;
-    if let Some(probe) = RETURN_PROBE.with_borrow_mut(Option::take) {
+    let deliver = if let Some(probe) = RETURN_PROBE.with_borrow_mut(Option::take) {
         if let Err(fault @ Fault::Keys) = &prepared
             && HOOK_KEYS_DOWN.with(Cell::get)
         {
@@ -320,7 +321,10 @@ async fn answer(attempt: Attempt) -> Vec<Answered> {
                 lookups: probe.lookups,
             })
             .expect("return-path observer");
-    }
+        probe.deliver
+    } else {
+        false
+    };
     let opener = match prepared {
         Ok(prepared) => prepared.opener,
         Err(Fault::Format(opener) | Fault::Recipients(opener) | Fault::Signer(opener)) => opener,
@@ -332,6 +336,7 @@ async fn answer(attempt: Attempt) -> Vec<Answered> {
         let roll =
             mix(attempt.message.key ^ u64::from(c.recipient) << 32 ^ u64::from(attempts)) % 4;
         let (answer, kind) = match roll {
+            _ if deliver => (Answer::Delivered, EventKind::Delivered),
             0 | 1 => (Answer::Delivered, EventKind::Delivered),
             2 => (Answer::Failed, EventKind::Failed),
             _ if attempts >= 3 => (Answer::Delivered, EventKind::Delivered),
@@ -1604,30 +1609,39 @@ async fn listed_with_head(
 const RETURN_SENDER: &str = "sender@news.example.org";
 
 fn prepared_return(return_path: bool, addresses: &'static [&'static str]) -> PreparedReturn {
-    prepared_return_with_outage(return_path, addresses, None)
+    prepared_return_with_outage(return_path, "example.org", addresses, None)
+}
+
+#[derive(Clone, Copy)]
+enum ReturnOutage {
+    RetryFor(Duration),
+    DuringDelivery,
+}
+
+struct RestoreReturnKeys;
+
+impl Drop for RestoreReturnKeys {
+    fn drop(&mut self) {
+        HOOK_KEYS_DOWN.set(false);
+    }
 }
 
 fn prepared_return_with_outage(
     return_path: bool,
+    name: &str,
     addresses: &'static [&'static str],
-    key_outage: Option<Duration>,
+    key_outage: Option<ReturnOutage>,
 ) -> PreparedReturn {
-    struct KeysDown;
-
-    impl Drop for KeysDown {
-        fn drop(&mut self) {
-            HOOK_KEYS_DOWN.set(false);
-        }
-    }
-
-    let _reset_keys = key_outage.map(|_| KeysDown);
+    let _reset_keys = key_outage.map(|_| RestoreReturnKeys);
     let driver = Rc::new(SimDriver::with_disk(47, Config::default(), created(47)));
     let cluster = started(&driver, 1);
     let nodes = cluster.nodes.clone();
+    let name = name.to_owned();
     cluster.run(async move {
-        let deadline = key_outage.map_or(Duration::from_secs(30), |outage| {
-            outage + Duration::from_secs(60)
-        });
+        let deadline = match key_outage {
+            Some(ReturnOutage::RetryFor(outage)) => outage + Duration::from_secs(60),
+            _ => Duration::from_secs(30),
+        };
         timeout(deadline, async move {
             ready(&nodes).await;
             let node = &nodes[0];
@@ -1636,13 +1650,13 @@ fn prepared_return_with_outage(
                 *probe = Some(ReturnProbe {
                     prepared: observe,
                     lookups: ReturnLookups::default(),
+                    deliver: matches!(key_outage, Some(ReturnOutage::DuringDelivery)),
                 });
             });
-            let name = "example.org";
             let selector = "s1";
             let alg = DkimAlg::Ed25519Sha256;
-            let key = node.dkim_new(1, alg, name, selector).await.expect("dkim");
-            let domain = node.domain_new(1, name).await.expect("domain");
+            let key = node.dkim_new(1, alg, &name, selector).await.expect("dkim");
+            let domain = node.domain_new(1, &name).await.expect("domain");
             let domain = node
                 .domain_write(Domain {
                     state: Verification::Verified,
@@ -1656,8 +1670,10 @@ fn prepared_return_with_outage(
                     .await
                     .expect("enable return path");
             }
+            let sender = format!("sender@news.{name}");
+            let from = format!("From: {sender}\r\n").into_bytes();
             let envelope = Envelope {
-                sender: RETURN_SENDER.into(),
+                sender,
                 signatures: vec![(key.id, alg)],
                 ret: Ret::Full,
                 ..Envelope::default()
@@ -1665,20 +1681,19 @@ fn prepared_return_with_outage(
             .encode()
             .expect("envelope");
             let received = b"Received: by test\r\n";
-            let from = b"From: sender@news.example.org\r\n";
             let signature = dkim::unsigned(
                 &dkim::Template {
                     alg,
-                    domain: name,
+                    domain: &name,
                     selector,
                     time: 1,
                     expiry: 2,
                 },
-                &dkim::parse(from).expect("from"),
+                &dkim::parse(&from).expect("from"),
                 &[0; 32],
             )
             .expect("unsigned signature");
-            let headers = [received.as_slice(), &signature, from].concat();
+            let headers = [received.as_slice(), &signature, &from].concat();
             let shard = owned_shard(node).await;
             answering(&nodes);
             let (draft, message) =
@@ -1688,7 +1703,7 @@ fn prepared_return_with_outage(
                 HOOK_KEYS_DOWN.set(true);
             }
             node.accept(draft, message).await.expect("accept");
-            if let Some(outage) = key_outage {
+            if let Some(ReturnOutage::RetryFor(outage)) = key_outage {
                 sleep(outage).await;
                 assert!(
                     observed.try_recv().is_none(),
@@ -1700,6 +1715,13 @@ fn prepared_return_with_outage(
             }
             let prepared = observed.recv().await.expect("prepared return path");
             assert_eq!(prepared.message, id);
+            if matches!(key_outage, Some(ReturnOutage::DuringDelivery)) {
+                drained(&nodes).await;
+                let answers = node.sched().answers();
+                assert_eq!(answers.delivered + answers.failed, 1);
+                assert_eq!(answers.deferred, 0);
+                assert_eq!(answers.later, 0);
+            }
             prepared
         })
         .await
@@ -1744,10 +1766,44 @@ fn return_path_requests_headers_only_for_rewritten_mail() {
 
 #[test]
 fn return_path_retries_when_keys_are_missing() {
-    let prepared =
-        prepared_return_with_outage(true, &["one@example.net"], Some(Duration::from_secs(100)));
+    let prepared = prepared_return_with_outage(
+        true,
+        "example.org",
+        &["one@example.net"],
+        Some(ReturnOutage::RetryFor(Duration::from_secs(100))),
+    );
     assert_eq!(verified_return(&prepared).recipient, 0);
     assert_eq!(prepared.ret, Ret::Headers);
+}
+
+#[test]
+fn return_path_keeps_sender_when_rewrite_is_too_long_and_keys_are_missing() {
+    let name = format!(
+        "{}.{}.{}.com",
+        "a".repeat(63),
+        "b".repeat(63),
+        "c".repeat(59)
+    );
+    assert_eq!(
+        sched::RETURN_PREFIX.len() + name.len() + crypto::TOKEN_TEXT + 3,
+        255
+    );
+    let prepared = prepared_return_with_outage(
+        true,
+        &name,
+        &["one@example.net"],
+        Some(ReturnOutage::DuringDelivery),
+    );
+    assert_eq!(prepared.sender, format!("sender@news.{name}"));
+    assert_eq!(prepared.ret, Ret::Full);
+    assert_eq!(prepared.recipients, [0]);
+    assert_eq!(
+        prepared.lookups,
+        ReturnLookups {
+            cached: 1,
+            ..ReturnLookups::default()
+        }
+    );
 }
 
 #[test]

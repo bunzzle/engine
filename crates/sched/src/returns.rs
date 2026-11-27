@@ -6,6 +6,10 @@ use crate::normal::MAX_ADDRESS;
 
 pub const RETURN_PREFIX: &str = "bounce";
 
+pub(crate) fn fits(prefix: &str, name: &str) -> bool {
+    prefix.len() + name.len() + TOKEN_TEXT + 3 <= MAX_ADDRESS && !prefix.contains('.')
+}
+
 pub(crate) fn return_sender(
     table: &Table,
     keys: &TenantKeys,
@@ -20,7 +24,7 @@ pub(crate) fn return_sender(
     }
     let (_, sender_domain) = envelope.sender.rsplit_once('@')?;
     let record = table.return_path(tenant, sender_domain)?;
-    if prefix.len() + record.name.len() + TOKEN_TEXT + 3 > MAX_ADDRESS || prefix.contains('.') {
+    if !fits(prefix, &record.name) {
         return None;
     }
     let domain = format!("{prefix}.{}", record.name);
@@ -210,6 +214,15 @@ mod tests {
             sender.split_once('@').map(|(_, domain)| domain),
             Some("bounce.a.com")
         );
+    }
+
+    #[test]
+    fn fits_at_254_but_not_255_octets() {
+        let name = format!("{}.{}.{}", "a".repeat(63), "b".repeat(63), "c".repeat(62));
+        assert_eq!(RETURN_PREFIX.len() + name.len() + TOKEN_TEXT + 3, 254);
+        assert!(fits(RETURN_PREFIX, &name));
+        assert!(!fits(RETURN_PREFIX, &format!("{name}c")));
+        assert!(!fits("a.b", &name));
     }
 
     #[test]

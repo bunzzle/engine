@@ -10,7 +10,7 @@ use crate::dkim::{sign, signer};
 use crate::envelope::{Envelope, Recipient, Ret, decode_slice};
 use crate::error::Refusal;
 use crate::policy::Answer;
-use crate::returns::{RETURN_PREFIX, return_sender};
+use crate::returns::{RETURN_PREFIX, fits, return_sender};
 use crate::sealing::{Keys, Opener, Unsealable, opener};
 use crate::transport::{Answered, Claimed};
 
@@ -343,7 +343,10 @@ async fn rewrite_sender(
     let (keys, table, tenant) = (&*signing.keys, &*signing.table, stored.tenant);
     if !envelope.smtp
         && let Some((_, domain)) = envelope.sender.rsplit_once('@')
-        && table.borrow().return_path(tenant, domain).is_some()
+        && table
+            .borrow()
+            .return_path(tenant, domain)
+            .is_some_and(|record| fits(RETURN_PREFIX, &record.name))
     {
         let tenant_keys = tenant_keys(keys, tenant, generation)
             .await
