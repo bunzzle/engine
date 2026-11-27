@@ -3,8 +3,9 @@ use std::cell::{Cell, OnceCell};
 use control::{KeyError, Verification};
 use crypto::{Ids, Token};
 use rt::{Instant, now, timeout};
-use sched::{Node, RETURN_PREFIX, Transport};
+use sched::{Node, RETURN_PREFIX, Refusal, ReportOutcome, Transport};
 use smtp::{Event, Reply, Server, reply};
+use spool::MessageId;
 use tls::Acceptor;
 
 use crate::conn::Conn;
@@ -12,11 +13,12 @@ use crate::guard::{Guard, Reserved, Slot};
 use crate::session::{Config, End, message_limit};
 
 pub const KEEP: usize = 1 << 20;
-pub const HOLD: usize = KEEP + 2 * smtp::CHUNK;
+pub const HOLD: usize = 3 * KEEP + 2 * smtp::CHUNK;
 pub const LOADS: usize = 8;
 
 const UNKNOWN: Reply = Reply::new(550, "5.1.1", "No such recipient");
 const BUSY: Reply = Reply::new(451, "4.3.2", "System busy");
+const PERMANENT: Reply = Reply::new(550, "5.0.0", "Permanent failure");
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ReportStats {
@@ -76,7 +78,7 @@ impl Reports {
         &self,
         node: &Node<T>,
         address: &str,
-    ) -> Result<Token, Reply> {
+    ) -> Result<(Token, u32), Reply> {
         let checked = self.verify(node, address).await;
         let count = match &checked {
             Ok(_) => &self.accepted,
@@ -91,7 +93,7 @@ impl Reports {
         &self,
         node: &Node<T>,
         address: &str,
-    ) -> Result<Token, Reply> {
+    ) -> Result<(Token, u32), Reply> {
         let (local, domain) = address.rsplit_once('@').ok_or(UNKNOWN)?;
         let text = local.strip_prefix(['b', 'B']).ok_or(UNKNOWN)?;
         let token = Token::parse(text.as_bytes()).ok_or(UNKNOWN)?;
@@ -134,7 +136,7 @@ impl Reports {
         if !token.verify(&keys) {
             return Err(UNKNOWN);
         }
-        Ok(token)
+        Ok((token, generation))
     }
 }
 
@@ -208,7 +210,7 @@ struct Session<'a, T> {
 
 #[derive(Default)]
 struct Tx {
-    token: Option<Token>,
+    token: Option<(Token, u32)>,
     body: Vec<u8>,
     hold: Option<Reserved>,
 }
@@ -305,7 +307,7 @@ impl<T: Transport + 'static> Session<'_, T> {
                 }
             }
             Event::End { .. } => {
-                let reply = self.finish();
+                let reply = self.finish().await;
                 self.server.message(&reply);
             }
             Event::Reset => self.tx = None,
@@ -359,10 +361,36 @@ impl<T: Transport + 'static> Session<'_, T> {
         Ok(())
     }
 
-    fn finish(&mut self) -> Reply {
-        if self.tx.take().is_some_and(|tx| tx.hold.is_some()) {
-            self.reports.held.set(self.reports.held.get() + 1);
+    async fn finish(&mut self) -> Reply {
+        let Some(tx) = self.tx.take() else {
+            return reply::TEMPORARY;
+        };
+        let Some(hold) = tx.hold else {
+            return reply::TEMPORARY;
+        };
+        self.reports.held.set(self.reports.held.get() + 1);
+        let Some((token, generation)) = tx.token else {
+            return reply::TEMPORARY;
+        };
+        let report = smtp::report::parse(&tx.body);
+        let ids = match self.reports.ids(self.node).await {
+            Ok(ids) => ids,
+            Err(reply) => return reply,
+        };
+        let Some(raw) = ids.reveal(&token.id) else {
+            return reply::TEMPORARY;
+        };
+        let id = MessageId::from_bytes(raw);
+        let Some(inbound) = crate::inbound::inbound(&token, id, generation, report) else {
+            return reply::OK;
+        };
+        let outcome = self.node.report(inbound).await;
+        drop(hold);
+        match outcome {
+            Ok(ReportOutcome::Written(_) | ReportOutcome::Duplicate | ReportOutcome::Unmatched)
+            | Err(Refusal::Tenant) => reply::OK,
+            Err(refusal) if refusal.temporary() => reply::TEMPORARY,
+            Err(_) => PERMANENT,
         }
-        reply::TEMPORARY
     }
 }

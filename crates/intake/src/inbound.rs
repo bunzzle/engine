@@ -3,7 +3,6 @@ use sched::{Inbound, ReportBlock, ReportKind};
 use smtp::report::Report;
 use spool::MessageId;
 
-#[cfg_attr(not(test), expect(dead_code, reason = "wired by the next intake job"))]
 pub(crate) fn inbound(
     token: &Token,
     id: MessageId,
