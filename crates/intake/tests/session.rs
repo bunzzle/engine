@@ -25,8 +25,8 @@ use keys::{
 use rt::sim::{Config, Disk, Machine, SimDriver, Stalls, check};
 use rt::{JoinHandle, Mesh, Runtime, TcpListener, TcpStream, sleep, spawn, timeout};
 use sched::{
-    Answer, Answered, Attempt, Body, Claimed, Clock, Fault, Keyring, Keys, Meshes, Node, Parts,
-    Running, Settings, Transport,
+    Answer, Answered, Attempt, Body, Claimed, Clock, EventBody, EventKind, EventRead, Fault,
+    Keyring, Keys, Meshes, Node, Parts, Running, Settings, Transport,
 };
 use spool::MessageId;
 use store::{Client, Committer, DataFile, Options, SLOT_SIZE, Setup, boot};
@@ -47,6 +47,7 @@ const OPTIONS: Options = Options {
 };
 const NAMING: [u8; 16] = *b"naming key 16 by";
 const KEYS_DIR: &str = "/keys";
+const KEY_START_DAY: u32 = 20_000;
 const KEYS_AT: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 9)), 7000);
 const HOST: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 1);
 const SUBMIT: u16 = 587;
@@ -64,6 +65,7 @@ struct Seen {
     routed: RefCell<BTreeSet<String>>,
     faults: RefCell<Vec<&'static str>>,
     deliver: Cell<bool>,
+    record_delivery: Cell<bool>,
     hold: Cell<bool>,
 }
 
@@ -116,7 +118,29 @@ impl Transport for Idle {
             return Vec::new();
         }
         seen.delivered.borrow_mut().insert(attempt.message);
-        answered(&claimed, Answer::Delivered)
+        let mut answers = answered(&claimed, Answer::Delivered);
+        if seen.record_delivery.get() {
+            let time = rt::wall_ms();
+            for ((answer, claim), (_, recipient)) in
+                answers.iter_mut().zip(&claimed).zip(&prepared.recipients)
+            {
+                let body = EventBody {
+                    kind: EventKind::Delivered,
+                    time,
+                    address: recipient.address.as_bytes().to_vec(),
+                    reply: b"250 OK".to_vec(),
+                    attempts: claim.attempts.saturating_add(1),
+                    class: claim.class,
+                };
+                answer.event = Some(
+                    prepared
+                        .opener
+                        .event(claim.recipient, claim.stamp, &body)
+                        .expect("delivery event"),
+                );
+            }
+        }
+        answers
     }
 }
 
@@ -239,7 +263,7 @@ fn keys_up(machine: &Machine) -> Rc<RefCell<Vec<SocketAddr>>> {
         let dir = Path::new(KEYS_DIR);
         let vault = match Vault::open(dir).await {
             Ok(vault) => vault,
-            Err(_) => Vault::init(dir, 20_000).await.expect("init"),
+            Err(_) => Vault::init(dir, KEY_START_DAY).await.expect("init"),
         };
         let audit = Audit::open(dir).await.expect("audit");
         let server = Rc::new(KeyServer::start(vault, audit, KeySettings::default()));
@@ -1530,7 +1554,7 @@ fn mx_accepts_only_verified_return_path_tokens() {
                     body.extend_from_slice(b"\r\n");
                 }
                 let reply = smtp.data(&body).await;
-                assert!(reply.starts_with("451 4.3.0"), "{reply}");
+                assert_eq!(reply, "250 2.0.0 OK");
                 assert!(smtp.command("QUIT").await.starts_with("221 "));
 
                 let swapped = Token::sign(&second, 0, public_id(control, own)).text();
@@ -1610,7 +1634,7 @@ fn mx_sessions_have_their_own_limits_and_no_auth_deadline() {
                 let (listening, reports) =
                     listen_mx_with(control, seed, MX, LOADS, (config, Limits::default())).await;
                 let small = Limits {
-                    budget: 1 << 20,
+                    budget: intake::HOLD - 1,
                     ..Limits::default()
                 };
                 let config = SessionConfig::new("mx1.example.net".into());
@@ -1634,7 +1658,7 @@ fn mx_sessions_have_their_own_limits_and_no_auth_deadline() {
                     .await;
                 smtp.send(body).await;
                 let reply = smtp.reply().await;
-                assert!(reply.starts_with("451 4.3.0"), "{reply}");
+                assert_eq!(reply, "250 2.0.0 OK");
                 assert!(smtp.command("QUIT").await.starts_with("221 "));
 
                 let mut raw = MessageId {
@@ -1678,4 +1702,206 @@ fn mx_sessions_have_their_own_limits_and_no_auth_deadline() {
         });
         cluster.stop();
     });
+}
+
+const BOUNCE_REPORT: &[u8] = b"From: Mail Delivery System <mailer-daemon@example.com>\r\n\
+Subject: Delivery failed\r\n\
+MIME-Version: 1.0\r\n\
+Content-Type: multipart/report; report-type=delivery-status; boundary=dsn\r\n\
+\r\n\
+--dsn\r\n\
+Content-Type: text/plain\r\n\
+\r\n\
+Delivery failed.\r\n\
+--dsn\r\n\
+Content-Type: message/delivery-status\r\n\
+\r\n\
+Reporting-MTA: dns; mx.example.com\r\n\
+\r\n\
+Final-Recipient: rfc822; a@example.com\r\n\
+Action: failed\r\n\
+Status: 5.1.1\r\n\
+Diagnostic-Code: smtp; 550 mailbox gone\r\n\
+--dsn--\r\n";
+
+async fn report_events(node: &Node<Idle>, id: MessageId) -> Vec<EventRead> {
+    let page = node.events(1, None, 10).await.expect("event page");
+    assert!(!page.more, "expected all events on one page");
+    assert!(
+        page.events
+            .iter()
+            .any(|read| read.event.message == id && read.event.kind == EventKind::Delivered),
+        "missing delivery event for {id:?}"
+    );
+    let reports: Vec<_> = page
+        .events
+        .into_iter()
+        .filter(|read| matches!(read.event.kind, EventKind::Bounced | EventKind::Complained))
+        .collect();
+    for read in &reports {
+        assert_eq!(read.event.message, id);
+    }
+    reports
+}
+
+fn mx_report_cluster(seed: u64) -> Cluster {
+    let config = Config {
+        wall_start_ms: u64::from(KEY_START_DAY) * sched::DAY + 3_600_000,
+        ..Config::default()
+    };
+    let driver = Rc::new(SimDriver::with_disk(seed, config, created(seed)));
+    started(&driver, 2).expect("start")
+}
+
+async fn mx_report_source(
+    nodes: &[Node<Idle>],
+    transport: &Seen,
+    seed: u64,
+    tls: &Arc<ClientConfig>,
+) -> (MessageId, String) {
+    let tokens = prepare(nodes).await;
+    enable_report_domain(nodes, 1, "example.org").await;
+    transport.publics.replace(tokens.publics);
+    transport.deliver.set(true);
+    transport.record_delivery.set(true);
+    let control = control_of(nodes);
+    let submission = listen_on(control, seed).await;
+    let mut smtp = Smtp::connect(SUBMIT, tls).await;
+    assert!(smtp.login(&tokens.first).await.starts_with("235 "));
+    let replies = smtp
+        .transaction("bounce@example.org", &["a@example.com"])
+        .await;
+    assert!(replies.iter().all(|r| r.starts_with("250 ")), "{replies:?}");
+    let reply = smtp.data(&message("ann@example.org", "", 300, seed)).await;
+    let id = opaque_id(control, &reply);
+    assert!(smtp.command("QUIT").await.starts_with("221 "));
+    submission.close().await;
+    until("source message delivered", || {
+        transport.delivered.borrow().contains(&id) && stored(nodes).is_empty()
+    })
+    .await;
+    assert_eq!(report_events(control, id).await, [] as [EventRead; 0]);
+
+    let keys = control.load_keys(1, 1).await.expect("keys");
+    let token = Token::sign(&keys, 0, hidden(control, id.bytes())).text();
+    (id, format!("b{token}@bounce.example.org"))
+}
+
+fn mx_report_events(bodies: &'static [&'static [u8]]) -> Vec<Vec<EventRead>> {
+    let seed = 0;
+    let cluster = mx_report_cluster(seed);
+    let nodes = cluster.nodes.clone();
+    let transport = Rc::clone(&cluster.seen);
+    let events = cluster.run(async move {
+        timeout(Duration::from_secs(60), async {
+            let tls = client_config(simulated(seed + 100));
+            let (id, to) = mx_report_source(&nodes, &transport, seed, &tls).await;
+            let control = control_of(&nodes);
+            let (listener, _) = listen_mx(control, seed, MX, LOADS).await;
+            let mut smtp = Smtp::connect(MX, &tls).await;
+            assert!(smtp.command("EHLO relay.test").await.starts_with("250 "));
+            let mut events = Vec::new();
+            for body in bodies {
+                let replies = smtp.transaction("", &[&to]).await;
+                assert!(replies.iter().all(|r| r.starts_with("250 ")), "{replies:?}");
+                assert_eq!(smtp.data(body).await, "250 2.0.0 OK");
+                assert!(stored(&nodes).is_empty());
+                events.push(report_events(control, id).await);
+            }
+            assert!(smtp.command("QUIT").await.starts_with("221 "));
+            listener.close().await;
+            events
+        })
+        .await
+        .expect("MX report test timed out")
+    });
+    cluster.stop();
+    events
+}
+
+#[test]
+fn mx_stores_a_bounce_report() {
+    let events = mx_report_events(&[BOUNCE_REPORT]);
+    assert_eq!(events[0].len(), 1);
+    let read = &events[0][0];
+    assert_eq!(read.event.kind, EventKind::Bounced);
+    assert_eq!(read.event.recipient, 0);
+    let body = read.body.as_ref().expect("bounce event body");
+    assert_eq!(body.address, b"a@example.com");
+    assert_eq!(body.reply, b"550 mailbox gone");
+}
+
+#[test]
+fn mx_accepts_a_duplicate_report() {
+    let events = mx_report_events(&[BOUNCE_REPORT, BOUNCE_REPORT]);
+    assert_eq!(events[0].len(), 1);
+    assert_eq!(events[0][0].event.kind, EventKind::Bounced);
+    assert_eq!(events[1], events[0]);
+}
+
+#[test]
+fn mx_accepts_a_plain_body_without_storing() {
+    let events = mx_report_events(&[b"Subject: Message\r\n\r\nPlain text.\r\n"]);
+    assert_eq!(events[0], [] as [EventRead; 0]);
+}
+
+#[test]
+fn mx_drops_a_report_for_a_deleted_tenant() {
+    let seed = 0;
+    let cluster = mx_report_cluster(seed);
+    let nodes = cluster.nodes.clone();
+    let transport = Rc::clone(&cluster.seen);
+    cluster.run(async move {
+        timeout(Duration::from_secs(60), async {
+            let tls = client_config(simulated(seed + 100));
+            let (id, to) = mx_report_source(&nodes, &transport, seed, &tls).await;
+            let control = control_of(&nodes);
+            let (listener, _) = listen_mx(control, seed, MX, LOADS).await;
+            let mut smtp = Smtp::connect(MX, &tls).await;
+            assert!(smtp.command("EHLO relay.test").await.starts_with("250 "));
+            let replies = smtp.transaction("", &[&to]).await;
+            assert!(replies.iter().all(|r| r.starts_with("250 ")), "{replies:?}");
+            assert!(smtp.command("DATA").await.starts_with("354 "));
+            smtp.send(BOUNCE_REPORT).await;
+
+            control.delete_tenant(1).await.expect("delete tenant");
+            until("tenant deleted", || {
+                nodes.iter().all(|node| {
+                    node.table()
+                        .tenant(1)
+                        .is_none_or(|tenant| tenant.state == State::Deleted)
+                })
+            })
+            .await;
+            assert_eq!(smtp.command(".").await, "250 2.0.0 OK");
+            assert!(smtp.command("QUIT").await.starts_with("221 "));
+            listener.close().await;
+
+            let owner = nodes
+                .iter()
+                .find(|node| node.spool().shards().contains(&id.shard))
+                .expect("message shard owner");
+            let entries = owner
+                .spool()
+                .changes()
+                .scan(
+                    id.shard,
+                    (sched::KIND_EVENT, KEY_START_DAY),
+                    [0; 20]..[0xff; 20],
+                    usize::MAX,
+                )
+                .await
+                .expect("event index");
+            let kinds: Vec<_> = entries
+                .iter()
+                .map(|entry| sched::Event::decode(&entry.value).expect("event"))
+                .filter(|event| event.message == id)
+                .map(|event| event.kind)
+                .collect();
+            assert_eq!(kinds, [EventKind::Delivered]);
+        })
+        .await
+        .expect("MX deleted tenant test timed out");
+    });
+    cluster.stop();
 }
