@@ -7,7 +7,7 @@ use crypto::{Ids, Opener as ChunkOpener, Wrap};
 use spool::{Chunks, Event, MessageId, Opened, Pinned, SLICE, Source, Spool, Stored};
 
 use crate::dkim::{sign, signer};
-use crate::envelope::{Envelope, Recipient, decode_slice};
+use crate::envelope::{Envelope, Recipient, Ret, decode_slice};
 use crate::error::Refusal;
 use crate::policy::Answer;
 use crate::returns::{RETURN_PREFIX, return_sender};
@@ -365,6 +365,7 @@ async fn rewrite_sender(
             recipient,
         ) {
             envelope.sender = sender;
+            envelope.ret = Ret::Headers;
         }
     }
     Ok(())

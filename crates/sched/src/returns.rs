@@ -2,6 +2,7 @@ use control::{Table, domain_ok};
 use crypto::{ANY, TOKEN_TEXT, TenantKeys, Token};
 
 use crate::Envelope;
+use crate::normal::MAX_ADDRESS;
 
 pub const RETURN_PREFIX: &str = "bounce";
 
@@ -19,7 +20,7 @@ pub(crate) fn return_sender(
     }
     let (_, sender_domain) = envelope.sender.rsplit_once('@')?;
     let record = table.return_path(tenant, sender_domain)?;
-    if prefix.len() + record.name.len() + TOKEN_TEXT + 3 > 256 || prefix.contains('.') {
+    if prefix.len() + record.name.len() + TOKEN_TEXT + 3 > MAX_ADDRESS || prefix.contains('.') {
         return None;
     }
     let domain = format!("{prefix}.{}", record.name);
@@ -212,20 +213,20 @@ mod tests {
     }
 
     #[test]
-    fn return_sender_is_limited_to_256_octets() {
-        let name = format!(
-            "{}.{}.{}.ddddd",
-            "a".repeat(63),
-            "b".repeat(63),
-            "c".repeat(63)
-        );
-        let table = table(vec![domain(1, &name, true)]);
-        let sender = format!("x@{name}");
+    fn return_sender_is_limited_to_254_octets() {
+        let name = format!("{}.{}.{}", "a".repeat(63), "b".repeat(63), "c".repeat(62));
+        let longer_name = format!("{name}c");
+        let table = table(vec![domain(1, &name, true), domain(2, &longer_name, true)]);
         assert_eq!(
-            rewrite(&table, "b", &sender).expect("return sender").len(),
-            256
+            rewrite(&table, RETURN_PREFIX, &format!("x@{name}"))
+                .expect("return sender")
+                .len(),
+            254
         );
-        assert_eq!(rewrite(&table, "bb", &sender), None);
+        assert_eq!(
+            rewrite(&table, RETURN_PREFIX, &format!("x@{longer_name}")),
+            None
+        );
     }
 
     #[test]

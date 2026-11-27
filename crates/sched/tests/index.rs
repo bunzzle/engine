@@ -29,7 +29,7 @@ use sched::{
     Deliver, Draft, EVENT_DAYS, EVENT_SHAPE, EVENT_VALUE, Envelope, Event, EventBody, EventKind,
     Fault, Found, Hash, HookChange, HookStats, KIND_EVENT, KIND_REQUEST, KIND_SEARCH,
     KIND_SUPPRESS, Keyring, Keys, MAX_HOOKS, MAX_REPLY, Made, Meshes, Node, Outcome, Parts,
-    ROTATION_MS, ReadError, Reason, Recipient, Refusal, Restore, Running, SEARCH_VALUE, SHAPE,
+    ROTATION_MS, ReadError, Reason, Recipient, Refusal, Restore, Ret, Running, SEARCH_VALUE, SHAPE,
     SearchField, SearchQuery, Searched, Sending, Settings, Signed, Suppression, Ticket, Transport,
     Unsealable, Unwrapped, drop_cursor, encode_slice, event_record, event_sealed, event_sequence,
     normalize, punycode, read_cursor, retain, retain_event, retain_request, retain_search,
@@ -273,6 +273,7 @@ struct ReturnProbe {
 struct PreparedReturn {
     message: MessageId,
     sender: String,
+    ret: Ret,
     recipients: Vec<u32>,
     lookups: ReturnLookups,
 }
@@ -308,6 +309,7 @@ async fn answer(attempt: Attempt) -> Vec<Answered> {
             .send(PreparedReturn {
                 message: attempt.message,
                 sender: prepared.envelope.sender.clone(),
+                ret: prepared.envelope.ret,
                 recipients,
                 lookups: probe.lookups,
             })
@@ -1624,6 +1626,7 @@ fn prepared_return(return_path: bool, addresses: &'static [&'static str]) -> Pre
             let envelope = Envelope {
                 sender: RETURN_SENDER.into(),
                 signatures: vec![(key.id, alg)],
+                ret: Ret::Full,
                 ..Envelope::default()
             }
             .encode()
@@ -1681,6 +1684,15 @@ fn return_path_uses_any_for_a_batch() {
     let prepared = prepared_return(true, &["one@example.net", "two@example.net"]);
     assert_eq!(prepared.recipients, [0, 1]);
     assert_eq!(verified_return(&prepared).recipient, ANY);
+}
+
+#[test]
+fn return_path_requests_headers_only_for_rewritten_mail() {
+    let rewritten = prepared_return(true, &["one@example.net"]);
+    assert_eq!(rewritten.ret, Ret::Headers);
+
+    let unchanged = prepared_return(false, &["one@example.net"]);
+    assert_eq!(unchanged.ret, Ret::Full);
 }
 
 #[test]
