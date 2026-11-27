@@ -296,8 +296,13 @@ async fn answer(attempt: Attempt) -> Vec<Answered> {
     });
     let prepared = attempt.outgoing.prepare().await;
     if let Some(probe) = RETURN_PROBE.with_borrow_mut(Option::take) {
-        let Ok(prepared) = &prepared else {
-            panic!("return-path message failed to prepare");
+        let prepared = match &prepared {
+            Ok(prepared) => prepared,
+            Err(fault @ Fault::Keys) if HOOK_KEYS_DOWN.with(Cell::get) => {
+                RETURN_PROBE.set(Some(probe));
+                return fault.answers(&attempt.recipients);
+            }
+            Err(_) => panic!("return-path message failed to prepare"),
         };
         let recipients = prepared
             .recipients
@@ -1539,17 +1544,21 @@ async fn accept_listed(
     addresses: &[&str],
     expiry: u64,
 ) -> (MessageId, [u8; spool::WRAP]) {
-    accept_listed_with_head(node, shard, addresses, expiry, &[1; 10], b"Subject: hi\r\n").await
+    let (draft, message) =
+        listed_with_head(node, shard, addresses, expiry, &[1; 10], b"Subject: hi\r\n").await;
+    let (id, wrap) = (message.id, message.head.wrap);
+    node.accept(draft, message).await.expect("accept");
+    (id, wrap)
 }
 
-async fn accept_listed_with_head(
+async fn listed_with_head(
     node: &Node<Idle>,
     shard: u16,
     addresses: &[&str],
     expiry: u64,
     envelope: &[u8],
     headers: &[u8],
-) -> (MessageId, [u8; spool::WRAP]) {
+) -> (Draft, Message) {
     let mut draft = node.draft(1, None).expect("draft");
     for address in addresses {
         node.recipient(&mut draft, address)
@@ -1565,7 +1574,6 @@ async fn accept_listed_with_head(
     let head = sealing
         .head(clear, expiry, envelope, headers)
         .expect("head");
-    let wrap = head.wrap;
     let body = sealing.inline_body(&[1; 30]).expect("body");
     let listed: Vec<Recipient> = addresses
         .iter()
@@ -1589,18 +1597,37 @@ async fn accept_listed_with_head(
     };
     let listed = addresses.iter().map(|a| (*a).to_owned()).collect();
     LISTED.with_borrow_mut(|l| l.insert(id.bytes(), listed));
-    node.accept(draft, message).await.expect("accept");
-    (id, wrap)
+    (draft, message)
 }
 
 const RETURN_SENDER: &str = "sender@news.example.org";
 
 fn prepared_return(return_path: bool, addresses: &'static [&'static str]) -> PreparedReturn {
+    prepared_return_with_outage(return_path, addresses, None)
+}
+
+fn prepared_return_with_outage(
+    return_path: bool,
+    addresses: &'static [&'static str],
+    key_outage: Option<Duration>,
+) -> PreparedReturn {
+    struct KeysDown;
+
+    impl Drop for KeysDown {
+        fn drop(&mut self) {
+            HOOK_KEYS_DOWN.set(false);
+        }
+    }
+
+    let _reset_keys = key_outage.map(|_| KeysDown);
     let driver = Rc::new(SimDriver::with_disk(47, Config::default(), created(47)));
     let cluster = started(&driver, 1);
     let nodes = cluster.nodes.clone();
     cluster.run(async move {
-        timeout(Duration::from_secs(30), async move {
+        let deadline = key_outage.map_or(Duration::from_secs(30), |outage| {
+            outage + Duration::from_secs(60)
+        });
+        timeout(deadline, async move {
             ready(&nodes).await;
             let node = &nodes[0];
             let (observe, mut observed) = rt::channel();
@@ -1653,9 +1680,23 @@ fn prepared_return(return_path: bool, addresses: &'static [&'static str]) -> Pre
             let headers = [received.as_slice(), &signature, from].concat();
             let shard = owned_shard(node).await;
             answering(&nodes);
-            let (id, _) =
-                accept_listed_with_head(node, shard, addresses, u64::MAX / 2, &envelope, &headers)
-                    .await;
+            let (draft, message) =
+                listed_with_head(node, shard, addresses, u64::MAX / 2, &envelope, &headers).await;
+            let id = message.id;
+            if key_outage.is_some() {
+                HOOK_KEYS_DOWN.set(true);
+            }
+            node.accept(draft, message).await.expect("accept");
+            if let Some(outage) = key_outage {
+                sleep(outage).await;
+                assert!(
+                    observed.try_recv().is_none(),
+                    "prepared while keys were missing"
+                );
+                assert_eq!(node.spool().messages_of(1), [id]);
+                assert!(node.sched().answers().later >= 3, "expected key retries");
+                HOOK_KEYS_DOWN.set(false);
+            }
             let prepared = observed.recv().await.expect("prepared return path");
             assert_eq!(prepared.message, id);
             prepared
@@ -1698,6 +1739,14 @@ fn return_path_requests_headers_only_for_rewritten_mail() {
 
     let unchanged = prepared_return(false, &["one@example.net"]);
     assert_eq!(unchanged.ret, Ret::Full);
+}
+
+#[test]
+fn return_path_retries_when_keys_are_missing() {
+    let prepared =
+        prepared_return_with_outage(true, &["one@example.net"], Some(Duration::from_secs(100)));
+    assert_eq!(verified_return(&prepared).recipient, 0);
+    assert_eq!(prepared.ret, Ret::Headers);
 }
 
 #[test]
