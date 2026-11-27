@@ -381,6 +381,7 @@ async fn prepare(nodes: &[Node<Idle>]) -> Tokens {
     let domain = control.domain_new(1, "example.org").await.expect("domain");
     let domain = control
         .domain_write(Domain {
+            return_path: false,
             state: Verification::Verified,
             rsa: rsa.id,
             ed25519: ed.id,
@@ -391,6 +392,7 @@ async fn prepare(nodes: &[Node<Idle>]) -> Tokens {
     let other = control.domain_new(2, "example.net").await.expect("domain");
     control
         .domain_write(Domain {
+            return_path: false,
             state: Verification::Verified,
             ..other
         })
@@ -829,6 +831,7 @@ fn attempts_carry_verified_signatures_and_wait_for_keys() {
                 .expect("rsa");
             control
                 .domain_write(Domain {
+                    return_path: false,
                     rsa: fresh.id,
                     ..tokens.domain.clone()
                 })

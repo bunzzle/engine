@@ -3930,6 +3930,7 @@ async fn bad_domain_writes(control: &Node<Idle>, made: &Domain, suffix: Domain, 
     domain_refused(
         control
             .domain_write(Domain {
+                return_path: false,
                 state: Verification::Verified,
                 ..suffix
             })
@@ -3940,6 +3941,7 @@ async fn bad_domain_writes(control: &Node<Idle>, made: &Domain, suffix: Domain, 
         domain_refused(
             control
                 .domain_write(Domain {
+                    return_path: false,
                     rsa,
                     ed25519,
                     ..made.clone()
@@ -3951,6 +3953,7 @@ async fn bad_domain_writes(control: &Node<Idle>, made: &Domain, suffix: Domain, 
     domain_refused(
         control
             .domain_write(Domain {
+                return_path: false,
                 name: "example.net".into(),
                 ..made.clone()
             })
@@ -3960,6 +3963,7 @@ async fn bad_domain_writes(control: &Node<Idle>, made: &Domain, suffix: Domain, 
     domain_refused(
         control
             .domain_write(Domain {
+                return_path: false,
                 tenant: 2,
                 ..made.clone()
             })
@@ -4001,6 +4005,7 @@ fn sender_domains_pick_their_keys_and_keep_named_keys() {
         bad_domain_writes(control, &made, suffix, [ed.id, rsa.id, elsewhere.id]).await;
         let verified = control
             .domain_write(Domain {
+                return_path: false,
                 state: Verification::Verified,
                 rsa: rsa.id,
                 ed25519: ed.id,
@@ -4027,7 +4032,11 @@ fn sender_domains_pick_their_keys_and_keep_named_keys() {
         ));
         control.dkim_remove(1, elsewhere.id).await.expect("remove");
         let unsigned = control
-            .domain_write(Domain { rsa: 0, ..verified })
+            .domain_write(Domain {
+                return_path: false,
+                rsa: 0,
+                ..verified
+            })
             .await
             .expect("write");
         domain_everywhere(&nodes, &unsigned).await;

@@ -20,6 +20,7 @@ impl<T: Transport + 'static> Node<T> {
             }
             let id = held.writer().reserve_domain().await?;
             let domain = Domain {
+                return_path: false,
                 id,
                 tenant,
                 generation,
