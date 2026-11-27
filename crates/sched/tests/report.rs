@@ -294,7 +294,7 @@ fn reports_find_a_duplicate_on_a_later_page() {
     let nodes = cluster.nodes.clone();
     cluster
         .run(async move {
-            timeout(Duration::from_secs(20 * 60), async {
+            timeout(Duration::from_mins(20), async {
                 ready(&nodes).await;
                 answering(&nodes);
                 let address = "shared@example.org";
@@ -366,11 +366,13 @@ fn an_any_report_for_another_messages_recipient_is_unmatched() {
                 );
                 report.recipient = crypto::ANY;
                 assert_eq!(nodes[1].report(report).await, Ok(ReportOutcome::Unmatched));
-                assert!(reports(&nodes[0], id, EventKind::Bounced).await.is_empty());
-                assert!(
-                    reports(&nodes[0], other, EventKind::Bounced)
-                        .await
-                        .is_empty()
+                assert_eq!(
+                    reports(&nodes[0], id, EventKind::Bounced).await,
+                    [] as [sched::EventRead; 0]
+                );
+                assert_eq!(
+                    reports(&nodes[0], other, EventKind::Bounced).await,
+                    [] as [sched::EventRead; 0]
                 );
                 assert_eq!(
                     nodes[0].suppressions().get(1, address).await.expect("get"),
