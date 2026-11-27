@@ -2,14 +2,15 @@ use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 use std::rc::Rc;
 
-use control::Table;
-use crypto::{Opener as ChunkOpener, Wrap};
+use control::{Table, tenant_keys};
+use crypto::{Ids, Opener as ChunkOpener, Wrap};
 use spool::{Chunks, Event, MessageId, Opened, Pinned, SLICE, Source, Spool, Stored};
 
 use crate::dkim::{sign, signer};
 use crate::envelope::{Envelope, Recipient, decode_slice};
 use crate::error::Refusal;
 use crate::policy::Answer;
+use crate::returns::{RETURN_PREFIX, return_sender};
 use crate::sealing::{Keys, Opener, Unsealable, opener};
 use crate::transport::{Answered, Claimed};
 
@@ -261,7 +262,7 @@ async fn prepare(
     let (envelope, section) = opener
         .head(&read.head)
         .map_err(|fault| unopened(fault, generation))?;
-    let Some((envelope, fields)) = check(&envelope, &section) else {
+    let Some((mut envelope, fields)) = check(&envelope, &section) else {
         return Err(Fault::Format(opener));
     };
     let recipients = match open_recipients(&opener, &read.slices, stored.clear.recipients, wanted) {
@@ -293,6 +294,7 @@ async fn prepare(
         cache.borrow_mut().put(stored.id, Rc::clone(&signed));
         signed
     };
+    rewrite_sender(signing, stored, generation, &mut envelope, &recipients).await?;
     for (key, _) in &envelope.signatures {
         match signer(&table.borrow(), stored.tenant, *key, |_| ()) {
             Ok(()) => {}
@@ -329,6 +331,43 @@ async fn prepare(
         opener,
         _pins: read.pins,
     })
+}
+
+async fn rewrite_sender(
+    signing: &Signing,
+    stored: &Stored,
+    generation: u32,
+    envelope: &mut Envelope,
+    recipients: &[(u32, Recipient)],
+) -> Result<(), Fault> {
+    let (keys, table, tenant) = (&*signing.keys, &*signing.table, stored.tenant);
+    if !envelope.smtp
+        && let Some((_, domain)) = envelope.sender.rsplit_once('@')
+        && table.borrow().return_path(tenant, domain).is_some()
+    {
+        let tenant_keys = tenant_keys(keys, tenant, generation)
+            .await
+            .map_err(|_| Fault::Keys)?;
+        let ids = keys.ids().ok_or(Fault::Keys)?;
+        let ids = Ids::new(&ids).map_err(|_| Fault::Keys)?;
+        let public = ids.hide(&stored.id.bytes());
+        let recipient = match recipients {
+            [(index, _)] => Some(*index),
+            _ => None,
+        };
+        if let Some(sender) = return_sender(
+            &table.borrow(),
+            &tenant_keys,
+            RETURN_PREFIX,
+            envelope,
+            tenant,
+            public,
+            recipient,
+        ) {
+            envelope.sender = sender;
+        }
+    }
+    Ok(())
 }
 
 pub(crate) async fn expiry_events(
