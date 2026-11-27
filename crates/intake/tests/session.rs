@@ -1856,7 +1856,7 @@ fn mx_drops_a_report_for_a_deleted_tenant() {
             let tls = client_config(simulated(seed + 100));
             let (id, to) = mx_report_source(&nodes, &transport, seed, &tls).await;
             let control = control_of(&nodes);
-            let (listener, _) = listen_mx(control, seed, MX, LOADS).await;
+            let (listener, reports) = listen_mx(control, seed, MX, LOADS).await;
             let mut smtp = Smtp::connect(MX, &tls).await;
             assert!(smtp.command("EHLO relay.test").await.starts_with("250 "));
             let replies = smtp.transaction("", &[&to]).await;
@@ -1876,6 +1876,8 @@ fn mx_drops_a_report_for_a_deleted_tenant() {
             assert_eq!(smtp.command(".").await, "250 2.0.0 OK");
             assert!(smtp.command("QUIT").await.starts_with("221 "));
             listener.close().await;
+            let stats = reports.stats();
+            assert_eq!((stats.gone, stats.unmatched), (1, 0));
 
             let owner = nodes
                 .iter()

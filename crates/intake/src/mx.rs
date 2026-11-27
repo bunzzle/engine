@@ -26,6 +26,8 @@ pub struct ReportStats {
     pub refused: u64,
     pub busy: u64,
     pub held: u64,
+    pub unmatched: u64,
+    pub gone: u64,
 }
 
 pub struct Reports {
@@ -36,6 +38,8 @@ pub struct Reports {
     refused: Cell<u64>,
     busy: Cell<u64>,
     held: Cell<u64>,
+    unmatched: Cell<u64>,
+    gone: Cell<u64>,
 }
 
 impl Reports {
@@ -48,6 +52,8 @@ impl Reports {
             refused: Cell::new(0),
             busy: Cell::new(0),
             held: Cell::new(0),
+            unmatched: Cell::new(0),
+            gone: Cell::new(0),
         }
     }
 
@@ -57,6 +63,8 @@ impl Reports {
             refused: self.refused.get(),
             busy: self.busy.get(),
             held: self.held.get(),
+            unmatched: self.unmatched.get(),
+            gone: self.gone.get(),
         }
     }
 
@@ -386,6 +394,14 @@ impl<T: Transport + 'static> Session<'_, T> {
         };
         let outcome = self.node.report(inbound).await;
         drop(hold);
+        let count = match outcome {
+            Ok(ReportOutcome::Unmatched) => Some(&self.reports.unmatched),
+            Err(Refusal::Tenant) => Some(&self.reports.gone),
+            _ => None,
+        };
+        if let Some(count) = count {
+            count.set(count.get() + 1);
+        }
         match outcome {
             Ok(ReportOutcome::Written(_) | ReportOutcome::Duplicate | ReportOutcome::Unmatched)
             | Err(Refusal::Tenant) => reply::OK,
