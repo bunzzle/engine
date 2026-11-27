@@ -981,4 +981,11 @@ fn mx_listen_flag_must_be_a_boolean() {
         error(&format!("{MINIMAL}mx = \"yes\"\n")),
         "line 21, column 1: `mx` must be a boolean, found a string"
     );
+    assert_eq!(
+        error(&format!("{MINIMAL}[mx]\nbudget = \"1MiB\"\n")),
+        format!(
+            "line 22, column 1: `budget` must be between {} and 1099511627776 bytes",
+            intake::HOLD
+        )
+    );
 }

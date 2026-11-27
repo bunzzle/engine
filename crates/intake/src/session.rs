@@ -110,7 +110,7 @@ pub async fn serve<T: Transport + 'static>(
     };
     let end = session.run().await;
     if let Some(conn) = session.conn.as_mut() {
-        conn.shutdown().await;
+        let _ = timeout(config.handshake, conn.shutdown()).await;
     }
     end
 }
@@ -204,12 +204,19 @@ impl<T: Transport + 'static> Session<'_, T> {
         if output.is_empty() {
             return Ok(());
         }
+        let wait = self.deadline().saturating_duration_since(now());
         let conn = self.conn.as_mut().ok_or(End::Io)?;
-        if conn.write_all(&output).await.is_err() {
-            self.conn = None;
-            return Err(End::Io);
+        match timeout(wait, conn.write_all(&output)).await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(_)) => {
+                self.conn = None;
+                Err(End::Io)
+            }
+            Err(_) => {
+                self.conn = None;
+                Err(End::Timeout)
+            }
         }
-        Ok(())
     }
 
     async fn event(&mut self, event: Event) -> Result<(), End> {

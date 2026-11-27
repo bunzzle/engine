@@ -12,6 +12,7 @@ use crate::guard::{Guard, Reserved, Slot};
 use crate::session::{Config, End, message_limit};
 
 pub const KEEP: usize = 1 << 20;
+pub const HOLD: usize = KEEP + 2 * smtp::CHUNK;
 pub const LOADS: usize = 8;
 
 const UNKNOWN: Reply = Reply::new(550, "5.1.1", "No such recipient");
@@ -92,7 +93,7 @@ impl Reports {
         address: &str,
     ) -> Result<Token, Reply> {
         let (local, _) = address.rsplit_once('@').ok_or(UNKNOWN)?;
-        let text = local.strip_prefix('b').ok_or(UNKNOWN)?;
+        let text = local.strip_prefix(['b', 'B']).ok_or(UNKNOWN)?;
         let token = Token::parse(text.as_bytes()).ok_or(UNKNOWN)?;
         let ids = self.ids(node).await?;
         let raw = ids.reveal(&token.id).ok_or(UNKNOWN)?;
@@ -173,7 +174,7 @@ pub async fn serve<T: Transport + 'static>(
     };
     let end = session.run().await;
     if let Some(conn) = session.conn.as_mut() {
-        conn.shutdown().await;
+        let _ = timeout(config.handshake, conn.shutdown()).await;
     }
     end
 }
@@ -252,12 +253,19 @@ impl<T: Transport + 'static> Session<'_, T> {
         if output.is_empty() {
             return Ok(());
         }
+        let wait = self.deadline().saturating_duration_since(now());
         let conn = self.conn.as_mut().ok_or(End::Io)?;
-        if conn.write_all(&output).await.is_err() {
-            self.conn = None;
-            return Err(End::Io);
+        match timeout(wait, conn.write_all(&output)).await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(_)) => {
+                self.conn = None;
+                Err(End::Io)
+            }
+            Err(_) => {
+                self.conn = None;
+                Err(End::Timeout)
+            }
         }
-        Ok(())
     }
 
     async fn event(&mut self, event: Event) -> Result<(), End> {
@@ -332,8 +340,8 @@ impl<T: Transport + 'static> Session<'_, T> {
         if tx.token.is_none() {
             return Err(reply::NO_RECIPIENTS);
         }
-        let hold = self.guard.reserve(KEEP + 2 * smtp::CHUNK).ok_or(BUSY)?;
-        tx.body = Vec::new();
+        let hold = self.guard.reserve(HOLD).ok_or(BUSY)?;
+        tx.body = Vec::with_capacity(KEEP);
         tx.hold = Some(hold);
         Ok(())
     }

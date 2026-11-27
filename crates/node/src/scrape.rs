@@ -8,7 +8,7 @@ use std::task::Poll;
 use std::time::Duration;
 
 use http::{Event, Limits, Phase, Request, Response, Server, Status};
-use intake::{Conn, End, Guard, Listener};
+use intake::{Conn, End, Guard, Listener, Reports};
 use metrics::{Board, Def, Kind, Slab, negotiate};
 use rt::{Instant, JoinHandle, Notify, TcpListener, now, sleep, spawn, timeout, wall_ms};
 use sched::{Keyring, Node, Transport};
@@ -72,6 +72,15 @@ catalog! {
     SmtpRefused: Counter, "smtp_refused", "SMTP connections refused by connection limits";
     SmtpTimeouts: Counter, "smtp_timeouts", "SMTP sessions ended by a timeout";
     SmtpTlsFailures: Counter, "smtp_tls_failures", "SMTP sessions ended by a TLS failure";
+    MxSessions: Gauge, "mx_sessions", "Open MX sessions";
+    MxRefused: Counter, "mx_refused", "MX connections refused by the MX guard";
+    MxTimeouts: Counter, "mx_timeouts", "MX sessions ended by a timeout";
+    MxTlsFailures: Counter, "mx_tls_failures", "MX sessions ended by a TLS failure";
+    MxMemoryLimit: Counter, "mx_memory_limit", "MX reports refused by the MX memory budget";
+    MxRecipientsAccepted: Counter, "mx_recipients_accepted", "MX recipients accepted with a verified return path token";
+    MxRecipientsRefused: Counter, "mx_recipients_refused", "MX recipients refused";
+    MxRecipientsBusy: Counter, "mx_recipients_busy", "MX recipients answered with a temporary failure";
+    MxReportsHeld: Counter, "mx_reports_held", "MX report bodies received";
     ApiSessions: Gauge, "api_sessions", "Open API sessions";
     ApiRefused: Counter, "api_refused", "API connections refused by connection limits";
     ApiForwarded: Counter, "api_forwarded", "API requests forwarded to another core";
@@ -159,13 +168,46 @@ pub(crate) struct Sources<'a, T> {
     pub node: &'a Node<T>,
     pub smtp: &'a [Listener],
     pub guard: &'a Guard,
+    pub mx: Mx<'a>,
     pub keys: &'a Keyring,
     pub api: Option<&'a api::Api>,
     pub admin: Option<&'a admin::Admin>,
 }
 
+pub(crate) struct Mx<'a> {
+    pub listeners: &'a [Listener],
+    pub guard: &'a Guard,
+    pub reports: &'a Reports,
+}
+
+impl Mx<'_> {
+    fn write(&self, slab: &Slab) {
+        let set = |id: Id, value: u64| slab.set(id as usize, value);
+        let listeners = self.listeners;
+        let sessions = listeners.iter().map(Listener::sessions).sum::<usize>();
+        set(Id::MxSessions, u64::try_from(sessions).unwrap_or(u64::MAX));
+        let refused = listeners
+            .iter()
+            .map(|l| l.refused() + l.ended(End::Refused));
+        set(Id::MxRefused, refused.sum());
+        let timeouts = listeners.iter().map(|l| l.ended(End::Timeout));
+        set(Id::MxTimeouts, timeouts.sum());
+        set(
+            Id::MxTlsFailures,
+            listeners.iter().map(|l| l.ended(End::Tls)).sum(),
+        );
+        set(Id::MxMemoryLimit, self.guard.stats().busy);
+        let reports = self.reports.stats();
+        set(Id::MxRecipientsAccepted, reports.accepted);
+        set(Id::MxRecipientsRefused, reports.refused);
+        set(Id::MxRecipientsBusy, reports.busy);
+        set(Id::MxReportsHeld, reports.held);
+    }
+}
+
 impl<T: Transport + 'static> Sources<'_, T> {
     fn write(&self, slab: &Slab) {
+        self.mx.write(slab);
         let set = |id: Id, value: u64| slab.set(id as usize, value);
         let wide = |value: usize| u64::try_from(value).unwrap_or(u64::MAX);
         let sched = self.node.sched();

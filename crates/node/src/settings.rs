@@ -110,11 +110,11 @@ pub fn parse(text: &str) -> Result<Config, Error> {
     }
     let mut limits = intake::Limits::default();
     if let Some(table) = root.table("guard") {
-        guard(table, &mut limits)?;
+        guard(table, &mut limits, 1 << 20)?;
     }
     let mut mx = intake::Limits::default();
     if let Some(table) = root.table("mx") {
-        guard(table, &mut mx)?;
+        guard(table, &mut mx, intake::HOLD as u64)?;
     }
     let listen = listen(root.tables("listen"))?;
     let api = match root.table("api") {
@@ -562,7 +562,7 @@ fn intake(mut table: Table, session: &mut intake::Config) -> Result<(), Error> {
     table.finish()
 }
 
-fn guard(mut table: Table, limits: &mut intake::Limits) -> Result<(), Error> {
+fn guard(mut table: Table, limits: &mut intake::Limits, floor: u64) -> Result<(), Error> {
     let failures = 1_000_000;
     limits.sessions = number(&mut table, "sessions", 1, MAX_COUNT, limits.sessions)?;
     limits.per_net = number(&mut table, "per_net", 1, u16::MAX.into(), limits.per_net)?;
@@ -577,7 +577,7 @@ fn guard(mut table: Table, limits: &mut intake::Limits) -> Result<(), Error> {
     limits.ban = duration(&mut table, "ban", limits.ban)?;
     limits.leak = duration(&mut table, "leak", limits.leak)?;
     limits.entries = number(&mut table, "entries", 1, MAX_COUNT, limits.entries)?;
-    limits.budget = size(&mut table, "budget", 1 << 20, 1 << 40, limits.budget)?;
+    limits.budget = size(&mut table, "budget", floor, 1 << 40, limits.budget)?;
     limits.ask = duration(&mut table, "ask", limits.ask)?;
     table.finish()
 }

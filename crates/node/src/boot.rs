@@ -241,8 +241,13 @@ pub async fn run<T: Transport + 'static>(
     let admin = ops::serve(up.admin, &up.node, cores, plan.engine);
     let sources = scrape::Sources {
         node: &up.node,
-        smtp: &listeners,
+        smtp: &listeners.submission,
         guard: &up.guard,
+        mx: scrape::Mx {
+            listeners: &listeners.mx,
+            guard: &up.mx,
+            reports: &listeners.reports,
+        },
         keys: &up.keys,
         api: apis.as_ref(),
         admin: admin.as_ref(),
@@ -250,8 +255,8 @@ pub async fn run<T: Transport + 'static>(
     let publishing = scrape::publishing(metrics, index, sources);
     let stopping = stop(watched, &orders, &peers, cores);
     let stopped = scrape::alongside(stopping, publishing).await;
-    let mut closing: Vec<_> = listeners
-        .into_iter()
+    let mut closing: Vec<_> = (listeners.submission.into_iter())
+        .chain(listeners.mx)
         .map(|listener| spawn(listener.close()))
         .collect();
     closing.extend(apis.into_iter().map(|api| spawn(api.close())));
@@ -478,34 +483,47 @@ async fn start<T: Transport + 'static>(
     })
 }
 
+struct SmtpListeners {
+    submission: Vec<Listener>,
+    mx: Vec<Listener>,
+    reports: Rc<Reports>,
+}
+
 fn smtp_listeners<T: Transport + 'static>(
     node: &Node<T>,
     sockets: Vec<(TcpListener, bool, bool)>,
     acceptor: &Rc<Acceptor>,
     session: &intake::Config,
     [submission, mx]: [&Guard; 2],
-) -> Vec<Listener> {
+) -> SmtpListeners {
     let session = Rc::new(session.clone());
-    let reports = Rc::new(Reports::new(LOADS));
-    sockets
-        .into_iter()
-        .map(|(socket, implicit, is_mx)| {
-            let (guard, reports) = if is_mx {
-                (mx.clone(), Some(Rc::clone(&reports)))
-            } else {
-                (submission.clone(), None)
-            };
-            listen(
-                node.clone(),
-                socket,
-                Rc::clone(acceptor),
-                Rc::clone(&session),
-                guard,
-                implicit,
-                reports,
-            )
-        })
-        .collect()
+    let mut out = SmtpListeners {
+        submission: Vec::new(),
+        mx: Vec::new(),
+        reports: Rc::new(Reports::new(LOADS)),
+    };
+    for (socket, implicit, is_mx) in sockets {
+        let (guard, reports) = if is_mx {
+            (mx.clone(), Some(Rc::clone(&out.reports)))
+        } else {
+            (submission.clone(), None)
+        };
+        let listener = listen(
+            node.clone(),
+            socket,
+            Rc::clone(acceptor),
+            Rc::clone(&session),
+            guard,
+            implicit,
+            reports,
+        );
+        if is_mx {
+            out.mx.push(listener);
+        } else {
+            out.submission.push(listener);
+        }
+    }
+    out
 }
 
 async fn bind_smtp(listens: &[Listen]) -> Result<Vec<(TcpListener, bool, bool)>, Error> {
