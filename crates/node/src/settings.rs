@@ -29,6 +29,12 @@ pub struct Config {
     pub webhooks: deliver::HookSettings,
 }
 
+impl Config {
+    pub fn hosts(&self) -> Vec<dns::Name> {
+        dns::Name::parse(&self.session.name).into_iter().collect()
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Tlsrpt {
     pub tenant: u32,

@@ -408,6 +408,7 @@ impl<T: Transport + 'static> Session<'_, T> {
         let envelope = Envelope {
             sender: tx.sender,
             declared: tx.declared,
+            smtp: true,
             ..Envelope::default()
         };
         let id = data

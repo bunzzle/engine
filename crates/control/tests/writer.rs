@@ -522,6 +522,7 @@ fn removed_access_keys_stay_gone_and_their_ids_are_never_reused() {
 #[test]
 fn a_sweep_removes_every_record_of_swept_tenants_only() {
     let domain = Object::Domain(Domain {
+        return_path: false,
         id: 1,
         tenant: 4,
         generation: 1,
@@ -620,6 +621,7 @@ fn domains_load_sealed_and_removed_dkim_keys_stay_gone() {
         assert_eq!(writer.reserve_domain().await.expect("reserve"), 1);
         assert_eq!(writer.reserve_domain().await.expect("reserve"), 2);
         let domain = Object::Domain(Domain {
+            return_path: false,
             id: 2,
             tenant: 4,
             generation: 1,

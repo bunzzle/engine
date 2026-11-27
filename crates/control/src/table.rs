@@ -177,6 +177,10 @@ impl Table {
             .max_by_key(|d| d.name.len())
     }
 
+    pub fn return_path(&self, tenant: u32, domain: &str) -> Option<&Domain> {
+        self.sender(tenant, domain).filter(|d| d.return_path)
+    }
+
     pub fn check(&self, token: &[u8], scope: Scope) -> Option<Grant> {
         self.authenticate(token)
             .filter(|(_, scopes)| scopes.has(scope))

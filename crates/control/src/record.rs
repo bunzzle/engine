@@ -193,6 +193,7 @@ pub struct Domain {
     pub tenant: u32,
     pub generation: u32,
     pub state: Verification,
+    pub return_path: bool,
     pub rsa: u32,
     pub ed25519: u32,
     pub name: Box<str>,
@@ -414,6 +415,9 @@ impl Object {
                 if d.rsa != 0 && d.rsa == d.ed25519 {
                     return Err(Error::Invalid("dkim keys"));
                 }
+                if d.return_path && d.state != Verification::Verified {
+                    return Err(Error::Invalid("return path"));
+                }
             }
             Self::Hook(h) => {
                 if h.id == 0 {
@@ -503,6 +507,7 @@ impl Update {
                 let mut body = [0; DOMAIN];
                 body[0..4].copy_from_slice(&d.generation.to_le_bytes());
                 body[4] = d.state.code();
+                body[5] = u8::from(d.return_path);
                 body[8..12].copy_from_slice(&d.rsa.to_le_bytes());
                 body[12..16].copy_from_slice(&d.tenant.to_le_bytes());
                 body[16..20].copy_from_slice(&d.ed25519.to_le_bytes());
@@ -696,7 +701,7 @@ fn access(id: u32, rest: &[u8]) -> Option<Access> {
 }
 
 fn domain(id: u32, rest: &[u8], secret: &[u8]) -> Option<Domain> {
-    if rest.len() != DOMAIN || rest[5..8] != [0; 3] || rest[20..24] != [0; 4] {
+    if rest.len() != DOMAIN || rest[6..8] != [0; 2] || rest[20..24] != [0; 4] {
         return None;
     }
     Some(Domain {
@@ -704,6 +709,11 @@ fn domain(id: u32, rest: &[u8], secret: &[u8]) -> Option<Domain> {
         tenant: u32_at(rest, 12)?,
         generation: u32_at(rest, 0)?,
         state: Verification::from_code(rest[4])?,
+        return_path: match rest[5] {
+            0 => false,
+            1 => true,
+            _ => return None,
+        },
         rsa: u32_at(rest, 8)?,
         ed25519: u32_at(rest, 16)?,
         name: str::from_utf8(secret).ok()?.into(),

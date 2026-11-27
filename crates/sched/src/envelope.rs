@@ -5,6 +5,7 @@ const EIGHT_BIT: u8 = 1;
 const DECLARED: u8 = 2;
 const RET_SHIFT: u8 = 2;
 const RET_MASK: u8 = 3 << RET_SHIFT;
+const SMTP: u8 = 16;
 const SMTPUTF8: u8 = 1;
 const REQUIRETLS: u8 = 2;
 const TLS_OPTIONAL: u8 = 4;
@@ -52,6 +53,7 @@ pub struct Envelope {
     pub sender: String,
     pub eight_bit: bool,
     pub declared: bool,
+    pub smtp: bool,
     pub ret: Ret,
     pub required: Required,
     pub envid: Vec<u8>,
@@ -70,6 +72,7 @@ impl Envelope {
         };
         let flags = (u8::from(self.eight_bit) * EIGHT_BIT)
             | (u8::from(self.declared) * DECLARED)
+            | (u8::from(self.smtp) * SMTP)
             | (ret << RET_SHIFT);
         if self.required.tls_optional && self.required.requiretls {
             return None;
@@ -122,6 +125,7 @@ impl Envelope {
             sender,
             eight_bit: flags & EIGHT_BIT != 0,
             declared: flags & DECLARED != 0,
+            smtp: flags & SMTP != 0,
             ret,
             required: Required {
                 smtputf8: required & SMTPUTF8 != 0,
@@ -208,6 +212,7 @@ mod tests {
             sender: "bounce@example.org".into(),
             eight_bit: true,
             declared: false,
+            smtp: true,
             ret: Ret::Headers,
             required: Required::new(false, true),
             envid: b"env-1".to_vec(),
@@ -225,13 +230,35 @@ mod tests {
 
     #[test]
     fn envelope_layout_is_frozen() {
-        let bytes = full().encode().expect("encode");
+        let bytes = Envelope {
+            smtp: false,
+            ..full()
+        }
+        .encode()
+        .expect("encode");
         let mut expected = vec![1, 0b1001, 2, 18, 0];
         expected.extend_from_slice(b"bounce@example.org");
         expected.push(5);
         expected.extend_from_slice(b"env-1");
         expected.extend_from_slice(&[2, 7, 0, 0, 0, 1, 9, 0, 0, 0, 2]);
         assert_eq!(bytes, expected);
+    }
+
+    #[test]
+    fn envelope_smtp_changes_only_bit_four() {
+        let mut envelope = full();
+        let smtp = envelope.encode().expect("encode SMTP envelope");
+        envelope.smtp = false;
+        let mut expected = envelope.encode().expect("encode non-SMTP envelope");
+        expected[1] ^= 1 << 4;
+        assert_eq!(smtp, expected);
+    }
+
+    #[test]
+    fn envelope_without_smtp_bit_decodes_as_non_smtp() {
+        let bytes = [1, 0b1001, 0, 0, 0, 0, 0];
+        let envelope = Envelope::decode(&bytes).expect("decode old envelope");
+        assert!(!envelope.smtp);
     }
 
     #[test]
