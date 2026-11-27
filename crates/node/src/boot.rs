@@ -10,7 +10,7 @@ use control::Naming;
 use crypto::Secret;
 use deliver::Hooks;
 use dns::Resolver;
-use intake::{Ask, Guard, Listener, Watch, listen, watch};
+use intake::{Ask, Guard, LOADS, Listener, Reports, Watch, listen, watch};
 use keys::{BatchSettings, Client, Connect, Ring, RingSettings};
 use rt::{
     JoinHandle, Mesh, Notify, Peers, Signal, Signals, TcpListener, UnixListener, spawn, timeout,
@@ -23,7 +23,7 @@ use tls::{Acceptor, Certs, Connector};
 use crate::ops;
 use crate::report;
 use crate::scrape;
-use crate::{Config, Error};
+use crate::{Config, Error, Listen};
 
 const BACKLOG: u32 = 1024;
 const NAMES: usize = 65_536;
@@ -46,6 +46,7 @@ pub struct Plan {
     roots: Option<Vec<u8>>,
     meshes: Meshes,
     guards: Mesh<Ask>,
+    mx_guards: Mesh<Ask>,
     orders: Mesh<Order>,
     forwards: Mesh<Forward>,
     board: Option<Arc<metrics::Board>>,
@@ -74,6 +75,7 @@ impl Plan {
             roots: None,
             meshes: Meshes::new(cores),
             guards: Mesh::new(cores),
+            mx_guards: Mesh::new(cores),
             orders: Mesh::new(cores),
             forwards: Mesh::new(cores),
             board,
@@ -161,10 +163,12 @@ struct Up<T> {
     running: Running,
     guard: Guard,
     guarding: JoinHandle<()>,
+    mx: Guard,
+    mx_guarding: JoinHandle<()>,
     acceptor: Rc<Acceptor>,
     hooks: Rc<dyn sched::Deliver>,
     keys: Rc<Keyring>,
-    sockets: Vec<(TcpListener, bool)>,
+    sockets: Vec<(TcpListener, bool, bool)>,
     apis: Vec<(TcpListener, bool, bool)>,
     scrapes: Vec<TcpListener>,
     admin: Option<UnixListener>,
@@ -206,21 +210,13 @@ pub async fn run<T: Transport + 'static>(
     };
     report::start(&up.node, &plan.config);
     let hooking = up.node.start_hooks(Rc::clone(&up.hooks));
-    let session = Rc::new(plan.config.session.clone());
-    let listeners: Vec<Listener> = up
-        .sockets
-        .into_iter()
-        .map(|(socket, implicit)| {
-            listen(
-                up.node.clone(),
-                socket,
-                Rc::clone(&up.acceptor),
-                Rc::clone(&session),
-                up.guard.clone(),
-                implicit,
-            )
-        })
-        .collect();
+    let listeners = smtp_listeners(
+        &up.node,
+        up.sockets,
+        &up.acceptor,
+        &plan.config.session,
+        [&up.guard, &up.mx],
+    );
     let apis: Option<api::Api> = plan.config.api.as_ref().map(|settings| {
         let sockets = up
             .apis
@@ -264,7 +260,12 @@ pub async fn run<T: Transport + 'static>(
     for closed in closing {
         closed.await;
     }
-    halt(&up.guard, &up.node, up.running, up.guarding).await;
+    halt(
+        &up.node,
+        up.running,
+        [(up.guard, up.guarding), (up.mx, up.mx_guarding)],
+    )
+    .await;
     drop(hooking);
     peers.close();
     stopped
@@ -290,15 +291,16 @@ async fn stop(
 }
 
 async fn halt<T: Transport + 'static>(
-    guard: &Guard,
     node: &Node<T>,
     running: Running,
-    guarding: JoinHandle<()>,
+    guards: [(Guard, JoinHandle<()>); 2],
 ) {
-    guard.close();
+    for (guard, _) in &guards {
+        guard.close();
+    }
     node.close();
     drop(running.stop().await);
-    drop(guarding);
+    drop(guards);
 }
 
 async fn ready<T: Transport + 'static>(
@@ -309,14 +311,24 @@ async fn ready<T: Transport + 'static>(
     let up = started_or_stopped(starting, orders).await;
     if let Some(e) = failed {
         if let Some(Ok(up)) = up {
-            halt(&up.guard, &up.node, up.running, up.guarding).await;
+            halt(
+                &up.node,
+                up.running,
+                [(up.guard, up.guarding), (up.mx, up.mx_guarding)],
+            )
+            .await;
         }
         return Err(e);
     }
     let up = up.ok_or(Error::Stopped)??;
     orders.until(|o| o.go.get() || o.stop.get()).await;
     if !orders.go.get() {
-        halt(&up.guard, &up.node, up.running, up.guarding).await;
+        halt(
+            &up.node,
+            up.running,
+            [(up.guard, up.guarding), (up.mx, up.mx_guarding)],
+        )
+        .await;
         return Err(Error::Stopped);
     }
     Ok(up)
@@ -418,13 +430,9 @@ async fn start<T: Transport + 'static>(
     let hooks = hooks(&node, plan)?;
     let ends = plan.guards.take(index).expect("guard of each core");
     let (guard, guarding) = Guard::start(ends, plan.guard, config.limits);
-    let mut sockets = Vec::with_capacity(config.listen.len());
-    for listen in &config.listen {
-        let socket = TcpListener::bind_shared(listen.address, BACKLOG)
-            .await
-            .map_err(|e| Error::Bind(listen.address, e))?;
-        sockets.push((socket, listen.implicit));
-    }
+    let ends = plan.mx_guards.take(index).expect("mx guard of each core");
+    let (mx, mx_guarding) = Guard::start(ends, plan.guard, config.mx);
+    let sockets = bind_smtp(&config.listen).await?;
     let mut apis = Vec::new();
     if let Some(api) = &config.api {
         let tls = api.listen.iter().map(|a| (*a, true));
@@ -458,6 +466,8 @@ async fn start<T: Transport + 'static>(
         running,
         guard,
         guarding,
+        mx,
+        mx_guarding,
         acceptor: Rc::new(acceptor),
         hooks,
         keys,
@@ -466,6 +476,47 @@ async fn start<T: Transport + 'static>(
         scrapes,
         admin,
     })
+}
+
+fn smtp_listeners<T: Transport + 'static>(
+    node: &Node<T>,
+    sockets: Vec<(TcpListener, bool, bool)>,
+    acceptor: &Rc<Acceptor>,
+    session: &intake::Config,
+    [submission, mx]: [&Guard; 2],
+) -> Vec<Listener> {
+    let session = Rc::new(session.clone());
+    let reports = Rc::new(Reports::new(LOADS));
+    sockets
+        .into_iter()
+        .map(|(socket, implicit, is_mx)| {
+            let (guard, reports) = if is_mx {
+                (mx.clone(), Some(Rc::clone(&reports)))
+            } else {
+                (submission.clone(), None)
+            };
+            listen(
+                node.clone(),
+                socket,
+                Rc::clone(acceptor),
+                Rc::clone(&session),
+                guard,
+                implicit,
+                reports,
+            )
+        })
+        .collect()
+}
+
+async fn bind_smtp(listens: &[Listen]) -> Result<Vec<(TcpListener, bool, bool)>, Error> {
+    let mut sockets = Vec::with_capacity(listens.len());
+    for listen in listens {
+        let socket = TcpListener::bind_shared(listen.address, BACKLOG)
+            .await
+            .map_err(|e| Error::Bind(listen.address, e))?;
+        sockets.push((socket, listen.implicit, listen.mx));
+    }
+    Ok(sockets)
 }
 
 fn hooks<T: Transport + 'static>(

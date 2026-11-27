@@ -302,6 +302,25 @@ impl<T: Transport + 'static> Node<T> {
         self.inner.keys.ids()
     }
 
+    pub async fn load_ids(&self) -> Option<crypto::Secret<16>> {
+        if self.ids().is_none() {
+            self.inner.keys.system().await.ok()?;
+        }
+        self.ids()
+    }
+
+    pub fn cached_keys(&self, tenant: u32, generation: u32) -> Option<crypto::TenantKeys> {
+        self.inner.keys.get(tenant, generation)
+    }
+
+    pub async fn load_keys(
+        &self,
+        tenant: u32,
+        generation: u32,
+    ) -> Result<crypto::TenantKeys, KeyError> {
+        self.inner.keys.ready(tenant, generation).await
+    }
+
     pub fn sched(&self) -> &Sched<T> {
         &self.inner.sched
     }

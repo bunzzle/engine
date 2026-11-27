@@ -40,11 +40,20 @@ impl Client {
     }
 
     pub fn with(implicit: bool, message: u64) -> Self {
+        Self::build(implicit, message, false)
+    }
+
+    pub fn mx(implicit: bool) -> Self {
+        Self::build(implicit, LIMIT, true)
+    }
+
+    fn build(implicit: bool, message: u64, mx: bool) -> Self {
         let mut server = Server::new(Config {
             name: "mx.example.org".into(),
             message,
             implicit,
             messages: MESSAGES,
+            mx,
         });
         let output = server.output();
         Self {

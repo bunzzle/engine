@@ -89,6 +89,7 @@ pub async fn serve<T: Transport + 'static>(
         message: message_limit(node),
         implicit: conn.secure(),
         messages: config.messages,
+        mx: false,
     });
     let mut session = Session {
         node,

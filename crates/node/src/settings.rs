@@ -18,6 +18,7 @@ pub struct Config {
     pub tls: Tls,
     pub session: intake::Config,
     pub limits: intake::Limits,
+    pub mx: intake::Limits,
     pub listen: Vec<Listen>,
     pub api: Option<Api>,
     pub metrics: Option<Metrics>,
@@ -84,6 +85,7 @@ pub struct Tls {
 pub struct Listen {
     pub address: SocketAddr,
     pub implicit: bool,
+    pub mx: bool,
 }
 
 pub fn parse(text: &str) -> Result<Config, Error> {
@@ -109,6 +111,10 @@ pub fn parse(text: &str) -> Result<Config, Error> {
     let mut limits = intake::Limits::default();
     if let Some(table) = root.table("guard") {
         guard(table, &mut limits)?;
+    }
+    let mut mx = intake::Limits::default();
+    if let Some(table) = root.table("mx") {
+        guard(table, &mut mx)?;
     }
     let listen = listen(root.tables("listen"))?;
     let api = match root.table("api") {
@@ -149,6 +155,7 @@ pub fn parse(text: &str) -> Result<Config, Error> {
         tls,
         session,
         limits,
+        mx,
         listen,
         api,
         metrics,
@@ -597,8 +604,16 @@ fn listen(tables: Vec<Table>) -> Result<Vec<Listen>, Error> {
                 _ => return Err(mode.error("must be \"starttls\" or \"implicit\"")),
             },
         };
+        let mx = match table.take("mx") {
+            Some(entry) => entry.bool()?,
+            None => false,
+        };
         table.finish()?;
-        listen.push(Listen { address, implicit });
+        listen.push(Listen {
+            address,
+            implicit,
+            mx,
+        });
     }
     Ok(listen)
 }
