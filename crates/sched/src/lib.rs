@@ -20,6 +20,7 @@ mod normal;
 mod policy;
 mod reader;
 mod requests;
+mod returns;
 mod sealing;
 mod search;
 mod sign;
