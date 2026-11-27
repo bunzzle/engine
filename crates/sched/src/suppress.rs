@@ -10,6 +10,7 @@ use store::{Changes, Claim, IndexRecord, IndexStamp};
 
 use crate::clock::Clock;
 use crate::error::Refusal;
+use crate::gate::Gate;
 use crate::normal::normalize;
 
 pub const KIND_SUPPRESS: u8 = 1;
@@ -133,6 +134,13 @@ pub fn retain(table: &Table, now: u64, entry: &Entry, oldest: bool) -> bool {
     !(oldest && value.suppression.until.is_some_and(|until| until <= now))
 }
 
+#[derive(Clone, Copy)]
+enum AddMode {
+    Set,
+    Keep,
+    Complaint,
+}
+
 enum Request {
     Check {
         tenant: u32,
@@ -147,7 +155,7 @@ enum Request {
         address: Box<str>,
         reason: Reason,
         until: Option<u64>,
-        keep: bool,
+        mode: AddMode,
     },
     Remove {
         tenant: u32,
@@ -184,6 +192,7 @@ enum Message {
     Answer { ticket: u64, answer: Answer },
 }
 
+#[derive(Clone)]
 pub struct Inputs {
     pub keys: Rc<dyn KeySource>,
     pub changes: Changes,
@@ -201,6 +210,7 @@ struct Inner {
     peers: OnceCell<Peers<Ask>>,
     waiting: RefCell<BTreeMap<u64, Sender<Answer>>>,
     tickets: Cell<u64>,
+    adding: Gate<(u32, Hash)>,
 }
 
 #[derive(Clone)]
@@ -218,6 +228,7 @@ impl Suppressions {
             peers: OnceCell::new(),
             waiting: RefCell::new(BTreeMap::new()),
             tickets: Cell::new(0),
+            adding: Gate::default(),
         });
         let suppressions = Self { inner };
         let handler = suppressions.clone();
@@ -302,14 +313,39 @@ impl Suppressions {
         until: Option<u64>,
     ) -> Result<(), Refusal> {
         let generation = self.generation(tenant)?;
-        self.put(tenant, generation, address, reason, until, false)
+        self.put(tenant, generation, address, reason, until, AddMode::Set)
             .await
     }
 
     pub async fn bounce(&self, tenant: u32, generation: u32, address: &str) -> Result<(), Refusal> {
         self.holds(tenant, generation)?;
-        self.put(tenant, generation, address, Reason::Bounce, None, true)
-            .await
+        self.put(
+            tenant,
+            generation,
+            address,
+            Reason::Bounce,
+            None,
+            AddMode::Keep,
+        )
+        .await
+    }
+
+    pub async fn complain(
+        &self,
+        tenant: u32,
+        generation: u32,
+        address: &str,
+    ) -> Result<(), Refusal> {
+        self.holds(tenant, generation)?;
+        self.put(
+            tenant,
+            generation,
+            address,
+            Reason::Complaint,
+            None,
+            AddMode::Complaint,
+        )
+        .await
     }
 
     async fn put(
@@ -319,7 +355,7 @@ impl Suppressions {
         address: &str,
         reason: Reason,
         until: Option<u64>,
-        keep: bool,
+        mode: AddMode,
     ) -> Result<(), Refusal> {
         let address = normalize(address).ok_or(Refusal::Address)?;
         let hash = self.hash(tenant, generation, &address).await?;
@@ -332,7 +368,7 @@ impl Suppressions {
             address: address.into(),
             reason,
             until,
-            keep,
+            mode,
         };
         match self.ask(shard, request).await? {
             Answer::Added(result) => result,
@@ -475,13 +511,21 @@ impl Suppressions {
                 address,
                 reason,
                 until,
-                keep,
-            } => Answer::Added(if keep {
-                self.kept(tenant, generation, shard, hash, &address).await
-            } else {
-                self.added(tenant, generation, shard, hash, &address, reason, until)
-                    .await
-            }),
+                mode,
+            } => {
+                let _guard = self.inner.adding.lock((tenant, hash)).await;
+                Answer::Added(match mode {
+                    AddMode::Keep => self.kept(tenant, generation, shard, hash, &address).await,
+                    AddMode::Complaint => {
+                        self.complained(tenant, generation, shard, hash, &address)
+                            .await
+                    }
+                    AddMode::Set => {
+                        self.added(tenant, generation, shard, hash, &address, reason, until)
+                            .await
+                    }
+                })
+            }
             Request::Remove {
                 tenant,
                 generation,
@@ -612,6 +656,32 @@ impl Suppressions {
             hash,
             address,
             Reason::Bounce,
+            None,
+        )
+        .await
+    }
+
+    async fn complained(
+        &self,
+        tenant: u32,
+        generation: u32,
+        shard: u16,
+        hash: Hash,
+        address: &str,
+    ) -> Result<(), Refusal> {
+        self.holds(tenant, generation)?;
+        if let Some(value) = &self.stored(tenant, generation, &[(shard, hash)]).await?[0]
+            && value.suppression.reason != Reason::Bounce
+        {
+            return Ok(());
+        }
+        self.added(
+            tenant,
+            generation,
+            shard,
+            hash,
+            address,
+            Reason::Complaint,
             None,
         )
         .await

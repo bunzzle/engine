@@ -9,7 +9,9 @@ mod envelope;
 mod error;
 mod events;
 mod finder;
+mod gate;
 mod hook;
+mod inbound;
 mod intake;
 mod json;
 mod keyring;
@@ -47,6 +49,7 @@ pub use events::{
 };
 pub use finder::{Query as SearchQuery, SEARCH_DAYS, SEARCH_LIMIT};
 pub use hook::{HookChange, MAX_HOOKS, ROTATION_MS};
+pub use inbound::{Block as ReportBlock, Inbound, Outcome as ReportOutcome, ReportKind};
 pub use intake::{Draft, domain_of};
 pub use json::{event_json, kind_name as event_kind_name};
 pub use keyring::Keyring;

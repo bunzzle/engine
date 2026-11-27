@@ -202,7 +202,7 @@ impl Keys for Toy {
     }
 }
 
-struct Idle;
+pub(crate) struct Idle;
 
 thread_local! {
     static RESTORED: RefCell<Option<Vec<Restore>>> = const { RefCell::new(None) };
@@ -320,20 +320,20 @@ fn saved(restores: &[Restore]) -> BTreeSet<(u16, u32, Vec<u8>)> {
         .collect()
 }
 
-struct Cluster {
+pub(crate) struct Cluster {
     machine: Machine,
-    nodes: Vec<Node<Idle>>,
+    pub(crate) nodes: Vec<Node<Idle>>,
     runnings: Vec<Running>,
     client: Client,
     committer: JoinHandle<Committer>,
 }
 
 impl Cluster {
-    fn run<T: 'static>(&self, future: impl Future<Output = T> + 'static) -> T {
+    pub(crate) fn run<T: 'static>(&self, future: impl Future<Output = T> + 'static) -> T {
         self.machine.block_on(1, future)
     }
 
-    fn stop(self) {
+    pub(crate) fn stop(self) {
         let Self {
             machine,
             nodes,
@@ -355,7 +355,7 @@ impl Cluster {
     }
 }
 
-fn created(seed: u64) -> Disk {
+pub(crate) fn created(seed: u64) -> Disk {
     created_with(seed, OPTIONS)
 }
 
@@ -407,7 +407,7 @@ fn tenant(id: u32, generation: u32, state: State) -> Object {
     })
 }
 
-fn started(driver: &Rc<SimDriver>, cores: u16) -> Cluster {
+pub(crate) fn started(driver: &Rc<SimDriver>, cores: u16) -> Cluster {
     started_behind(driver, cores, 0)
 }
 
@@ -582,7 +582,7 @@ async fn wait_for(nodes: &[Node<Idle>], tenant: u32, generation: u32, state: Sta
     }
 }
 
-async fn ready(nodes: &[Node<Idle>]) {
+pub(crate) async fn ready(nodes: &[Node<Idle>]) {
     let pool = Object::Pool(Pool {
         id: 1,
         addresses: vec![(IpAddr::from([192, 0, 2, 1]), 1)],
@@ -1147,7 +1147,7 @@ struct Sealed {
     slice: Vec<u8>,
 }
 
-async fn owned_shard(node: &Node<Idle>) -> u16 {
+pub(crate) async fn owned_shard(node: &Node<Idle>) -> u16 {
     for shard in 0..SHARDS {
         if node.spool().id(shard).await.is_ok() {
             return shard;
@@ -1450,7 +1450,7 @@ fn events_seal_under_their_message_and_open_from_the_record() {
     cluster.stop();
 }
 
-async fn accept_listed(
+pub(crate) async fn accept_listed(
     node: &Node<Idle>,
     shard: u16,
     addresses: &[&str],
@@ -2007,7 +2007,7 @@ fn domain_query() -> SearchQuery {
     SearchQuery::new(SearchField::Domain, b"example.org", &[], from, to).expect("query")
 }
 
-async fn every_event(node: &Node<Idle>) -> Vec<sched::EventRead> {
+pub(crate) async fn every_event(node: &Node<Idle>) -> Vec<sched::EventRead> {
     let mut found = Vec::new();
     let mut cursor: Option<String> = None;
     loop {
@@ -4336,7 +4336,7 @@ async fn expire_some(nodes: &[Node<Idle>], from: usize, count: usize) {
     }
 }
 
-fn answering(nodes: &[Node<Idle>]) {
+pub(crate) fn answering(nodes: &[Node<Idle>]) {
     let clock = nodes[0].sched().clock();
     ANSWERS.with_borrow_mut(|a| {
         let given = a.take().map(|a| a.given).unwrap_or_default();
