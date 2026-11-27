@@ -24,6 +24,7 @@ use crate::transport::Transport;
 const DEADLINE: Duration = Duration::from_secs(30);
 const DONE_LIMIT: usize = 1024;
 const SKEW: u64 = 3_600_000;
+const RUNNING: usize = 256;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ReportKind {
@@ -100,6 +101,7 @@ struct Inner {
     peers: OnceCell<Peers<Ask>>,
     waiting: RefCell<BTreeMap<u64, Sender<Result<Outcome, Refusal>>>>,
     tickets: Cell<u64>,
+    running: Cell<usize>,
     locks: Gate<(u32, MessageId)>,
     done: RefCell<VecDeque<Done>>,
 }
@@ -118,6 +120,7 @@ impl Reports {
                 peers: OnceCell::new(),
                 waiting: RefCell::new(BTreeMap::new()),
                 tickets: Cell::new(0),
+                running: Cell::new(0),
                 locks: Gate::default(),
                 done: RefCell::new(VecDeque::new()),
             }),
@@ -151,8 +154,19 @@ impl Reports {
         match message {
             Message::Ask { ticket, inbound } => {
                 let reports = self.clone();
+                let running = &self.inner.running;
+                if running.get() >= RUNNING {
+                    if let Some(peers) = self.inner.peers.get() {
+                        let outcome = Err(Refusal::Busy);
+                        peers.send(from, Ask(Message::Answer { ticket, outcome }));
+                    }
+                    return;
+                }
+                running.set(running.get() + 1);
                 drop(spawn(async move {
                     let outcome = reports.serve(inbound).await;
+                    let running = &reports.inner.running;
+                    running.set(running.get() - 1);
                     if let Some(peers) = reports.inner.peers.get() {
                         peers.send(from, Ask(Message::Answer { ticket, outcome }));
                     }
@@ -173,19 +187,17 @@ impl Reports {
             recipient: inbound.recipient,
             kind: inbound.kind,
         };
-        if self.cached(done) {
+        let cache = inbound.recipient != crypto::ANY;
+        if cache && self.cached(done) {
             return Ok(Outcome::Duplicate);
         }
-        let _guard = self
-            .inner
-            .locks
-            .lock((inbound.tenant, inbound.message))
-            .await;
-        if self.cached(done) {
+        let lock = self.inner.locks.lock((inbound.tenant, inbound.message));
+        let _guard = timeout(DEADLINE, lock).await.map_err(|_| Refusal::Busy)?;
+        if cache && self.cached(done) {
             return Ok(Outcome::Duplicate);
         }
         let outcome = self.process(&inbound).await?;
-        if outcome != Outcome::Unmatched {
+        if cache && outcome != Outcome::Unmatched {
             self.done(done);
         }
         Ok(outcome)
@@ -231,7 +243,7 @@ impl Reports {
         if days.get(today).is_none() {
             return Err(Refusal::Failed);
         }
-        let from = now.saturating_sub(u64::from(events::EVENT_DAYS - 1) * DAY);
+        let from = u64::from(events::retired(today)) * DAY;
         let to = now.saturating_add(SKEW);
         let mut written = 0;
         let mut duplicate = false;
