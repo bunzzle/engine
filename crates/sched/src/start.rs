@@ -18,6 +18,7 @@ use crate::delete::sweep_queues;
 use crate::error::Error;
 use crate::events::{self, KIND_EVENT};
 use crate::finder::Query;
+use crate::inbound::{self, Reports as ReportService};
 use crate::message::{self, MESSAGE_LIMIT, MessagePage};
 use crate::node::{Config, Note, Sched};
 use crate::reader::{self, EventPage, ReadError, Reader};
@@ -38,6 +39,7 @@ pub struct Meshes {
     sched: Mesh<Note>,
     suppress: Mesh<suppress::Ask>,
     events: Mesh<reader::Ask>,
+    reports: Mesh<inbound::Ask>,
     steps: Mesh<()>,
     desks: Mesh<Desk>,
 }
@@ -51,6 +53,7 @@ impl Meshes {
             sched: Mesh::new(cores),
             suppress: Mesh::new(cores),
             events: Mesh::new(cores),
+            reports: Mesh::new(cores),
             steps: Mesh::new(cores),
             desks: Mesh::new(cores),
         }
@@ -64,6 +67,7 @@ impl Meshes {
             sched: self.sched.take(core)?,
             suppress: self.suppress.take(core)?,
             events: self.events.take(core)?,
+            reports: self.reports.take(core)?,
             steps: self.steps.take(core)?,
             desks: self.desks.take(core)?,
         })
@@ -77,6 +81,7 @@ pub struct Links {
     sched: Ends<Note>,
     suppress: Ends<suppress::Ask>,
     events: Ends<reader::Ask>,
+    reports: Ends<inbound::Ask>,
     steps: Ends<()>,
     desks: Ends<Desk>,
 }
@@ -111,6 +116,7 @@ pub(crate) struct Inner<T> {
     pub(crate) suppressions: Suppressions,
     pub(crate) desks: Rc<Desks<T>>,
     pub(crate) requests: Requests,
+    pub(crate) reports: ReportService,
     reader: Reader,
     config: Peers<control::Note>,
     writer: RefCell<Option<Writer>>,
@@ -208,16 +214,15 @@ impl<T: Transport + 'static> Node<T> {
             None => None,
         };
 
-        let inputs = Inputs {
-            keys: Rc::clone(&parts.keys) as Rc<dyn KeySource>,
-            changes: changes.clone(),
-            table: Rc::clone(&table),
-            clock,
-            naming: settings.naming,
-            shards: found.shards.clone(),
-        };
-        let (suppressions, requests, reader, mut index_done) =
-            index_services(links.suppress, links.events, inputs).await?;
+        let (suppressions, requests, reader, reports, mut index_done) = index_services(
+            (links.suppress, links.events, links.reports),
+            &parts,
+            &changes,
+            &table,
+            (&settings, &found.shards),
+            spool.clone(),
+        )
+        .await?;
         let (queues, names_done) = loaded.start(
             links.names,
             changes.clone(),
@@ -258,6 +263,7 @@ impl<T: Transport + 'static> Node<T> {
             suppressions,
             desks,
             requests,
+            reports,
             reader,
             config,
             writer: RefCell::new(writer),
@@ -619,16 +625,39 @@ impl<T: Transport + 'static> Node<T> {
         inner.suppressions.close();
         inner.desks.close();
         inner.requests.close();
+        inner.reports.close();
         inner.reader.close();
         inner.config.close();
     }
 }
 
-async fn index_services(
-    ends: Ends<suppress::Ask>,
-    events: Ends<reader::Ask>,
-    inputs: Inputs,
-) -> Result<(Suppressions, Requests, Reader, Vec<JoinHandle<()>>), Error> {
+async fn index_services<T>(
+    ends: (Ends<suppress::Ask>, Ends<reader::Ask>, Ends<inbound::Ask>),
+    parts: &Parts<T>,
+    changes: &Changes,
+    table: &Rc<RefCell<Table>>,
+    configured: (&Settings, &[u16]),
+    spool: spool::Spool,
+) -> Result<
+    (
+        Suppressions,
+        Requests,
+        Reader,
+        ReportService,
+        Vec<JoinHandle<()>>,
+    ),
+    Error,
+> {
+    let (ends, events, reports) = ends;
+    let (settings, shards) = configured;
+    let inputs = Inputs {
+        keys: Rc::clone(&parts.keys) as Rc<dyn KeySource>,
+        changes: changes.clone(),
+        table: Rc::clone(table),
+        clock: parts.clock,
+        naming: settings.naming,
+        shards: shards.to_vec(),
+    };
     let (reader, reader_done) =
         Reader::start(events, inputs.changes.clone(), Rc::clone(&inputs.table));
     let request_inputs = RequestInputs {
@@ -639,7 +668,16 @@ async fn index_services(
         naming: inputs.naming,
         shards: inputs.shards.clone(),
     };
-    let (suppressions, lists_done) = Suppressions::start(ends, inputs);
+    let (suppressions, lists_done) = Suppressions::start(ends, inputs.clone());
+    let report_inputs = inbound::Inputs {
+        keys: Rc::clone(&parts.keys),
+        changes: inputs.changes.clone(),
+        table: Rc::clone(&inputs.table),
+        clock: inputs.clock,
+        spool,
+        suppressions: suppressions.clone(),
+    };
+    let (reports, reports_done) = ReportService::start(reports, report_inputs);
     let (requests, requests_done) = Requests::start(request_inputs)
         .await
         .map_err(spool::Error::from)?;
@@ -647,7 +685,8 @@ async fn index_services(
         suppressions,
         requests,
         reader,
-        vec![lists_done, requests_done, reader_done],
+        reports,
+        vec![lists_done, requests_done, reader_done, reports_done],
     ))
 }
 
