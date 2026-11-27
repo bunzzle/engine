@@ -1615,14 +1615,19 @@ fn prepared_return(return_path: bool, addresses: &'static [&'static str]) -> Pre
             let alg = DkimAlg::Ed25519Sha256;
             let key = node.dkim_new(1, alg, name, selector).await.expect("dkim");
             let domain = node.domain_new(1, name).await.expect("domain");
-            node.domain_write(Domain {
-                return_path,
-                state: Verification::Verified,
-                ed25519: key.id,
-                ..domain
-            })
-            .await
-            .expect("verify domain");
+            let domain = node
+                .domain_write(Domain {
+                    state: Verification::Verified,
+                    ed25519: key.id,
+                    ..domain
+                })
+                .await
+                .expect("verify domain");
+            if return_path {
+                node.return_path_set(1, domain.id, true)
+                    .await
+                    .expect("enable return path");
+            }
             let envelope = Envelope {
                 sender: RETURN_SENDER.into(),
                 signatures: vec![(key.id, alg)],
@@ -1706,6 +1711,117 @@ fn return_path_skips_key_lookups_for_an_unflagged_domain() {
             ..ReturnLookups::default()
         }
     );
+}
+
+fn return_path_test(test: impl AsyncFnOnce(&Node<Idle>, Domain) + 'static) {
+    let driver = Rc::new(SimDriver::with_disk(45, Config::default(), created(45)));
+    let cluster = started_with_keys(&driver, 1);
+    let nodes = cluster.nodes.clone();
+    cluster.run(async move {
+        timeout(Duration::from_secs(30), async {
+            keys_listening().await;
+            ready(&nodes).await;
+            let node = &nodes[0];
+            let domain = node.domain_new(1, "example.org").await.expect("domain");
+            test(node, domain).await;
+        })
+        .await
+        .expect("return path test in time");
+    });
+}
+
+#[test]
+fn domain_write_refuses_to_enable_return_path() {
+    return_path_test(async |node, domain| {
+        let verified = node
+            .domain_write(Domain {
+                state: Verification::Verified,
+                ..domain
+            })
+            .await
+            .expect("verify domain");
+        domain_refused(
+            node.domain_write(Domain {
+                return_path: true,
+                ..verified.clone()
+            })
+            .await,
+            "return path",
+        );
+        assert_eq!(node.table().domain(1, verified.id), Some(&verified));
+    });
+}
+
+#[test]
+fn domain_write_refuses_to_disable_return_path() {
+    return_path_test(async |node, domain| {
+        let id = domain.id;
+        node.domain_write(Domain {
+            state: Verification::Verified,
+            ..domain
+        })
+        .await
+        .expect("verify domain");
+        let enabled = node.return_path_set(1, id, true).await.expect("enable");
+        domain_refused(
+            node.domain_write(Domain {
+                return_path: false,
+                ..enabled.clone()
+            })
+            .await,
+            "return path",
+        );
+        assert_eq!(node.table().domain(1, id), Some(&enabled));
+    });
+}
+
+#[test]
+fn return_path_set_refuses_to_enable_an_unverified_domain() {
+    return_path_test(async |node, domain| {
+        domain_refused(
+            node.return_path_set(1, domain.id, true).await,
+            "return path",
+        );
+        assert_eq!(node.table().domain(1, domain.id), Some(&domain));
+    });
+}
+
+#[test]
+fn return_path_set_changes_only_the_flag() {
+    return_path_test(async |node, domain| {
+        let rsa = node
+            .dkim_new(1, DkimAlg::RsaSha256, &domain.name, "r1")
+            .await
+            .expect("rsa key");
+        let ed25519 = node
+            .dkim_new(1, DkimAlg::Ed25519Sha256, &domain.name, "e1")
+            .await
+            .expect("ed25519 key");
+        let verified = node
+            .domain_write(Domain {
+                state: Verification::Verified,
+                rsa: rsa.id,
+                ed25519: ed25519.id,
+                ..domain
+            })
+            .await
+            .expect("verify domain");
+        let id = verified.id;
+        let enabled = node.return_path_set(1, id, true).await.expect("enable");
+        assert_eq!(
+            enabled,
+            Domain {
+                return_path: true,
+                ..verified.clone()
+            }
+        );
+        assert_eq!(node.table().domain(1, id), Some(&enabled));
+        assert_eq!(
+            node.return_path_set(1, id, false).await.expect("disable"),
+            verified
+        );
+        assert_eq!(node.table().domain(1, id), Some(&verified));
+    });
 }
 
 #[test]

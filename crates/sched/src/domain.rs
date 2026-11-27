@@ -35,18 +35,45 @@ impl<T: Transport + 'static> Node<T> {
     }
 
     pub async fn domain_write(&self, domain: Domain) -> Result<Domain, Error> {
+        self.update_domain(domain.tenant, domain.id, move |current| {
+            if domain.name != current.name || domain.generation != current.generation {
+                return Err(control::Error::Refused.into());
+            }
+            if domain.return_path != current.return_path {
+                return Err(control::Error::Invalid("return path").into());
+            }
+            Ok(domain)
+        })
+        .await
+    }
+
+    pub async fn return_path_set(&self, tenant: u32, id: u32, on: bool) -> Result<Domain, Error> {
+        self.update_domain(tenant, id, move |current| {
+            Ok(Domain {
+                return_path: on,
+                ..current.clone()
+            })
+        })
+        .await
+    }
+
+    async fn update_domain(
+        &self,
+        tenant: u32,
+        id: u32,
+        update: impl FnOnce(&Domain) -> Result<Domain, Error> + 'static,
+    ) -> Result<Domain, Error> {
         let node = self.clone();
         rt::spawn(async move {
             let mut held = node.hold()?;
-            let generation = node.generation(domain.tenant)?;
-            {
+            let generation = node.generation(tenant)?;
+            let domain = {
                 let table = node.table();
-                let known = table
-                    .domain(domain.tenant, domain.id)
-                    .is_some_and(|d| d.name == domain.name && d.generation == generation);
-                if !known || domain.generation != generation {
-                    return Err(control::Error::Refused.into());
-                }
+                let current = table
+                    .domain(tenant, id)
+                    .filter(|d| d.generation == generation)
+                    .ok_or(control::Error::Refused)?;
+                let domain = update(current)?;
                 if domain.return_path && domain.state != Verification::Verified {
                     return Err(control::Error::Invalid("return path").into());
                 }
@@ -58,14 +85,15 @@ impl<T: Transport + 'static> Node<T> {
                     (domain.ed25519, DkimAlg::Ed25519Sha256),
                 ] {
                     let fits = key == 0
-                        || table.dkim(domain.tenant, key).is_some_and(|d| {
+                        || table.dkim(tenant, key).is_some_and(|d| {
                             d.alg == alg && d.generation == generation && d.domain == domain.name
                         });
                     if !fits {
                         return Err(control::Error::Invalid("dkim keys").into());
                     }
                 }
-            }
+                domain
+            };
             node.write_domain(&mut held, domain).await
         })
         .await

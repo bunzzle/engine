@@ -73,11 +73,7 @@ pub async fn enable<T: Transport + 'static>(
     if current.name != domain.name || current.generation != domain.generation {
         return Err(control::Error::Refused.into());
     }
-    node.domain_write(Domain {
-        return_path: true,
-        ..current
-    })
-    .await
+    node.return_path_set(tenant, id, true).await
 }
 
 pub async fn disable<T: Transport + 'static>(
@@ -85,12 +81,7 @@ pub async fn disable<T: Transport + 'static>(
     tenant: u32,
     id: u32,
 ) -> Result<Domain, Error> {
-    let domain = read_domain(node, tenant, id)?;
-    node.domain_write(Domain {
-        return_path: false,
-        ..domain
-    })
-    .await
+    node.return_path_set(tenant, id, false).await
 }
 
 fn read_domain<T: Transport + 'static>(

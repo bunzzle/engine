@@ -1322,16 +1322,13 @@ async fn rcpt(port: u16, tls: &Arc<ClientConfig>, to: &str) -> String {
 
 async fn enable_report_domain(nodes: &[Node<Idle>], tenant: u32, name: &str) {
     let control = control_of(nodes);
-    let domain = control
+    let id = control
         .table()
         .sender(tenant, name)
-        .cloned()
-        .expect("verified domain");
+        .expect("verified domain")
+        .id;
     control
-        .domain_write(Domain {
-            return_path: true,
-            ..domain
-        })
+        .return_path_set(tenant, id, true)
         .await
         .expect("enable return path");
     until("return path enabled", || {

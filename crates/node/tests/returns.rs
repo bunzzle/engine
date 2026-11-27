@@ -268,11 +268,7 @@ fn only_verified_domains_can_enable_and_disable_needs_no_dns() {
         ));
         assert_eq!(dns.sent(), 0);
         assert!(matches!(
-            node.domain_write(Domain {
-                return_path: true,
-                ..unverified.clone()
-            })
-            .await,
+            node.return_path_set(1, id, true).await,
             Err(sched::Error::Control(control::Error::Invalid(
                 "return path"
             )))
