@@ -171,13 +171,19 @@ fn seal<const NK: usize>(
     let shared = shared_secret(&dh, &enc, public);
     let (key, nonce) = schedule::<NK>(aead_id, &shared, info);
     let key = LessSafeKey::new(UnboundKey::new(algorithm, key.expose()).map_err(|_| Error::Key)?);
-    let mut body = clear.to_vec();
-    key.seal_in_place_append_tag(
-        Nonce::assume_unique_for_key(*nonce.expose()),
-        Aad::from(aad),
-        &mut body,
-    )
-    .map_err(|_| Error::Key)?;
+    let mut body = Vec::with_capacity(clear.len() + algorithm.tag_len());
+    body.extend_from_slice(clear);
+    if key
+        .seal_in_place_append_tag(
+            Nonce::assume_unique_for_key(*nonce.expose()),
+            Aad::from(aad),
+            &mut body,
+        )
+        .is_err()
+    {
+        sys::mem::wipe(&mut body);
+        return Err(Error::Key);
+    }
     Ok((enc, body))
 }
 
@@ -344,6 +350,7 @@ mod tests {
         .expect("seals");
         assert_eq!(enc, array(AES_256.pk_e));
         assert_eq!(ct, hex(AES_256.ct));
+        assert_eq!(ct.capacity(), ct.len());
         let clear = open::<32>(
             &AES_256_GCM,
             2,
