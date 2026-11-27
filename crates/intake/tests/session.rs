@@ -1341,7 +1341,7 @@ async fn enable_report_domain(nodes: &[Node<Idle>], tenant: u32, name: &str) {
     .await;
 }
 
-fn refuses_report_domain(domain: &'static str, enabled: bool) {
+fn refuses_report_domain(domain: &'static str) {
     let seed = 0;
     let driver = Rc::new(SimDriver::with_disk(seed, Config::default(), created(seed)));
     let cluster = started(&driver, 2).expect("start");
@@ -1349,9 +1349,7 @@ fn refuses_report_domain(domain: &'static str, enabled: bool) {
     cluster.run(async move {
         timeout(Duration::from_secs(60), async {
             prepare(&nodes).await;
-            if enabled {
-                enable_report_domain(&nodes, 2, "example.net").await;
-            }
+            enable_report_domain(&nodes, 2, "example.net").await;
             let control = control_of(&nodes);
             let other = nodes.iter().find(|n| !n.controls()).expect("second core");
             let keys = control.load_keys(2, 1).await.expect("keys");
@@ -1371,13 +1369,53 @@ fn refuses_report_domain(domain: &'static str, enabled: bool) {
 }
 
 #[test]
-fn mx_refuses_a_verified_domain_without_return_path() {
-    refuses_report_domain("bounce.example.net", false);
+fn mx_accepts_a_token_for_a_verified_domain_after_the_flag_is_off() {
+    let seed = 0;
+    let driver = Rc::new(SimDriver::with_disk(seed, Config::default(), created(seed)));
+    let cluster = started(&driver, 2).expect("start");
+    let nodes = cluster.nodes.clone();
+    cluster.run(async move {
+        timeout(Duration::from_secs(60), async {
+            prepare(&nodes).await;
+            enable_report_domain(&nodes, 2, "example.net").await;
+            let control = control_of(&nodes);
+            let other = nodes.iter().find(|n| !n.controls()).expect("second core");
+            let keys = control.load_keys(2, 1).await.expect("keys");
+            let token = Token::sign(&keys, 0, public_id(control, other.spool().node())).text();
+            let id = control
+                .table()
+                .sender(2, "example.net")
+                .expect("verified domain")
+                .id;
+            control
+                .return_path_set(2, id, false)
+                .await
+                .expect("disable return path");
+            until("return path disabled", || {
+                nodes.iter().all(|node| {
+                    node.table()
+                        .sender(2, "example.net")
+                        .is_some_and(|domain| !domain.return_path)
+                })
+            })
+            .await;
+            let (listening, _) = listen_mx(other, seed, MX, LOADS).await;
+            let tls = client_config(simulated(seed + 100));
+            assert!(other.cached_keys(2, 1).is_none());
+            let reply = rcpt(MX, &tls, &format!("b{token}@bounce.example.net")).await;
+            assert!(reply.starts_with("250 "), "{reply}");
+            assert!(other.cached_keys(2, 1).is_some());
+            listening.close().await;
+        })
+        .await
+        .expect("report domain test timed out");
+    });
+    cluster.stop();
 }
 
 #[test]
 fn mx_refuses_a_misspelled_return_path_prefix() {
-    refuses_report_domain("bounc.example.net", true);
+    refuses_report_domain("bounc.example.net");
 }
 
 #[test]

@@ -105,8 +105,7 @@ impl Reports {
             let (prefix, name) = domain.split_once('.').ok_or(UNKNOWN)?;
             if !prefix.eq_ignore_ascii_case(RETURN_PREFIX)
                 || !table.domains(token.tenant).any(|record| {
-                    record.return_path
-                        && record.state == Verification::Verified
+                    record.state == Verification::Verified
                         && record.generation == generation
                         && name.eq_ignore_ascii_case(&record.name)
                 })
