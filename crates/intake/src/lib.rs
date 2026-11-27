@@ -3,6 +3,7 @@ mod conn;
 mod date;
 mod guard;
 mod header;
+mod inbound;
 mod listen;
 mod mailbox;
 mod mx;
