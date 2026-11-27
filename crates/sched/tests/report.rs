@@ -2,7 +2,7 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use rt::sim::{Config, SimDriver};
-use rt::{sleep, spawn};
+use rt::{sleep, spawn, timeout};
 use sched::{EventKind, Inbound, Node, Reason, ReportBlock, ReportKind, ReportOutcome};
 use spool::MessageId;
 
@@ -251,6 +251,135 @@ fn any_reports_write_events_without_suppressions() {
             );
         }
     });
+    cluster.stop();
+}
+
+#[test]
+fn separate_any_reports_write_an_event_for_each_recipient() {
+    let (_, cluster) = setup(180);
+    let nodes = cluster.nodes.clone();
+    cluster
+        .run(async move {
+            timeout(Duration::from_secs(180), async {
+                ready(&nodes).await;
+                answering(&nodes);
+                let addresses = ["first@example.org", "second@example.org"];
+                let id = source(&nodes[0], &addresses).await;
+                for address in addresses {
+                    let mut report = inbound(
+                        id,
+                        ReportKind::Bounce,
+                        vec![block(address, (5, 1, 1), "gone")],
+                    );
+                    report.recipient = crypto::ANY;
+                    assert_eq!(nodes[1].report(report).await, Ok(ReportOutcome::Written(1)));
+                }
+                let events = reports(&nodes[0], id, EventKind::Bounced).await;
+                let mut written: Vec<_> = events
+                    .iter()
+                    .map(|event| event.body.as_ref().expect("body").address.as_slice())
+                    .collect();
+                written.sort_unstable();
+                assert_eq!(written, addresses.map(str::as_bytes));
+            })
+            .await
+        })
+        .expect("report test timed out");
+    cluster.stop();
+}
+
+#[test]
+fn reports_find_a_duplicate_on_a_later_page() {
+    let (_, cluster) = setup(190);
+    let nodes = cluster.nodes.clone();
+    cluster
+        .run(async move {
+            timeout(Duration::from_secs(20 * 60), async {
+                ready(&nodes).await;
+                answering(&nodes);
+                let address = "shared@example.org";
+                let node = &nodes[0];
+                let shard = owned_shard(node).await;
+                let mut ids = Vec::new();
+                for _ in 0..101 {
+                    let (id, _) = accept_listed(node, shard, &[address], u64::MAX / 2).await;
+                    ids.push(id);
+                }
+                for _ in 0..20_000 {
+                    if ids.iter().all(|&id| node.spool().tenant(id).is_none()) {
+                        break;
+                    }
+                    sleep(Duration::from_millis(50)).await;
+                }
+                let pending = ids
+                    .iter()
+                    .filter(|&&id| node.spool().tenant(id).is_some())
+                    .count();
+                assert_eq!(pending, 0, "messages still pending");
+                let first = ids[0];
+                let last = *ids.last().expect("last message");
+                let report = |id| {
+                    let mut report = inbound(
+                        id,
+                        ReportKind::Bounce,
+                        vec![block(address, (5, 1, 1), "gone")],
+                    );
+                    report.recipient = crypto::ANY;
+                    report
+                };
+                for id in [first, last] {
+                    assert_eq!(
+                        nodes[1].report(report(id)).await,
+                        Ok(ReportOutcome::Written(1))
+                    );
+                }
+                assert_eq!(
+                    nodes[1].report(report(last)).await,
+                    Ok(ReportOutcome::Duplicate)
+                );
+                for id in [first, last] {
+                    assert_eq!(reports(&nodes[0], id, EventKind::Bounced).await.len(), 1);
+                }
+            })
+            .await
+        })
+        .expect("report test timed out");
+    cluster.stop();
+}
+
+#[test]
+fn an_any_report_for_another_messages_recipient_is_unmatched() {
+    let (_, cluster) = setup(200);
+    let nodes = cluster.nodes.clone();
+    cluster
+        .run(async move {
+            timeout(Duration::from_secs(180), async {
+                ready(&nodes).await;
+                answering(&nodes);
+                let id = source(&nodes[0], &["original@example.org"]).await;
+                let address = "other@example.org";
+                let other = source(&nodes[0], &[address]).await;
+                let mut report = inbound(
+                    id,
+                    ReportKind::Bounce,
+                    vec![block(address, (5, 1, 1), "gone")],
+                );
+                report.recipient = crypto::ANY;
+                assert_eq!(nodes[1].report(report).await, Ok(ReportOutcome::Unmatched));
+                assert!(reports(&nodes[0], id, EventKind::Bounced).await.is_empty());
+                assert!(
+                    reports(&nodes[0], other, EventKind::Bounced)
+                        .await
+                        .is_empty()
+                );
+                assert_eq!(
+                    nodes[0].suppressions().get(1, address).await.expect("get"),
+                    None
+                );
+            })
+            .await
+        })
+        .expect("report test timed out");
     cluster.stop();
 }
 
