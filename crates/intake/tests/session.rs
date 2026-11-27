@@ -89,6 +89,7 @@ impl Transport for Idle {
                 return fault.answers(&claimed);
             }
         };
+        assert!(prepared.envelope.smtp);
         let indexes: Vec<u32> = prepared.recipients.iter().map(|(r, _)| *r).collect();
         let claimed_indexes: Vec<u32> = claimed.iter().map(|c| c.recipient).collect();
         assert_eq!(indexes, claimed_indexes);
