@@ -52,11 +52,15 @@ fn cname(target: &str) -> packets::Rr {
 }
 
 fn txt(texts: &[&[u8]]) -> Vec<packets::Rr> {
-    let mut answers = vec![cname(HOST)];
+    txt_at(HOST, texts)
+}
+
+fn txt_at(target: &str, texts: &[&[u8]]) -> Vec<packets::Rr> {
+    let mut answers = vec![cname(target)];
     answers.extend(texts.iter().map(|text| {
         let mut data = vec![u8::try_from(text.len()).expect("short TXT")];
         data.extend_from_slice(text);
-        packets::rr(HOST, Type::Txt.code(), 300, data)
+        packets::rr(target, Type::Txt.code(), 300, data)
     }));
     answers
 }
@@ -114,6 +118,21 @@ fn cname_without_mx_is_refused() {
 fn cname_with_null_mx_is_refused() {
     let null_mx = packets::rr(HOST, Type::Mx.code(), 300, packets::mx(0, "."));
     refused(vec![cname(HOST), null_mx], None, Refused::Mx);
+}
+
+#[test]
+fn cname_with_nonzero_root_mx_is_refused() {
+    let root_mx = packets::rr(HOST, Type::Mx.code(), 300, packets::mx(10, "."));
+    refused(vec![cname(HOST), root_mx], None, Refused::Mx);
+}
+
+#[test]
+fn txt_cname_to_a_different_target_is_refused() {
+    refused(
+        vec![cname(HOST), mx(HOST)],
+        Some(txt_at("other.example.net", &[b"v=spf1 -all"])),
+        Refused::Cname,
+    );
 }
 
 #[test]

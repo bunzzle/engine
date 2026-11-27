@@ -24,9 +24,10 @@ pub async fn check(resolver: &Resolver, name: &str, hosts: &[Name]) -> Result<()
     let Found::Records(records) = &mx.found else {
         return Err(Refused::Mx);
     };
-    if !records.iter().any(|record| {
-        matches!(record, Record::Mx { preference, exchange } if *preference != 0 || !exchange.is_root())
-    }) {
+    if !records
+        .iter()
+        .any(|record| matches!(record, Record::Mx { exchange, .. } if !exchange.is_root()))
+    {
         return Err(Refused::Mx);
     }
     if mx.name == name || !hosts.contains(&mx.name) {
@@ -36,6 +37,9 @@ pub async fn check(resolver: &Resolver, name: &str, hosts: &[Name]) -> Result<()
         .lookup(&name, Type::Txt)
         .await
         .map_err(|_| Refused::Dns)?;
+    if txt.name != mx.name {
+        return Err(Refused::Cname);
+    }
     let Found::Records(records) = &txt.found else {
         return Err(Refused::Spf);
     };
