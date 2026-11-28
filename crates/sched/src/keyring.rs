@@ -124,6 +124,7 @@ impl Keys for Keyring {
 
     fn settled(&self, day: u32) {
         self.ring.settled(day);
+        self.batches.borrow_mut().settle(day);
     }
 
     fn forget(&self, tenant: u32, generation: u32) {
@@ -252,7 +253,7 @@ impl Keys for Keyring {
                 return Ok(key);
             }
             let key = Rc::new(BatchKey::new(&secret));
-            batches.remember(tenant, generation, shard, id, Rc::clone(&key));
+            batches.remember(tenant, generation, shard, id, wrap.day, Rc::clone(&key));
             Ok(key)
         })
     }

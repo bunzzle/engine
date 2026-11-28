@@ -107,10 +107,10 @@ fn cached_keys_answer_only_their_own_tenant_and_generation() {
         assert!(batches.cached(4, 2, 2, 77).is_none());
         assert!(batches.cached(4, 1, 3, 77).is_none());
         for id in 1..10 {
-            batches.remember(9, 1, 2, id, Rc::clone(&batch.key));
+            batches.remember(9, 1, 2, id, DAY, Rc::clone(&batch.key));
         }
         assert!(batches.cached(4, 1, 2, 77).is_some(), "open batch evicted");
-        batches.remember(5, 1, 6, 900, Rc::clone(&batch.key));
+        batches.remember(5, 1, 6, 900, DAY, Rc::clone(&batch.key));
         assert!(batches.cached(4, 1, 6, 900).is_none());
         assert!(batches.stats().mismatched >= 3);
         batches.forget(4, 1);
@@ -133,10 +133,68 @@ fn a_batch_rotates_on_its_own_age_between_sweeps_and_keeps_its_cache_owner() {
             .expect("seal");
         assert_eq!(aged.id, 102);
         assert_eq!(batches.stats().aged, 1);
-        batches.remember(5, 1, 2, 100, Rc::clone(&aged.key));
+        batches.remember(5, 1, 2, 100, DAY, Rc::clone(&aged.key));
         let kept = batches.cached(4, 1, 2, 100).expect("owner kept");
         assert!(same_key(&kept, &first.key));
         assert!(batches.cached(5, 1, 2, 100).is_none());
         assert!(batches.stats().mismatched >= 2);
     });
+}
+
+#[test]
+fn settle_drops_cached_keys_through_its_day() {
+    let mut batches = Batches::new(BatchSettings::default());
+    let key = Rc::new(BatchKey::new(&secret(4, DAY)));
+    batches.remember(4, 1, 2, 77, DAY - 1, Rc::clone(&key));
+    batches.remember(4, 1, 2, 78, DAY, Rc::clone(&key));
+    batches.remember(4, 1, 2, 79, DAY + 1, Rc::clone(&key));
+    assert_eq!(Rc::strong_count(&key), 4);
+
+    batches.settle(DAY);
+
+    assert_eq!(Rc::strong_count(&key), 2);
+    assert!(batches.cached(4, 1, 2, 77).is_none());
+    assert!(batches.cached(4, 1, 2, 78).is_none());
+    let kept = batches.cached(4, 1, 2, 79).expect("later key kept");
+    assert!(Rc::ptr_eq(&kept, &key));
+}
+
+#[test]
+fn settle_drops_open_batches_and_sealing_still_works() {
+    run(async {
+        let mut batches = Batches::new(BatchSettings::default());
+        let today = working(4, 1, DAY);
+        let start = now();
+        batches.seal(&today, 2, 77, start).expect("seal");
+        assert_eq!(batches.open_count(), 1);
+        assert!(batches.cached(4, 1, 2, 77).is_some());
+
+        batches.settle(DAY);
+
+        assert_eq!(batches.open_count(), 0);
+        assert!(batches.cached(4, 1, 2, 77).is_none());
+        let batch = batches.seal(&today, 2, 78, start).expect("seal");
+        assert_eq!(batch.id, 78);
+        assert_eq!(batches.seal(&today, 2, 79, start).expect("seal").id, 78);
+        assert!(batches.cached(4, 1, 2, 78).is_none());
+        batches.sweep(start + Duration::from_secs(60));
+        assert!(batches.cached(4, 1, 2, 78).is_none());
+        assert_eq!(Rc::strong_count(&batch.key), 1);
+    });
+}
+
+#[test]
+fn remember_skips_settled_days_after_a_lower_settle() {
+    let mut batches = Batches::new(BatchSettings::default());
+    let key = Rc::new(BatchKey::new(&secret(4, DAY)));
+    batches.remember(4, 1, 2, 77, DAY + 1, Rc::clone(&key));
+    batches.settle(DAY);
+    batches.settle(DAY - 1);
+
+    batches.remember(5, 1, 2, 77, DAY, Rc::clone(&key));
+    batches.remember(4, 1, 2, 78, DAY, Rc::clone(&key));
+
+    assert_eq!(batches.stats().mismatched, 0);
+    assert_eq!(Rc::strong_count(&key), 2);
+    assert!(batches.cached(4, 1, 2, 78).is_none());
 }
