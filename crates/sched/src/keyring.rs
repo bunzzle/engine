@@ -33,6 +33,19 @@ impl Keyring {
     pub fn ring(&self) -> &Ring {
         &self.ring
     }
+
+    fn advance(&self, tenant: u32, generation: u32) -> bool {
+        let Some(working) = self.ring.get(tenant, generation) else {
+            return false;
+        };
+        if working.seen < keys::wall_day() {
+            self.ring.refresh(tenant, generation);
+        }
+        self.batches
+            .borrow_mut()
+            .advance(tenant, generation, working.oldest);
+        true
+    }
 }
 
 fn key_error(fault: Fault) -> KeyError {
@@ -124,7 +137,6 @@ impl Keys for Keyring {
 
     fn settled(&self, day: u32) {
         self.ring.settled(day);
-        self.batches.borrow_mut().settle(day);
     }
 
     fn forget(&self, tenant: u32, generation: u32) {
@@ -233,10 +245,11 @@ impl Keys for Keyring {
         wrap: Wrap,
     ) -> Unwrapped<'_> {
         Box::pin(async move {
-            if let Some(key) = self
-                .batches
-                .borrow_mut()
-                .cached(tenant, generation, shard, id)
+            if self.advance(tenant, generation)
+                && let Some(key) = self
+                    .batches
+                    .borrow_mut()
+                    .cached(tenant, generation, shard, id)
             {
                 return Ok(key);
             }
@@ -248,11 +261,15 @@ impl Keys for Keyring {
             if self.ring.forgotten(tenant, generation) {
                 return Err(Unsealable::Gone);
             }
+            let known = self.advance(tenant, generation);
             let mut batches = self.batches.borrow_mut();
-            if let Some(key) = batches.cached(tenant, generation, shard, id) {
+            if known && let Some(key) = batches.cached(tenant, generation, shard, id) {
                 return Ok(key);
             }
             let key = Rc::new(BatchKey::new(&secret));
+            if !known {
+                return Ok(key);
+            }
             batches.remember(tenant, generation, shard, id, wrap.day, Rc::clone(&key));
             Ok(key)
         })

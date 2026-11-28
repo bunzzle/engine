@@ -64,7 +64,7 @@ struct Cached {
 pub struct Batches {
     settings: BatchSettings,
     next_sweep: Option<Instant>,
-    floor: u32,
+    floors: HashMap<(u32, u32), u32>,
     open: HashMap<(u32, u32, u16), Opened>,
     cache: Cache<(u16, u64), Cached>,
     stats: BatchStats,
@@ -75,7 +75,7 @@ impl Batches {
         Self {
             settings,
             next_sweep: None,
-            floor: 0,
+            floors: HashMap::new(),
             open: HashMap::new(),
             cache: Cache::new(settings.cache),
             stats: BatchStats::default(),
@@ -104,6 +104,7 @@ impl Batches {
             self.sweep(now);
         }
         let (tenant, generation) = (working.keys.tenant(), working.keys.generation());
+        self.advance(tenant, generation, working.oldest);
         let slot = (tenant, generation, shard);
         if let Some(opened) = self.open.get_mut(&slot) {
             if now.saturating_duration_since(opened.since) >= self.settings.age {
@@ -166,18 +167,19 @@ impl Batches {
         if let Some(opened) = self.open.get(&(tenant, generation, shard))
             && opened.batch.id == id
         {
-            return (opened.batch.day > self.floor).then(|| Rc::clone(&opened.batch.key));
+            return (opened.batch.day >= self.floor(tenant, generation))
+                .then(|| Rc::clone(&opened.batch.key));
         }
         let found = self.cache.get(&(shard, id))?;
-        if found.day <= self.floor {
+        if (found.tenant, found.generation) != (tenant, generation) {
+            self.stats.mismatched += 1;
             return None;
         }
-        if (found.tenant, found.generation) == (tenant, generation) {
-            Some(found.key)
-        } else {
-            self.stats.mismatched += 1;
-            None
+        if found.day < self.floor(tenant, generation) {
+            self.cache.remove(&(shard, id));
+            return None;
         }
+        Some(found.key)
     }
 
     pub fn remember(
@@ -189,13 +191,13 @@ impl Batches {
         day: u32,
         key: Rc<BatchKey>,
     ) {
-        if day <= self.floor {
-            return;
-        }
         if let Some(held) = self.cache.peek(&(shard, id))
             && (held.tenant, held.generation) != (tenant, generation)
         {
             self.stats.mismatched += 1;
+            return;
+        }
+        if day < self.floor(tenant, generation) {
             return;
         }
         self.cache.put(
@@ -209,13 +211,21 @@ impl Batches {
         );
     }
 
-    pub fn settle(&mut self, day: u32) {
-        if day <= self.floor {
+    fn floor(&self, tenant: u32, generation: u32) -> u32 {
+        self.floors.get(&(tenant, generation)).copied().unwrap_or(0)
+    }
+
+    pub fn advance(&mut self, tenant: u32, generation: u32, oldest: u32) {
+        if oldest <= self.floor(tenant, generation) {
             return;
         }
-        self.floor = day;
-        self.cache.retain(|_, cached| cached.day > day);
-        self.open.retain(|_, opened| opened.batch.day > day);
+        self.floors.insert((tenant, generation), oldest);
+        self.cache.retain(|_, cached| {
+            (cached.tenant, cached.generation) != (tenant, generation) || cached.day >= oldest
+        });
+        self.open.retain(|&(t, g, _), opened| {
+            (t, g) != (tenant, generation) || opened.batch.day >= oldest
+        });
     }
 
     pub fn sweep(&mut self, now: Instant) {
@@ -243,6 +253,7 @@ impl Batches {
     }
 
     pub fn forget(&mut self, tenant: u32, generation: u32) {
+        self.floors.remove(&(tenant, generation));
         self.open
             .retain(|&(t, g, _), _| (t, g) != (tenant, generation));
         self.cache
