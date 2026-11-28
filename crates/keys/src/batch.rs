@@ -220,9 +220,6 @@ impl Batches {
             return;
         }
         self.floors.insert((tenant, generation), oldest);
-        self.cache.retain(|_, cached| {
-            (cached.tenant, cached.generation) != (tenant, generation) || cached.day >= oldest
-        });
         self.open.retain(|&(t, g, _), opened| {
             (t, g) != (tenant, generation) || opened.batch.day >= oldest
         });

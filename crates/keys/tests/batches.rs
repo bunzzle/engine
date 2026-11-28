@@ -152,8 +152,8 @@ fn advance_drops_the_keys_of_older_days_for_that_tenant_only() {
 
     batches.advance(4, 1, DAY);
 
-    assert_eq!(Rc::strong_count(&key), 3);
     assert!(batches.cached(4, 1, 2, 77).is_none());
+    assert_eq!(Rc::strong_count(&key), 3);
     assert!(batches.cached(4, 1, 2, 78).is_some());
     assert!(batches.cached(6, 1, 3, 79).is_some());
 }

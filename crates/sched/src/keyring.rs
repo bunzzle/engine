@@ -34,17 +34,25 @@ impl Keyring {
         &self.ring
     }
 
-    fn advance(&self, tenant: u32, generation: u32) -> bool {
-        let Some(working) = self.ring.get(tenant, generation) else {
-            return false;
+    fn advance(&self, tenant: u32, generation: u32) {
+        let wall = keys::wall_day();
+        let floor = match self.ring.get(tenant, generation) {
+            Some(working) => {
+                if working.seen < wall {
+                    self.ring.refresh(tenant, generation);
+                }
+                let latest = working
+                    .day
+                    .saturating_add(wall.saturating_sub(working.seen))
+                    .saturating_add(1)
+                    .min(wall);
+                working
+                    .oldest
+                    .max(latest.saturating_sub(u32::from(self.retention)))
+            }
+            None => wall.saturating_sub(u32::from(self.retention)),
         };
-        if working.seen < keys::wall_day() {
-            self.ring.refresh(tenant, generation);
-        }
-        self.batches
-            .borrow_mut()
-            .advance(tenant, generation, working.oldest);
-        true
+        self.batches.borrow_mut().advance(tenant, generation, floor);
     }
 }
 
@@ -245,11 +253,11 @@ impl Keys for Keyring {
         wrap: Wrap,
     ) -> Unwrapped<'_> {
         Box::pin(async move {
-            if self.advance(tenant, generation)
-                && let Some(key) = self
-                    .batches
-                    .borrow_mut()
-                    .cached(tenant, generation, shard, id)
+            self.advance(tenant, generation);
+            if let Some(key) = self
+                .batches
+                .borrow_mut()
+                .cached(tenant, generation, shard, id)
             {
                 return Ok(key);
             }
@@ -261,15 +269,12 @@ impl Keys for Keyring {
             if self.ring.forgotten(tenant, generation) {
                 return Err(Unsealable::Gone);
             }
-            let known = self.advance(tenant, generation);
+            self.advance(tenant, generation);
             let mut batches = self.batches.borrow_mut();
-            if known && let Some(key) = batches.cached(tenant, generation, shard, id) {
+            if let Some(key) = batches.cached(tenant, generation, shard, id) {
                 return Ok(key);
             }
             let key = Rc::new(BatchKey::new(&secret));
-            if !known {
-                return Ok(key);
-            }
             batches.remember(tenant, generation, shard, id, wrap.day, Rc::clone(&key));
             Ok(key)
         })
