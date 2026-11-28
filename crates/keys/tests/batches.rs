@@ -107,10 +107,10 @@ fn cached_keys_answer_only_their_own_tenant_and_generation() {
         assert!(batches.cached(4, 2, 2, 77).is_none());
         assert!(batches.cached(4, 1, 3, 77).is_none());
         for id in 1..10 {
-            batches.remember(9, 1, 2, id, Rc::clone(&batch.key));
+            batches.remember(9, 1, 2, id, DAY, Rc::clone(&batch.key));
         }
         assert!(batches.cached(4, 1, 2, 77).is_some(), "open batch evicted");
-        batches.remember(5, 1, 6, 900, Rc::clone(&batch.key));
+        batches.remember(5, 1, 6, 900, DAY, Rc::clone(&batch.key));
         assert!(batches.cached(4, 1, 6, 900).is_none());
         assert!(batches.stats().mismatched >= 3);
         batches.forget(4, 1);
@@ -133,10 +133,79 @@ fn a_batch_rotates_on_its_own_age_between_sweeps_and_keeps_its_cache_owner() {
             .expect("seal");
         assert_eq!(aged.id, 102);
         assert_eq!(batches.stats().aged, 1);
-        batches.remember(5, 1, 2, 100, Rc::clone(&aged.key));
+        batches.remember(5, 1, 2, 100, DAY, Rc::clone(&aged.key));
         let kept = batches.cached(4, 1, 2, 100).expect("owner kept");
         assert!(same_key(&kept, &first.key));
         assert!(batches.cached(5, 1, 2, 100).is_none());
         assert!(batches.stats().mismatched >= 2);
+    });
+}
+
+#[test]
+fn advance_drops_the_keys_of_older_days_for_that_tenant_only() {
+    let mut batches = Batches::new(BatchSettings::default());
+    let key = Rc::new(BatchKey::new(&secret(4, DAY)));
+    batches.remember(4, 1, 2, 77, DAY - 1, Rc::clone(&key));
+    batches.remember(4, 1, 2, 78, DAY, Rc::clone(&key));
+    batches.remember(6, 1, 3, 79, DAY - 1, Rc::clone(&key));
+    assert_eq!(Rc::strong_count(&key), 4);
+
+    batches.advance(4, 1, DAY);
+
+    assert!(batches.cached(4, 1, 2, 77).is_none());
+    assert_eq!(Rc::strong_count(&key), 3);
+    assert!(batches.cached(4, 1, 2, 78).is_some());
+    assert!(batches.cached(6, 1, 3, 79).is_some());
+}
+
+#[test]
+fn a_sealed_batch_advances_the_floor_and_a_lower_floor_is_ignored() {
+    run(async {
+        let mut batches = Batches::new(BatchSettings::default());
+        let key = Rc::new(BatchKey::new(&secret(4, DAY)));
+        batches.remember(4, 1, 2, 77, DAY - 1, Rc::clone(&key));
+        let today = working(4, 1, DAY);
+        let batch = batches.seal(&today, 2, 78, now()).expect("seal");
+        assert!(batches.cached(4, 1, 2, 77).is_none());
+        assert!(batches.cached(4, 1, 2, 78).is_some());
+
+        batches.advance(4, 1, DAY - 5);
+        batches.remember(4, 1, 2, 80, DAY - 1, Rc::clone(&key));
+
+        assert!(batches.cached(4, 1, 2, 80).is_none());
+        assert_eq!(Rc::strong_count(&batch.key), 2);
+    });
+}
+
+#[test]
+fn old_days_are_not_remembered_and_other_tenants_still_count_as_mismatched() {
+    let mut batches = Batches::new(BatchSettings::default());
+    let key = Rc::new(BatchKey::new(&secret(4, DAY)));
+    batches.advance(4, 1, DAY);
+    batches.remember(4, 1, 2, 77, DAY - 1, Rc::clone(&key));
+    batches.remember(4, 1, 2, 78, DAY, Rc::clone(&key));
+    batches.remember(5, 1, 2, 78, DAY - 1, Rc::clone(&key));
+
+    assert_eq!(Rc::strong_count(&key), 2);
+    assert!(batches.cached(4, 1, 2, 77).is_none());
+    assert_eq!(batches.stats().mismatched, 1);
+    batches.forget(4, 1);
+    batches.remember(4, 1, 2, 79, DAY - 1, Rc::clone(&key));
+    assert!(batches.cached(4, 1, 2, 79).is_some());
+}
+
+#[test]
+fn an_open_batch_below_the_floor_is_not_served() {
+    run(async {
+        let mut batches = Batches::new(BatchSettings::default());
+        let batch = batches
+            .seal(&working(4, 1, DAY), 2, 77, now())
+            .expect("seal");
+        assert!(batches.cached(4, 1, 2, 77).is_some());
+        batches.advance(4, 1, DAY);
+        assert!(batches.cached(4, 1, 2, 77).is_some());
+        batches.advance(4, 1, DAY + 1);
+        assert!(batches.cached(4, 1, 2, 77).is_none());
+        drop(batch);
     });
 }

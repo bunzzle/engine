@@ -178,6 +178,7 @@ struct Inner {
     joining: RefCell<Vec<Sender<()>>>,
     naming: RefCell<Option<(Secret<16>, Secret<16>, TenantKeys)>>,
     day: Cell<u32>,
+    day_seen: Cell<u32>,
     failed: Cell<bool>,
     tenants: RefCell<Cache<(u32, u32), Working>>,
     hooks: RefCell<Cache<HookKey, Arc<Secret<32>>>>,
@@ -229,6 +230,7 @@ impl Ring {
                 joining: RefCell::new(Vec::new()),
                 naming: RefCell::new(None),
                 day: Cell::new(0),
+                day_seen: Cell::new(0),
                 failed: Cell::new(false),
                 tenants: RefCell::new(Cache::new(settings.tenants)),
                 hooks: RefCell::new(Cache::new(settings.hooks)),
@@ -252,6 +254,10 @@ impl Ring {
 
     pub fn day(&self) -> u32 {
         self.inner.day.get()
+    }
+
+    pub fn day_seen(&self) -> u32 {
+        self.inner.day_seen.get()
     }
 
     pub fn naming(&self) -> Option<[u8; 16]> {
@@ -572,7 +578,8 @@ impl Ring {
             generation,
             retention,
         };
-        let working = self.answered(tenant, generation, self.call(&request).await)?;
+        let asked = wall_day();
+        let working = self.answered(tenant, generation, asked, self.call(&request).await)?;
         let request = Request::Retention {
             tenant,
             generation,
@@ -766,14 +773,16 @@ impl Ring {
 
     async fn fetch(&self, tenant: u32, generation: u32) -> Result<Working, Fault> {
         self.count(|s| s.opens += 1);
+        let asked = wall_day();
         let answer = self.call(&Request::Open { tenant, generation }).await;
-        self.answered(tenant, generation, answer)
+        self.answered(tenant, generation, asked, answer)
     }
 
     fn answered(
         &self,
         tenant: u32,
         generation: u32,
+        asked: u32,
         answer: Result<Answer, Error>,
     ) -> Result<Working, Fault> {
         match answer {
@@ -794,7 +803,7 @@ impl Ring {
                 if usize::try_from(expected).ok() != Some(search.len()) {
                     return Err(self.fault(None, None));
                 }
-                self.saw_day(day);
+                self.saw_day(day, asked);
                 Ok(Working {
                     keys: TenantKeys::new(tenant, generation, &data, version, hash, ret),
                     day,
@@ -889,6 +898,7 @@ impl Ring {
         let hello = Request::Hello {
             node: settings.node,
         };
+        let asked = wall_day();
         let answer = client.call_within(&hello, settings.deadline).await;
         let Ok(Answer::Hello {
             day,
@@ -926,7 +936,7 @@ impl Ring {
             self.inner.hooks.borrow_mut().clear();
             return Err(Error::Changed);
         }
-        self.saw_day(day);
+        self.saw_day(day, asked);
         Ok(Rc::new(client))
     }
 
@@ -942,8 +952,11 @@ impl Ring {
         }
     }
 
-    fn saw_day(&self, day: u32) {
-        self.inner.day.set(self.inner.day.get().max(day));
+    fn saw_day(&self, day: u32, asked: u32) {
+        if day >= self.inner.day.get() {
+            self.inner.day.set(day);
+            self.inner.day_seen.set(asked);
+        }
     }
 
     fn count(&self, change: impl FnOnce(&mut RingStats)) {

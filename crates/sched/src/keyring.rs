@@ -33,6 +33,34 @@ impl Keyring {
     pub fn ring(&self) -> &Ring {
         &self.ring
     }
+
+    fn advance(&self, tenant: u32, generation: u32) {
+        let wall = keys::wall_day();
+        let retention = u32::from(self.retention);
+        let day = self.ring.day();
+        let ring_latest = match day {
+            0 => 0,
+            _ => latest_day(day, self.ring.day_seen(), wall).max(day),
+        };
+        let floor = match self.ring.get(tenant, generation) {
+            Some(working) => {
+                if working.seen < wall {
+                    self.ring.refresh(tenant, generation);
+                }
+                let latest = latest_day(working.day, working.seen, wall).max(ring_latest);
+                working.oldest.max(latest.saturating_sub(retention))
+            }
+            None if day == 0 => return,
+            None => ring_latest.saturating_sub(retention),
+        };
+        self.batches.borrow_mut().advance(tenant, generation, floor);
+    }
+}
+
+fn latest_day(day: u32, seen: u32, wall: u32) -> u32 {
+    day.saturating_add(wall.saturating_sub(seen))
+        .saturating_add(1)
+        .min(wall.max(seen))
 }
 
 fn key_error(fault: Fault) -> KeyError {
@@ -232,6 +260,10 @@ impl Keys for Keyring {
         wrap: Wrap,
     ) -> Unwrapped<'_> {
         Box::pin(async move {
+            if self.ring.forgotten(tenant, generation) {
+                return Err(Unsealable::Gone);
+            }
+            self.advance(tenant, generation);
             if let Some(key) = self
                 .batches
                 .borrow_mut()
@@ -247,12 +279,13 @@ impl Keys for Keyring {
             if self.ring.forgotten(tenant, generation) {
                 return Err(Unsealable::Gone);
             }
+            self.advance(tenant, generation);
             let mut batches = self.batches.borrow_mut();
             if let Some(key) = batches.cached(tenant, generation, shard, id) {
                 return Ok(key);
             }
             let key = Rc::new(BatchKey::new(&secret));
-            batches.remember(tenant, generation, shard, id, Rc::clone(&key));
+            batches.remember(tenant, generation, shard, id, wrap.day, Rc::clone(&key));
             Ok(key)
         })
     }

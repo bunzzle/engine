@@ -533,15 +533,15 @@ fn started_with_keys(driver: &Rc<SimDriver>, cores: u16) -> Cluster {
 const KEYS_DIR: &str = "/keys";
 const KEYS_AT: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 9)), 7000);
 
-fn keys_up(machine: &Machine) {
-    drop(machine.spawn_on(0, async {
+fn keys_up(machine: &Machine, settings: KeySettings) {
+    drop(machine.spawn_on(0, async move {
         let dir = Path::new(KEYS_DIR);
         let vault = match Vault::open(dir).await {
             Ok(vault) => vault,
             Err(_) => Vault::init(dir, 20_000).await.expect("init"),
         };
         let audit = Audit::open(dir).await.expect("audit");
-        let server = Rc::new(Server::start(vault, audit, KeySettings::default()));
+        let server = Rc::new(Server::start(vault, audit, settings));
         let listener = TcpListener::bind(KEYS_AT, 16).await.expect("bind");
         while let Ok((stream, _)) = listener.accept().await {
             server.serve(stream);
@@ -550,13 +550,17 @@ fn keys_up(machine: &Machine) {
 }
 
 fn keyring() -> Rc<dyn Keys> {
+    Rc::new(keyring_with(30, RingSettings::new(1)))
+}
+
+fn keyring_with(retention: u16, settings: RingSettings) -> Keyring {
     let connect: Connect =
         Rc::new(|| Box::pin(async { Ok(KeyClient::new(TcpStream::connect(KEYS_AT).await?)) }));
-    Rc::new(Keyring::new(
-        Ring::new(connect, RingSettings::new(1)),
-        30,
+    Keyring::new(
+        Ring::new(connect, settings),
+        retention,
         BatchSettings::default(),
-    ))
+    )
 }
 
 async fn keys_listening() {
@@ -592,7 +596,7 @@ fn try_started(
         .ok()?;
     let committer = machine.spawn_on(0, booted.committer.run());
     if real_keys {
-        keys_up(&machine);
+        keys_up(&machine, KeySettings::default());
     }
     let meshes = std::sync::Arc::new(Meshes::new(cores));
     let mut tasks = Vec::new();
@@ -2426,6 +2430,144 @@ fn a_search_finds_nothing_after_a_shred_with_real_keys() {
         }
     });
     cluster.stop();
+}
+
+#[test]
+fn keyring_drops_a_shredded_batch_key_with_working() {
+    shredded_batch_key(Shred::Working);
+}
+
+#[test]
+fn keyring_drops_a_shredded_batch_key_without_working() {
+    shredded_batch_key(Shred::Evicted);
+}
+
+#[test]
+fn keyring_drops_a_shredded_batch_key_after_the_clock_steps_back() {
+    shredded_batch_key(Shred::SteppedBack);
+}
+
+#[test]
+fn keyring_drops_a_shredded_batch_key_without_working_after_the_clock_steps_back() {
+    shredded_batch_key(Shred::EvictedSteppedBack);
+}
+
+#[test]
+fn keyring_drops_a_shredded_batch_key_after_the_clock_jumps_ahead_and_back() {
+    shredded_batch_key(Shred::JumpedAhead);
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Shred {
+    Working,
+    Evicted,
+    SteppedBack,
+    EvictedSteppedBack,
+    JumpedAhead,
+}
+
+impl Shred {
+    fn evicted(self) -> bool {
+        matches!(self, Self::Evicted | Self::EvictedSteppedBack)
+    }
+
+    fn stepped_back(self) -> bool {
+        matches!(self, Self::SteppedBack | Self::EvictedSteppedBack)
+    }
+}
+
+fn shredded_batch_key(shred: Shred) {
+    use keys::proto::{Answer, Request};
+
+    let config = Config {
+        wall_start_ms: 20_000 * DAY + 3_600_000,
+        ..Config::default()
+    };
+    let driver = Rc::new(SimDriver::new(50, config));
+    let clock = Rc::clone(&driver);
+    let machine = Machine::new(driver, 1, Stalls::default());
+    keys_up(
+        &machine,
+        KeySettings {
+            tick: Duration::from_secs(10),
+            ..KeySettings::default()
+        },
+    );
+    machine.block_on(0, async move {
+        timeout(Duration::from_hours(49), async {
+            keys_listening().await;
+            let settings = RingSettings {
+                tenants: if shred == Shred::JumpedAhead { 2 } else { 1 },
+                ..RingSettings::new(1)
+            };
+            let keyring = keyring_with(1, settings);
+            keyring.create(1, 1).await.expect("create tenant");
+            let batch = keyring.batch(1, 1, 0, 7).await.expect("seal batch");
+            let wrap = Wrap::decode(&batch.wrap).expect("decode wrap");
+            sleep(BatchSettings::default().age).await;
+            keyring.tick();
+            let key = keyring
+                .batch_key(1, 1, 0, 7, wrap.clone())
+                .await
+                .expect("cached key");
+            assert!(Rc::ptr_eq(&key, &batch.key));
+            drop(batch);
+
+            if shred == Shred::JumpedAhead {
+                clock.jump_wall_clock(5 * DAY_MS);
+                let working = keyring.ring().fresh(1, 1).await.expect("fresh keys");
+                assert_eq!((working.day, working.seen), (wrap.day, wrap.day + 5));
+                clock.jump_wall_clock(-5 * DAY_MS);
+            }
+            if shred.evicted() || shred == Shred::JumpedAhead {
+                keyring.create(2, 1).await.expect("create second tenant");
+            }
+            if shred == Shred::JumpedAhead {
+                assert_eq!(keyring.ring().day_seen(), wrap.day);
+            }
+            sleep(Duration::from_hours(24)).await;
+            let live = keyring
+                .batch_key(1, 1, 0, 7, wrap.clone())
+                .await
+                .expect("live day key");
+            assert!(Rc::ptr_eq(&live, &key));
+            drop(live);
+            sleep(Duration::from_hours(24)).await;
+            let ring = keyring.ring();
+            if shred.stepped_back() {
+                clock.jump_wall_clock(-2 * 3_600_000);
+                let tenant = if shred.evicted() { 2 } else { 1 };
+                let working = ring.fresh(tenant, 1).await.expect("fresh keys");
+                assert_eq!(working.day, wrap.day + 2);
+                assert_eq!(working.seen, wrap.day + 1);
+            }
+            assert!(matches!(
+                ring.call(&Request::Settled { day: wrap.day }).await,
+                Ok(Answer::Done)
+            ));
+            assert_eq!(
+                ring.unwrap(1, 1, 0, 7, &wrap).await.err(),
+                Some(keys::Fault::Gone)
+            );
+            if shred.stepped_back() {
+                assert_eq!(ring.day(), wrap.day + 2);
+            } else {
+                assert!(ring.day() < wrap.day + 2);
+            }
+            assert_eq!(
+                ring.get(1, 1).map(|working| working.oldest),
+                (!shred.evicted()).then_some(wrap.day)
+            );
+            assert_eq!(Rc::strong_count(&key), 2);
+            assert_eq!(
+                keyring.batch_key(1, 1, 0, 7, wrap).await.err(),
+                Some(Unsealable::Gone)
+            );
+            assert_eq!(Rc::strong_count(&key), 1);
+        })
+        .await
+        .expect("keyring test timed out");
+    });
 }
 
 fn search_range() -> (u64, u64) {
