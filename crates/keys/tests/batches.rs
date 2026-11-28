@@ -193,3 +193,19 @@ fn old_days_are_not_remembered_and_other_tenants_still_count_as_mismatched() {
     batches.remember(4, 1, 2, 79, DAY - 1, Rc::clone(&key));
     assert!(batches.cached(4, 1, 2, 79).is_some());
 }
+
+#[test]
+fn an_open_batch_below_the_floor_is_not_served() {
+    run(async {
+        let mut batches = Batches::new(BatchSettings::default());
+        let batch = batches
+            .seal(&working(4, 1, DAY), 2, 77, now())
+            .expect("seal");
+        assert!(batches.cached(4, 1, 2, 77).is_some());
+        batches.advance(4, 1, DAY);
+        assert!(batches.cached(4, 1, 2, 77).is_some());
+        batches.advance(4, 1, DAY + 1);
+        assert!(batches.cached(4, 1, 2, 77).is_none());
+        drop(batch);
+    });
+}

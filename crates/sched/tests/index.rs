@@ -2434,15 +2434,27 @@ fn a_search_finds_nothing_after_a_shred_with_real_keys() {
 
 #[test]
 fn keyring_drops_a_shredded_batch_key_with_working() {
-    shredded_batch_key(false);
+    shredded_batch_key(Shred::Working);
 }
 
 #[test]
 fn keyring_drops_a_shredded_batch_key_without_working() {
-    shredded_batch_key(true);
+    shredded_batch_key(Shred::Evicted);
 }
 
-fn shredded_batch_key(evict_working: bool) {
+#[test]
+fn keyring_drops_a_shredded_batch_key_after_the_clock_steps_back() {
+    shredded_batch_key(Shred::SteppedBack);
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Shred {
+    Working,
+    Evicted,
+    SteppedBack,
+}
+
+fn shredded_batch_key(shred: Shred) {
     use keys::proto::{Answer, Request};
 
     let config = Config {
@@ -2450,6 +2462,7 @@ fn shredded_batch_key(evict_working: bool) {
         ..Config::default()
     };
     let driver = Rc::new(SimDriver::new(50, config));
+    let clock = Rc::clone(&driver);
     let machine = Machine::new(driver, 1, Stalls::default());
     keys_up(
         &machine,
@@ -2478,11 +2491,24 @@ fn shredded_batch_key(evict_working: bool) {
             assert!(Rc::ptr_eq(&key, &batch.key));
             drop(batch);
 
-            if evict_working {
+            if shred == Shred::Evicted {
                 keyring.create(2, 1).await.expect("create second tenant");
             }
-            sleep(Duration::from_hours(48)).await;
+            sleep(Duration::from_hours(24)).await;
+            let live = keyring
+                .batch_key(1, 1, 0, 7, wrap.clone())
+                .await
+                .expect("live day key");
+            assert!(Rc::ptr_eq(&live, &key));
+            drop(live);
+            sleep(Duration::from_hours(24)).await;
             let ring = keyring.ring();
+            if shred == Shred::SteppedBack {
+                clock.jump_wall_clock(-2 * 3_600_000);
+                let working = ring.fresh(1, 1).await.expect("fresh keys");
+                assert_eq!(working.day, wrap.day + 2);
+                assert_eq!(working.seen, wrap.day + 1);
+            }
             assert!(matches!(
                 ring.call(&Request::Settled { day: wrap.day }).await,
                 Ok(Answer::Done)
@@ -2491,10 +2517,14 @@ fn shredded_batch_key(evict_working: bool) {
                 ring.unwrap(1, 1, 0, 7, &wrap).await.err(),
                 Some(keys::Fault::Gone)
             );
-            assert_eq!(ring.day(), wrap.day);
+            if shred == Shred::SteppedBack {
+                assert_eq!(ring.day(), wrap.day + 2);
+            } else {
+                assert!(ring.day() < wrap.day + 2);
+            }
             assert_eq!(
                 ring.get(1, 1).map(|working| working.oldest),
-                (!evict_working).then_some(wrap.day)
+                (shred != Shred::Evicted).then_some(wrap.day)
             );
             assert_eq!(Rc::strong_count(&key), 2);
             assert_eq!(

@@ -42,13 +42,13 @@ impl Keyring {
                 if working.seen < wall {
                     self.ring.refresh(tenant, generation);
                 }
-                let latest = latest_day(working.day, working.seen, wall);
+                let latest = latest_day(working.day, working.seen, wall).max(self.ring.day());
                 working.oldest.max(latest.saturating_sub(retention))
             }
             None if self.ring.day() == 0 => return,
-            None => {
-                latest_day(self.ring.day(), self.ring.day_seen(), wall).saturating_sub(retention)
-            }
+            None => latest_day(self.ring.day(), self.ring.day_seen(), wall)
+                .max(self.ring.day())
+                .saturating_sub(retention),
         };
         self.batches.borrow_mut().advance(tenant, generation, floor);
     }
