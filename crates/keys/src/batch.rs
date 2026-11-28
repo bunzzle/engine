@@ -220,9 +220,6 @@ impl Batches {
             return;
         }
         self.floors.insert((tenant, generation), oldest);
-        self.open.retain(|&(t, g, _), opened| {
-            (t, g) != (tenant, generation) || opened.batch.day >= oldest
-        });
     }
 
     pub fn sweep(&mut self, now: Instant) {

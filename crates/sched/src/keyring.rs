@@ -36,24 +36,28 @@ impl Keyring {
 
     fn advance(&self, tenant: u32, generation: u32) {
         let wall = keys::wall_day();
+        let retention = u32::from(self.retention);
         let floor = match self.ring.get(tenant, generation) {
             Some(working) => {
                 if working.seen < wall {
                     self.ring.refresh(tenant, generation);
                 }
-                let latest = working
-                    .day
-                    .saturating_add(wall.saturating_sub(working.seen))
-                    .saturating_add(1)
-                    .min(wall);
-                working
-                    .oldest
-                    .max(latest.saturating_sub(u32::from(self.retention)))
+                let latest = latest_day(working.day, working.seen, wall);
+                working.oldest.max(latest.saturating_sub(retention))
             }
-            None => wall.saturating_sub(u32::from(self.retention)),
+            None if self.ring.day() == 0 => return,
+            None => {
+                latest_day(self.ring.day(), self.ring.day_seen(), wall).saturating_sub(retention)
+            }
         };
         self.batches.borrow_mut().advance(tenant, generation, floor);
     }
+}
+
+fn latest_day(day: u32, seen: u32, wall: u32) -> u32 {
+    day.saturating_add(wall.saturating_sub(seen))
+        .saturating_add(1)
+        .min(wall.max(seen))
 }
 
 fn key_error(fault: Fault) -> KeyError {
@@ -253,6 +257,9 @@ impl Keys for Keyring {
         wrap: Wrap,
     ) -> Unwrapped<'_> {
         Box::pin(async move {
+            if self.ring.forgotten(tenant, generation) {
+                return Err(Unsealable::Gone);
+            }
             self.advance(tenant, generation);
             if let Some(key) = self
                 .batches

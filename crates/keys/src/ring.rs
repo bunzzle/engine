@@ -178,6 +178,7 @@ struct Inner {
     joining: RefCell<Vec<Sender<()>>>,
     naming: RefCell<Option<(Secret<16>, Secret<16>, TenantKeys)>>,
     day: Cell<u32>,
+    day_seen: Cell<u32>,
     failed: Cell<bool>,
     tenants: RefCell<Cache<(u32, u32), Working>>,
     hooks: RefCell<Cache<HookKey, Arc<Secret<32>>>>,
@@ -229,6 +230,7 @@ impl Ring {
                 joining: RefCell::new(Vec::new()),
                 naming: RefCell::new(None),
                 day: Cell::new(0),
+                day_seen: Cell::new(0),
                 failed: Cell::new(false),
                 tenants: RefCell::new(Cache::new(settings.tenants)),
                 hooks: RefCell::new(Cache::new(settings.hooks)),
@@ -252,6 +254,10 @@ impl Ring {
 
     pub fn day(&self) -> u32 {
         self.inner.day.get()
+    }
+
+    pub fn day_seen(&self) -> u32 {
+        self.inner.day_seen.get()
     }
 
     pub fn naming(&self) -> Option<[u8; 16]> {
@@ -943,7 +949,10 @@ impl Ring {
     }
 
     fn saw_day(&self, day: u32) {
-        self.inner.day.set(self.inner.day.get().max(day));
+        if day >= self.inner.day.get() {
+            self.inner.day.set(day);
+            self.inner.day_seen.set(wall_day());
+        }
     }
 
     fn count(&self, change: impl FnOnce(&mut RingStats)) {
