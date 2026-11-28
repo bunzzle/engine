@@ -811,7 +811,7 @@ impl Ring {
                     today,
                     tomorrow,
                     search: SearchKeys::new(day.saturating_add(1), search),
-                    seen: asked,
+                    seen: wall_day(),
                 })
             }
             Ok(Answer::Refused(refused)) => Err(self.fault(None, Some(refused))),

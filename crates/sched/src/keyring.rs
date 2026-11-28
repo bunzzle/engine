@@ -37,18 +37,21 @@ impl Keyring {
     fn advance(&self, tenant: u32, generation: u32) {
         let wall = keys::wall_day();
         let retention = u32::from(self.retention);
+        let day = self.ring.day();
+        let ring_latest = match day {
+            0 => 0,
+            _ => latest_day(day, self.ring.day_seen(), wall).max(day),
+        };
         let floor = match self.ring.get(tenant, generation) {
             Some(working) => {
                 if working.seen < wall {
                     self.ring.refresh(tenant, generation);
                 }
-                let latest = latest_day(working.day, working.seen, wall).max(self.ring.day());
+                let latest = latest_day(working.day, working.seen, wall).max(ring_latest);
                 working.oldest.max(latest.saturating_sub(retention))
             }
-            None if self.ring.day() == 0 => return,
-            None => latest_day(self.ring.day(), self.ring.day_seen(), wall)
-                .max(self.ring.day())
-                .saturating_sub(retention),
+            None if day == 0 => return,
+            None => ring_latest.saturating_sub(retention),
         };
         self.batches.borrow_mut().advance(tenant, generation, floor);
     }
